@@ -6,7 +6,8 @@
 //! (Just Works) with bonding, and connectable advertising. It talks to the
 //! link layer through the typed API of [`crate::link`], not through HCI.
 //!
-//! So far only the AES seam ([`Aes`] and [`Ecb`]) exists; the modules below
+//! So far only the AES seam ([`Aes`] and [`Ecb`]) and the cryptography of
+//! pairing ([`smp::toolbox`] and [`smp::ecc`]) exist; the modules below
 //! describe what the next stages put into them. The protocol core ([`l2cap`],
 //! [`signal`], [`att`], [`gatt`], [`smp`] and [`engine`]) is to hold no
 //! futures and touch no peripheral, so it runs in the host tests on the PC;
