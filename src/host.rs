@@ -6,11 +6,12 @@
 //! (Just Works) with bonding, and connectable advertising. It talks to the
 //! link layer through the typed API of [`crate::link`], not through HCI.
 //!
-//! So far the AES seam ([`Aes`] and [`Ecb`]), the cryptography of pairing
-//! ([`smp::toolbox`] and [`smp::ecc`]), the L2CAP fixed channels
-//! ([`l2cap`]), LE signalling ([`signal`]), the ATT server ([`att`]) and the
-//! GATT table with the Spotlight's ([`gatt`]) exist, but nothing calls them on
-//! a running connection yet: that is the engine stage. The other modules
+//! So far the AES seam ([`Aes`] and [`Ecb`]), the security manager
+//! ([`smp`], with its cryptography in [`smp::toolbox`] and [`smp::ecc`]),
+//! the L2CAP fixed channels ([`l2cap`]), LE signalling ([`signal`]), the ATT
+//! server ([`att`]) and the GATT table with the Spotlight's ([`gatt`]) exist,
+//! but nothing calls them on a running connection yet: that is the engine
+//! stage. The other modules
 //! describe what the next stages put into them. The protocol core ([`l2cap`],
 //! [`signal`], [`att`], [`gatt`], [`smp`] and [`engine`]) is to hold no
 //! futures and touch no peripheral, so it runs in the host tests on the PC;
