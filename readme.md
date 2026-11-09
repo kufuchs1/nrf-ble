@@ -260,11 +260,14 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   counters: `R retx (A with ack), K acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback,
   prepare max P us`, where `late` counts answers in place only after the radio started sending, `answer max` the
   time from the END until the answer was in place, `retx with ack` the central's retransmissions that acknowledged
-  ours, the signature of an answer the central did not take, and `prepare max` the time preparing and sealing the
-  next PDU takes between events. The first eight events of a link log both headers of their first exchange, every
+  ours, which also follow late answers without an acknowledgement (`late` less `on ack`), as those sent our PDU with
+  its previous flags, so that only a count beyond those points to an answer the central did not take, such as an echo
+  of its packet, and `prepare max` the time preparing and sealing the next PDU takes between events. The first eight events of a link log both headers of their first exchange, every
   control PDU of ours logs when it is sent and acknowledged, and the radio's packet layout is logged once per link.
-  The `ifs-delay-test` feature makes the answer to an acknowledgement late on purpose every 16th event, which `late`
-  counts while the link goes on.
+  The `ifs-delay-test` feature makes the answer to an acknowledgement late on purpose every 16th event, 160 µs after
+  the END, past the radio's start but before our shortest packet ends, which `late` counts while the link goes on.
+  On the nRF51 the answer sets the turnaround after it at once, as the radio's own turnaround follows the END of our
+  answer, about 230 µs after the central's for an empty PDU, also when the answer is late.
   The advertiser points the radio at the scan response once a request's access address came and stops at once for
   anything but a scan request, so a late scan request decision sends the scan response, never the request; such late
   decisions are logged. The ramp-up time is still to be confirmed against the nRF51802 product specification. The

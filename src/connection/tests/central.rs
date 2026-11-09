@@ -381,12 +381,21 @@ fn a_late_answer_resends_our_previous_pdu_and_the_link_goes_on() {
         sim.run();
         assert!(sim.link.stats.late_ack > 0);
         assert_eq!(sim.link.stats.late_noack, 0);
+        // The central retransmits after each, without acknowledging ours
+        // again.
+        assert!(sim.link.stats.retx > 0);
+        assert_eq!(sim.link.stats.retx_with_ack, 0);
         // Every answer late: the flags go out one exchange behind, and still
         // everything arrives.
         let both = Faults { late_ack: 1000, late_noack: 1000, ..Faults::NONE };
         let mut sim = Sim::new(3, both, Late::Latched, encrypted);
         sim.run();
         assert!(sim.link.stats.late_noack > 0);
+        // A late answer without an acknowledgement sent the previous NESN:
+        // the central sends its packet again and acknowledges ours, without
+        // any echo.
+        assert!(sim.link.stats.retx_with_ack > 0);
+        assert!(sim.link.stats.retx_with_ack <= sim.link.stats.late_noack);
     }
 }
 
@@ -403,6 +412,10 @@ fn a_thousand_links_with_random_faults_lose_nothing_and_never_echo() {
         };
         let mut sim = Sim::new(seed, faults, Late::Latched, seed % 2 == 1);
         sim.run();
+        // Without an echo, only late answers without an acknowledgement
+        // make the central acknowledge ours in a retransmission.
+        let stats = sim.link.stats;
+        assert!(stats.retx_with_ack <= stats.late_noack, "seed {seed}: {} > {}", stats.retx_with_ack, stats.late_noack);
     }
 }
 
@@ -551,4 +564,41 @@ fn a_loss_after_a_late_answer_is_not_the_path() {
     link.after_answer(decision, &[0; BUFFER_LEN], (None, false, 0), &shared);
     assert_eq!(for_phy_mut(&mut link.power, link.tx_phy).level(), level);
     assert!(!link.late_answer);
+}
+
+#[test]
+fn host_data_queued_during_the_sleep_goes_out_at_that_event() {
+    let shared = Shared::new();
+    shared.set_connected(true);
+    for encrypted in [false, true] {
+        let mut link = connection();
+        link.encryption.tx_on = encrypted;
+        link.start_slots(&shared);
+        // Before the sleep, nothing to send.
+        link.prepare_next(&shared);
+        link.prepare_room(&shared);
+        assert!(!link.next_ready);
+        // The host answers during the sleep, and its wake-up prepares again
+        // in time.
+        let packet: Vec<u8> = (1..=9).collect();
+        assert!(shared.queue_acl_for_test(&packet));
+        assert!(link.prepare_after_wake(1000, 1000 + SETUP_US + PREPARE_AGAIN_US + 1, &shared));
+        assert!(link.next_ready);
+        // The central's acknowledgement at the event sends it.
+        let decision = link.decide(Some((Llid::Continuation.bits() | NESN, 0, true)), 1000, true, &shared).unwrap();
+        assert!(decision.acked.is_some() && !decision.fallback);
+        assert!(link.tx_kind == TxKind::Acl);
+        assert_eq!(&link.current().plain.0[DATA_HEADER_LEN..DATA_HEADER_LEN + packet.len()], &packet[..]);
+        assert_eq!(link.current().encrypted, encrypted);
+        // A wake-up too close to the radio's setup leaves the data for the
+        // next event.
+        let mut late = connection();
+        late.start_slots(&shared);
+        late.prepare_next(&shared);
+        assert!(shared.queue_acl_for_test(&packet));
+        assert!(!late.prepare_after_wake(1000, 1000 + SETUP_US + PREPARE_AGAIN_US, &shared));
+        assert!(!late.next_ready);
+        late.prepare_next(&shared);
+        assert!(late.next_ready);
+    }
 }

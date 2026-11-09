@@ -37,6 +37,12 @@ pub(crate) const LENGTH_BITS: u8 = 8;
 /// Receiver ready time after RXEN: 40 us with the fast ramp-up of the
 /// nRF52832, about 140 us on the nRF51.
 pub const RX_READY_US: u32 = chip::RX_READY_US;
+/// Whether the answer within the interframe space sets the next turnaround.
+///
+/// It does so right after its packet pointer with the nRF51's own
+/// turnaround; with TIMER1 on the nRF52832 the exchange sets it once the
+/// answer started.
+pub const TURNAROUND_IN_ANSWER: bool = switch::SET_IN_ANSWER;
 /// Time by which the receiver is ready before the earliest packet start one
 /// interframe space after our packet: the peer may be 2 us early, and the
 /// receiver locks onto the preamble before the access address.

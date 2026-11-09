@@ -19,8 +19,9 @@ defmt = ["dep:defmt", "embassy-time/defmt"]
 data-length = []
 # A test of the answer within the interframe space on hardware, never for
 # use: every 16th connection event, the answer to an acknowledgement waits
-# 200 us, so it comes too late. The `late` counters of the 10 s report count
-# those events, and the link goes on as with a lost answer.
+# until 160 us after the END, past the radio's start, so it comes too late
+# and the radio resends our previous PDU. The `late` counters of the 10 s
+# report count those events, and the link goes on as with a lost answer.
 ifs-delay-test = []
 
 [dependencies]

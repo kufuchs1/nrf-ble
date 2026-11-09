@@ -20,6 +20,15 @@
 use super::{REGS, Radio, Turnaround};
 use core::sync::atomic::{Ordering, compiler_fence};
 
+/// Whether the answer within the interframe space sets the turnaround after
+/// it, at once. The END of our answer disables the radio, and the shortcuts
+/// set then decide what follows: the DISABLED to TXEN shortcut armed for our
+/// answer would otherwise send a second packet about 150 us later. So the
+/// turnaround after our answer must be set before that answer ends, about
+/// 230 us after the END of the central's packet for an empty PDU, also when
+/// the answer came late.
+pub const SET_IN_ANSWER: bool = true;
+
 /// Sets what the radio does after the current packet. A turnaround to send
 /// follows a reception, whose signal strength the radio measures; during our
 /// own packets it measures nothing, so that a sample of the central's packet

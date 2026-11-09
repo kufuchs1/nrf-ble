@@ -17,6 +17,10 @@ use embassy_nrf::pac::{
 const PPI_SWITCH_START: usize = 4;
 /// Programmable PPI channel: TIMER1 COMPARE0 to RADIO TXEN or RXEN.
 const PPI_SWITCH_ENABLE: usize = 5;
+/// Whether the answer within the interframe space sets the next turnaround:
+/// no, TIMER1 starts the answer, and the exchange sets the next turnaround
+/// once it did, while our answer goes out.
+pub const SET_IN_ANSWER: bool = false;
 /// TIMER1 ticks per microsecond, at 16 MHz.
 const SWITCH_TICKS_PER_US: u32 = 16;
 

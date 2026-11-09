@@ -13,7 +13,7 @@ mod transmit;
 use crate::{
     channel::{Hopping, UsedChannels},
     chip,
-    clock::{Clock, reached},
+    clock::{Clock, SETUP_US, reached},
     crypto::{self, CONFIG_LEN, SCRATCH_LEN},
     link::{
         ACL_MAX,
@@ -33,9 +33,8 @@ use crate::{
     log::info,
     pdu::{BUFFER_LEN, ConnectInd, LLID_MASK, Llid, NESN, SN, field, valid_channel_map, valid_connection_parameters},
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
-    radio::{Phy, Radio, Turnaround},
+    radio::{Phy, Radio, TURNAROUND_IN_ANSWER, Turnaround},
 };
-use core::future::pending;
 use embassy_futures::select::{Either, select};
 use entropy::Prefetch;
 use transmit::Ring;
@@ -189,9 +188,14 @@ const TRACE_EVENTS: u16 = 8;
 /// Control PDUs sent or acknowledged per event that the log shows.
 const TRACE_CONTROLS: usize = 4;
 /// How long after the END the answer to an acknowledgement waits every 16th
-/// event with the `ifs-delay-test` feature: past the radio's start.
+/// event with the `ifs-delay-test` feature: past the radio's start, about
+/// 150 us after the END, and well before our shortest packet, an empty PDU,
+/// ends about 230 us after it, by which the nRF51's turnaround must be set.
 #[cfg(feature = "ifs-delay-test")]
-const IFS_DELAY_TEST_US: u32 = 200;
+const IFS_DELAY_TEST_US: u32 = 160;
+/// Time preparing the next PDU again may take, copy and sealing included,
+/// after the host woke the sleep before an event, on top of [`SETUP_US`].
+const PREPARE_AGAIN_US: u32 = 200;
 
 /// Why a connection ended.
 #[derive(Clone, Copy)]
@@ -245,12 +249,16 @@ pub struct Stats {
     pub prepare_us_max:    u32,
     /// New data PDUs received.
     pub received:          u32,
-    /// Packets the central sent again: it missed our answer, or got it too
-    /// late or without room for its packet.
+    /// Packets the central sent again that we had taken: it missed our
+    /// answer, or our answer came late. A packet refused for lack of room
+    /// comes again as a new one and is not counted.
     pub retx:              u32,
     /// Of [`Self::retx`], those that acknowledged our PDU: the central heard
-    /// an answer of ours that did not acknowledge its packet. Without a
-    /// lack of room for its packets, this stays zero.
+    /// an answer of ours that did not acknowledge its packet. Each late
+    /// answer without an acknowledgement to a packet we took is followed by
+    /// one, as the radio sent our PDU with its previous flags (see
+    /// [`Self::late_noack`]); only a count beyond `late_noack` points to an
+    /// answer the central did not take, such as an echo of its packet.
     pub retx_with_ack:     u32,
     /// Connection events skipped with peripheral latency.
     pub skipped:           u32,
@@ -1352,9 +1360,11 @@ impl Connection {
                 }
             } else {
                 // The switch started the answer; the next turnaround follows
-                // its end.
-                radio.wait_switched();
-                radio.set_turnaround(if more { Turnaround::Receive } else { Turnaround::None });
+                // its end. On the nRF51 the answer set it already.
+                if !TURNAROUND_IN_ANSWER {
+                    radio.wait_switched();
+                    radio.set_turnaround(if more { Turnaround::Receive } else { Turnaround::None });
+                }
                 // While ours goes out, the next PDU, into the slot the radio
                 // does not send: not after a late answer, which sends it.
                 if chip::PREPARE_IN_EVENT && more && !late && !self.next_ready {
@@ -1903,6 +1913,23 @@ impl Connection {
         radio.clear_ready();
     }
 
+    /// Prepares the coming event again after the host woke the sleep before
+    /// it, at `now`, for a radio start at `start`: the host's data queued
+    /// during the sleep, unless a PDU is prepared already, and the room its
+    /// reading made. Only as long as this ends before the radio's setup;
+    /// otherwise the data waits for the next event. Returns whether it
+    /// prepared again.
+    fn prepare_after_wake(&mut self, now: u32, start: u32, shared: &Shared) -> bool {
+        if reached(now.wrapping_add(SETUP_US).wrapping_add(PREPARE_AGAIN_US), start) {
+            return false;
+        }
+        if !self.next_ready {
+            self.prepare_next(shared);
+        }
+        self.prepare_room(shared);
+        true
+    }
+
     /// Prepares the coming event outside the interframe space, so that the
     /// answer within it only decides: the next PDU, timed, the air time of
     /// another exchange, and the room for the central's packets.
@@ -2065,6 +2092,12 @@ impl Connection {
         // SAFETY: the slots belong to this connection, and the exchange
         // disables the radio before it returns.
         let () = unsafe { radio.set_buffer(buffer) };
+        if TURNAROUND_IN_ANSWER {
+            // Before our answer ends, also a late one: the radio's own
+            // turnaround follows that END (see `switch_tifs`).
+            radio.wait_switched();
+            radio.set_turnaround(if decision.more { Turnaround::Receive } else { Turnaround::None });
+        }
         let late = radio.tx_started();
         let answer_us = clock.now().wrapping_sub(clock.end_time());
         self.after_answer(decision, rx, (radio.rssi(), late, answer_us), shared);
@@ -2170,7 +2203,15 @@ impl Connection {
             if let Some(reason) = self.abort {
                 break Ended::Error(reason);
             }
-            clock.sleep_until(window.0, pending::<()>()).await;
+            // The host runs while the link layer sleeps: what it queues then
+            // wakes the sleep and is prepared again, so that it goes out at
+            // this event rather than the next.
+            while !clock.sleep_until(window.0, shared.wakeup()).await {
+                self.prepare_after_wake(clock.now(), window.0, shared);
+            }
+            if let Some(reason) = self.abort {
+                break Ended::Error(reason);
+            }
             if !clock.ensure_crystal().await && reached(clock.now(), window.0) {
                 self.stats.skipped = self.stats.skipped.wrapping_add(1);
                 self.counter = self.counter.wrapping_add(1);
