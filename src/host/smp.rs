@@ -1,7 +1,8 @@
 //! The security manager: LE Secure Connections pairing as responder.
 //!
-//! Not written yet: the security manager stage fills this module. What it is
-//! to do:
+//! So far only its cryptography exists: the AES-CMAC based functions of
+//! pairing in [`toolbox`] and P-256 in [`ecc`]. The security manager stage
+//! fills this module with the rest. What it is to do:
 //!
 //! - Pair with Just Works, bond, and distribute the identity resolving key and
 //!   identity address, taking the central's in return. A pairing that does not
@@ -19,7 +20,8 @@
 //!   nRF51. The application's watchdog hook is called right before each
 //!   multiplication, and the task yields between two jobs.
 
-/// The P-256 scalar multiplication.
+/// P-256: the key pair, the check of the central's public key and the
+/// Diffie-Hellman key.
 pub mod ecc;
-/// The cryptographic functions of pairing.
+/// The cryptographic functions of pairing: AES-CMAC, f4, f5, f6, g2 and ah.
 pub mod toolbox;

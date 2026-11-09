@@ -32,6 +32,9 @@ p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic"
 [dev-dependencies]
 # Software AES for the host tests, in place of the hardware ECB.
 aes = "0"
+# The Diffie-Hellman of the p256 crate, to check our own scalar
+# multiplication against in the host tests.
+p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic", "ecdh"] }
 # The RTC time driver only provides the time symbols for the host tests; no
 # test starts it. The chip comes from the chip feature: features unify, and
 # naming one here would build both chips for the other.
