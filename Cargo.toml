@@ -1,0 +1,85 @@
+[package]
+name = "nrf-ble"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Bluetooth LE link layer and a minimal host for the nRF52832 and the nRF51, joined by a typed link API"
+readme = "readme.md"
+
+[features]
+default = ["nrf52832"]
+# The chip, exactly one: the nRF52832 by default, the nRF51 with
+# default-features = false.
+nrf52832 = ["embassy-nrf/nrf52832"]
+nrf51 = ["embassy-nrf/nrf51"]
+defmt = ["dep:defmt", "bt-hci/defmt", "embassy-time/defmt"]
+# Data length extension: payloads of up to 251 octets instead of 27, at
+# about 1.5 KB more static RAM for the larger packet buffers. The nRF52832
+# only: the nRF51 CCM encrypts payloads of up to 27 octets.
+data-length = []
+
+[dependencies]
+bt-hci = { version = "0", default-features = false }
+cortex-m = "0"
+defmt = { version = "1", optional = true }
+embassy-futures = "0"
+embassy-nrf = { version = "0", features = ["unstable-pac"] }
+embassy-sync = "0"
+embassy-time = "0"
+embedded-io = "0.7"
+# P-256 for LE Secure Connections pairing: field and point arithmetic only,
+# with a scalar multiplication loop of our own (src/host/smp/ecc.rs).
+p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic"] }
+
+[dev-dependencies]
+# Software AES for the host tests, in place of the hardware ECB.
+aes = "0"
+# The RTC time driver only provides the time symbols for the host tests; no
+# test starts it. The chip comes from the chip feature: features unify, and
+# naming one here would build both chips for the other.
+embassy-nrf = { version = "0", features = ["time", "time-driver-rtc1", "unstable-pac"] }
+embassy-time = { version = "0", features = ["tick-hz-32_768"] }
+
+[target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+
+# Standalone: not a member of the spotlight_rust root package or of fw.
+[workspace]
+
+[lib]
+test = true
+bench = false
+
+# Embassy from its main branch, for the firmware and for TrouBLE alike.
+[patch.crates-io]
+embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = 1 }
+pedantic = { level = "deny", priority = 1 }
+restriction = { level = "deny", priority = 1 }
+nursery = { level = "deny", priority = 1 }
+blanket_clippy_restriction_lints = { level = "allow", priority = 2 }
+big_endian_bytes = { level = "allow", priority = 2 }
+future_not_send = { level = "allow", priority = 2 }
+implicit_return = { level = "allow", priority = 2 }
+little_endian_bytes = { level = "allow", priority = 2 }
+separated_literal_suffix = { level = "allow", priority = 2 }
+single_call_fn = { level = "allow", priority = 2 }
+self_named_module_files = { level = "allow", priority = 2 }
+pub_with_shorthand = { level = "allow", priority = 2 }
+pub_use = { level = "allow", priority = 2 }
+# Result/Option propagation is intentional; it keeps driver error paths explicit.
+question_mark_used = { level = "allow", priority = 2 }
+# Raised inside the defmt macro expansion, only for some log formats.
+missing_asserts_for_indexing = { level = "allow", priority = 2 }
+
