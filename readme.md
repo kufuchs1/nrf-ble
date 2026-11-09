@@ -11,8 +11,8 @@ nrf-ble starts as a copy of nrf-ll, the link layer of the replacement firmwares 
 and the MX Master 3S mouse, which talks to a host stack such as [TrouBLE](https://github.com/embassy-rs/trouble) over
 HCI. nrf-ll stays as it is, and the MX firmwares keep using it until they move here.
 
-This crate has no HCI: no bt-hci, no TrouBLE, and no command or event encoded into bytes. The host (`src/host`) is to
-talk to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs). Its only target is Linux with BlueZ,
+This crate has no HCI: no bt-hci, no TrouBLE, and no command or event encoded into bytes. The host (`src/host`) talks
+to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs). Its only target is Linux with BlueZ,
 and its first user is the firmware of the Logitech Spotlight remote (an nRF51802), later the MX firmwares. The design is
 in [`docs/host/design.md`](../docs/host/design.md), with the fixes of its reviews; it was written for a separate host
 crate and an HCI adapter, and this crate replaces both with one crate and the typed API.
@@ -38,8 +38,29 @@ What is done so far:
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
   phases, and their setup of the link layer's accept list, resolving list and privacy) and the bond (`host::bond`: the
   record of the one central with its fixed 50 octet stored form).
-- In the doc comments of the other modules, what each of the next stages puts into them. The engine, which wires the
-  code above to a running connection, and the async advertise call do not exist yet.
+- The engine (`host::engine::Engine`): all of the host's protocol state for one link, without futures. It takes the
+  link layer's events and fragments, the time and the results of the P-256 jobs, and gives the fragments to send (pulled
+  one at a time, the connection parameter request leaving one place of the link layer's queue free), the calls of the
+  link layer, its next deadline, the jobs and the events for the application. It holds the peripheral latency off until
+  discovery is over (the link encrypted and ATT idle for 500 ms), asks for the table's preferred connection parameters
+  with the L2CAP request once ATT has been idle for 1.5 s, answers a key request for EDIV 0 and Rand 0 only, with the
+  pairing's key or the bond's for the bonded central, restores the bond's client characteristic configuration only once
+  the link is encrypted with the bond's key, builds the bond from the pairing and keeps its subscriptions up to date,
+  and ends a link that is not encrypted in time, whose pairing failed or timed out.
+- The async glue (`host::Host`, `host::Conn`): a static `Host` whose engine sits behind a thread mode mutex, never a
+  critical section. `Host::run` waits for the link layer, the next deadline, room in the link layer's queue while output
+  waits, or a wake-up; `Host::crypto` runs the P-256 jobs with the firmware's watchdog hook before each multiplication
+  and a yield between jobs; `Host::advertise` waits for the key pair before pairable advertising, runs the schedule's
+  phases and keeps or ends a link that arrives after its future was dropped; `Conn::notify` paces by acknowledgement,
+  with at most two fragments in flight and one place of the queue kept free. The link layer is reached through the
+  `host::Port` trait, which `link::Link` implements; the host tests drive the whole host over a stand-in link layer.
+  The module documentation of `host` shows how the Spotlight firmware wires it.
+
+On the nRF51 (thumbv6m, measured with `-Zprint-type-sizes`) the static `Host<Link>` takes 896 bytes, 800 of them the
+engine (368 the security manager), the `Host::run` future 136 bytes, the `Host::crypto` future 32, a `Host::advertise`
+future 96 and a `Conn::notify` future 48.
+
+Nothing has run on hardware or against BlueZ yet.
 
 ## The typed link API
 
@@ -54,8 +75,9 @@ What is done so far:
 - **Received data:** each `AclIn` carries an `encrypted` flag, set when the link layer received the PDU, so a security
   check does not depend on when the host learns of the encryption.
 - **Sending:** `try_send` and `send` queue one fragment of up to 27 octets (251 with `data-length`), `tx_room` gives
-  the free room, `tx_room_changed` waits until the link layer took a fragment, and `in_flight` counts the fragments the
-  central has not acknowledged, so the host can keep at most one notification unacknowledged.
+  the free room, `tx_room_changed` waits until the link layer took a fragment or the central acknowledged some, and
+  `in_flight` counts the fragments the central has not acknowledged, so the host can keep at most one notification
+  unacknowledged.
 - **Link information:** `Link::info` gives the central's address on the air with its type, its resolved identity
   separately, our own address on the air (the resolvable private address or the identity), the parameters and the
   central's clock accuracy: pairing uses the addresses on the air.

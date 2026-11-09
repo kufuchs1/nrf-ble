@@ -11,34 +11,34 @@ use crate::{
 use core::cell::Cell;
 
 /// The private key of the reference central: device A of P-256 data set 2.
-const CENTRAL_SECRET: &str = "06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663";
+pub(crate) const CENTRAL_SECRET: &str = "06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663";
 
 /// The central's address on the air: a public address.
-const CENTRAL_ADDRESS: [u8; 6] = [0xCE, 0xBF, 0x37, 0x37, 0x12, 0x56];
+pub(crate) const CENTRAL_ADDRESS: [u8; 6] = [0xCE, 0xBF, 0x37, 0x37, 0x12, 0x56];
 
 /// The central's identity resolving key, least significant octet first.
-const CENTRAL_IRK: [u8; 16] = [0xA5; 16];
+pub(crate) const CENTRAL_IRK: [u8; 16] = [0xA5; 16];
 
 /// The central's identity address, public.
-const CENTRAL_IDENTITY: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+pub(crate) const CENTRAL_IDENTITY: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
 
 /// Our identity resolving key, least significant octet first.
-const OUR_IRK: [u8; 16] =
+pub(crate) const OUR_IRK: [u8; 16] =
     [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xA9, 0xBA, 0xCB, 0xDC, 0xED, 0xFE, 0x0F];
 
 /// Our static random identity address, least significant octet first.
-const OUR_ADDRESS: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0xC6];
+pub(crate) const OUR_ADDRESS: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0xC6];
 
 /// The `AuthReq` of a Linux central: bonding, MITM, Secure Connections and
 /// CT2.
-const LINUX_AUTH: u8 = 0x2D;
+pub(crate) const LINUX_AUTH: u8 = 0x2D;
 
 /// The time the pairing starts at.
 const START: u64 = 1_000;
 
 /// AES and a seeded xorshift generator: the device for the state machine.
 #[derive(Clone)]
-struct Device(u64);
+pub(crate) struct Device(pub(crate) u64);
 
 impl Aes for Device {
     fn encrypt(&self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] { Software.encrypt(key, block) }
@@ -70,33 +70,33 @@ struct Variant {
 
 /// The reference central: the initiator's side of Just Works, from the
 /// toolbox and a key pair of its own.
-struct Central {
+pub(crate) struct Central {
     /// Its address on the air: A.
-    address:   Peer,
+    pub(crate) address:   Peer,
     /// Our confirm value as received.
-    confirm:   [u8; 16],
+    pub(crate) confirm:   [u8; 16],
     /// The long term key, most significant octet first.
-    ltk:       [u8; 16],
+    pub(crate) ltk:       [u8; 16],
     /// The `MacKey`.
-    mac_key:   [u8; 16],
+    pub(crate) mac_key:   [u8; 16],
     /// Its nonce.
-    na:        [u8; 16],
+    pub(crate) na:        [u8; 16],
     /// Our nonce as received.
-    nb:        [u8; 16],
+    pub(crate) nb:        [u8; 16],
     /// Its key pair.
-    pair:      KeyPair,
+    pub(crate) pair:      KeyPair,
     /// Our public key as received, most significant octet first.
-    peer_key:  [u8; PUBLIC_KEY_LEN],
+    pub(crate) peer_key:  [u8; PUBLIC_KEY_LEN],
     /// Its Pairing Request.
-    request:   [u8; 7],
+    pub(crate) request:   [u8; 7],
     /// Our address as the central sees it: B.
-    responder: Peer,
+    pub(crate) responder: Peer,
 }
 
 impl Central {
     /// Its Pairing DHKey Check: computes the keys from our public key and
     /// nonce.
-    fn check(&mut self) -> [u8; 17] {
+    pub(crate) fn check(&mut self) -> [u8; 17] {
         let dh_key = self.pair.dh_key(&self.peer_key, || ()).expect("our public key is valid");
         let (a, b) = (address(self.address), address(self.responder));
         (self.mac_key, self.ltk) = f5(&Software, &dh_key, (&self.na, &self.nb), (&a, &b));
@@ -106,7 +106,7 @@ impl Central {
     }
 
     /// Our Pairing DHKey Check as it must be.
-    fn expected_check(&self) -> [u8; 17] {
+    pub(crate) fn expected_check(&self) -> [u8; 17] {
         let (a, b) = (address(self.address), address(self.responder));
         let eb = f6(&Software, &self.mac_key, (&self.nb, &self.na), &[0; 16], [0x09, 0x00, 0x03], (&b, &a));
         pdu(PAIRING_DHKEY_CHECK, &reversed(&eb))
@@ -114,7 +114,7 @@ impl Central {
 
     /// A central with the given request parameters, which takes our address
     /// on the air as `responder`.
-    fn new(params: [u8; 6], responder: Peer) -> Self {
+    pub(crate) fn new(params: [u8; 6], responder: Peer) -> Self {
         let mut secret = hex::<KEY_LEN>(CENTRAL_SECRET);
         let mut request = [PAIRING_REQUEST; 7];
         request[1..].copy_from_slice(&params);
@@ -133,26 +133,26 @@ impl Central {
     }
 
     /// Its Pairing Public Key.
-    fn public_key(&self) -> [u8; 65] { pdu(PAIRING_PUBLIC_KEY, &flip_coordinates(self.pair.public_key())) }
+    pub(crate) fn public_key(&self) -> [u8; 65] { pdu(PAIRING_PUBLIC_KEY, &flip_coordinates(self.pair.public_key())) }
 
     /// Its Pairing Random.
-    fn random(&self) -> [u8; 17] { pdu(PAIRING_RANDOM, &reversed(&self.na)) }
+    pub(crate) fn random(&self) -> [u8; 17] { pdu(PAIRING_RANDOM, &reversed(&self.na)) }
 
     /// Takes our Pairing Confirm.
-    fn take_confirm(&mut self, pdu: &[u8]) {
+    pub(crate) fn take_confirm(&mut self, pdu: &[u8]) {
         assert_eq!(pdu[0], PAIRING_CONFIRM);
         self.confirm = reversed(pdu[1..].try_into().unwrap());
     }
 
     /// Takes our Pairing Public Key.
-    fn take_public_key(&mut self, pdu: &[u8]) {
+    pub(crate) fn take_public_key(&mut self, pdu: &[u8]) {
         assert_eq!(pdu[0], PAIRING_PUBLIC_KEY);
         self.peer_key = flip_coordinates(pdu[1..].try_into().unwrap());
     }
 
     /// Takes our Pairing Random and checks our confirm value with it, as an
     /// initiator does.
-    fn take_random(&mut self, pdu: &[u8]) {
+    pub(crate) fn take_random(&mut self, pdu: &[u8]) {
         assert_eq!(pdu[0], PAIRING_RANDOM);
         self.nb = reversed(pdu[1..].try_into().unwrap());
         let own_x = self.pair.public_key()[..KEY_LEN].try_into().unwrap();
@@ -162,7 +162,7 @@ impl Central {
 }
 
 /// A PDU of `code` and `params`.
-fn pdu<const N: usize>(code: u8, params: &[u8]) -> [u8; N] {
+pub(crate) fn pdu<const N: usize>(code: u8, params: &[u8]) -> [u8; N] {
     let mut out = [code; N];
     out[1..].copy_from_slice(params);
     out
@@ -185,7 +185,7 @@ fn info(peer: Peer, local: Peer) -> Info {
 
 /// A resolvable private address of our identity resolving key, as the link
 /// layer advertises with: B of a pairing with privacy.
-fn local_rpa() -> Peer {
+pub(crate) fn local_rpa() -> Peer {
     let prand = [0x48, 0x12, 0x34];
     let hash = toolbox::ah(&Software, &reversed(&OUR_IRK), prand);
     Peer::new([hash[2], hash[1], hash[0], prand[2], prand[1], prand[0]], true)
@@ -222,7 +222,7 @@ fn responder(local: Peer) -> Responder {
 /// The request parameters of a Linux central: keyboard and display, no OOB
 /// data, `AuthReq` 0x2D, 16 octets, and its identity keys if `central_id`
 /// besides encryption and signing, ours if `our_id`.
-const fn linux_request(central_id: bool, our_id: bool) -> [u8; 6] {
+pub(crate) const fn linux_request(central_id: bool, our_id: bool) -> [u8; 6] {
     let init = if central_id { 0x07 } else { 0x05 };
     let resp = if our_id { 0x07 } else { 0x05 };
     [0x04, 0x00, LINUX_AUTH, 0x10, init, resp]

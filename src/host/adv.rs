@@ -44,15 +44,14 @@
 //! then 50 ms for 12 s and 400 ms for 45 s, one minute in all; 60 s to pair,
 //! and 20 s for the bonded central to encrypt, which it does at once.
 //!
-//! # Still to do
+//! # The advertising call
 //!
-//! The asynchronous advertising call of the engine stage is to build on these:
-//!
-//! - Have pairable advertising wait for the P-256 key pair before it calls
-//!   [`Advertising::start`], so a reconnection never computes one.
-//! - Handle a connection that arrives while no advertising call is waiting,
-//!   because the call's future was dropped: keep it for the next call, or
-//!   disconnect it with reason 0x13. Both are to be tested.
+//! [`crate::host::Host::advertise`] builds on these: in pairing mode it
+//! waits for the P-256 key pair of the next pairing before it calls
+//! [`Advertising::start`], so a reconnection never computes one, then runs
+//! the phases until a central connects. A central that connects after the
+//! call's future was dropped is kept for the next call or disconnected with
+//! reason 0x13, as [`crate::host::engine::Unclaimed`] says.
 
 use crate::{
     advertiser::legacy::{self, Kind},

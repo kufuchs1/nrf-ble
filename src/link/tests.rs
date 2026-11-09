@@ -282,6 +282,26 @@ fn taking_a_fragment_for_the_air_signals_room() {
 }
 
 #[test]
+fn an_acknowledgement_signals_room() {
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    let epoch = connect(&shared);
+    let mut context = Context::from_waker(Waker::noop());
+    link.try_send(epoch, true, &[1]).unwrap();
+    assert!(shared.next_acl_out().is_some());
+    let mut room = pin!(link.tx_room_changed());
+    assert!(room.as_mut().poll(&mut context).is_ready());
+    // Fewer fragments in flight is room for the host's pacing too.
+    let mut room = pin!(link.tx_room_changed());
+    assert!(room.as_mut().poll(&mut context).is_pending());
+    shared.acknowledged(0);
+    assert!(room.as_mut().poll(&mut context).is_pending());
+    shared.acknowledged(1);
+    assert!(room.as_mut().poll(&mut context).is_ready());
+    assert_eq!(link.in_flight(epoch), 0);
+}
+
+#[test]
 fn a_key_reply_needs_its_link_and_a_pending_request() {
     let shared = Shared::new();
     let link = Link::new(&shared);

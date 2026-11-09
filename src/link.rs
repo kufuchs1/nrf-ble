@@ -46,7 +46,8 @@
 //! [`Link::try_send`] queues one fragment of an L2CAP message without
 //! waiting, [`Link::send`] waits for room. [`Link::tx_room`] gives the free
 //! room, [`Link::tx_room_changed`] waits until the link layer took a fragment
-//! from the queue, and [`Link::in_flight`] counts the fragments of the link
+//! from the queue or the central acknowledged some, and [`Link::in_flight`]
+//! counts the fragments of the link
 //! that the central has not acknowledged yet, so the host can keep at most
 //! one notification unacknowledged.
 //!
@@ -341,6 +342,15 @@ pub struct AclIn {
 }
 
 impl AclIn {
+    /// A fragment of `payload`, which `start`s an L2CAP message or not and
+    /// was received `encrypted` or not, for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(start: bool, encrypted: bool, payload: &[u8]) -> Self {
+        let mut data = [0; ACL_MAX];
+        data[..payload.len()].copy_from_slice(payload);
+        Self { data, encrypted, len: u8::try_from(payload.len()).unwrap(), start }
+    }
+
     /// Whether the PDU was received encrypted, with a valid MIC. Set when
     /// the link layer received it, so it holds even if the host learns of
     /// the encryption later.
@@ -608,6 +618,12 @@ impl Shared {
             let mut state = cell.borrow_mut();
             state.acked = state.acked.wrapping_add(u32::from(count));
         });
+        // The host paces by the fragments in flight, which only an
+        // acknowledgement lowers: the link layer counts them after the
+        // connection event, when no fragment may be taken any more.
+        if count != 0 {
+            self.tx_room.signal(());
+        }
     }
 
     /// Waits until the host read all ACL data received from the air, so
@@ -999,6 +1015,7 @@ pub struct Link<'shared> {
     shared: &'shared Shared,
 }
 
+#[expect(clippy::same_name_method, reason = "the host's port trait mirrors these calls")]
 impl<'shared> Link<'shared> {
     /// Adds a device to the filter accept list. Refused while advertising
     /// uses the list.
@@ -1663,8 +1680,9 @@ impl<'shared> Link<'shared> {
     #[must_use = "the room is only read"]
     pub fn tx_room(&self) -> usize { self.shared.acl_out.free_capacity() }
 
-    /// Waits until the link layer takes a fragment from the queue, or the
-    /// link ends, either of which can give room. One task waits.
+    /// Waits until the link layer takes a fragment from the queue, the
+    /// central acknowledges fragments, which lowers [`Self::in_flight`], or
+    /// the link ends: each can give room. One task waits.
     #[inline]
     pub async fn tx_room_changed(&self) { self.shared.tx_room.wait().await; }
 

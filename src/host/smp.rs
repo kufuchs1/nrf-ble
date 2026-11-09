@@ -1080,4 +1080,4 @@ fn same(left: &[u8; 16], right: &[u8; 16]) -> bool {
     left.iter().zip(right.iter()).fold(0_u8, |difference, (&one, &other)| difference | (one ^ other)) == 0
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)] pub(crate) mod tests;
