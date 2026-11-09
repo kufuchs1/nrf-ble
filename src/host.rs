@@ -22,8 +22,8 @@
 //! hold off the link layer for the whole of the longer AES computations of
 //! pairing. Each AES block on the ECB still holds a critical section for that
 //! one block, as [`crate::encrypt_block`] shares the ECB with the link layer:
-//! a CMAC of f5 holds interrupts off 13 times, each for about 7 us on the
-//! nRF52832.
+//! f5, which runs three CMACs, takes 13 AES blocks and so holds interrupts
+//! off 13 times, each for about 7 us on the nRF52832.
 
 /// Connectable advertising and the advertising data writer.
 pub mod adv;

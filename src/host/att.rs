@@ -41,8 +41,13 @@
 //! host learns of the encryption. A request that lacks it gets Insufficient
 //! Encryption (0x0F), never Insufficient Authentication (0x05), on which
 //! BlueZ would ask for pairing with protection against a man in the middle,
-//! and Just Works pairing would fail. Only an attribute that needs
-//! authenticated pairing gives 0x05.
+//! and Just Works pairing would fail. The table refuses attributes that
+//! need authenticated pairing while it is compiled
+//! ([`crate::host::gatt::Db::new`]), so the server never sends 0x05.
+//!
+//! Notifications and indications need the security their characteristic
+//! was declared with, also for a characteristic that can be neither read
+//! nor written.
 
 use crate::host::gatt::{
     AttError,
@@ -455,6 +460,12 @@ impl Server {
 
     /// Takes the client characteristic configuration a bond restores. It
     /// counts as written on no link yet.
+    ///
+    /// The engine calls it only once the link is encrypted with the bond's
+    /// key, never at the connection: a value whose characteristic is open,
+    /// such as the battery level, would otherwise be notified before the
+    /// encryption, which BlueZ does not expect, and would take a link layer
+    /// buffer that pairing needs.
     #[inline]
     pub const fn restore(&mut self, subscriptions: Subscriptions) { self.subscriptions = subscriptions; }
 

@@ -27,7 +27,9 @@ const ZERO: &str = "00000000 00000000 00000000 00000000 00000000 00000000 000000
 const Y_OF_ZERO: &str = "66485c78 0e2f83d7 2433bd5d 84a06bb6 541c2af3 1dae8717 28bf856a 174f93f4";
 
 /// A key pair from `secret`, which must be valid.
-fn key_pair(secret: [u8; KEY_LEN]) -> KeyPair { KeyPair::generate(secret, || ()).expect("a valid private key") }
+fn key_pair(mut secret: [u8; KEY_LEN]) -> KeyPair {
+    KeyPair::generate(&mut secret, || ()).expect("a valid private key")
+}
 
 /// The negation of the public key `key`: the same X and the other Y.
 fn negated(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] { encode(&point(key).neg()).expect("not the identity") }
@@ -65,8 +67,10 @@ fn scalars(mut seed: u64) -> impl Iterator<Item = [u8; KEY_LEN]> {
 #[test]
 fn the_debug_private_key_gives_the_debug_public_key() {
     let calls = Cell::new(0);
-    let pair = KeyPair::generate(hex(DEBUG_PRIVATE_KEY), || calls.set(calls.get() + 1)).expect("a valid key");
+    let mut secret = hex(DEBUG_PRIVATE_KEY);
+    let pair = KeyPair::generate(&mut secret, || calls.set(calls.get() + 1)).expect("a valid key");
     assert_eq!(pair.public_key(), &DEBUG_PUBLIC_KEY);
+    assert_eq!(secret, [0; KEY_LEN], "the caller's copy is wiped");
     assert_eq!(calls.get(), 1, "the hook is called once, for the one multiplication");
 }
 
@@ -165,7 +169,8 @@ fn random_scalars_match_p256_ecdh() {
     let mut secrets = scalars(0x5EED_0FB1_EC0D_E000);
     for _ in 0..64 {
         let (Some(secret_a), Some(secret_b)) = (secrets.next(), secrets.next()) else { unreachable!() };
-        let (Some(pair_a), Some(pair_b)) = (KeyPair::generate(secret_a, || ()), KeyPair::generate(secret_b, || ()))
+        let (Some(pair_a), Some(pair_b)) =
+            (KeyPair::generate(&mut secret_a.clone(), || ()), KeyPair::generate(&mut secret_b.clone(), || ()))
         else {
             // About one in four billion is not below the order.
             continue;
@@ -188,8 +193,10 @@ fn private_keys_out_of_range_are_refused_without_a_multiplication() {
     above_order[KEY_LEN - 1] += 1;
     for secret in [[0; KEY_LEN], hex(ORDER), above_order, [0xFF; KEY_LEN]] {
         let called = Cell::new(false);
-        assert!(KeyPair::generate(secret, || called.set(true)).is_none(), "{secret:02x?}");
+        let mut copy = secret;
+        assert!(KeyPair::generate(&mut copy, || called.set(true)).is_none(), "{secret:02x?}");
         assert!(!called.get());
+        assert_eq!(copy, [0; KEY_LEN], "a refused key is wiped too");
     }
 }
 

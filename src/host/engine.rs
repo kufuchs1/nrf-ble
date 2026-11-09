@@ -16,3 +16,14 @@
 //! - Hold the peripheral latency off with [`crate::link::Link::hold_latency`]
 //!   from the connection until discovery and the input reports' configuration
 //!   are done and ATT has been idle for a while.
+//! - Restore the bond's client characteristic configuration
+//!   ([`crate::host::att::Server::restore`]) only once the link is encrypted
+//!   with the bond's key, never at the connection: nothing is notified before
+//!   the encryption, which also keeps the link layer buffers free for the
+//!   pairing's burst.
+//! - Give the ATT server, for each request, the security of the link as the
+//!   request was received ([`crate::link::AclIn::encrypted`] and the key the
+//!   host handed over with [`crate::link::Link::ltk_reply`]), and wipe the
+//!   Diffie-Hellman key, the `MacKey` and the long term key once they are no
+//!   longer needed ([`crate::host::smp::ecc`] and [`crate::host::smp::toolbox`]
+//!   wipe their own).

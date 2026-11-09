@@ -24,7 +24,7 @@ use super::{Access, Attr, Kind, Sec, Uuid, Value};
 const OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 /// FNV-1a 64-bit prime.
 const PRIME: u64 = 0x0000_0100_0000_01B3;
-/// Start of the second lane: the basis with every bit of a nibble flipped.
+/// Start of the second lane: the basis XOR `0x5A5A_5A5A_5A5A_5A5A`.
 const OFFSET_SECOND: u64 = OFFSET ^ 0x5A5A_5A5A_5A5A_5A5A;
 
 /// Two FNV-1a lanes that take every octet; the second takes each octet
@@ -119,7 +119,7 @@ pub(super) const fn layout(attrs: &[Attr]) -> [u8; 16] {
             Kind::Characteristic(props) => lanes.byte(1).byte(props),
             Kind::Descriptor(access) => lanes.byte(2).access(access),
             Kind::Service => lanes.byte(3),
-            Kind::Value(access) => lanes.byte(4).access(access),
+            Kind::Value(access, sec) => lanes.byte(4).access(access).sec(Some(sec)),
         };
         lanes = lanes.value(attr.value);
         handle = handle.wrapping_add(1);

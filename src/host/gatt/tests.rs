@@ -184,6 +184,47 @@ fn the_hash_follows_the_layout() {
 }
 
 #[test]
+fn notify_and_indicate_only_characteristics_keep_their_security() {
+    crate::gatt! {
+        const SILENT;
+        service 0x1812 {
+            char SECRET_NOTIFY: 0x2A4D [notify; encrypted] = Value::Zeros(8);
+            ccc;
+            char SECRET_INDICATE: 0x2A4D [indicate; encrypted] = Value::Empty;
+            ccc;
+            char OPEN_NOTIFY: 0x2A4D [notify] = Value::Zeros(8);
+            ccc;
+        }
+    }
+    crate::gatt! {
+        const OPEN;
+        service 0x1812 {
+            char 0x2A4D [notify] = Value::Zeros(8);
+            ccc;
+            char 0x2A4D [indicate; encrypted] = Value::Empty;
+            ccc;
+            char 0x2A4D [notify] = Value::Zeros(8);
+            ccc;
+        }
+    }
+    assert_eq!(SECRET_NOTIFY.sec(), Sec::Encrypted);
+    assert_eq!(SECRET_INDICATE.sec(), Sec::Encrypted);
+    assert_eq!(OPEN_NOTIFY.sec(), Sec::Open);
+    let value = SILENT.attr(SECRET_NOTIFY.handle()).unwrap();
+    assert_eq!(value.kind(), Kind::Value(Access { read: None, write: None }, Sec::Encrypted));
+    let descriptor = SILENT.attr(SECRET_NOTIFY.handle() + 1).unwrap();
+    assert_eq!(descriptor.access(), Access { read: Some(Sec::Encrypted), write: Some(Sec::Encrypted) });
+    // The tables differ only in the level of the first characteristic, and
+    // their first three attributes only in that of its value, which can
+    // be neither read nor written: the hash follows it all the same.
+    assert_ne!(SILENT.hash(), OPEN.hash());
+    assert_ne!(
+        hash::layout(&[SILENT.attrs()[0], SILENT.attrs()[1], SILENT.attrs()[2]]),
+        hash::layout(&[OPEN.attrs()[0], OPEN.attrs()[1], OPEN.attrs()[2]]),
+    );
+}
+
+#[test]
 fn subscriptions_keep_the_allowed_bits_and_what_this_link_wrote() {
     let mut subscriptions = Subscriptions::new();
     subscriptions.set(1, 0x0003, PROP_NOTIFY | PROP_READ);

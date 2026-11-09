@@ -437,12 +437,12 @@ const LONG_SERVICE: [u8; 16] =
 /// A 128-bit UUID of a characteristic in the tests.
 const LONG_CHAR: [u8; 16] =
     [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F];
-/// A value the application keeps, which needs authentication.
+/// A value the application keeps, which needs encryption.
 const SECRET: ValueId = ValueId::new(1);
 
 crate::gatt! {
-    /// A table with Service Changed, 128-bit UUIDs and an attribute that
-    /// needs authentication.
+    /// A table with Service Changed, 128-bit UUIDs and a dynamic value that
+    /// needs encryption.
     const TEST_DB;
     service 0x1801 {
         char CHANGED: 0x2A05 [indicate] = Value::Empty;
@@ -450,7 +450,7 @@ crate::gatt! {
     }
     service (Uuid::U128(&LONG_SERVICE)) {
         char 0x2A00 [read] = Value::Const(b"x");
-        char (Uuid::U128(&LONG_CHAR)) [read, write, write_without_response; authenticated] =
+        char (Uuid::U128(&LONG_CHAR)) [read, write, write_without_response; encrypted] =
             Value::Dynamic(SECRET);
         desc 0x2901 [read] = Value::Const(b"description");
     }
@@ -535,23 +535,62 @@ fn discovery_groups_entries_by_uuid_size_and_reports_real_ends() {
 }
 
 #[test]
-fn an_attribute_that_needs_authentication_answers_insufficient_authentication() {
+fn a_dynamic_value_that_needs_encryption_is_served_only_encrypted() {
     let app = App::new();
     let mut server = Server::new(&TEST_DB);
-    for level in [Sec::Open, Sec::Encrypted] {
-        let response = exchange(&mut server, &app, &[0x0A, 0x09, 0x00], level).unwrap();
-        assert_eq!(*response, [0x01, 0x0A, 0x09, 0x00, 0x05]);
-    }
-    let response = exchange(&mut server, &app, &[0x0A, 0x09, 0x00], Sec::Authenticated).unwrap();
+    let response = exchange(&mut server, &app, &[0x0A, 0x09, 0x00], Sec::Open).unwrap();
+    assert_eq!(*response, [0x01, 0x0A, 0x09, 0x00, 0x0F]);
+    let response = exchange(&mut server, &app, &[0x12, 0x09, 0x00, 0xAA, 0xBB], Sec::Open).unwrap();
+    assert_eq!(*response, [0x01, 0x12, 0x09, 0x00, 0x0F]);
+    // A command is dropped unanswered.
+    assert!(exchange(&mut server, &app, &[0x52, 0x09, 0x00, 9], Sec::Open).is_none());
+    assert_eq!(app.written.get(), None);
+    let response = exchange(&mut server, &app, &[0x0A, 0x09, 0x00], Sec::Encrypted).unwrap();
     assert_eq!(*response, [0x0B, 1, 2, 3, 4]);
-    let response = exchange(&mut server, &app, &[0x12, 0x09, 0x00, 0xAA, 0xBB], Sec::Authenticated).unwrap();
+    let response = exchange(&mut server, &app, &[0x12, 0x09, 0x00, 0xAA, 0xBB], Sec::Encrypted).unwrap();
     assert_eq!(*response, [0x13]);
     assert_eq!(app.written.get(), Some(([0xAA, 0xBB, 0, 0], 2, true)));
     // The application's error is the answer to a request, and dropped for
     // a command.
-    let response = exchange(&mut server, &app, &[0x12, 0x09, 0x00, 1, 2, 3, 4, 5], Sec::Authenticated).unwrap();
+    let response = exchange(&mut server, &app, &[0x12, 0x09, 0x00, 1, 2, 3, 4, 5], Sec::Encrypted).unwrap();
     assert_eq!(*response, [0x01, 0x12, 0x09, 0x00, 0x80]);
-    assert!(exchange(&mut server, &app, &[0x52, 0x09, 0x00, 1, 2, 3, 4, 5], Sec::Authenticated).is_none());
-    assert!(exchange(&mut server, &app, &[0x52, 0x09, 0x00, 7], Sec::Authenticated).is_none());
+    assert!(exchange(&mut server, &app, &[0x52, 0x09, 0x00, 1, 2, 3, 4, 5], Sec::Encrypted).is_none());
+    assert!(exchange(&mut server, &app, &[0x52, 0x09, 0x00, 7], Sec::Encrypted).is_none());
     assert_eq!(app.written.get(), Some(([7, 0, 0, 0], 1, false)));
+}
+
+crate::gatt! {
+    /// A table whose characteristics only notify or indicate, so their
+    /// security is that of the declaration alone.
+    const SILENT_DB;
+    service 0x1812 {
+        char SECRET_NOTIFY: 0x2A4D [notify; encrypted] = Value::Zeros(8);
+        ccc;
+        char SECRET_INDICATE: 0x2A4D [indicate; encrypted] = Value::Empty;
+        ccc;
+        char OPEN_NOTIFY: 0x2A4D [notify] = Value::Zeros(8);
+        ccc;
+    }
+}
+
+#[test]
+fn notify_and_indicate_only_values_keep_their_security() {
+    let app = App::new();
+    let mut server = Server::new(&SILENT_DB);
+    let mut out = [0_u8; MTU];
+    // As a bond restores them: every descriptor with both bits.
+    server.restore(crate::host::gatt::Subscriptions::from_bits(0b11_1111));
+    assert_eq!(server.notify(SECRET_NOTIFY, &[1; 8], Sec::Open, &mut out), Err(NotifyError::Insecure));
+    assert_eq!(server.indicate(SECRET_INDICATE, &[1], Sec::Open, &mut out), Err(NotifyError::Insecure));
+    assert!(!server.is_indicating());
+    assert!(server.notify(OPEN_NOTIFY, &[1; 8], Sec::Open, &mut out).is_ok());
+    let len = server.notify(SECRET_NOTIFY, &[1; 8], Sec::Encrypted, &mut out).unwrap();
+    assert_eq!(&out[..len], &[0x1B, 0x03, 0x00, 1, 1, 1, 1, 1, 1, 1, 1]);
+    let len = server.indicate(SECRET_INDICATE, &[1], Sec::Encrypted, &mut out).unwrap();
+    assert_eq!(&out[..len], &[0x1D, 0x06, 0x00, 1]);
+    // Their configuration descriptors need the same.
+    let response = exchange(&mut server, &app, &[0x0A, 0x04, 0x00], Sec::Open).unwrap();
+    assert_eq!(*response, [0x01, 0x0A, 0x04, 0x00, 0x0F]);
+    let response = exchange(&mut server, &app, &[0x12, 0x07, 0x00, 0x02, 0x00], Sec::Open).unwrap();
+    assert_eq!(*response, [0x01, 0x12, 0x07, 0x00, 0x0F]);
 }

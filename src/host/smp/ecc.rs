@@ -12,18 +12,32 @@
 //! a fixed window of signed radix 16 digits on `ProjectivePoint` with a
 //! table of 8 points selected in constant time, as `p256` does, but with the
 //! table on the multiplication's own frame and the point formulas called
-//! rather than inlined into the loop. Measured on an emulated nRF51 at opt
-//! level "z", it is as fast as `ProjectivePoint::mul` (2.94 s against 2.93 s
-//! per multiplication), takes about 0.5 KB less stack (2.65 KB against 3.13
-//! to 3.22 KB for the whole call) and about 0.2 KB less flash. Public key and
-//! Diffie-Hellman key go through the same multiplication, so there is one
-//! copy of it.
+//! rather than inlined into the loop. The research benchmark of
+//! research-crypto.md, on an emulated nRF51 at opt level "z", found this loop
+//! as fast as `ProjectivePoint::mul` (2.94 s against 2.93 s per
+//! multiplication), with about 0.5 KB less stack (2.65 KB against 3.13 to
+//! 3.22 KB for the whole call) and about 0.2 KB less flash. These figures
+//! were not measured on this crate and are still to be checked on the chip.
+//! Public key and Diffie-Hellman key go through the same multiplication, so
+//! there is one copy of it.
+//!
+//! Secrets are overwritten once they are no longer needed: the private key
+//! when the [`KeyPair`] is dropped, the caller's random octets by
+//! [`KeyPair::generate`], and the recoded private key and the products on
+//! the multiplication's own frame. The Diffie-Hellman key that
+//! [`KeyPair::dh_key`] returns is the caller's to wipe, once f5 has derived
+//! the keys from it.
 //!
 //! Each multiplication blocks the thread for about 3 s on the nRF51, so the
 //! security manager runs them as jobs outside its state machine, and each
 //! call here takes a hook it calls right before its multiplication, for the
 //! firmware to feed its watchdog.
 
+use crate::crypto::wipe;
+use core::{
+    hint::black_box,
+    sync::atomic::{Ordering, compiler_fence},
+};
 use p256::{
     AffinePoint,
     FieldBytes,
@@ -74,7 +88,7 @@ pub enum KeyError {
 }
 
 /// Our key pair for one pairing: the private key and the public key it
-/// gives, 96 octets.
+/// gives, 96 octets. The private key is overwritten when it is dropped.
 pub struct KeyPair {
     /// The public key, X then Y.
     public: [u8; PUBLIC_KEY_LEN],
@@ -100,33 +114,52 @@ impl KeyPair {
     {
         let point = decode(peer, &self.public)?;
         before_multiplication();
-        x_coordinate(&multiply(&self.secret, &ProjectivePoint::from(point))).ok_or(KeyError::Invalid)
+        let mut product = multiply(&self.secret, &ProjectivePoint::from(point));
+        let key = x_coordinate(&product).ok_or(KeyError::Invalid);
+        clear(&mut product);
+        key
     }
 
     /// The key pair of the private key `secret`, random octets, or `None` if
     /// they are zero or not below the order of the curve, as about one in
     /// four billion are: then the caller draws new ones.
     ///
+    /// `secret` is overwritten with zeros either way, so the caller's copy
+    /// of the private key does not stay in RAM.
+    ///
     /// `before_multiplication` is called right before the multiplication,
     /// and not at all if `secret` is refused.
     #[inline]
     #[must_use = "the key pair is only computed"]
-    pub fn generate<F>(secret: [u8; KEY_LEN], before_multiplication: F) -> Option<Self>
+    pub fn generate<F>(secret: &mut [u8; KEY_LEN], before_multiplication: F) -> Option<Self>
     where
         F: FnOnce(),
     {
-        if !bool::from(NonZeroScalar::from_repr(FieldBytes::from(secret)).is_some()) {
+        let mut pair = Self { public: [0; PUBLIC_KEY_LEN], secret: *secret };
+        wipe(secret);
+        let mut repr = FieldBytes::from(pair.secret);
+        let valid = bool::from(NonZeroScalar::from_repr(repr).is_some());
+        wipe(&mut repr);
+        if !valid {
             return None;
         }
         before_multiplication();
-        let public = encode(&multiply(&secret, &ProjectivePoint::GENERATOR))?;
-        Some(Self { public, secret })
+        let mut product = multiply(&pair.secret, &ProjectivePoint::GENERATOR);
+        let public = encode(&product);
+        clear(&mut product);
+        pair.public = public?;
+        Some(pair)
     }
 
     /// The public key, X then Y.
     #[inline]
     #[must_use = "the key is only borrowed"]
     pub const fn public_key(&self) -> &[u8; PUBLIC_KEY_LEN] { &self.public }
+}
+
+impl Drop for KeyPair {
+    #[inline]
+    fn drop(&mut self) { wipe(&mut self.secret); }
 }
 
 /// Adds `term` to `sum`, outside the loop, so the formulas are not inlined
@@ -169,6 +202,15 @@ fn decode(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN]) -> Result<Aff
     point.filter(|valid| !bool::from(valid.is_identity())).ok_or(KeyError::Invalid)
 }
 
+/// Overwrites `point`, which depends on a private key, with the identity,
+/// so it does not stay in RAM.
+fn clear(point: &mut ProjectivePoint) {
+    *point = ProjectivePoint::IDENTITY;
+    // As in `wipe`: keeps the compiler from dropping the store.
+    black_box(point);
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Doubles `point`, outside the loop, as [`add_in_place`] adds.
 #[inline(never)]
 fn double_in_place(point: &mut ProjectivePoint) { *point = point.double(); }
@@ -192,7 +234,9 @@ fn encode(point: &ProjectivePoint) -> Option<[u8; PUBLIC_KEY_LEN]> {
 ///
 /// The table holds 1 to 8 times `base`; each digit, from the most
 /// significant, takes four doublings and the addition of the table entry
-/// of its magnitude, negated for a negative digit.
+/// of its magnitude, negated for a negative digit. The digits, which are
+/// the private key in another form, and the term are overwritten before it
+/// returns, and so is its copy of the product; the caller clears its own.
 #[inline(never)]
 fn multiply(secret: &[u8; KEY_LEN], base: &ProjectivePoint) -> ProjectivePoint {
     let mut table = [ProjectivePoint::IDENTITY; 8];
@@ -201,7 +245,7 @@ fn multiply(secret: &[u8; KEY_LEN], base: &ProjectivePoint) -> ProjectivePoint {
         *entry = multiple;
         add_in_place(&mut multiple, base);
     }
-    let digits = recode(secret);
+    let mut digits = recode(secret);
     let mut product = ProjectivePoint::IDENTITY;
     let mut term = ProjectivePoint::IDENTITY;
     let mut first = true;
@@ -215,7 +259,13 @@ fn multiply(secret: &[u8; KEY_LEN], base: &ProjectivePoint) -> ProjectivePoint {
         select(&table, digit, &mut term);
         add_in_place(&mut product, &term);
     }
-    product
+    digits.fill(0);
+    black_box(&mut digits);
+    compiler_fence(Ordering::SeqCst);
+    clear(&mut term);
+    let result = product;
+    clear(&mut product);
+    result
 }
 
 /// The digits of `secret`, least significant first, each from -8 to 7 but

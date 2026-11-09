@@ -66,16 +66,16 @@
 //! Each `service` is a primary service. Each `char` adds the characteristic
 //! declaration and its value, with the properties in brackets (`read`,
 //! `write`, `write_without_response`, `notify`, `indicate`) and after a
-//! semicolon the security its value needs (`encrypted` or `authenticated`;
-//! none for an open value). A name before the UUID defines a [`Char`]
-//! constant of that name. `ccc;` adds the client characteristic configuration
-//! descriptor of the characteristic before it, with that characteristic's
-//! security, and `desc` adds another descriptor with its permissions (`read`,
-//! `write`) and security. A UUID is a 16-bit literal or, in parentheses, an
-//! expression of type [`Uuid`]. The table is checked while it is compiled:
-//! every characteristic that notifies or indicates has exactly one client
-//! characteristic configuration descriptor and no other has one. A table
-//! without it does not build:
+//! semicolon the security its value needs (`encrypted`, or none for an open
+//! value); its notifications and indications need it too. A name before the
+//! UUID defines a [`Char`] constant of that name. `ccc;` adds the client
+//! characteristic configuration descriptor of the characteristic before it,
+//! with that characteristic's security, and `desc` adds another descriptor
+//! with its permissions (`read`, `write`) and security. A UUID is a 16-bit
+//! literal or, in parentheses, an expression of type [`Uuid`]. The table is
+//! checked while it is compiled: every characteristic that notifies or
+//! indicates has exactly one client characteristic configuration descriptor
+//! and no other has one. A table without it does not build:
 //!
 //! ```compile_fail
 //! use nrf_ble::host::gatt::Value;
@@ -84,6 +84,25 @@
 //!     const DB;
 //!     service 0x180F {
 //!         char 0x2A19 [read, notify] = Value::Const(&[50]);
+//!     }
+//! }
+//!
+//! const CCCDS: u8 = DB.cccds();
+//! ```
+//!
+//! Nor does a table with an attribute that needs authentication
+//! (`authenticated`): the host pairs with Just Works only, so no link ever
+//! has it, and BlueZ, answered Insufficient Authentication, would pair again
+//! with protection against a man in the middle required, which fails (see
+//! [`Db::new`]):
+//!
+//! ```compile_fail
+//! use nrf_ble::host::gatt::Value;
+//!
+//! nrf_ble::gatt! {
+//!     const DB;
+//!     service 0x180F {
+//!         char 0x2A19 [read; authenticated] = Value::Const(&[50]);
 //!     }
 //! }
 //!
@@ -292,8 +311,10 @@ pub enum Kind {
     Descriptor(Access),
     /// A primary service declaration.
     Service,
-    /// A characteristic value.
-    Value(Access),
+    /// A characteristic value: who may read and write it, and the security
+    /// the characteristic was declared with, which its notifications and
+    /// indications need too, even where it can be neither read nor written.
+    Value(Access, Sec),
 }
 
 /// The security of a link, or the security an attribute needs.
@@ -408,7 +429,7 @@ impl Attr {
     pub const fn access(&self) -> Access {
         match self.kind {
             Kind::Characteristic(_) | Kind::Service => Access { read: Some(Sec::Open), write: None },
-            Kind::Descriptor(access) | Kind::Value(access) => access,
+            Kind::Descriptor(access) | Kind::Value(access, _) => access,
         }
     }
 
@@ -460,7 +481,7 @@ impl Attr {
         match self.kind {
             Kind::Characteristic(_) => Uuid::U16(CHARACTERISTIC),
             Kind::Service => Uuid::U16(PRIMARY_SERVICE),
-            Kind::Descriptor(_) | Kind::Value(_) => self.uuid,
+            Kind::Descriptor(_) | Kind::Value(..) => self.uuid,
         }
     }
 
@@ -475,7 +496,7 @@ impl Attr {
     #[inline]
     #[must_use = "the attribute is only built"]
     pub const fn value(uuid: Uuid, props: u8, sec: Sec, value: Value) -> Self {
-        Self { kind: Kind::Value(Access::from_props(props, sec)), uuid, value }
+        Self { kind: Kind::Value(Access::from_props(props, sec), sec), uuid, value }
     }
 
     /// The stored value: what is read is built from it.
@@ -615,12 +636,20 @@ impl Db {
     /// failing the build, if a characteristic that notifies or indicates
     /// lacks its client characteristic configuration descriptor, if
     /// another has one, if the descriptor indices do not count up from 0,
-    /// or if the table is too large.
-    #[inline]
-    #[must_use = "the table is only built"]
+    /// if an attribute needs authentication ([`Sec::Authenticated`]), or
+    /// if the table is too large.
+    ///
+    /// The host pairs with Just Works only, so no link is ever
+    /// authenticated: an attribute that needs it would answer Insufficient
+    /// Authentication (0x05) on every link, on which BlueZ pairs again
+    /// with protection against a man in the middle required, and that
+    /// pairing fails.
+    ///
     /// # Panics
     ///
     /// If the table breaks one of these rules.
+    #[inline]
+    #[must_use = "the table is only built"]
     pub const fn new(attrs: &'static [Attr]) -> Self {
         assert!(attrs.len() < 0xFFFF, "the table has more attributes than handles");
         let cccds = check(attrs);
@@ -802,6 +831,10 @@ const fn check(attrs: &[Attr]) -> u8 {
     let mut has_cccd = false;
     let mut rest = attrs;
     while let Some((attr, tail)) = rest.split_first() {
+        assert!(
+            !needs_authentication(attr.kind),
+            "no attribute may need authentication: the host pairs with Just Works"
+        );
         match (attr.kind, attr.value) {
             (Kind::Characteristic(next), _) => {
                 check_cccd(props, has_cccd);
@@ -839,6 +872,18 @@ const fn check_cccd(props: u8, has_cccd: bool) {
     );
 }
 
+/// Whether an attribute of `kind` needs authentication for anything.
+const fn needs_authentication(kind: Kind) -> bool {
+    const fn authenticated(sec: Option<Sec>) -> bool { matches!(sec, Some(Sec::Authenticated)) }
+    match kind {
+        Kind::Characteristic(_) | Kind::Service => false,
+        Kind::Descriptor(access) => authenticated(access.read) || authenticated(access.write),
+        Kind::Value(access, sec) => {
+            authenticated(access.read) || authenticated(access.write) || authenticated(Some(sec))
+        },
+    }
+}
+
 /// Copies `source` into the start of `out` and returns its length, or 0 if
 /// `out` is too short.
 fn copy(out: &mut [u8], source: &[u8]) -> usize {
@@ -853,11 +898,7 @@ const fn char_at(attrs: &'static [Attr], handle: u16) -> Option<Char> {
     let (Some(declaration), Some(value)) = (nth(attrs, handle.wrapping_sub(1)), nth(attrs, handle)) else {
         return None;
     };
-    let (Kind::Characteristic(props), Kind::Value(access)) = (declaration.kind, value.kind) else { return None };
-    let sec = match (access.read, access.write) {
-        (Some(sec), _) | (None, Some(sec)) => sec,
-        (None, None) => Sec::Open,
-    };
+    let (Kind::Characteristic(props), Kind::Value(_, sec)) = (declaration.kind, value.kind) else { return None };
     let value_handle = handle.saturating_add(1);
     Some(Char { cccd: cccd_after(attrs, value_handle), handle: value_handle, props, sec })
 }

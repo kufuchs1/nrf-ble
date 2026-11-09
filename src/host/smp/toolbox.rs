@@ -14,9 +14,16 @@
 //! Every AES block goes through the [`Aes`] trait: the hardware ECB in the
 //! firmware, software AES in the host tests. The CMAC is fed piece by piece
 //! ([`Cmac::update`]), so no message is assembled on the stack: it keeps one
-//! chaining block and one pending block, and a CMAC of f5 needs 13 blocks.
+//! chaining block and one pending block. A CMAC takes one AES block for its
+//! subkeys and one for each 16 octets of its message: 6 for f4, f6 and g2,
+//! and 13 for f5, which runs three CMACs.
+//!
+//! A [`Cmac`] overwrites its key, chaining block and pending block when it
+//! is dropped, and f5 overwrites its intermediate key T once both keys are
+//! derived. The keys these functions return, and those the caller passes
+//! in, are the caller's to wipe.
 
-use crate::{host::Aes, pdu::Peer};
+use crate::{crypto::wipe, host::Aes, pdu::Peer};
 
 /// The SALT of f5 (Core specification, volume 3, part H, section 2.2.7).
 const F5_SALT: [u8; 16] =
@@ -35,7 +42,8 @@ const CMAC_RB: u128 = 0x87;
 ///
 /// The last block of a message is treated apart from the others, so a full
 /// block is kept pending until more of the message arrives or
-/// [`Self::finish`] is called.
+/// [`Self::finish`] is called. The key and the blocks are overwritten when
+/// it is dropped.
 pub struct Cmac<'aes, A: Aes> {
     /// The block cipher.
     aes:    &'aes A,
@@ -92,6 +100,15 @@ impl<'aes, A: Aes> Cmac<'aes, A> {
             self.filled = self.filled.saturating_add(1);
         }
         self
+    }
+}
+
+impl<A: Aes> Drop for Cmac<'_, A> {
+    #[inline]
+    fn drop(&mut self) {
+        wipe(&mut self.key);
+        wipe(&mut self.state);
+        wipe(&mut self.block);
     }
 }
 
@@ -189,11 +206,13 @@ pub fn f5<A>(
 where
     A: Aes,
 {
-    let key_t = cmac(aes, F5_SALT, &[w]);
-    let derive = |counter: u8| {
-        cmac(aes, key_t, &[&[counter], &F5_KEY_ID, nonces.0, nonces.1, addresses.0, addresses.1, &F5_LENGTH])
+    let mut key_t = cmac(aes, F5_SALT, &[w]);
+    let derive = |key: [u8; 16], counter: u8| {
+        cmac(aes, key, &[&[counter], &F5_KEY_ID, nonces.0, nonces.1, addresses.0, addresses.1, &F5_LENGTH])
     };
-    (derive(0), derive(1))
+    let keys = (derive(key_t, 0), derive(key_t, 1));
+    wipe(&mut key_t);
+    keys
 }
 
 /// The check value generation function f6 (section 2.2.8): AES-CMAC with
