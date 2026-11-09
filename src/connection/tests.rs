@@ -1,6 +1,13 @@
 //! Regression tests for the actual link state machine, without radio MMIO.
 
 use super::*;
+use crate::link::{Epoch, Link, ParamRange};
+
+/// Fills the host's event queue.
+fn fill(shared: &Shared) { while shared.try_push_event(Event::PayloadTimeout) {} }
+
+/// Takes the events queued for the host and counts them.
+fn queued(shared: &Shared) -> usize { core::iter::from_fn(|| shared.take_event()).count() }
 
 /// A new connection. It is built in a critical section, which a test that
 /// changes the sleep clock all tests share holds meanwhile.
@@ -117,9 +124,7 @@ fn unsolicited_start_response_never_enables_encryption() {
 #[test]
 fn security_notification_survives_host_queue_pressure() {
     let full = Shared::new();
-    for _ in 0..4 {
-        assert!(full.try_push_event(Packet::completed_packets(1)));
-    }
+    fill(&full);
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
     link.encryption.rx_on = true;
@@ -129,10 +134,8 @@ fn security_notification_survives_host_queue_pressure() {
     let available = Shared::new();
     link.process(&[0; BUFFER_LEN], true, &available);
     assert_eq!(link.encryption_change, None);
-    for _ in 0..3 {
-        assert!(available.try_push_event(Packet::completed_packets(1)));
-    }
-    assert!(!available.try_push_event(Packet::completed_packets(1)));
+    assert_eq!(available.take_event(), Some(Event::Encryption { on: true, refresh: false, status: 0 }));
+    assert_eq!(queued(&available), 0);
 }
 
 #[test]
@@ -339,16 +342,17 @@ fn peripheral_latency_is_used_only_without_pending_work() {
     let mut link = connection();
     link.expect = Expect::Anchor;
     let shared = Shared::new();
-    assert!(link.can_skip(&shared));
+    let now = 2_000_000;
+    assert!(link.can_skip(now, &shared));
     link.enqueue(Llid::Control, &[OP_PING_RSP]);
-    assert!(!link.can_skip(&shared));
+    assert!(!link.can_skip(now, &shared));
     link.queue.fill(None);
     link.encryption.phase = Phase::Starting;
-    assert!(!link.can_skip(&shared));
+    assert!(!link.can_skip(now, &shared));
     link.encryption.phase = Phase::Idle;
-    assert!(link.can_skip(&shared));
+    assert!(link.can_skip(now, &shared));
     link.phy_update = Some((Phy::M2, 10));
-    assert!(!link.can_skip(&shared));
+    assert!(!link.can_skip(now, &shared));
 }
 
 #[test]
@@ -542,7 +546,7 @@ fn without_2m_a_host_phy_request_completes_at_once_on_le_1m() {
     assert_eq!(link.phy_status, Some(STATUS_SUCCESS));
     link.service_queries(1, &shared);
     assert!(link.host_phy.is_none());
-    assert_eq!(shared.take_event_code(), Some((0x3E, 0x0C)));
+    assert_eq!(shared.take_event(), Some(Event::PhyUpdated { rx: 1, status: 0, tx: 1 }));
 }
 
 #[cfg(feature = "nrf52832")]
@@ -742,13 +746,13 @@ fn an_expired_payload_timeout_waits_for_room_in_the_event_queue() {
     let shared = Shared::with_all_events();
     let mut link = encrypted();
     link.payload_timer = Some((0, true));
-    while shared.try_push_event(Packet::completed_packets(1)) {}
+    fill(&shared);
     link.start_procedures(31_000_000, &shared);
-    assert!(link.notifications.iter().flatten().any(Packet::is_payload_timeout));
+    assert!(link.notifications.contains(&Some(Event::PayloadTimeout)));
     // It is not queued twice while it waits.
     link.payload_timer = Some((0, true));
     link.start_procedures(62_000_000, &shared);
-    assert_eq!(link.notifications.iter().flatten().filter(|event| event.is_payload_timeout()).count(), 1);
+    assert_eq!(link.notifications.iter().filter(|&&event| event == Some(Event::PayloadTimeout)).count(), 1);
 }
 
 #[test]
@@ -803,11 +807,7 @@ fn events_at_instant(link: &mut Connection) -> usize {
     let shared = Shared::with_all_events();
     link.counter = 10;
     link.apply_instants(&shared);
-    let mut count = 0;
-    while shared.try_push_event(Packet::completed_packets(1)) {
-        count += 1;
-    }
-    4 - count
+    queued(&shared)
 }
 
 #[test]
@@ -897,14 +897,9 @@ fn asymmetric_phy_update_keeps_both_directions_and_unchanged_fields() {
 #[test]
 fn host_notifications_survive_queue_pressure() {
     let full = Shared::with_all_events();
-    for _ in 0..4 {
-        assert!(full.try_push_event(Packet::completed_packets(1)));
-    }
+    fill(&full);
     let mut link = connection();
-    link.notify(
-        Packet::connection_complete(0, (crate::pdu::Peer::new([1; 6], false), None), link.current_params(), 0),
-        &full,
-    );
+    link.notify(Event::Connected(Epoch::for_test(1)), &full);
     link.handle_control(&[OP_PHY_UPDATE_IND, 2, 2, 10, 0], false);
     assert_eq!(link.abort, None);
     link.counter = 10;
@@ -913,10 +908,9 @@ fn host_notifications_survive_queue_pressure() {
     let available = Shared::with_all_events();
     link.flush_notifications(&available);
     assert!(link.notifications.iter().all(Option::is_none));
-    for _ in 0..2 {
-        assert!(available.try_push_event(Packet::completed_packets(1)));
-    }
-    assert!(!available.try_push_event(Packet::completed_packets(1)));
+    assert_eq!(available.take_event(), Some(Event::Connected(Epoch::for_test(1))));
+    assert_eq!(available.take_event(), Some(Event::PhyUpdated { rx: 2, status: 0, tx: 2 }));
+    assert_eq!(queued(&available), 0);
 }
 
 #[cfg(feature = "nrf51")]
@@ -970,10 +964,9 @@ fn host_remote_queries_work_without_encryption_and_version_is_sent_once() {
     link.handle_control(&[OP_FEATURE_RSP, 31, 1, 0, 0, 0, 0, 0, 0], false);
     link.service_queries(10, &shared);
     assert_eq!(link.host_queries, 0);
-    for _ in 0..2 {
-        assert!(shared.try_push_event(Packet::completed_packets(1)));
-    }
-    assert!(!shared.try_push_event(Packet::completed_packets(1)));
+    assert_eq!(shared.take_event(), Some(Event::RemoteFeatures { features: [31, 1, 0, 0, 0, 0, 0, 0], status: 0 }));
+    assert_eq!(shared.take_event(), Some(Event::RemoteVersion([11, 1, 2, 3, 4])));
+    assert_eq!(queued(&shared), 0);
 }
 
 #[cfg(feature = "nrf52832")]
@@ -991,10 +984,8 @@ fn host_phy_request_completes_even_when_the_central_keeps_the_current_phy() {
     link.service_queries(1, &shared);
     assert!(link.host_phy.is_none());
     assert!(link.phy_status.is_none());
-    for _ in 0..3 {
-        assert!(shared.try_push_event(Packet::completed_packets(1)));
-    }
-    assert!(!shared.try_push_event(Packet::completed_packets(1)));
+    assert_eq!(shared.take_event(), Some(Event::PhyUpdated { rx: 1, status: 0, tx: 1 }));
+    assert_eq!(queued(&shared), 0);
 }
 
 #[test]
@@ -1120,8 +1111,14 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
     rx[1] = 0;
     link.stash(&rx, false, &shared);
     link.process(&rx, false, &shared);
-    assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0xA1));
-    assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0xA2));
+    assert_eq!(
+        shared.take_acl_in().map(|acl| (acl.payload()[0], acl.start(), acl.encrypted())),
+        Some((0xA1, true, false))
+    );
+    assert_eq!(
+        shared.take_acl_in().map(|acl| (acl.payload()[0], acl.start(), acl.encrypted())),
+        Some((0xA2, true, false))
+    );
     assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PING_RSP));
     assert_eq!(link.stats.received, 4);
     assert!(link.pending.iter().all(Option::is_none));
@@ -1139,7 +1136,7 @@ fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
     assert_eq!(link.receive(rx[0], 5, true, 999, &shared), Some(true));
     link.stash(&rx, true, &shared);
     assert_eq!(link.encryption.rx_counter, 1);
-    assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0x42));
+    assert_eq!(shared.take_acl_in().map(|acl| (acl.payload()[0], acl.encrypted())), Some((0x42, true)));
 }
 
 #[test]
@@ -1177,11 +1174,12 @@ fn a_host_that_enabled_the_event_decides_on_a_central_parameter_request() {
     link.drive_remote_request(0, &shared);
     assert!(link.queue[0].is_none());
     assert!(link.notifications.iter().all(Option::is_none));
-    let hci = crate::hci::Hci::new(&shared);
+    let link_api = Link::new(&shared);
+    let epoch = Epoch::for_test(1);
+    assert_eq!(shared.take_event(), Some(Event::ParamsRequested(ParamRange::new(12, 24, 4, 600))));
     // The host offers 30 to 40 units, latency 2 and timeout 800.
-    let reply = [0, 0, 30, 0, 40, 0, 2, 0, 0x20, 0x03, 0, 0, 0, 0];
-    assert_eq!(hci.reply_parameters(0x2020, &reply), 0);
-    assert_eq!(hci.reply_parameters(0x2021, &[0, 0, 0x3B]), 0x0C);
+    assert_eq!(link_api.reply_params(epoch, Ok(ParamRange::new(30, 40, 2, 800))), Ok(()));
+    assert_eq!(link_api.reply_params(epoch, Err(0x3B)), Err(crate::link::Error::Disallowed));
     link.drive_remote_request(1000, &shared);
     let response = link.queue[0].unwrap();
     assert_eq!(response.data[..9], [OP_CONNECTION_PARAM_RSP, 30, 0, 40, 0, 2, 0, 0x20, 0x03]);
@@ -1224,7 +1222,7 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     // The host lets the link send 251 octets. Nothing longer goes out until
     // the central has been told, and has answered.
     shared.set_connected(true);
-    assert_eq!(crate::hci::Hci::new(&shared).set_data_length(&[0, 0, 251, 0, 0x48, 0x08]), 0);
+    assert_eq!(Link::new(&shared).set_data_length(Epoch::for_test(1), 251, 0x0848), Ok(()));
     link.drive_length(&shared);
     assert_eq!(link.length.local_tx, LENGTH_MAX);
     assert_eq!(link.tx_payload_max(), 27);
@@ -1332,12 +1330,13 @@ fn a_partly_sent_host_packet_keeps_the_event_open_and_latency_off() {
     shared.set_connected(true);
     let mut link = connection();
     link.expect = Expect::Anchor;
-    assert!(shared.queue_acl_for_test(&[7; 60]));
-    link.load_next(&shared);
-    assert!(link.tx_kind == TxKind::AclPart);
+    let now = 2_000_000;
+    assert!(link.can_skip(now, &shared));
+    assert!(shared.queue_acl_for_test(&[7; ACL_MAX]));
+    // One octet of it went out; the rest waits for the next fragment.
+    link.acl = shared.next_acl_out().map(|packet| (packet, 1));
     assert!(!shared.has_acl_out());
-    link.tx_kind = TxKind::Empty;
-    assert!(!link.can_skip(&shared));
+    assert!(!link.can_skip(now, &shared));
 }
 
 #[test]
@@ -1377,17 +1376,19 @@ fn a_central_rejecting_our_parameter_response_ends_its_procedure() {
 fn a_host_update_sent_with_the_answer_completes_once_the_central_update_is_in_place() {
     let shared = Shared::with_all_events();
     shared.set_connected(true);
-    let hci = crate::hci::Hci::new(&shared);
+    let host = Link::new(&shared);
+    let epoch = Epoch::for_test(1);
     let mut link = encrypted();
     link.features_request = Request::Done;
     link.phy_request = Request::Done;
     link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
     link.drive_remote_request(0, &shared);
-    assert_eq!(shared.take_event_code(), Some((0x3E, 0x06)));
-    // TrouBLE's accept: LE Connection Update for the central's range, then
-    // the reply. The central's periodicity is not repeated.
-    assert_eq!(hci.command_async(0x2013, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
-    assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
+    assert!(matches!(shared.take_event(), Some(Event::ParamsRequested(_))));
+    // A host that asks for the central's range while it answers, then
+    // replies. The central's periodicity is not repeated.
+    let range = ParamRange::new(12, 24, 4, 600);
+    assert_eq!(host.request_params(epoch, range), Ok(()));
+    assert_eq!(host.reply_params(epoch, Ok(range)), Ok(()));
     link.drive_remote_request(10, &shared);
     let response = link.queue[0].unwrap();
     assert_eq!(response.data[..10], [OP_CONNECTION_PARAM_RSP, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0]);
@@ -1401,8 +1402,11 @@ fn a_host_update_sent_with_the_answer_completes_once_the_central_update_is_in_pl
     assert!(link.remote_update.is_none());
     link.counter = 6;
     link.apply_instants(&shared);
-    assert_eq!(shared.take_event_code(), Some((0x3E, 0x03)));
-    assert_eq!(shared.take_event_code(), None);
+    assert_eq!(
+        shared.take_event(),
+        Some(Event::ParamsUpdated { params: ConnectionParams::new(20, 4, 600), status: STATUS_SUCCESS })
+    );
+    assert_eq!(shared.take_event(), None);
     assert_eq!(shared.take_merged_updates(), 0);
 }
 
@@ -1410,25 +1414,27 @@ fn a_host_update_sent_with_the_answer_completes_once_the_central_update_is_in_pl
 fn a_merged_host_update_completes_with_the_central_rejection() {
     let shared = Shared::with_all_events();
     shared.set_connected(true);
-    let hci = crate::hci::Hci::new(&shared);
+    let host = Link::new(&shared);
+    let epoch = Epoch::for_test(1);
     let mut link = encrypted();
     link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
     link.drive_remote_request(0, &shared);
-    _ = shared.take_event_code();
-    assert_eq!(hci.command_async(0x2013, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
-    assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
+    _ = shared.take_event();
+    let range = ParamRange::new(12, 24, 4, 600);
+    assert_eq!(host.request_params(epoch, range), Ok(()));
+    assert_eq!(host.reply_params(epoch, Ok(range)), Ok(()));
     link.drive_remote_request(10, &shared);
     link.handle_control(&[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_RSP, ERROR_INVALID_PARAMETERS], true);
     link.drive_remote_request(20, &shared);
-    assert_eq!(shared.take_event_code(), Some((0x3E, 0x03)));
-    assert_eq!(shared.take_event_code(), None);
+    assert!(matches!(shared.take_event(), Some(Event::ParamsUpdated { status: ERROR_INVALID_PARAMETERS, .. })));
+    assert_eq!(shared.take_event(), None);
 }
 
 #[test]
 fn owed_update_complete_events_wait_for_room_instead_of_being_dropped() {
     let shared = Shared::with_all_events();
     let mut link = connection();
-    while shared.try_push_event(Packet::completed_packets(1)) {}
+    fill(&shared);
     let params = link.current_params();
     link.complete_updates(3, STATUS_SUCCESS, params, &shared);
     assert_eq!(link.notifications.iter().flatten().count(), 1);
@@ -1436,8 +1442,8 @@ fn owed_update_complete_events_wait_for_room_instead_of_being_dropped() {
     // The host reads its events: the rest follows in order.
     let mut updates = 0;
     for _ in 0..8 {
-        while let Some((code, subevent)) = shared.take_event_code() {
-            updates += usize::from(code == 0x3E && subevent == 0x03);
+        while let Some(event) = shared.take_event() {
+            updates += usize::from(event.is_params_update());
         }
         link.flush_notifications(&shared);
     }
@@ -1471,6 +1477,7 @@ fn latent(csa2: bool) -> Connection {
     link.counter = 1000;
     link.last_valid = link.anchor;
     link.establishment_deadline = None;
+    link.hold_until = None;
     link
 }
 
@@ -1612,4 +1619,136 @@ fn a_host_wakeup_inside_a_batch_listens_at_the_first_event_still_ahead() {
     assert_eq!(link.first_after(link.counter, listen, time), 1006);
     // Before the first start: the current event.
     assert_eq!(link.first_after(link.counter, listen, link.enable_at(1000).wrapping_sub(1)), 1000);
+}
+
+#[test]
+fn no_event_is_skipped_in_the_first_second_of_a_link() {
+    let shared = Shared::new();
+    let mut link = connection();
+    link.expect = Expect::Anchor;
+    link.latency = 30;
+    // The connection request ended at 100 us.
+    assert!(!link.can_skip(100 + LATENCY_HOLD_START_US - 1, &shared));
+    assert!(link.can_skip(100 + LATENCY_HOLD_START_US, &shared));
+    // The loop forgets a hold that ran out, so the time cannot wrap into it.
+    link.drive_host(100 + LATENCY_HOLD_START_US, &shared, &Prefetch::new());
+    assert!(link.hold_until.is_none());
+}
+
+#[test]
+fn a_received_payload_holds_the_latency_off_for_a_while() {
+    let shared = Shared::new();
+    let mut link = latent(false);
+    let now = link.anchor;
+    assert!(link.can_skip(now, &shared));
+    // An empty PDU holds nothing.
+    let mut rx = [0; BUFFER_LEN];
+    rx[0] = Llid::Continuation.bits();
+    assert_eq!(link.receive(rx[0], 0, true, now, &shared), Some(true));
+    link.stash(&rx, false, &shared);
+    assert!(link.can_skip(now, &shared));
+    // A payload holds for 200 ms, longer than 8 events of 15 ms.
+    rx[0] = Llid::Start.bits() | SN;
+    rx[1] = 1;
+    assert_eq!(link.receive(rx[0], 1, true, now, &shared), Some(true));
+    link.stash(&rx, false, &shared);
+    assert!(!link.can_skip(now.wrapping_add(LATENCY_HOLD_US - 1), &shared));
+    assert!(link.can_skip(now.wrapping_add(LATENCY_HOLD_US), &shared));
+    // With a long interval, 8 events are longer than 200 ms.
+    let mut slow = latent(false);
+    slow.interval = 100_000;
+    slow.hold_latency_from(now);
+    assert!(!slow.can_skip(now.wrapping_add(8 * 100_000 - 1), &shared));
+    assert!(slow.can_skip(now.wrapping_add(8 * 100_000), &shared));
+    // A later hold never shortens a longer one.
+    slow.interval = 15_000;
+    slow.hold_latency_from(now);
+    assert!(!slow.can_skip(now.wrapping_add(8 * 100_000 - 1), &shared));
+}
+
+#[test]
+fn an_acknowledged_payload_of_ours_holds_the_latency_off_too() {
+    let shared = Shared::new();
+    let mut link = latent(false);
+    let now = link.anchor;
+    link.tx_kind = TxKind::Control;
+    link.last_valid = now;
+    assert_eq!(link.acknowledge(NESN, &shared), Some(()));
+    assert!(link.tx_kind == TxKind::Empty);
+    assert!(!link.can_skip(now.wrapping_add(LATENCY_HOLD_US - 1), &shared));
+    assert!(link.can_skip(now.wrapping_add(LATENCY_HOLD_US), &shared));
+    // The acknowledgement of an empty PDU holds nothing.
+    let mut quiet = latent(false);
+    quiet.last_valid = now;
+    assert_eq!(quiet.acknowledge(NESN, &shared), Some(()));
+    assert!(quiet.can_skip(now, &shared));
+}
+
+#[test]
+fn the_host_can_hold_the_latency_off() {
+    let shared = Shared::new();
+    let link = latent(false);
+    crate::link::Link::new(&shared).hold_latency(true);
+    assert!(!link.can_skip(link.anchor, &shared));
+    crate::link::Link::new(&shared).hold_latency(false);
+    assert!(link.can_skip(link.anchor, &shared));
+}
+
+#[test]
+fn encrypted_data_is_marked_before_the_host_learns_of_the_encryption() {
+    let full = Shared::new();
+    fill(&full);
+    let mut link = connection();
+    link.encryption.phase = Phase::AwaitingStartResponse;
+    link.encryption.rx_on = true;
+    link.handle_control(&[OP_START_ENC_RSP], true);
+    link.process(&[0; BUFFER_LEN], true, &full);
+    // The encryption change waits for room; data arrives meanwhile.
+    assert_eq!(link.encryption_change, Some((0, true)));
+    let mut rx = [0; BUFFER_LEN];
+    rx[0] = Llid::Start.bits();
+    rx[1] = 5;
+    link.rx_plain[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
+    assert_eq!(link.receive(rx[0], 5, true, 999, &full), Some(true));
+    link.stash(&rx, true, &full);
+    let acl = full.take_acl_in().unwrap();
+    assert!(acl.encrypted());
+    assert!(!queued_encryption(&full));
+}
+
+/// Whether the host's queue holds an encryption event.
+fn queued_encryption(shared: &Shared) -> bool {
+    core::iter::from_fn(|| shared.take_event()).any(|event| matches!(event, Event::Encryption { on: true, .. }))
+}
+
+#[test]
+fn data_waits_while_the_host_has_not_got_the_start_of_the_link() {
+    let full = Shared::new();
+    fill(&full);
+    let mut link = connection();
+    link.notify(Event::Connected(Epoch::for_test(1)), &full);
+    assert_eq!(link.receive(Llid::Start.bits(), 1, true, 999, &full), Some(true));
+    assert!(!link.received);
+    // Once the event is through, the central's next attempt is taken.
+    _ = queued(&full);
+    link.flush_notifications(&full);
+    assert_eq!(link.receive(Llid::Start.bits(), 1, true, 999, &full), Some(true));
+    assert!(link.received);
+}
+
+#[test]
+fn acknowledged_host_packets_are_counted_for_the_host() {
+    let shared = Shared::new();
+    shared.set_connected(true);
+    let link_api = crate::link::Link::new(&shared);
+    let epoch = Epoch::for_test(1);
+    link_api.try_send(epoch, true, &[1]).unwrap();
+    let mut link = connection();
+    link.load_next(&shared);
+    assert!(link.tx_kind == TxKind::Acl);
+    assert_eq!(link_api.in_flight(epoch), 1);
+    assert_eq!(link.acknowledge(NESN, &shared), Some(()));
+    link.process(&[0; BUFFER_LEN], false, &shared);
+    assert_eq!(link_api.in_flight(epoch), 0);
+    assert_eq!(link_api.acked(), 1);
 }

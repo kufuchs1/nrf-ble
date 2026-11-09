@@ -43,7 +43,7 @@ use super::{
 use crate::{
     chip,
     clock::reached,
-    hci::{ConnectionParams, Packet, Shared},
+    link::{ConnectionParams, Event, ParamRange, Shared},
     log::info,
     pdu::{Llid, field, valid_connection_parameters},
     power_control::LEVELS_DBM,
@@ -99,10 +99,9 @@ impl Connection {
         let timeout = shared.payload_timeout();
         let elapsed = now.wrapping_sub(last);
         if elapsed >= timeout {
-            // Retained until the host takes it; dropped by the delivery only
-            // if the host did not enable it in event mask page 2.
-            if !self.notifications.iter().flatten().any(Packet::is_payload_timeout) {
-                self.notify(Packet::payload_timeout_expired(), shared);
+            // Retained until the host takes it, once.
+            if !self.notifications.contains(&Some(Event::PayloadTimeout)) {
+                self.notify(Event::PayloadTimeout, shared);
             }
             self.payload_timer = Some((now, false));
             info!("authenticated payload timeout expired");
@@ -139,7 +138,7 @@ impl Connection {
         let effective = self.length.effective();
         if effective != self.length.reported {
             self.length.reported = effective;
-            self.notify(Packet::data_length_change(effective), shared);
+            self.notify(Event::DataLength(effective), shared);
             info!("data length now {} octets out, {} in", effective[0], effective[2]);
         }
     }
@@ -173,7 +172,8 @@ impl Connection {
                 let bytes = request.params.get(index..index.saturating_add(2)).unwrap_or_default();
                 bytes.first_chunk::<2>().map_or(0, |&pair| u16::from_le_bytes(pair))
             };
-            self.notify(Packet::remote_parameter_request([field(0), field(2), field(4), field(6)]), shared);
+            let range = ParamRange::new(field(0), field(2), field(4), field(6));
+            self.notify(Event::ParamsRequested(range), shared);
             shared.ask_parameters();
             self.remote_request = Some(RemoteRequest { asked: Some(now.wrapping_add(HOST_REPLY_US)), ..request });
             return;
@@ -247,7 +247,7 @@ impl Connection {
                 } else if self.param_update.is_some()
                     || self.phy_update.is_some()
                     || self.channel_update.is_some()
-                    || self.notifications.iter().flatten().any(Packet::is_parameter_update)
+                    || self.notifications.iter().flatten().any(Event::is_params_update)
                 {
                     self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                 } else {
@@ -273,7 +273,7 @@ impl Connection {
                 } else if self.param_update.is_some()
                     || self.phy_update.is_some()
                     || self.channel_update.is_some()
-                    || self.notifications.iter().flatten().any(Packet::is_parameter_update)
+                    || self.notifications.iter().flatten().any(Event::is_params_update)
                 {
                     self.enqueue(Llid::Control, &[
                         OP_REJECT_EXT_IND,
@@ -335,7 +335,7 @@ impl Connection {
         } else if self.phy_update.is_some()
             || self.param_update.is_some()
             || self.channel_update.is_some()
-            || self.notifications.iter().flatten().any(Packet::is_phy_update)
+            || self.notifications.iter().flatten().any(Event::is_phy_update)
         {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
         } else if phy != self.phy || other != self.tx_phy {
@@ -442,7 +442,7 @@ impl Connection {
     /// an update.
     pub(super) fn report_parameters(&mut self, shared: &Shared) {
         if let Some(status) = self.param_status
-            && shared.try_push_event(Packet::connection_update_complete(status, self.current_params()))
+            && shared.try_push_event(Event::ParamsUpdated { params: self.current_params(), status })
         {
             self.param_status = None;
             shared.finish_param_request();

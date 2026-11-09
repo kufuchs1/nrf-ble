@@ -4,15 +4,15 @@
 //! The path is taken as symmetric and the central as sending at 0 dBm, so the
 //! central hears this peripheral at about its own power plus the received
 //! signal strength. Power steps down while that estimate stays above
-//! [`TARGET_HIGH_DBM`] and up below [`TARGET_LOW_DBM`]. A central that sends
+//! `TARGET_HIGH_DBM` and up below `TARGET_LOW_DBM`. A central that sends
 //! stronger than assumed still hears the device 15 dB above its
 //! sensitivity. A packet of ours that the central did not acknowledge raises
 //! the power at once, and keeps it from stepping down for
-//! [`HOLD_AFTER_LOSS`] packets. Packets of the central that were not
+//! `HOLD_AFTER_LOSS` packets. Packets of the central that were not
 //! received say nothing about this side's power and are ignored.
 //!
 //! A central that runs power control measures this side's signal itself and
-//! asks for a change. Its request becomes a floor for [`FLOOR_HOLD`]
+//! asks for a change. Its request becomes a floor for `FLOOR_HOLD`
 //! received packets: the own control does not step below it in that time.
 //! Afterwards the own control decides again, and each change it makes is
 //! reported to a central that asked for reports. Some centrals ask for the
@@ -90,7 +90,7 @@ impl PowerControl {
     pub const fn level(&self) -> usize { self.level }
 
     /// Moves to the level closest to `dbm`, as the central asked, and keeps
-    /// the own control from stepping below it for [`FLOOR_HOLD`] packets.
+    /// the own control from stepping below it for `FLOOR_HOLD` packets.
     #[inline]
     pub fn move_to(&mut self, dbm: i32) {
         let closest = LEVELS_DBM.iter().enumerate().min_by_key(|&(_, &level)| i32::from(level).abs_diff(dbm));

@@ -12,7 +12,21 @@ use crate::{
     chip,
     clock::{Clock, reached},
     crypto::{self, CONFIG_LEN, SCRATCH_LEN},
-    hci::{ACL_MAX, AclOut, ConnectionParams, LENGTH_DEFAULT, LENGTH_MAX, Packet, Shared},
+    link::{
+        ACL_MAX,
+        AclOut,
+        ConnectionParams,
+        Event,
+        LATENCY_HOLD_EVENTS,
+        LATENCY_HOLD_START_US,
+        LATENCY_HOLD_US,
+        LENGTH_DEFAULT,
+        LENGTH_MAX,
+        QUERY_FEATURES,
+        QUERY_PHY,
+        QUERY_VERSION,
+        Shared,
+    },
     log::info,
     pdu::{BUFFER_LEN, ConnectInd, LLID_MASK, Llid, NESN, SN, field, valid_channel_map, valid_connection_parameters},
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
@@ -505,6 +519,9 @@ pub struct Connection {
     feature_error:          Option<u8>,
     /// The feature exchange this side starts.
     features_request:       Request,
+    /// Until when no connection event is skipped: the first second of the
+    /// link, and a while after each PDU with a payload either way.
+    hold_until:             Option<u32>,
     /// Channel selection.
     hopping:                Hopping,
     /// PHY preferences requested by the host until completion.
@@ -523,7 +540,7 @@ pub struct Connection {
     length_request:         Request,
     /// Used data channels.
     map:                    UsedChannels,
-    /// Status for the LE Connection Update commands that were part of the
+    /// Status for the connection parameter requests that were part of the
     /// host's answer, once the central's request ended without an update.
     merged_outcome:         Option<u8>,
     /// Next expected sequence number.
@@ -531,7 +548,7 @@ pub struct Connection {
     /// Transmit PHY to apply with the next PHY instant.
     next_tx_phy:            Phy,
     /// Ordered host notifications retained while its queue is full.
-    notifications:          [Option<Packet>; 3],
+    notifications:          [Option<Event>; 3],
     /// Deadline of the host's connection parameter request, while it runs.
     param_request:          Option<u32>,
     /// Status of the host's connection parameter request to report when it
@@ -603,7 +620,7 @@ pub struct Connection {
     tx_phy:                 Phy,
     /// Encrypted copy of [`Self::tx`] as sent.
     tx_sealed:              [u8; DATA_BUFFER_LEN],
-    /// LE Connection Update Complete events still owed to the host beyond
+    /// Parameter update events still owed to the host beyond
     /// the retained notifications, with their status and parameters.
     updates_owed:           (u8, u8, ConnectionParams),
     /// Remote version, retained once our only version response is queued.
@@ -625,6 +642,9 @@ impl Connection {
             }
         } else {
             self.sn = !self.sn;
+            if self.tx_kind != TxKind::Empty {
+                self.hold_latency_from(self.last_valid);
+            }
             match self.tx_kind {
                 TxKind::Acl => self.completed = self.completed.saturating_add(1),
                 TxKind::Terminate => {
@@ -660,9 +680,9 @@ impl Connection {
             self.tx_phy = self.next_tx_phy;
             shared.set_phys(self.phy.hci(), self.tx_phy.hci());
             self.host_phy = None;
-            shared.complete_query(4);
+            shared.complete_query(QUERY_PHY);
             self.phy_update = None;
-            self.notify(Packet::phy_update_complete_pair(phy.hci(), self.tx_phy.hci()), shared);
+            self.notify(Event::PhyUpdated { rx: phy.hci(), status: STATUS_SUCCESS, tx: self.tx_phy.hci() }, shared);
             info!("PHY now {}M", phy.hci());
         }
         if let Some(update) = self.param_update
@@ -714,9 +734,14 @@ impl Connection {
     /// Whether the current event can pass without listening: nothing to send
     /// or acknowledge and no procedure running. As in Zephyr, latency also
     /// stops while a connection or PHY update waits for its instant, so the
-    /// anchor is fresh when the timing or the PHY changes.
-    fn can_skip(&self, shared: &Shared) -> bool {
-        matches!(self.expect, Expect::Anchor)
+    /// anchor is fresh when the timing or the PHY changes. It stops too
+    /// while the latency is held: in the first second of the link, a while
+    /// after traffic, and while the host holds it, so that a central's
+    /// request is answered at the next event.
+    fn can_skip(&self, now: u32, shared: &Shared) -> bool {
+        self.hold_until.is_none_or(|until| reached(now, until))
+            && !shared.latency_held()
+            && matches!(self.expect, Expect::Anchor)
             && self.param_update.is_none()
             && self.phy_update.is_none()
             && self.tx_kind == TxKind::Empty
@@ -742,14 +767,14 @@ impl Connection {
             .wrapping_sub(EVENT_GUARD_US)
     }
 
-    /// Sends `count` LE Connection Update Complete events with `status` and
+    /// Sends `count` `Event::ParamsUpdated` events with `status` and
     /// `params`: the first retained until delivered, any further one if the
     /// host has room.
     fn complete_updates(&mut self, count: u8, status: u8, params: ConnectionParams, shared: &Shared) {
         if count == 0 {
             return;
         }
-        self.notify(Packet::connection_update_complete(status, params), shared);
+        self.notify(Event::ParamsUpdated { params, status }, shared);
         // Further events follow the retained ones as the host makes room.
         let (owed, _, _) = self.updates_owed;
         self.updates_owed = (owed.saturating_add(count.saturating_sub(1)), status, params);
@@ -803,6 +828,9 @@ impl Connection {
 
     /// Services host traffic before the next radio event.
     fn drive_host(&mut self, now: u32, shared: &Shared, entropy: &Prefetch) {
+        if self.hold_until.is_some_and(|until| reached(now, until)) {
+            self.hold_until = None;
+        }
         self.drive_encryption(shared, entropy);
         self.drive_remote_request(now, shared);
         self.drive_length(shared);
@@ -1069,7 +1097,7 @@ impl Connection {
             let (owed, status, params) = self.updates_owed;
             if matches!(
                 embassy_futures::select::select(
-                    shared.push_event(Packet::connection_update_complete(status, params)),
+                    shared.push_event(Event::ParamsUpdated { params, status }),
                     shared.reset_requested()
                 )
                 .await,
@@ -1095,7 +1123,7 @@ impl Connection {
         }
         let (owed, status, params) = self.updates_owed;
         for remaining in (0..owed).rev() {
-            if !shared.try_push_event(Packet::connection_update_complete(status, params)) {
+            if !shared.try_push_event(Event::ParamsUpdated { params, status }) {
                 break;
             }
             self.updates_owed.0 = remaining;
@@ -1246,6 +1274,17 @@ impl Connection {
         }
     }
 
+    /// Holds the peripheral latency off until [`LATENCY_HOLD_US`] or
+    /// [`LATENCY_HOLD_EVENTS`] intervals after `time`, whichever is later,
+    /// unless it is held longer already.
+    fn hold_latency_from(&mut self, time: u32) {
+        let span = LATENCY_HOLD_US.max(self.interval.saturating_mul(LATENCY_HOLD_EVENTS));
+        let until = time.wrapping_add(span);
+        if self.hold_until.is_none_or(|current| reached(until, current)) {
+            self.hold_until = Some(until);
+        }
+    }
+
     /// Event to listen at after skipping from the current one: as many as
     /// the latency leaves.
     const fn listen_counter(&self) -> u16 { self.counter.wrapping_add(self.latency.saturating_sub(self.skipped)) }
@@ -1372,6 +1411,7 @@ impl Connection {
             version: None,
             version_request: Request::NotStarted,
             host_queries: 0,
+            hold_until: Some(end.wrapping_add(LATENCY_HOLD_START_US)),
             feature_error: None,
             host_phy: None,
             phy_status: None,
@@ -1419,7 +1459,7 @@ impl Connection {
             return None;
         }
         if self.acl.is_none() {
-            self.acl = shared.next_acl_out_if(true).map(|packet| (packet, 0));
+            self.acl = shared.next_acl_out().map(|packet| (packet, 0));
         }
         let limit = self.tx_payload_max();
         let current = self.acl.as_mut()?;
@@ -1464,7 +1504,7 @@ impl Connection {
     }
 
     /// Retains a host notification without blocking radio progress.
-    pub(crate) fn notify(&mut self, event: Packet, shared: &Shared) {
+    pub(crate) fn notify(&mut self, event: Event, shared: &Shared) {
         if self.notifications.iter().all(Option::is_none) && shared.try_push_event(event) {
             return;
         }
@@ -1496,19 +1536,16 @@ impl Connection {
             crypto::wipe(&mut packet.bytes);
         }
         if let Some((status, enabled)) = self.encryption_change {
-            let event = if self.encryption.procedure == Procedure::Refresh {
-                Packet::key_refresh_complete(status)
-            } else {
-                Packet::encryption_change(status, enabled)
-            };
+            let refresh = self.encryption.procedure == Procedure::Refresh;
+            let event = Event::Encryption { on: enabled, refresh, status };
             if shared.try_push_event(event) {
                 self.encryption_change = None;
                 self.encryption.procedure = Procedure::First;
             }
         }
         self.report_parameters(shared);
-        if self.completed != 0 && shared.try_push_event(Packet::completed_packets(self.completed)) {
-            self.completed = 0;
+        if self.completed != 0 {
+            shared.acknowledged(core::mem::take(&mut self.completed));
         }
     }
 
@@ -1553,7 +1590,9 @@ impl Connection {
         } else if header & LLID_MASK == Llid::Control.bits() {
             self.pending.iter().any(Option::is_none)
         } else {
-            shared.acl_room() != 0
+            // Data waits while the host has not got the link's start, so it
+            // never learns of data before the link.
+            shared.acl_room() != 0 && !self.notifications.iter().flatten().any(Event::is_connected)
         };
         if !duplicate && room {
             self.nesn = !self.nesn;
@@ -1741,7 +1780,7 @@ impl Connection {
                 continue;
             }
             shared.reset_wakeup();
-            if self.skipped < self.latency && self.can_skip(shared) {
+            if self.skipped < self.latency && self.can_skip(clock.now(), shared) {
                 // One sleep for the whole run of skipped events, ending where
                 // the event-by-event loop would last have woken: at the start
                 // of the last skipped event, or of the first one at or after
@@ -1830,31 +1869,31 @@ impl Connection {
             self.phy_request = Request::NotStarted;
         }
         if let Some(status) = self.phy_status.take() {
-            self.notify(Packet::phy_update_result(status, self.phy.hci(), self.tx_phy.hci()), shared);
+            self.notify(Event::PhyUpdated { rx: self.phy.hci(), status, tx: self.tx_phy.hci() }, shared);
             self.host_phy = None;
-            shared.complete_query(4);
+            shared.complete_query(QUERY_PHY);
         }
         if let Some(error) = self.feature_error.take() {
-            self.notify(Packet::remote_features_result(error, [0; 8]), shared);
-            self.host_queries &= !1;
-            shared.complete_query(1);
+            self.notify(Event::RemoteFeatures { features: [0; 8], status: error }, shared);
+            self.host_queries &= !QUERY_FEATURES;
+            shared.complete_query(QUERY_FEATURES);
         }
-        if self.host_queries & 1 != 0 {
+        if self.host_queries & QUERY_FEATURES != 0 {
             if let Some(features) = self.central_features {
-                self.notify(Packet::remote_features(features), shared);
-                self.host_queries &= !1;
-                shared.complete_query(1);
+                self.notify(Event::RemoteFeatures { features, status: STATUS_SUCCESS }, shared);
+                self.host_queries &= !QUERY_FEATURES;
+                shared.complete_query(QUERY_FEATURES);
             } else if self.features_request == Request::Done {
                 self.features_request = Request::NotStarted;
             } else {
                 // The outstanding feature procedure will answer this query.
             }
         }
-        if self.host_queries & 2 != 0 {
+        if self.host_queries & QUERY_VERSION != 0 {
             if let Some(version) = self.version {
-                self.notify(Packet::remote_version(version), shared);
-                self.host_queries &= !2;
-                shared.complete_query(2);
+                self.notify(Event::RemoteVersion(version), shared);
+                self.host_queries &= !QUERY_VERSION;
+                shared.complete_query(QUERY_VERSION);
             } else if self.version_request == Request::NotStarted
                 && self.encryption.phase == Phase::Idle
                 && self.queue.iter().all(Option::is_none)
@@ -1923,6 +1962,10 @@ impl Connection {
     fn stash(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool, shared: &Shared) {
         self.received = false;
         self.stats.received = self.stats.received.wrapping_add(1);
+        // A payload, encrypted or not, holds the latency off for a while.
+        if rx.get(1).is_some_and(|&len| len != 0) {
+            self.hold_latency_from(self.last_valid);
+        }
         // Empty PDUs have no MIC and need not produce a CCM output packet.
         let source = if encrypted && rx.get(1) != Some(&0) { self.rx_plain.as_slice() } else { rx.as_slice() };
         let header = source.first().copied().unwrap_or_default();
@@ -1951,7 +1994,7 @@ impl Connection {
             // the event, so no data follows one that waits. `receive` made
             // sure of the room.
             let kind = if header & LLID_MASK == Llid::Start.bits() { Llid::Start } else { Llid::Continuation };
-            _ = shared.push_acl_in(kind, payload);
+            _ = shared.push_acl_in(kind, payload, encrypted);
         }
     }
 

@@ -9,18 +9,43 @@ peripheral. The nRF51 support, for an nRF51802, builds and passes the host tests
 
 nrf-ble starts as a copy of nrf-ll, the link layer of the replacement firmwares for the Logitech MX Keys S keyboard
 and the MX Master 3S mouse, which talks to a host stack such as [TrouBLE](https://github.com/embassy-rs/trouble) over
-HCI. nrf-ll stays as it is, and the MX firmwares keep using it
-until they move here.
+HCI. nrf-ll stays as it is, and the MX firmwares keep using it until they move here.
 
-In this crate HCI is being replaced. The host (`src/host`) talks to the link layer through a typed Rust API
-(`src/link.rs`) instead of serialised HCI commands and events: no bt-hci and no TrouBLE. Its only target is Linux with
-BlueZ, and its first user is the firmware of the Logitech Spotlight remote (an nRF51802), later the MX firmwares. The
-design is in [`docs/host/design.md`](../docs/host/design.md), with the fixes of its reviews; it was written for a
-separate host crate and an HCI adapter, and this crate replaces both with one crate and the typed API.
+This crate has no HCI: no bt-hci, no TrouBLE, and no command or event encoded into bytes. The host (`src/host`) is to
+talk to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs). Its only target is Linux with BlueZ,
+and its first user is the firmware of the Logitech Spotlight remote (an nRF51802), later the MX firmwares. The design is
+in [`docs/host/design.md`](../docs/host/design.md), with the fixes of its reviews; it was written for a separate host
+crate and an HCI adapter, and this crate replaces both with one crate and the typed API.
 
-What is done so far: the link layer as copied from nrf-ll, with its byte level HCI module (`src/hci.rs`) still in
-place, and the skeleton of the host's modules. Until the typed API replaces it, the sections below describe the link
-layer as nrf-ll's readme does, HCI included.
+What is done so far:
+
+- The link layer as copied from nrf-ll, with nrf-ll's byte level HCI module replaced by the typed API, and with the
+  peripheral latency hold (see below). Every behaviour nrf-ll's HCI offered stays, as a typed call: identity, filter
+  accept list, resolving list and privacy, advertising, long term key replies, disconnection, connection parameter
+  requests and replies, data length, PHY, authenticated payload timeout, RSSI and the central's features and version.
+- The host's AES seam (`host::Aes`, the hardware ECB behind `host::Ecb`, software AES in the tests) and, in the doc
+  comments of its modules, what each of the next stages puts into them. The L2CAP, ATT, GATT, security manager, engine
+  and advertising code does not exist yet.
+
+## The typed link API
+
+`link::Shared` is the static the link layer task and the host share; `link::Link` is the host's copyable handle on it.
+
+- **Epochs:** each link has an `Epoch`, which `Event::Connected` and `Link::info` carry. A call for a link that ended
+  returns `Error::Gone` and has no effect on the next link.
+- **Events:** `Link::next` returns `Rx::Event` and `Rx::Acl`. The event queue holds 6 events of 12 bytes, as the
+  thread executor stalls for about 3 s during a P-256 multiplication; the connection keeps 3 more until there is room.
+  `Event::Connected` comes before the first received fragment of its link and `Event::Disconnected` after its last;
+  events and fragments are not otherwise in one order.
+- **Received data:** each `AclIn` carries an `encrypted` flag, set when the link layer received the PDU, so a security
+  check does not depend on when the host learns of the encryption.
+- **Sending:** `try_send` and `send` queue one fragment of up to 27 octets (251 with `data-length`), `tx_room` gives
+  the free room, `tx_room_changed` waits until the link layer took a fragment, and `in_flight` counts the fragments the
+  central has not acknowledged, so the host can keep at most one notification unacknowledged.
+- **Link information:** `Link::info` gives the central's address on the air with its type, its resolved identity
+  separately, our own address on the air (the resolvable private address or the identity), the parameters and the
+  central's clock accuracy: pairing uses the addresses on the air.
+- **Long term key:** `ltk_reply` takes the key least significant octet first, as the link layer uses it.
 
 ## What it does
 
@@ -30,34 +55,33 @@ layer as nrf-ll's readme does, HCI included.
   advertising keeps running; peer addresses in the resolving list are resolved for the filter accept list and for
   directed advertising. A reset forgets every key the host gave.
 - **Connections:** as peripheral, with channel selection algorithm 1 or 2, as the central chooses. It answers the LL
-  control procedures a central starts. A host that enabled the LE remote connection parameter request event decides on
-  the parameters a central asks for, with LE Remote Connection Parameter Request Reply or Negative Reply (TrouBLE's
-  `connection-params-update` feature), and has them rejected if it does not answer in 30 s; otherwise the link layer
-  accepts any valid parameters. Our own procedures wait until the central's update arrives. An LE Connection
-  Update the host sends while it answers (as TrouBLE's `accept` does) is part of that answer: it leaves an own update
-  of the host alone and completes when the central's procedure ends, with the update or with the reason it ended. Every packet
+  control procedures a central starts. A host that called `Link::set_host_decides_params` decides on the parameters a central
+  asks for (`Event::ParamsRequested`, `Link::reply_params`), and has them rejected if it does not answer in 30 s;
+  otherwise the link layer accepts any valid parameters. Our own procedures wait until the central's update arrives. A
+  `Link::request_params` the host makes while it answers is part of that answer: it leaves an own request of the host
+  alone and completes when the central's procedure ends, with the update or with the reason it ended. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
   is answered as unknown.
-- **Link end:** the host reads every packet the link acknowledged before it gets the disconnection complete event;
-  requests of the host for a link that ended cannot reach the next one, and every link starts with the default
-  authenticated payload timeout.
-- **Read RSSI** answers with the averaged signal strength of the central's packets.
-- **HCI events** follow the host's event masks; a host without the LE enhanced connection complete event gets the
-  plain one. Keys the host gave, and the keys of a link, are overwritten once they are no longer needed.
+- **Link end:** the host reads every packet the link acknowledged before it gets `Event::Disconnected`; requests of
+  the host for a link that ended cannot reach the next one, and every link starts with the default authenticated
+  payload timeout.
+- **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets. Keys the host gave, and the keys
+  of a link, are overwritten once they are no longer needed.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
   the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
   or as long as the host sets: after three quarters of that time without one, the link layer pings the central, and
   the host learns when the whole time passes. A central that leaves the ping unanswered for 40 s ends the link with
-  an LL response timeout, as any other procedure does. A key reply to an LTK request whose link ended before the host
-  answered is taken without effect, so a central that leaves while encryption starts cannot stop the host.
-- **Connection updates from the host** run one at a time: LE Connection Update returns Command Disallowed until the
-  previous one reported its LE Connection Update Complete event.
+  an LL response timeout, as any other procedure does. A key reply for a link that ended before the host answered
+  returns `Error::Gone` and has no effect on the next link.
+- **Connection parameter requests from the host** run one at a time: `Link::request_params` returns
+  `Error::Disallowed` until the previous one reported its `Event::ParamsUpdated`, and `Error::UnsupportedRemote` for a
+  central without the connection parameters request procedure, for which the host sends the L2CAP request.
 - **Data length extension** (feature `data-length`, nRF52832 only): payloads of up to 251 octets each way instead of 27.
   The link layer receives 251 octets from the start and tells a central that asks (LL_LENGTH_REQ). It sends longer
-  packets once the host allows them for the link (LE Set Data Length, TrouBLE's `Connection::update_data_length`) or for
-  new links (LE Write Suggested Default Data Length), and then asks the central itself; a longer length only takes
-  effect once the central was told and answered, or acknowledged our answer. The host learns the effective lengths from
-  LE Data Length Change. The host's ACL packets hold up to 251 octets and are sent in fragments as long as the central
+  packets once the host allows them for the link (`Link::set_data_length`) or for new links
+  (`Link::set_suggested_length`), and then asks the central itself; a longer length only takes effect once the central
+  was told and answered, or acknowledged our answer. The host learns the effective lengths from `Event::DataLength`. The
+  host's fragments hold up to 251 octets and are sent in fragments as long as the central
   receives, within its time on the air. The CCM runs in extended length mode and generates its key stream when it is
   armed, as in Zephyr, instead of at radio READY.
 - **LE 2M PHY** (nRF52832 only) when the central supports it, which halves the airtime of every packet: the link layer
@@ -80,12 +104,16 @@ layer as nrf-ll's readme does, HCI included.
   without room towards the host, a running encryption or termination procedure, or different PHYs per direction
   close the event after the answer.
 - **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
-  instant; data from the host ends the skipping at the next connection event. The receive window widens with the time
+  instant; data from the host ends the skipping at the next connection event. It is also held off, so that every
+  connection event is listened to: during the first second of a link, for 200 ms or 8 connection events, whichever is
+  longer, after any PDU with a payload in either direction, and while the host asks for it with `Link::hold_latency`.
+  Linux reconnects with the latency it stored from the very first event, so without the hold each ATT round trip of a
+  reconnection could wait up to the whole latency. The receive window widens with the time
   since the last anchor, up to half the interval less the interframe space.
 
 ## Crypto for the host
 
-The host stack can take its random numbers from the hardware generator ([`random`](src/hci.rs)) and AES-128 from the
+The host can take its random numbers from the hardware generator ([`rng::fill`](src/rng.rs)) and AES-128 from the
 hardware AES ([`encrypt_block`](src/crypto.rs), the ECB). The resolvable private addresses and the identity resolving
 keys use the ECB as well. It shares its AES core with the link encryption, which aborts it during a radio event: each
 block runs with interrupts off and is retried after an abort, once the link layer has handled the event. The CPU
@@ -139,8 +167,8 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
 16 MHz Cortex-M0 with 16 or 32 KB of RAM, and its radio lacks parts of the nRF52832's:
 
 - **Not available:** LE 2M (the link layer neither claims nor asks for it, answers a central's PHY request as unknown,
-  refuses an LE Set PHY or LE Set Default PHY that names LE 2M or LE Coded with Unsupported Feature or Parameter Value,
-  and completes an LE Set PHY for LE 1M at once), the data length extension (the CCM encrypts 27 octets at most;
+  refuses a `Link::set_phy` or `Link::set_default_phy` that names LE 2M or LE Coded with `Error::Unsupported`, and
+  completes a `Link::set_phy` for LE 1M at once), the data length extension (the CCM encrypts 27 octets at most;
   `data-length` does not build for the nRF51), the fast ramp-up, and +3 dBm: the power steps through -20, -16, -12,
   -8, -4, 0 and +4 dBm.
 - **Turnarounds:** the radio's own interframe timing, with the shortcuts from the end of a packet over the disabled
@@ -172,8 +200,8 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   priority bits, but Embassy builds the nRF51 with three, so `P0` and `P1`, `P2` and `P3`, `P4` and `P5`, and `P6` and
   `P7` are the same level: the link layer must be in a higher pair than everything else, such as `P2` over `P4` or `P1`
   over `P2`, not `P2` over `P3`.
-- **RAM:** without the data length extension a `Connection` takes 1224 bytes and `Shared` 1040 on thumbv6m, with
-  packet buffers of 40 bytes.
+- **RAM:** without the data length extension a `Connection` takes 1040 bytes, `link::Shared` 840 and the link layer
+  task's future 1840 on thumbv6m (nrf-ll with HCI: 1224, 1040 and 2024), with packet buffers of 40 bytes.
 - **Errata:** the nRF52832 workarounds are not applied. Of the nRF51's, only the sign of the temperature is fixed;
   the others wait for the nRF51802 errata document (see `src/chip/nrf51.rs`).
 - **Timing, unverified:** the answer within the 150 µs interframe space, with its CCM encryption, and the scan request
@@ -211,7 +239,11 @@ cargo clippy --target thumbv6m-none-eabi --no-default-features --features nrf51 
 cargo build --release --target thumbv7em-none-eabihf
 cargo build --release --target thumbv6m-none-eabi --no-default-features --features nrf51
 cargo fmt --check
+cargo doc --no-deps                                # rustdoc lints are errors too
 ```
+
+Clippy runs on the library for the chip targets, as in nrf-ll. The tests are not linted (`cargo clippy --all-targets`
+fails on the test code under the `restriction` group, as in nrf-ll).
 
 ## License
 

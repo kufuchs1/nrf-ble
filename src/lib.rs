@@ -1,6 +1,6 @@
-//! Bluetooth LE link layer for the nRF52832 and the nRF51, with a minimal
-//! host for Linux and BlueZ that talks to it through the typed API of
-//! [`link`].
+//! Bluetooth LE link layer for the nRF52832 and the nRF51, and the start of a
+//! minimal host for Linux and BlueZ, which talks to the link layer through
+//! the typed API of [`link`] instead of HCI.
 
 #![no_std]
 
@@ -33,11 +33,10 @@ pub mod connection;
 pub mod controller;
 /// Link encryption.
 mod crypto;
-/// Host controller interface.
-pub mod hci;
 /// Radio executor progress monitoring.
 pub mod health;
-/// The minimal host: L2CAP, ATT and GATT, the security manager, advertising.
+/// The minimal host: L2CAP, ATT and GATT, the security manager, advertising;
+/// so far its AES seam and the plan of each module.
 pub mod host;
 /// The typed interface between the link layer and the host.
 pub mod link;

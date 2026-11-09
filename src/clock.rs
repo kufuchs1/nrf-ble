@@ -629,10 +629,10 @@ fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_o
 
 /// Keeps the low frequency RC oscillator within 500 ppm forever.
 ///
-/// On the nRF51 it first waits until [`Clock::new`] or [`Clock::with_config`]
+/// On the nRF51 it first waits until [`Clock::new`] or `Clock::with_config`
 /// took the board's clock sources, so it may be spawned before the clock is
 /// built: it starts the crystal only once its frequency is set, and decides
-/// from the [`Config`] whether to calibrate. With a crystal as the low
+/// from the `Config` whether to calibrate. With a crystal as the low
 /// frequency clock it then waits forever without calibrating; without a
 /// clock it waits forever.
 ///
@@ -643,7 +643,7 @@ fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_o
 /// measurement.
 ///
 /// As Nordic specifies it, the temperature is checked every
-/// [`CALIBRATION_INTERVAL`], and the oscillator calibrated when it changed by
+/// `CALIBRATION_INTERVAL`, and the oscillator calibrated when it changed by
 /// 0.5 °C, or at the latest every second interval.
 #[inline]
 pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>) -> ! {

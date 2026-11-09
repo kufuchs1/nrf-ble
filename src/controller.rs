@@ -5,7 +5,7 @@ use crate::{
     advertiser::legacy::{self, Kind, Settings},
     clock::{Clock, SETUP_US},
     connection::{Connection, Ended},
-    hci::{ConnectionParams, Packet, Shared},
+    link::{ConnectionParams, Event, Shared},
     log::info,
     pdu::BUFFER_LEN,
     radio::Radio,
@@ -23,8 +23,6 @@ const HIGH_DUTY_INTERVAL_US: u32 = 3750;
 const REASON_TIMEOUT: u8 = 0x08;
 /// Disconnection reason: connection terminated by local host.
 const REASON_LOCAL_HOST: u8 = 0x16;
-/// Status: success.
-const STATUS_SUCCESS: u8 = 0x00;
 
 /// Ends high duty cycle directed advertising after its time. `since` is
 /// when the advertising was enabled. Returns true if it ended.
@@ -36,7 +34,7 @@ async fn check_limits(settings: &Settings, since: &mut Option<Instant>, shared: 
     *since = None;
     shared.stop_advertising();
     if matches!(
-        select(shared.push_event(Packet::advertising_timeout()), shared.reset_requested()).await,
+        select(shared.push_event(Event::AdvertisingTimeout), shared.reset_requested()).await,
         embassy_futures::select::Either::Second(())
     ) {
         shared.signal_reset();
@@ -108,17 +106,8 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         shown.reverse();
         info!("central {=[u8; 6]:02X} random {}", shown, central.random);
         let params = ConnectionParams::new(request.interval, request.latency, request.timeout);
-        let local = (settings.own != settings.address).then_some(settings.own.address);
-        connection.notify(
-            Packet::connection_complete_resolved(
-                STATUS_SUCCESS,
-                (request.central(), local),
-                params,
-                request.sca,
-                settings.resolve(request.central()),
-            ),
-            shared,
-        );
+        let epoch = shared.set_info((central, settings.resolve(central), settings.own), params, request.sca);
+        connection.notify(Event::Connected(epoch), shared);
         since = None;
         let (ended, stats) = connection.run(radio, clock, &mut rx, shared).await;
         info!(
@@ -152,7 +141,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         };
         shared.set_connected(false);
         if matches!(
-            select(shared.push_event(Packet::disconnection_complete(reason)), shared.reset_requested()).await,
+            select(shared.push_event(Event::Disconnected(reason)), shared.reset_requested()).await,
             embassy_futures::select::Either::Second(())
         ) {
             radio.disable();

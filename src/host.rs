@@ -1,19 +1,25 @@
 //! A minimal Bluetooth LE host for Linux and BlueZ.
 //!
-//! The host serves one connection as a peripheral: L2CAP with the fixed
+//! The host is to serve one connection as a peripheral: L2CAP with the fixed
 //! channels for ATT, signalling and the security manager, a GATT server over
 //! a constant attribute table, LE Secure Connections pairing as responder
 //! (Just Works) with bonding, and connectable advertising. It talks to the
 //! link layer through the typed API of [`crate::link`], not through HCI.
 //!
-//! The protocol core ([`l2cap`], [`signal`], [`att`], [`gatt`], [`smp`] and
-//! [`engine`]) holds no futures and touches no peripheral, so it runs in the
-//! host tests on the PC; only the async glue around the [`engine`] uses the
-//! link layer. Every buffer is a fixed array: no heap and no allocation.
+//! So far only the AES seam ([`Aes`] and [`Ecb`]) exists; the modules below
+//! describe what the next stages put into them. The protocol core ([`l2cap`],
+//! [`signal`], [`att`], [`gatt`], [`smp`] and [`engine`]) is to hold no
+//! futures and touch no peripheral, so it runs in the host tests on the PC;
+//! only the async glue around the [`engine`] uses the link layer. Every buffer
+//! is to be a fixed array: no heap and no allocation.
 //!
-//! Every call into the host comes from thread mode, as its state sits behind a
-//! thread mode mutex rather than a critical section, which would hold off the
-//! link layer during the longer AES computations of pairing.
+//! Every call into the host is to come from thread mode, as its state sits
+//! behind a thread mode mutex rather than a critical section, which would
+//! hold off the link layer for the whole of the longer AES computations of
+//! pairing. Each AES block on the ECB still holds a critical section for that
+//! one block, as [`crate::encrypt_block`] shares the ECB with the link layer:
+//! a CMAC of f5 holds interrupts off 13 times, each for about 7 us on the
+//! nRF52832.
 
 /// Connectable advertising and the advertising data writer.
 pub mod adv;
@@ -55,16 +61,17 @@ impl Aes for Ecb {
     fn encrypt(&self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] { crate::encrypt_block(key, block) }
 }
 
+/// Software AES-128 in place of the ECB, for the host tests of every module.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_aes {
+    use super::Aes;
     use aes::{
         Aes128,
         cipher::{BlockCipherEncrypt as _, KeyInit as _},
     };
 
-    /// Software AES-128 in place of the ECB.
-    struct Software;
+    /// Software AES-128 from the `aes` crate.
+    pub(crate) struct Software;
 
     impl Aes for Software {
         fn encrypt(&self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
@@ -73,6 +80,11 @@ mod tests {
             data.into()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Aes as _, test_aes::Software};
 
     /// The software stand-in gives the AES-128 example of FIPS-197 appendix
     /// C.1.
