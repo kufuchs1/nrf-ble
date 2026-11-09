@@ -35,8 +35,10 @@ pub mod controller;
 mod crypto;
 /// Radio executor progress monitoring.
 pub mod health;
-/// The minimal host: L2CAP, ATT and GATT, the security manager, advertising;
-/// so far its AES seam and the plan of each module.
+/// The minimal host: L2CAP, ATT and GATT, the security manager, advertising.
+///
+/// So far it has its AES seam, the pairing cryptography, L2CAP, signalling,
+/// ATT and GATT, and the plan of each other module.
 pub mod host;
 /// The typed interface between the link layer and the host.
 pub mod link;

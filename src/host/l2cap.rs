@@ -257,7 +257,7 @@ impl Segmenter {
 
     /// Length of the PDU, header included.
     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "a header of 4 fits a u16")]
-    const fn total(&self) -> u16 { self.len.saturating_add(HEADER_LEN as u16) }
+    const fn total(self) -> u16 { self.len.saturating_add(HEADER_LEN as u16) }
 }
 
 /// Length of the fragment of a PDU of `total` octets that starts at
