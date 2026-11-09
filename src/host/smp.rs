@@ -1,27 +1,1083 @@
-//! The security manager: LE Secure Connections pairing as responder.
+//! The security manager: LE Secure Connections pairing as responder, with
+//! Just Works and bonding.
 //!
-//! So far only its cryptography exists: the AES-CMAC based functions of
-//! pairing in [`toolbox`] and P-256 in [`ecc`]. The security manager stage
-//! fills this module with the rest. What it is to do:
+//! [`Responder`] is a state machine without input or output of its own: the
+//! engine gives it the PDUs of the security manager channel (CID 6), the
+//! link's encryption, the time and the results of the P-256 jobs, and takes
+//! from it the PDUs to send, the jobs, the deadline, the long term key for
+//! [`crate::link::Link::ltk_reply`] and the outcome of each pairing. The
+//! cryptography is that of [`toolbox`] and [`ecc`].
 //!
-//! - Pair with Just Works, bond, and distribute the identity resolving key and
-//!   identity address, taking the central's in return. A pairing that does not
-//!   complete within 30 s fails. Requests without Secure Connections, with a
-//!   key size under 16 octets, or while a bond is set and pairing is not
-//!   allowed, are refused.
-//! - Use the addresses on the air for f5 and f6: the central's and ours from
-//!   [`crate::link::Info`], with their types, not the identities.
-//! - Hand the long term key to [`crate::link::Link::ltk_reply`] least
-//!   significant octet first: f5 gives it most significant octet first, so it
-//!   is reversed, and tested with the f5 sample data through the link layer's
-//!   session key derivation.
-//! - Run the P-256 key generation and Diffie-Hellman as jobs outside the state
-//!   machine, on their own task, as each blocks the thread for about 3 s on the
-//!   nRF51. The application's watchdog hook is called right before each
-//!   multiplication, and the task yields between two jobs.
+//! # Pairing
+//!
+//! The sequence is that of a Linux central, the kernel's own (Core
+//! specification, volume 3, part H, section 2.3.5.6.2):
+//!
+//! 1. Pairing Request, answered with the Pairing Response: no input and no
+//!    output (0x03), no out of band data, `AuthReq` 0x09 (bonding and Secure
+//!    Connections, never protection against a man in the middle, on which BlueZ
+//!    would fail Just Works), a key size of 16 octets, and of each key
+//!    distribution only the identity keys (0x02) the central offered.
+//! 2. The central's public key, checked with [`ecc::check_public_key`],
+//!    answered with ours and the confirm value Cb = f4(PKbx, PKax, Nb, 0).
+//! 3. The central's nonce Na, answered with ours, Nb.
+//! 4. The central's `DHKey` check Ea, verified with the `MacKey` and long term
+//!    key of f5, answered with ours, Eb. A and B in f5 and f6 are the addresses
+//!    on the air with their types, never the identities: A the central's
+//!    ([`crate::link::Info::peer`]) and B our own
+//!    ([`crate::link::Info::local`]), the resolvable private address with
+//!    privacy.
+//! 5. The central encrypts the link with the long term key, which
+//!    [`Responder::ltk_request`] gives least significant octet first, as
+//!    [`crate::link::Link::ltk_reply`] takes it, for EDIV 0 and Rand 0 only.
+//! 6. Once the link is encrypted, our identity resolving key and static random
+//!    identity address (Identity Information and Identity Address Information),
+//!    then the central's, if it offered them, which BlueZ sends only after it
+//!    received ours.
+//! 7. [`Outcome::Bonded`] with the long term key and the central's identity.
+//!
+//! A request without Secure Connections or without bonding is refused with
+//! Authentication Requirements (0x03), a key size under 16 octets with
+//! Encryption Key Size (0x06), out of band data from the central with OOB Not
+//! Available (0x02), a value out of its range with Invalid Parameters (0x0A),
+//! and any request while pairing is not allowed with Pairing Not Supported
+//! (0x05). A code the security manager does not know gets Command Not
+//! Supported (0x07); a PDU it does not expect now, Unspecified Reason (0x08);
+//! a PDU of the wrong length, Invalid Parameters; a public key that is not a
+//! point of the curve, or is the debug key or our own reflected, and a `DHKey`
+//! check that fails, `DHKey` Check Failed (0x0B). A Pairing Failed from the
+//! central ends the pairing and is never answered. A failed pairing reports
+//! [`Outcome::Failed`]; the engine disconnects once the Pairing Failed went
+//! out.
+//!
+//! # The timer
+//!
+//! A pairing has to complete within 30 s of the last PDU the security manager
+//! queued, the Pairing Response first ([`TIMEOUT`]). The engine drives the
+//! timer: it gives the time to [`Responder::on_time`] once
+//! [`Responder::deadline`] has passed, and on [`Outcome::TimedOut`]
+//! disconnects. After a timeout the security manager sends nothing more and
+//! ignores every PDU until the next link, as the specification requires.
+//!
+//! # P-256 jobs
+//!
+//! Each scalar multiplication blocks the thread for about 3 s on the nRF51, so
+//! the state machine never runs one: it gives a [`Job`], which the firmware
+//! runs on a task of its own with [`Job::run`], calling its watchdog hook right
+//! before each multiplication and yielding between two jobs, and takes the
+//! [`JobResult`] back with [`Responder::job_done`]. A key pair job is asked for
+//! with [`Responder::prepare_key_pair`] before pairable advertising starts, so
+//! a reconnection never computes one, and by a Pairing Request if no key pair
+//! is ready. The Diffie-Hellman job starts once our public key and confirm
+//! value are queued, so the multiplication never holds them back; a `DHKey`
+//! check that arrives before the Diffie-Hellman key waits for it. The key pair
+//! moves into the Diffie-Hellman job, so each one serves one pairing; one
+//! whose pairing ended before it is kept for the next. A result that arrives
+//! after its pairing ended is dropped.
+//!
+//! # Secrets
+//!
+//! The Diffie-Hellman key is overwritten once f5 derived the keys from it, the
+//! `MacKey` once both check values are computed, and the long term key once the
+//! pairing ends: handed over in [`Bonded`], or failed. The private key is
+//! [`ecc::KeyPair`]'s to overwrite, when the Diffie-Hellman job drops it.
+//!
+//! # Byte order
+//!
+//! The PDUs carry every value least significant octet first, and the toolbox
+//! takes them most significant octet first: the nonces, confirm and check
+//! values and each coordinate of the public keys are reversed on the way in
+//! and out. The long term key and the identity resolving keys stay least
+//! significant octet first, as the link layer takes them.
+//!
+//! Not supported: legacy pairing, passkey entry, numeric comparison, out of
+//! band data, the Security Request, Keypress Notifications and signing keys.
 
 /// P-256: the key pair, the check of the central's public key and the
 /// Diffie-Hellman key.
 pub mod ecc;
 /// The cryptographic functions of pairing: AES-CMAC, f4, f5, f6, g2 and ah.
 pub mod toolbox;
+
+use crate::{crypto::wipe, host::Aes, link::Info, pdu::Peer};
+use core::fmt;
+use ecc::{KEY_LEN, KeyError, KeyPair, PUBLIC_KEY_LEN, check_public_key};
+use embassy_time::{Duration, Instant};
+use toolbox::{address, f4, f5, f6};
+
+/// Code of a Pairing Request.
+pub const PAIRING_REQUEST: u8 = 0x01;
+/// Code of a Pairing Response.
+pub const PAIRING_RESPONSE: u8 = 0x02;
+/// Code of a Pairing Confirm.
+pub const PAIRING_CONFIRM: u8 = 0x03;
+/// Code of a Pairing Random.
+pub const PAIRING_RANDOM: u8 = 0x04;
+/// Code of a Pairing Failed.
+pub const PAIRING_FAILED: u8 = 0x05;
+/// Code of an Encryption Information, of legacy pairing.
+pub const ENCRYPTION_INFORMATION: u8 = 0x06;
+/// Code of a Central Identification, of legacy pairing.
+pub const CENTRAL_IDENTIFICATION: u8 = 0x07;
+/// Code of an Identity Information.
+pub const IDENTITY_INFORMATION: u8 = 0x08;
+/// Code of an Identity Address Information.
+pub const IDENTITY_ADDRESS_INFORMATION: u8 = 0x09;
+/// Code of a Signing Information.
+pub const SIGNING_INFORMATION: u8 = 0x0A;
+/// Code of a Security Request.
+pub const SECURITY_REQUEST: u8 = 0x0B;
+/// Code of a Pairing Public Key.
+pub const PAIRING_PUBLIC_KEY: u8 = 0x0C;
+/// Code of a Pairing `DHKey` Check.
+pub const PAIRING_DHKEY_CHECK: u8 = 0x0D;
+/// Code of a Keypress Notification.
+pub const KEYPRESS_NOTIFICATION: u8 = 0x0E;
+/// Longest PDU the security manager sends or takes: a Pairing Public Key.
+pub const PDU_MAX: usize = 1 + PUBLIC_KEY_LEN;
+/// The time a pairing has from the last PDU the security manager queued.
+pub const TIMEOUT: Duration = Duration::from_secs(30);
+/// IO capability: no input and no output, which makes pairing Just Works.
+pub const NO_INPUT_NO_OUTPUT: u8 = 0x03;
+/// `AuthReq` bit: bonding.
+pub const AUTH_BONDING: u8 = 0x01;
+/// `AuthReq` bit: protection against a man in the middle.
+pub const AUTH_MITM: u8 = 0x04;
+/// `AuthReq` bit: LE Secure Connections.
+pub const AUTH_SECURE_CONNECTIONS: u8 = 0x08;
+/// Key distribution bit: the identity resolving key and identity address.
+pub const KEY_DIST_ID: u8 = 0x02;
+/// The only key size the security manager takes, in octets.
+pub const KEY_SIZE: u8 = 16;
+/// Our `AuthReq`: bonding and Secure Connections, without MITM.
+const AUTH_REQ: u8 = AUTH_BONDING | AUTH_SECURE_CONNECTIONS;
+/// Our `IOcap` for f6: `AuthReq`, OOB data flag, IO capability.
+const IO_CAP_B: [u8; 3] = [AUTH_REQ, 0, NO_INPUT_NO_OUTPUT];
+/// The largest IO capability: keyboard and display.
+const IO_CAPABILITY_MAX: u8 = 0x04;
+/// The smallest key size a request may give.
+const KEY_SIZE_MIN: u8 = 7;
+/// R of f6, zero for Just Works.
+const R_ZERO: [u8; 16] = [0; 16];
+/// Output: the Pairing Response.
+const OUT_RESPONSE: u8 = 0x01;
+/// Output: our Pairing Public Key.
+const OUT_PUBLIC_KEY: u8 = 0x02;
+/// Output: our Pairing Confirm, Cb.
+const OUT_CONFIRM: u8 = 0x04;
+/// Output: our Pairing Random, Nb.
+const OUT_RANDOM: u8 = 0x08;
+/// Output: our Pairing `DHKey` Check, Eb.
+const OUT_CHECK: u8 = 0x10;
+/// Output, and in [`Responder::received`] input: an Identity Information.
+const ID_INFO: u8 = 0x20;
+/// Output, and in [`Responder::received`] input: an Identity Address
+/// Information.
+const ID_ADDRESS: u8 = 0x40;
+/// Output: a Pairing Failed.
+const OUT_FAILED: u8 = 0x80;
+
+/// The bond a pairing made.
+///
+/// Its [`core::fmt::Debug`] leaves the keys out.
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct Bonded {
+    /// The central's identity, if it distributed one that is public or
+    /// static random. Without it the central is known by its address on
+    /// the air.
+    pub identity: Option<Identity>,
+    /// The long term key, least significant octet first, as
+    /// [`crate::link::Link::ltk_reply`] takes it.
+    pub ltk:      [u8; 16],
+}
+
+/// Whether the Diffie-Hellman key of the pairing was asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dh {
+    /// The job is queued or running.
+    Asked,
+    /// The key is in [`Responder::dh_key`].
+    Ready,
+    /// Not yet.
+    Unasked,
+}
+
+/// The central's identity: its identity address and identity resolving key.
+///
+/// Its [`core::fmt::Debug`] leaves the key out.
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct Identity {
+    /// The identity address: public, or static random.
+    pub address: Peer,
+    /// The identity resolving key, least significant octet first, as
+    /// [`crate::link::Link::add_peer`] takes it.
+    pub irk:     [u8; 16],
+}
+
+/// A P-256 job for the firmware's crypto task: run it with [`Self::run`]
+/// and give the result to [`Responder::job_done`].
+#[non_exhaustive]
+pub struct Job {
+    /// What to compute.
+    kind: JobKind,
+}
+
+/// What a job computes.
+enum JobKind {
+    /// The Diffie-Hellman key of the key pair and the central's public key.
+    DhKey {
+        /// The key pair, which the job drops once it is used.
+        pair:   KeyPair,
+        /// The central's public key, X then Y.
+        peer:   [u8; PUBLIC_KEY_LEN],
+        /// The number of the job.
+        serial: u8,
+    },
+    /// A new key pair.
+    KeyPair,
+}
+
+/// The result of a [`Job`].
+#[non_exhaustive]
+pub struct JobResult {
+    /// The result.
+    kind: JobOutput,
+}
+
+/// The result of a job.
+enum JobOutput {
+    /// The Diffie-Hellman key, or why the central's key was refused.
+    DhKey {
+        /// The key, most significant octet first.
+        key:    Result<[u8; KEY_LEN], KeyError>,
+        /// The number of the job.
+        serial: u8,
+    },
+    /// A new key pair.
+    KeyPair(KeyPair),
+}
+
+/// What a pairing came to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Outcome {
+    /// Pairing completed and made a bond, which the firmware stores.
+    Bonded(Bonded),
+    /// Pairing failed, or a Pairing Request was refused. Unless the central
+    /// sent the Pairing Failed, ours waits in [`Responder::next_pdu`].
+    Failed {
+        /// Whether the central sent the Pairing Failed.
+        by_central: bool,
+        /// The reason.
+        reason:     Reason,
+    },
+    /// A Pairing Request was taken: pairing has started.
+    Started,
+    /// The 30 s timer expired: the security manager sends nothing more on
+    /// this link, which the engine is to end.
+    TimedOut,
+}
+
+/// One PDU to send on the security manager channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct Output {
+    /// The PDU, of which the first `len` octets count.
+    data: [u8; PDU_MAX],
+    /// Its length.
+    len:  u8,
+}
+
+/// A reason of a Pairing Failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub struct Reason(u8);
+
+/// The security manager of the peripheral: LE Secure Connections pairing
+/// as responder, one link at a time, and the key pair between pairings.
+#[non_exhaustive]
+pub struct Responder {
+    /// Our own static random identity address, least significant octet
+    /// first.
+    address:       [u8; 6],
+    /// The central's address on the air: A of f5 and f6.
+    central:       Peer,
+    /// The central's `DHKey` check Ea, most significant octet first, until
+    /// it is verified; then ours, Eb.
+    check:         [u8; 16],
+    /// Our confirm value Cb, most significant octet first.
+    confirm:       [u8; 16],
+    /// When the pairing times out.
+    deadline:      Option<Instant>,
+    /// Whether the Diffie-Hellman key was asked for.
+    dh:            Dh,
+    /// The Diffie-Hellman key, most significant octet first, once
+    /// [`Self::dh`] is ready, until f5 used it.
+    dh_key:        [u8; KEY_LEN],
+    /// The central's identity keys the pairing distributes: 0 or
+    /// [`KEY_DIST_ID`].
+    init_dist:     u8,
+    /// The central's `IOcap` for f6: `AuthReq`, OOB data flag, IO
+    /// capability.
+    io_cap:        [u8; 3],
+    /// Our own identity resolving key, least significant octet first.
+    irk:           [u8; 16],
+    /// The job waiting to be taken.
+    job:           Option<Task>,
+    /// The output whose PDU is being sent, 0 or one bit: it stays the next
+    /// PDU until [`Self::pdu_sent`], so its fragments never change.
+    latched:       u8,
+    /// Our own address on the air: B of f5 and f6.
+    local:         Peer,
+    /// The long term key, least significant octet first, from the `DHKey`
+    /// check until the pairing ends.
+    ltk:           [u8; 16],
+    /// The central's nonce Na, most significant octet first.
+    na:            [u8; 16],
+    /// Our nonce Nb, most significant octet first.
+    nb:            [u8; 16],
+    /// Our key pair, between its job and the Diffie-Hellman job.
+    pair:          Option<KeyPair>,
+    /// Whether a Pairing Request is taken.
+    pairable:      bool,
+    /// The central's identity address, once it arrived.
+    peer_identity: Option<Peer>,
+    /// The central's identity resolving key, least significant octet
+    /// first, once it arrived.
+    peer_irk:      [u8; 16],
+    /// The central's public key, X then Y, most significant octet first.
+    peer_key:      [u8; PUBLIC_KEY_LEN],
+    /// The PDUs to send, one bit each, sent from the lowest bit up.
+    pending:       u8,
+    /// The reason of our Pairing Failed.
+    reason:        Reason,
+    /// The central's identity keys received: [`ID_INFO`] and
+    /// [`ID_ADDRESS`].
+    received:      u8,
+    /// Our identity keys the pairing distributes: 0 or [`KEY_DIST_ID`].
+    resp_dist:     u8,
+    /// The job being run, with its number.
+    running:       Option<(Task, u8)>,
+    /// The number of the last Diffie-Hellman job.
+    serial:        u8,
+    /// Where the pairing stands.
+    state:         State,
+}
+
+/// Where a pairing stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum State {
+    /// Nb is queued: waiting for the central's `DHKey` check and the
+    /// Diffie-Hellman key, whichever is still missing; with whether the
+    /// check arrived.
+    Check(bool),
+    /// Eb is queued: waiting for the central to encrypt the link with the
+    /// long term key.
+    Encryption,
+    /// No pairing on the link.
+    Idle,
+    /// The central's public key arrived before our key pair.
+    KeyPair,
+    /// The link is encrypted with the new key: the identity keys go both
+    /// ways.
+    Keys,
+    /// The Pairing Response is queued: waiting for the central's public
+    /// key.
+    PublicKey,
+    /// Our public key and Cb are queued: waiting for the central's nonce.
+    Random,
+    /// The timer expired: nothing more until the next link.
+    TimedOut,
+}
+
+/// A job, as the state machine keeps track of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Task {
+    /// The Diffie-Hellman key.
+    DhKey,
+    /// A key pair.
+    KeyPair,
+}
+
+/// Random numbers for pairing: our nonce and the private keys.
+pub trait Random {
+    /// Fills `out` with octets of a cryptographically secure random number
+    /// generator.
+    fn fill(&mut self, out: &mut [u8]);
+}
+
+impl fmt::Debug for Bonded {
+    #[inline]
+    #[expect(clippy::renamed_function_params, reason = "a name of one character is refused")]
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Bonded").field("identity", &self.identity).finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Identity {
+    #[inline]
+    #[expect(clippy::renamed_function_params, reason = "a name of one character is refused")]
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Identity")
+            .field("address", &self.address.address)
+            .field("random", &self.address.random)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Job {
+    /// Whether the job makes a key pair, rather than the Diffie-Hellman key.
+    #[inline]
+    #[must_use = "the kind is only read"]
+    pub const fn is_key_pair(&self) -> bool { matches!(self.kind, JobKind::KeyPair) }
+
+    /// Runs the job: one scalar multiplication, which blocks the thread for
+    /// about 3 s on the nRF51, with `before_multiplication` called right
+    /// before it, for the watchdog. A key pair takes its private key from
+    /// `random`, and draws again in the rare case it is refused.
+    #[inline]
+    #[must_use = "the result goes to the security manager"]
+    pub fn run<R, F>(self, random: &mut R, mut before_multiplication: F) -> JobResult
+    where
+        R: Random,
+        F: FnMut(),
+    {
+        let kind = match self.kind {
+            JobKind::DhKey { pair, peer, serial } => {
+                // The key pair is dropped, which overwrites its private key.
+                JobOutput::DhKey { key: pair.dh_key(&peer, before_multiplication), serial }
+            },
+            JobKind::KeyPair => loop {
+                let mut secret = [0; KEY_LEN];
+                random.fill(&mut secret);
+                if let Some(pair) = KeyPair::generate(&mut secret, &mut before_multiplication) {
+                    break JobOutput::KeyPair(pair);
+                }
+            },
+        };
+        JobResult { kind }
+    }
+}
+
+impl Output {
+    /// The PDU for the security manager channel.
+    #[inline]
+    #[must_use = "the PDU is only read"]
+    pub fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
+
+    /// A PDU with `code` and the parameters `parts` in order.
+    fn new(code: u8, parts: &[&[u8]]) -> Self {
+        let mut data = [0_u8; PDU_MAX];
+        let mut len = 0_usize;
+        for &byte in core::iter::once(&code).chain(parts.iter().flat_map(|part| part.iter())) {
+            if let Some(slot) = data.get_mut(len) {
+                *slot = byte;
+                len = len.saturating_add(1);
+            }
+        }
+        Self { data, len: u8::try_from(len).unwrap_or_default() }
+    }
+}
+
+impl Reason {
+    /// The central's request lacks Secure Connections or bonding.
+    pub const AUTHENTICATION_REQUIREMENTS: Self = Self(0x03);
+    /// A code the security manager does not know.
+    pub const COMMAND_NOT_SUPPORTED: Self = Self(0x07);
+    /// The confirm value does not match.
+    pub const CONFIRM_VALUE_FAILED: Self = Self(0x04);
+    /// The `DHKey` check failed, or the public key is refused.
+    pub const DHKEY_CHECK_FAILED: Self = Self(0x0B);
+    /// The key size is below 16 octets.
+    pub const ENCRYPTION_KEY_SIZE: Self = Self(0x06);
+    /// A value is out of its range, or a PDU has the wrong length.
+    pub const INVALID_PARAMETERS: Self = Self(0x0A);
+    /// The central has out of band data, which we lack.
+    pub const OOB_NOT_AVAILABLE: Self = Self(0x02);
+    /// Pairing is not allowed now.
+    pub const PAIRING_NOT_SUPPORTED: Self = Self(0x05);
+    /// Too many pairing attempts in too short a time.
+    pub const REPEATED_ATTEMPTS: Self = Self(0x09);
+    /// A PDU the security manager does not expect now.
+    pub const UNSPECIFIED: Self = Self(0x08);
+
+    /// The code a Pairing Failed carries.
+    #[inline]
+    #[must_use = "the code is only read"]
+    pub const fn code(self) -> u8 { self.0 }
+
+    /// The reason with the code `code`, as a central's Pairing Failed
+    /// carries it.
+    #[inline]
+    #[must_use = "the reason is only built"]
+    pub const fn from_code(code: u8) -> Self { Self(code) }
+}
+
+impl Responder {
+    /// Answers the central's public key with ours and Cb, once both the
+    /// central's key and our key pair are there.
+    fn answer_public_key<C>(&mut self, crypto: &mut C) -> Result<Option<Outcome>, Reason>
+    where
+        C: Aes + Random,
+    {
+        let pair = self.pair.as_ref().ok_or(Reason::UNSPECIFIED)?;
+        if check_public_key(&self.peer_key, pair.public_key()).is_err() {
+            return Err(Reason::DHKEY_CHECK_FAILED);
+        }
+        let own_x = pair.public_key().first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
+        let peer_x = self.peer_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
+        crypto.fill(&mut self.nb);
+        self.confirm = f4(&*crypto, own_x, peer_x, &self.nb, 0);
+        self.pending |= OUT_PUBLIC_KEY | OUT_CONFIRM;
+        self.state = State::Random;
+        Ok(None)
+    }
+
+    /// Starts on a new link, with the addresses on the air of
+    /// [`crate::link::Link::info`]; forgets the previous link as
+    /// [`Self::disconnected`] does.
+    #[inline]
+    pub fn connected(&mut self, info: &Info) {
+        self.disconnected();
+        self.central = info.peer;
+        self.local = info.local;
+    }
+
+    /// The deadline of the pairing's timer, if one runs: give the time to
+    /// [`Self::on_time`] once it passed.
+    #[inline]
+    #[must_use = "the deadline is only read"]
+    pub const fn deadline(&self) -> Option<Instant> { self.deadline }
+
+    /// Takes the central's `DHKey` check.
+    fn dhkey_check<A>(&mut self, aes: &A, params: &[u8]) -> Result<Option<Outcome>, Reason>
+    where
+        A: Aes,
+    {
+        if self.state != (State::Check(false)) || self.queued(OUT_RANDOM) {
+            return Err(Reason::UNSPECIFIED);
+        }
+        self.check =
+            reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+        self.state = State::Check(true);
+        if self.dh == Dh::Ready { self.verify(aes) } else { Ok(None) }
+    }
+
+    /// Forgets the link: its pairing and its secrets. The key pair and the
+    /// jobs being run stay; a result for this link is dropped.
+    #[inline]
+    pub fn disconnected(&mut self) {
+        self.end();
+        self.state = State::Idle;
+        self.pending = 0;
+        self.latched = 0;
+    }
+
+    /// Takes the encryption of the link, after the long term key went to
+    /// the link layer: `on` once it is encrypted, not `on` if encryption
+    /// failed, which fails the pairing.
+    #[inline]
+    pub fn encryption_changed(&mut self, on: bool) -> Option<Outcome> {
+        if self.state != State::Encryption {
+            return None;
+        }
+        if !on {
+            return self.fail(Reason::UNSPECIFIED, true);
+        }
+        self.state = State::Keys;
+        if self.resp_dist != 0 {
+            self.pending |= ID_INFO | ID_ADDRESS;
+        }
+        self.finish()
+    }
+
+    /// Ends the pairing, with its secrets and its timer.
+    fn end(&mut self) {
+        wipe(&mut self.dh_key);
+        wipe(&mut self.ltk);
+        wipe(&mut self.peer_irk);
+        self.peer_identity = None;
+        self.received = 0;
+        self.dh = Dh::Unasked;
+        if self.job == Some(Task::DhKey) {
+            // The key pair was never used: it stays for the next pairing.
+            self.job = None;
+        }
+        if self.running.is_some_and(|(task, _)| task == Task::DhKey) {
+            // Its result is dropped when it arrives.
+            self.running = None;
+        }
+        self.deadline = None;
+        self.state = State::Idle;
+    }
+
+    /// Fails the pairing for `reason`: our Pairing Failed follows the PDU
+    /// being sent, and replaces the others. `report` it as the outcome if a
+    /// pairing ends, or a request is refused.
+    fn fail(&mut self, reason: Reason, report: bool) -> Option<Outcome> {
+        self.end();
+        self.pending = (self.pending & self.latched) | OUT_FAILED;
+        self.reason = reason;
+        report.then_some(Outcome::Failed { by_central: false, reason })
+    }
+
+    /// Bonds once the link is encrypted, our identity keys are queued and
+    /// the central's arrived.
+    fn finish(&mut self) -> Option<Outcome> {
+        if self.state != State::Keys
+            || self.queued(ID_INFO | ID_ADDRESS)
+            || (self.init_dist != 0 && self.received & ID_ADDRESS == 0)
+        {
+            return None;
+        }
+        let identity = self.peer_identity.map(|address| Identity { address, irk: self.peer_irk });
+        let bonded = Bonded { identity, ltk: self.ltk };
+        self.end();
+        Some(Outcome::Bonded(bonded))
+    }
+
+    /// Whether a job waits to be taken with [`Self::take_job`].
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn has_job(&self) -> bool { self.job.is_some() }
+
+    /// Whether a key pair is ready, so a pairing needs only the
+    /// Diffie-Hellman job.
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn has_key_pair(&self) -> bool { self.pair.is_some() }
+
+    /// Whether a PDU waits to be sent with [`Self::next_pdu`].
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn has_output(&self) -> bool { self.pending != 0 }
+
+    /// Takes the central's identity address, after its identity resolving
+    /// key.
+    fn identity_address(&mut self, params: &[u8], encrypted: bool) -> Result<Option<Outcome>, Reason> {
+        if !self.takes_keys(encrypted) || self.received != ID_INFO {
+            return Err(Reason::UNSPECIFIED);
+        }
+        let &[kind, a0, a1, a2, a3, a4, a5] = params else { return Err(Reason::INVALID_PARAMETERS) };
+        let address = [a0, a1, a2, a3, a4, a5];
+        let random = match kind {
+            0 => false,
+            1 => true,
+            _ => return Err(Reason::INVALID_PARAMETERS),
+        };
+        self.received |= ID_ADDRESS;
+        // An identity address is public or static random, with the two most
+        // significant bits set. Linux drops any other, with its key, and so
+        // does the bond: the central is then known by its address on the
+        // air.
+        if !random || a5 & 0xC0 == 0xC0 {
+            self.peer_identity = Some(Peer::new(address, random));
+        } else {
+            wipe(&mut self.peer_irk);
+        }
+        Ok(self.finish())
+    }
+
+    /// Takes the central's identity resolving key.
+    fn identity_information(&mut self, params: &[u8], encrypted: bool) -> Result<Option<Outcome>, Reason> {
+        if !self.takes_keys(encrypted) || self.received != 0 {
+            return Err(Reason::UNSPECIFIED);
+        }
+        self.peer_irk =
+            params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?;
+        self.received = ID_INFO;
+        Ok(None)
+    }
+
+    /// Whether a pairing is under way: from the Pairing Request until it
+    /// bonds, fails or times out.
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn is_pairing(&self) -> bool { !matches!(self.state, State::Idle | State::TimedOut) }
+
+    /// Takes the result of a job from [`Job::run`]. A result whose pairing
+    /// ended is dropped; a key pair is kept for the next pairing.
+    #[inline]
+    pub fn job_done<C>(&mut self, crypto: &mut C, result: JobResult) -> Option<Outcome>
+    where
+        C: Aes + Random,
+    {
+        let answer = match result.kind {
+            JobOutput::KeyPair(pair) => {
+                if self.running.is_some_and(|(task, _)| task == Task::KeyPair) {
+                    self.running = None;
+                }
+                if self.pair.is_none() {
+                    self.pair = Some(pair);
+                }
+                if self.state == State::KeyPair { self.answer_public_key(crypto) } else { Ok(None) }
+            },
+            JobOutput::DhKey { mut key, serial } => {
+                let current = self.running == Some((Task::DhKey, serial));
+                if current {
+                    self.running = None;
+                }
+                let waiting = current && self.dh == Dh::Asked && matches!(self.state, State::Random | State::Check(_));
+                let answer = match key.as_ref() {
+                    Ok(dh_key) if waiting => {
+                        self.dh_key = *dh_key;
+                        self.dh = Dh::Ready;
+                        if self.state == (State::Check(true)) { self.verify(&*crypto) } else { Ok(None) }
+                    },
+                    Err(_) if waiting => Err(Reason::DHKEY_CHECK_FAILED),
+                    Ok(_) | Err(_) => Ok(None),
+                };
+                if let Ok(dh_key) = key.as_mut() {
+                    wipe(dh_key);
+                }
+                answer
+            },
+        };
+        self.settle(answer)
+    }
+
+    /// The long term key for the link layer's request with `ediv` and
+    /// `rand`, least significant octet first: the key of the pairing under
+    /// way, for EDIV 0 and Rand 0 only, from our `DHKey` check on. Otherwise
+    /// `None`, and the bond's key is the engine's to give.
+    #[inline]
+    #[must_use = "the key is only read"]
+    pub fn ltk_request(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
+        (ediv == 0 && rand == [0; 8] && matches!(self.state, State::Encryption | State::Keys)).then_some(self.ltk)
+    }
+
+    /// A security manager without a key pair, pairing or identity: give it
+    /// one with [`Self::set_identity`] before pairing is allowed.
+    #[inline]
+    #[must_use = "the security manager is only built"]
+    pub const fn new() -> Self {
+        Self {
+            address:       [0; 6],
+            central:       Peer::new([0; 6], false),
+            check:         [0; 16],
+            confirm:       [0; 16],
+            deadline:      None,
+            dh:            Dh::Unasked,
+            dh_key:        [0; KEY_LEN],
+            init_dist:     0,
+            io_cap:        [0; 3],
+            irk:           [0; 16],
+            job:           None,
+            latched:       0,
+            local:         Peer::new([0; 6], false),
+            ltk:           [0; 16],
+            na:            [0; 16],
+            nb:            [0; 16],
+            pair:          None,
+            pairable:      false,
+            peer_identity: None,
+            peer_irk:      [0; 16],
+            peer_key:      [0; PUBLIC_KEY_LEN],
+            pending:       0,
+            reason:        Reason::UNSPECIFIED,
+            received:      0,
+            resp_dist:     0,
+            running:       None,
+            serial:        0,
+            state:         State::Idle,
+        }
+    }
+
+    /// The next PDU to send: the same one, rendered again, until
+    /// [`Self::pdu_sent`] says it was queued, so the fragments of a public
+    /// key all come from one PDU.
+    #[inline]
+    pub fn next_pdu(&mut self) -> Option<Output> {
+        if self.latched == 0 {
+            self.latched = self.pending & self.pending.wrapping_neg();
+        }
+        match self.latched {
+            OUT_RESPONSE => Some(Output::new(PAIRING_RESPONSE, &[&[
+                NO_INPUT_NO_OUTPUT,
+                0,
+                AUTH_REQ,
+                KEY_SIZE,
+                self.init_dist,
+                self.resp_dist,
+            ]])),
+            OUT_PUBLIC_KEY => {
+                let key = flip_coordinates(self.pair.as_ref()?.public_key());
+                Some(Output::new(PAIRING_PUBLIC_KEY, &[&key]))
+            },
+            OUT_CONFIRM => Some(Output::new(PAIRING_CONFIRM, &[&reversed(&self.confirm)])),
+            OUT_RANDOM => Some(Output::new(PAIRING_RANDOM, &[&reversed(&self.nb)])),
+            OUT_CHECK => Some(Output::new(PAIRING_DHKEY_CHECK, &[&reversed(&self.check)])),
+            ID_INFO => Some(Output::new(IDENTITY_INFORMATION, &[&self.irk])),
+            ID_ADDRESS => Some(Output::new(IDENTITY_ADDRESS_INFORMATION, &[&[1], &self.address])),
+            OUT_FAILED => Some(Output::new(PAIRING_FAILED, &[&[self.reason.code()]])),
+            _ => None,
+        }
+    }
+
+    /// Takes the time, `now`: past the deadline the pairing times out.
+    #[inline]
+    pub fn on_time(&mut self, now: Instant) -> Option<Outcome> {
+        if self.deadline.is_none_or(|deadline| now < deadline) {
+            return None;
+        }
+        self.end();
+        self.state = State::TimedOut;
+        self.pending &= self.latched;
+        Some(Outcome::TimedOut)
+    }
+
+    /// Takes the central's Pairing Failed: the pairing ends, unanswered.
+    fn pairing_failed(&mut self, params: &[u8]) -> Option<Outcome> {
+        if !self.is_pairing() {
+            return None;
+        }
+        self.end();
+        self.pending &= self.latched;
+        let reason = params.first().map_or(Reason::UNSPECIFIED, |&code| Reason(code));
+        Some(Outcome::Failed { by_central: true, reason })
+    }
+
+    /// Takes a Pairing Request, received at `now`.
+    fn pairing_request(&mut self, params: &[u8], now: Instant) -> Result<Option<Outcome>, Reason> {
+        if self.is_pairing() {
+            return Err(Reason::UNSPECIFIED);
+        }
+        let &[io, oob, auth, key_size, init_dist, resp_dist] = params else {
+            return Err(Reason::INVALID_PARAMETERS);
+        };
+        if !self.pairable {
+            return Err(Reason::PAIRING_NOT_SUPPORTED);
+        }
+        if io > IO_CAPABILITY_MAX || oob > 1 || !(KEY_SIZE_MIN..=KEY_SIZE).contains(&key_size) {
+            return Err(Reason::INVALID_PARAMETERS);
+        }
+        if auth & AUTH_SECURE_CONNECTIONS == 0 || auth & AUTH_BONDING == 0 {
+            return Err(Reason::AUTHENTICATION_REQUIREMENTS);
+        }
+        if key_size < KEY_SIZE {
+            return Err(Reason::ENCRYPTION_KEY_SIZE);
+        }
+        if oob != 0 {
+            // With Secure Connections, out of band data on one side is
+            // enough for that method, which we cannot follow.
+            return Err(Reason::OOB_NOT_AVAILABLE);
+        }
+        self.end();
+        // Only the PDU being sent stays from an earlier pairing.
+        self.pending &= self.latched;
+        self.io_cap = [auth, oob, io];
+        self.init_dist = init_dist & KEY_DIST_ID;
+        self.resp_dist = resp_dist & KEY_DIST_ID;
+        if self.resp_dist == 0 {
+            // BlueZ keeps no bond without our identity address.
+            crate::log::info!("smp: the central asks for no identity keys");
+        }
+        self.pending |= OUT_RESPONSE;
+        self.state = State::PublicKey;
+        self.deadline = Some(now.checked_add(TIMEOUT).unwrap_or(Instant::MAX));
+        self.prepare_key_pair();
+        Ok(Some(Outcome::Started))
+    }
+
+    /// Notes that the PDU [`Self::next_pdu`] gave was queued whole, at
+    /// `now`, which restarts the pairing's timer.
+    #[inline]
+    pub fn pdu_sent(&mut self, now: Instant) -> Option<Outcome> {
+        if self.latched == 0 {
+            return None;
+        }
+        self.pending &= !self.latched;
+        self.latched = 0;
+        if self.is_pairing() {
+            self.deadline = Some(now.checked_add(TIMEOUT).unwrap_or(Instant::MAX));
+        }
+        if matches!(self.state, State::Random | State::Check(_))
+            && self.dh == Dh::Unasked
+            && !self.queued(OUT_PUBLIC_KEY | OUT_CONFIRM)
+        {
+            self.dh = Dh::Asked;
+            self.job = Some(Task::DhKey);
+        }
+        self.finish()
+    }
+
+    /// Asks for a key pair if none is ready or being made: before pairable
+    /// advertising starts, which then waits for [`Self::has_key_pair`].
+    #[inline]
+    pub fn prepare_key_pair(&mut self) {
+        let making = self.running.is_some_and(|(task, _)| task == Task::KeyPair);
+        if self.pair.is_none() && self.job.is_none() && !making {
+            self.job = Some(Task::KeyPair);
+        }
+    }
+
+    /// Takes the central's public key.
+    fn public_key<C>(&mut self, crypto: &mut C, params: &[u8]) -> Result<Option<Outcome>, Reason>
+    where
+        C: Aes + Random,
+    {
+        if self.state != State::PublicKey || self.queued(OUT_RESPONSE) {
+            return Err(Reason::UNSPECIFIED);
+        }
+        let key: &[u8; PUBLIC_KEY_LEN] =
+            params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?;
+        self.peer_key = flip_coordinates(key);
+        if self.pair.is_some() {
+            return self.answer_public_key(crypto);
+        }
+        self.state = State::KeyPair;
+        self.prepare_key_pair();
+        Ok(None)
+    }
+
+    /// Whether an output of `bits` is queued or being sent.
+    const fn queued(&self, bits: u8) -> bool { (self.pending | self.latched) & bits != 0 }
+
+    /// Takes the central's nonce.
+    fn random(&mut self, params: &[u8]) -> Result<Option<Outcome>, Reason> {
+        if self.state != State::Random || self.queued(OUT_PUBLIC_KEY | OUT_CONFIRM) {
+            return Err(Reason::UNSPECIFIED);
+        }
+        self.na =
+            reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+        self.pending |= OUT_RANDOM;
+        self.state = State::Check(false);
+        Ok(None)
+    }
+
+    /// Takes a PDU of the security manager channel, `encrypted` if each of
+    /// its fragments was received encrypted, at `now`.
+    #[inline]
+    pub fn receive<C>(&mut self, crypto: &mut C, pdu: &[u8], encrypted: bool, now: Instant) -> Option<Outcome>
+    where
+        C: Aes + Random,
+    {
+        if self.state == State::TimedOut {
+            return None;
+        }
+        let (&code, params) = pdu.split_first()?;
+        // A refused request is reported, as is the end of a pairing.
+        let report = code == PAIRING_REQUEST || self.is_pairing();
+        let answer = match code {
+            PAIRING_REQUEST => self.pairing_request(params, now),
+            PAIRING_PUBLIC_KEY => self.public_key(crypto, params),
+            PAIRING_RANDOM => self.random(params),
+            PAIRING_DHKEY_CHECK => self.dhkey_check(&*crypto, params),
+            IDENTITY_INFORMATION => self.identity_information(params, encrypted),
+            IDENTITY_ADDRESS_INFORMATION => self.identity_address(params, encrypted),
+            PAIRING_FAILED => return self.pairing_failed(params),
+            PAIRING_RESPONSE
+            | PAIRING_CONFIRM
+            | ENCRYPTION_INFORMATION
+            | CENTRAL_IDENTIFICATION
+            | SIGNING_INFORMATION
+            | SECURITY_REQUEST
+            | KEYPRESS_NOTIFICATION => Err(Reason::UNSPECIFIED),
+            _ => Err(Reason::COMMAND_NOT_SUPPORTED),
+        };
+        answer.unwrap_or_else(|reason| self.fail(reason, report))
+    }
+
+    /// Sets our own identity, which pairing distributes: the identity
+    /// resolving key, least significant octet first as
+    /// [`crate::link::Link::add_peer`] takes it, and the static random
+    /// identity address, least significant octet first.
+    #[inline]
+    pub const fn set_identity(&mut self, irk: [u8; 16], address: [u8; 6]) {
+        self.irk = irk;
+        self.address = address;
+    }
+
+    /// Sets whether a Pairing Request is taken; one that is not gets Pairing
+    /// Not Supported (0x05). A pairing under way goes on.
+    #[inline]
+    pub const fn set_pairable(&mut self, pairable: bool) { self.pairable = pairable; }
+
+    /// Fails the pairing with the reason of a failed step.
+    fn settle(&mut self, answer: Result<Option<Outcome>, Reason>) -> Option<Outcome> {
+        answer.unwrap_or_else(|reason| self.fail(reason, true))
+    }
+
+    /// The next job for the crypto task, if one waits.
+    #[inline]
+    pub fn take_job(&mut self) -> Option<Job> {
+        let kind = match self.job.take()? {
+            Task::DhKey => {
+                let pair = self.pair.take()?;
+                self.serial = self.serial.wrapping_add(1);
+                self.running = Some((Task::DhKey, self.serial));
+                JobKind::DhKey { pair, peer: self.peer_key, serial: self.serial }
+            },
+            Task::KeyPair => {
+                self.running = Some((Task::KeyPair, 0));
+                JobKind::KeyPair
+            },
+        };
+        Some(Job { kind })
+    }
+
+    /// Whether the central's identity keys are taken now: offered, after
+    /// our `DHKey` check and received encrypted. They may overtake the
+    /// encryption event, but never the encryption.
+    const fn takes_keys(&self, encrypted: bool) -> bool {
+        encrypted && self.init_dist != 0 && matches!(self.state, State::Encryption | State::Keys)
+    }
+
+    /// Verifies the central's `DHKey` check with the Diffie-Hellman key, and
+    /// queues ours.
+    fn verify<A>(&mut self, aes: &A) -> Result<Option<Outcome>, Reason>
+    where
+        A: Aes,
+    {
+        let (addr_a, addr_b) = (address(self.central), address(self.local));
+        let (mut mac_key, mut ltk) = f5(aes, &self.dh_key, (&self.na, &self.nb), (&addr_a, &addr_b));
+        wipe(&mut self.dh_key);
+        let expected = f6(aes, &mac_key, (&self.na, &self.nb), &R_ZERO, self.io_cap, (&addr_a, &addr_b));
+        if !same(&expected, &self.check) {
+            wipe(&mut mac_key);
+            wipe(&mut ltk);
+            return Err(Reason::DHKEY_CHECK_FAILED);
+        }
+        self.check = f6(aes, &mac_key, (&self.nb, &self.na), &R_ZERO, IO_CAP_B, (&addr_b, &addr_a));
+        wipe(&mut mac_key);
+        self.ltk = reversed(&ltk);
+        wipe(&mut ltk);
+        self.pending |= OUT_CHECK;
+        self.state = State::Encryption;
+        Ok(None)
+    }
+}
+
+impl Default for Responder {
+    #[inline]
+    fn default() -> Self { Self::new() }
+}
+
+/// A public key with each coordinate in the other byte order, X then Y:
+/// the PDU's order from the toolbox's, and back.
+fn flip_coordinates(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] {
+    let mut out = *key;
+    for coordinate in out.as_chunks_mut::<KEY_LEN>().0 {
+        coordinate.reverse();
+    }
+    out
+}
+
+/// `value` in the other byte order.
+fn reversed<const N: usize>(value: &[u8; N]) -> [u8; N] {
+    let mut out = *value;
+    out.reverse();
+    out
+}
+
+/// Whether two check values are the same, in a time that does not depend
+/// on where they differ.
+fn same(left: &[u8; 16], right: &[u8; 16]) -> bool {
+    left.iter().zip(right.iter()).fold(0_u8, |difference, (&one, &other)| difference | (one ^ other)) == 0
+}
+
+#[cfg(test)] mod tests;

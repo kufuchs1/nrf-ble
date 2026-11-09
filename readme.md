@@ -26,13 +26,16 @@ What is done so far:
 - The host's AES seam (`host::Aes`, the hardware ECB behind `host::Ecb`, software AES in the tests).
 - The cryptography of pairing: AES-CMAC and f4, f5, f6, g2 and ah in `host::smp::toolbox`, and P-256 key generation,
   Diffie-Hellman and public key checks in `host::smp::ecc`, with a constant time scalar multiplication of our own.
+- The security manager (`host::smp::Responder`): LE Secure Connections Just Works pairing as responder, with bonding and
+  the identity keys both ways, as a state machine without input or output of its own. The P-256 multiplications are
+  jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
+  reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout.
 - L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer, fragmenting on demand), LE signalling
   (`host::signal`: the connection parameter update request and command rejects), the ATT server at MTU 23
   (`host::att`) and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state, a constant table hash and the
   Spotlight table in `host::gatt::spotlight`).
-- In the doc comments of the other modules, what each of the next stages puts into them. The rest of the security
-  manager, the bond, the engine (which wires the code above to a running connection), the identity and advertising do
-  not exist yet.
+- In the doc comments of the other modules, what each of the next stages puts into them. The bond, the engine (which
+  wires the code above to a running connection), the identity and advertising do not exist yet.
 
 ## The typed link API
 
