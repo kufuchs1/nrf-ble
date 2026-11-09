@@ -35,6 +35,16 @@ pub const ADV_MAXLEN: u8 = MAX_PAYLOAD;
 /// Busy-wait iterations for a decryption to finish after the packet end,
 /// about 250 us at 64 MHz.
 pub const DECRYPT_WAIT: u32 = 2000;
+/// Busy-wait iterations for sealing a PDU ahead of its event, whose key
+/// stream the CCM generates first: about 1 ms at 64 MHz, far above
+/// the time it takes.
+#[cfg_attr(test, expect(dead_code, reason = "the host tests seal with a stand-in"))]
+pub const SEAL_WAIT: u32 = 8000;
+/// Whether the next PDU is prepared, and sealed, while our answer goes out,
+/// so that one connection event carries several PDUs of ours: a few
+/// microseconds at 64 MHz, well within our packet and the interframe space
+/// after it.
+pub const PREPARE_IN_EVENT: bool = true;
 /// Transmit power levels in dBm, lowest first: the radio's levels from
 /// -20 dBm up.
 pub const LEVELS_DBM: [i8; 8] = [-20, -16, -12, -8, -4, 0, 3, 4];

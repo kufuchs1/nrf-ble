@@ -5,27 +5,33 @@
 //! nRF51 has only the slow ramp-up, with which this timing works, and keeps
 //! TIMER1 and the PPI channels 4 and 5 free.
 //!
-//! The radio reads the packet pointer and the header when it starts, about
-//! 150 us after the END of the packet before, so the CPU has that long to
-//! decide on the answer.
-//! TODO(timing): that is about 2,200 cycles of the 16 MHz Cortex-M0, for
-//! the answer of a connection event (`Connection::respond` with the CCM
-//! encryption) and for the scan request checks of the advertiser, which the
-//! nRF52832 does in the same time at 64 MHz. A late answer sends whatever
-//! the packet pointer points at. Measure the slack on hardware before relying
-//! on it, and move work out of the interframe space where it is short.
+//! The radio latches the packet pointer when the answer starts, about 140 us
+//! after the END of the packet before, and sends whatever it points at then.
+//! The pointer is double-buffered: once the access address of the received
+//! packet has come, a new pointer applies to the next start only. So the
+//! connection points the radio at its unacknowledged PDU right after that
+//! access address, and its answer within the interframe space only patches
+//! that PDU's header flags or switches to the other, prepared slot, in a few
+//! hundred cycles: an answer that comes too late resends the previous PDU
+//! with its previous flags, which the central takes as a retransmission,
+//! and never echoes the received packet (see `Connection::respond`). The
+//! advertiser points the radio at the scan response the same way.
 
 use super::{REGS, Radio, Turnaround};
 use core::sync::atomic::{Ordering, compiler_fence};
 
-/// Sets what the radio does after the current packet.
+/// Sets what the radio does after the current packet. A turnaround to send
+/// follows a reception, whose signal strength the radio measures; during our
+/// own packets it measures nothing, so that a sample of the central's packet
+/// stays readable while ours goes out.
 #[inline]
 pub fn arm(turnaround: Turnaround) {
+    let receiving = turnaround == Turnaround::Transmit;
     REGS.shorts().write(|w| {
         w.set_ready_start(true);
         w.set_end_disable(true);
-        w.set_address_rssistart(true);
-        w.set_disabled_rssistop(true);
+        w.set_address_rssistart(receiving);
+        w.set_disabled_rssistop(receiving);
         w.set_disabled_txen(turnaround == Turnaround::Transmit);
         w.set_disabled_rxen(turnaround == Turnaround::Receive);
     });

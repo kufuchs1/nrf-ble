@@ -70,7 +70,7 @@ impl Connection {
     fn announce_power(&mut self) {
         let level = for_phy_mut(&mut self.power, self.tx_phy).level();
         let supports = self.central_features.is_some_and(|[_, _, _, _, power, ..]| power & 0x02 != 0);
-        let free = self.encryption.phase == Phase::Idle && self.queue.iter().all(Option::is_none);
+        let free = self.encryption.phase == Phase::Idle && self.queue.is_empty();
         if level == *for_phy_mut(&mut self.announced_power, self.tx_phy)
             || !supports
             || !free
@@ -109,7 +109,7 @@ impl Connection {
             && self.ping_request.is_none()
             && elapsed >= timeout.saturating_sub(timeout >> 2_u32)
             && self.encryption.phase == Phase::Idle
-            && self.queue.iter().all(Option::is_none)
+            && self.queue.is_empty()
         {
             self.enqueue(Llid::Control, &[OP_PING_REQ]);
             self.payload_timer = Some((last, true));
@@ -478,7 +478,7 @@ impl Connection {
             && self.param_update.is_none()
             && self.phy_update.is_none()
             && self.channel_update.is_none()
-            && self.queue.iter().all(Option::is_none)
+            && self.queue.is_empty()
             && self.notifications.iter().all(Option::is_none)
             && self.remote_request.is_none()
             && self.remote_update.is_none();

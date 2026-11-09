@@ -65,22 +65,28 @@ pub unsafe fn arm_decrypt(
     PPI.chenset().write(|w| w.set_ch(PPI_CRYPT, true));
 }
 
-/// Prepares the CCM to encrypt `input` into `output` while it is sent.
+/// Encrypts the PDU at `input` into `output` now and waits until the CCM is
+/// done: header, length with the MIC, the S1 byte, payload and MIC. The
+/// answer within the interframe space then only patches the header's SN,
+/// NESN and MD bits, which the MIC does not cover: the CCM masks them out of
+/// the header it authenticates (Core, Vol 6, Part E). Returns
+/// false if the CCM failed or did not finish in time.
 ///
 /// # Safety
 ///
 /// The CCM reads `config` and `input` and writes `output` and `scratch` by
-/// DMA after this returns. All four must stay valid, and the CPU must not
-/// access `output` or `scratch` while the CCM may, until the operation ends,
-/// [`disarm`], [`stop`] or [`disable`]. `input` and `output` must point to
-/// RAM holding [`crate::pdu::BUFFER_LEN`] bytes.
+/// DMA until this returns. `input` must point to a PDU in RAM and `output`
+/// to RAM with room for it and its MIC, neither accessed meanwhile. No
+/// decryption may be armed.
+#[cfg(not(test))]
+#[expect(clippy::cfg_not_test, reason = "the host tests seal with a stand-in, without the CCM's registers")]
 #[inline]
-pub unsafe fn arm_encrypt(
+pub unsafe fn seal(
     config: &[u8; CONFIG_LEN],
     (input, output): (*const u8, *mut u8),
     scratch: &mut [u8; SCRATCH_LEN],
     phy: Phy,
-) {
+) -> bool {
     PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
     chip::ccm_mode(Mode::Encryption, phy);
     set_pointers(config, input, output, scratch);
@@ -89,8 +95,49 @@ pub unsafe fn arm_encrypt(
     CCM.events_endcrypt().write_value(0);
     CCM.events_error().write_value(0);
     compiler_fence(Ordering::SeqCst);
-    // The packet is encrypted at once, ahead of the radio reading it.
     CCM.tasks_ksgen().write_value(1);
+    let mut remaining = chip::SEAL_WAIT;
+    while CCM.events_endcrypt().read() == 0 && CCM.events_error().read() == 0 && remaining != 0 {
+        remaining = remaining.saturating_sub(1);
+    }
+    let completed = CCM.events_endcrypt().read() != 0 && CCM.events_error().read() == 0;
+    disarm();
+    if !completed {
+        stop();
+    }
+    compiler_fence(Ordering::SeqCst);
+    completed
+}
+
+/// The host tests' stand-in for the CCM: copies the header, adds the MIC to
+/// the length, flips the payload and puts the low four octets of the packet
+/// counter where the MIC goes, so a test sees which counter sealed a PDU.
+///
+/// # Safety
+///
+/// `input` points to a PDU and `output` to a distinct buffer with room for
+/// it and its MIC.
+#[cfg(test)]
+pub unsafe fn seal(
+    config: &[u8; CONFIG_LEN],
+    (input, output): (*const u8, *mut u8),
+    _scratch: &mut [u8; SCRATCH_LEN],
+    _phy: Phy,
+) -> bool {
+    // SAFETY: the caller passes two distinct buffers, which hold a whole
+    // PDU and room for its MIC.
+    let (plain, sealed) = unsafe {
+        let len = usize::from(*input.add(1));
+        (core::slice::from_raw_parts(input, 3 + len), core::slice::from_raw_parts_mut(output, 3 + len + 4))
+    };
+    let len = plain.len() - 3;
+    sealed[..3].copy_from_slice(&plain[..3]);
+    sealed[1] = plain[1] + 4;
+    for (target, source) in sealed[3..3 + len].iter_mut().zip(&plain[3..]) {
+        *target = !*source;
+    }
+    sealed[3 + len..].copy_from_slice(&config[COUNTER_OFFSET..COUNTER_OFFSET + 4]);
+    true
 }
 
 /// A CCM configuration for one direction.

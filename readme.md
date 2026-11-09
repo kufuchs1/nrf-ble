@@ -130,15 +130,25 @@ Nothing has run on hardware or against BlueZ yet.
   it could lower its own power. The transmit power also follows the link on its own: the radio measures the signal of
   every packet from the central and, taking the path as symmetric, lowers the power from 0 dBm in steps down to -20 dBm
   while the central would still hear the device well, and raises it again, up to +4 dBm (by way of +3 dBm on the
-  nRF52832), when the signal weakens or the central does not acknowledge a packet; after that it waits 64 packets before
-  stepping down. A power a central asked for is kept as a floor for 1024 received packets (about 8 s of traffic at
-  7.5 ms); then the link layer decides again and reports each change to a central that asked for reports. Some centrals
-  ask for the maximum once and never again. Advertising always uses 0 dBm.
+  nRF52832), when the signal weakens or the central does not acknowledge a packet that went out in time; after that it
+  waits 64 packets before stepping down. A power a central asked for is kept as a floor for 1024 received packets
+  (about 8 s of traffic at 7.5 ms); then the link layer decides again and reports each change to a central that asked
+  for reports. Some centrals ask for the maximum once and never again. Advertising always uses 0 dBm.
 - **Connection events with several packets:** the event goes on while the central or the link layer has more data
   (MD) and another exchange fits before the next event. Received payloads wait in plain text and are handled after
   the event, so the answer within the 150 µs interframe space stays short. A control PDU, a CRC error, a payload
   without room towards the host, a running encryption or termination procedure, or different PHYs per direction
   close the event after the answer.
+- **The answer within the interframe space:** two transmit slots hold the PDU on the air until the central
+  acknowledges it and the next one, which is copied, and on an encrypted link sealed by the CCM, before the event
+  (`src/connection/transmit.rs`); preparing only peeks at the control queue and the host's packet, and a PDU uses up
+  its packet counter only once it is sent. Right after the access address of the central's packet the radio points at
+  the PDU on the air, so the answer only decides, switches to the prepared slot or writes an empty PDU there, and
+  patches the header flags, which the MIC does not cover: no copy, no seal, no queue and no host call. An answer that
+  comes too late resends our previous PDU with its previous flags, which the central takes as a retransmission, and
+  never sends the received packet back; within the interframe space nothing writes to the buffer the radio points at
+  but that header byte. The nRF52832 prepares the next PDU while its answer goes out, so an event carries several PDUs
+  of ours; the nRF51 prepares between events only and sends one new PDU per event until its timing is measured.
 - **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
   instant; data from the host ends the skipping at the next connection event. It is also held off, so that every
   connection event is listened to: during the first second of a link, for 200 ms or 8 connection events, whichever is
@@ -236,15 +246,30 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   priority bits, but Embassy builds the nRF51 with three, so `P0` and `P1`, `P2` and `P3`, `P4` and `P5`, and `P6` and
   `P7` are the same level: the link layer must be in a higher pair than everything else, such as `P2` over `P4` or `P1`
   over `P2`, not `P2` over `P3`.
-- **RAM:** without the data length extension a `Connection` takes 1040 bytes, `link::Shared` 840 and the link layer
-  task's future 1840 on thumbv6m (nrf-ll with HCI: 1224, 1040 and 2024), with packet buffers of 40 bytes.
+- **RAM:** without the data length extension a `Connection` takes 1240 bytes, `link::Shared` 840 and the link layer
+  task's future 2080 on thumbv6m (nrf-ll with HCI: 1224, 1040 and 2024), with packet buffers of 40 bytes and two
+  transmit slots of 76.
 - **Errata:** the nRF52832 workarounds are not applied. Of the nRF51's, only the sign of the temperature is fixed;
   the others wait for the nRF51802 errata document (see `src/chip/nrf51.rs`).
-- **Timing, unverified:** the answer within the 150 µs interframe space, with its CCM encryption, and the scan request
-  checks of the advertiser get about 2,200 cycles of the 16 MHz CPU, a quarter of the nRF52832's. Measure the slack on
-  hardware before relying on encrypted links and scan responses; the ramp-up time is still to be confirmed against the
-  nRF51802 product specification. The power control's 12 dB between stepping down and up assumes the nRF52832's RSSI
-  accuracy; the nRF51's is coarser and may make the power step back and forth (see `src/power_control.rs`).
+- **Timing:** the radio latches the answer's packet pointer about 140 µs after the END of the central's packet, some
+  2,240 cycles of the 16 MHz CPU. The first hardware run answered an acknowledgement only after about 2,900 cycles,
+  copying and rotating the PDU queue within the interframe space, so the radio sent the received packet back: the
+  central never got `LL_FEATURE_RSP` and ended the link after the 40 s procedure timeout. The answer now takes about
+  400 to 600 cycles from the start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up
+  at the END (emulated on the Spotlight firmware's release build). The 10 s report and the end of each link log its
+  counters: `R retx (A with ack), K acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback,
+  prepare max P us`, where `late` counts answers in place only after the radio started sending, `answer max` the
+  time from the END until the answer was in place, `retx with ack` the central's retransmissions that acknowledged
+  ours, the signature of an answer the central did not take, and `prepare max` the time preparing and sealing the
+  next PDU takes between events. The first eight events of a link log both headers of their first exchange, every
+  control PDU of ours logs when it is sent and acknowledged, and the radio's packet layout is logged once per link.
+  The `ifs-delay-test` feature makes the answer to an acknowledgement late on purpose every 16th event, which `late`
+  counts while the link goes on.
+  The advertiser points the radio at the scan response once a request's access address came and stops at once for
+  anything but a scan request, so a late scan request decision sends the scan response, never the request; such late
+  decisions are logged. The ramp-up time is still to be confirmed against the nRF51802 product specification. The
+  power control's 12 dB between stepping down and up assumes the nRF52832's RSSI accuracy; the nRF51's is coarser and
+  may make the power step back and forth (see `src/power_control.rs`).
 
 Embassy assumes 128 KB of flash on the nRF51, so its `Nvmc` cannot write the upper half of an nRF51802's 256 KB.
 

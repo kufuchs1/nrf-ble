@@ -17,6 +17,11 @@ defmt = ["dep:defmt", "embassy-time/defmt"]
 # about 1.5 KB more static RAM for the larger packet buffers. The nRF52832
 # only: the nRF51 CCM encrypts payloads of up to 27 octets.
 data-length = []
+# A test of the answer within the interframe space on hardware, never for
+# use: every 16th connection event, the answer to an acknowledgement waits
+# 200 us, so it comes too late. The `late` counters of the 10 s report count
+# those events, and the link goes on as with a lost answer.
+ifs-delay-test = []
 
 [dependencies]
 cortex-m = "0"

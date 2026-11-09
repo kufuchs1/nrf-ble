@@ -53,11 +53,22 @@ async fn interval(settings: &Settings) -> u32 {
     settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).checked_rem(ADV_DELAY_MAX_US).unwrap_or(0))
 }
 
+/// Logs the scan requests the advertiser decided only after the radio had
+/// started sending the scan response, when there are more than `seen`.
+fn log_late_scans(seen: &mut u32) {
+    let late = legacy::late_scan_decisions();
+    if late != *seen {
+        *seen = late;
+        info!("advertising: {} scan requests decided late", late);
+    }
+}
+
 /// Runs the link layer forever.
 #[inline]
 pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) -> ! {
     let mut rx = [0_u8; BUFFER_LEN];
     let mut since = None;
+    let mut late_scans = 0;
     loop {
         crate::health::checkpoint(15);
         crate::maintenance::service(clock, radio).await;
@@ -81,7 +92,9 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         clock.resume_now().await;
         let (primary, scan_response) = settings.pdus();
         let started = clock.now();
-        let Some((request, end)) = legacy::event(radio, clock, &settings, (&primary, &scan_response), &mut rx) else {
+        let event = legacy::event(radio, clock, &settings, (&primary, &scan_response), &mut rx);
+        log_late_scans(&mut late_scans);
+        let Some((request, end)) = event else {
             let next = started.wrapping_add(interval(&settings).await);
             // The sleep returns `SETUP_US` early, for a radio start the timer
             // triggers; advertising starts when it returns, so it sleeps that
@@ -114,6 +127,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             "connection ended: {} events, {} missed, {} crc errors, {} packets",
             stats.events, stats.missed, stats.crc_errors, stats.received
         );
+        stats.log_answers("connection ended");
         if matches!(ended, Ended::Reset) {
             radio.disable();
             clock.pause();

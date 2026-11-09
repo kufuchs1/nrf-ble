@@ -16,10 +16,12 @@ use crate::{
         LegacyAdvertisement,
         Peer,
         SCAN_RSP,
+        is_scan_request,
         scan_request,
     },
     radio::{Radio, Turnaround},
 };
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Largest advertising or scan response data.
 pub const DATA_MAX: usize = 31;
@@ -27,6 +29,9 @@ pub const DATA_MAX: usize = 31;
 pub const FILTER_LIST_SIZE: usize = 4;
 /// Peers in the resolving list.
 pub const RESOLVING_LIST_SIZE: usize = 2;
+/// Scan requests decided only after the radio had started sending the scan
+/// response. Only the link layer task writes it.
+static LATE_SCAN_DECISIONS: AtomicU32 = AtomicU32::new(0);
 
 /// Advertising type.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -385,13 +390,21 @@ pub fn event(
         .find_map(|(channel, _)| on_channel(radio, clock, settings, pdus, rx, channel))
 }
 
+/// Scan requests decided only after the radio had started sending the scan
+/// response: sent to a scanner the filter accept list refuses, or cut short
+/// by the decision to refuse it.
+#[inline]
+#[must_use = "the count is only read"]
+pub fn late_scan_decisions() -> u32 { LATE_SCAN_DECISIONS.load(Ordering::Relaxed) }
+
 /// Sends the advertisement on one channel and serves a request that follows.
 ///
-/// TODO(nRF51 timing): the scan request checks run within the interframe
-/// space, with up to two address resolutions on the ECB for the filter
-/// accept list, which may not fit on the 16 MHz Cortex-M0. Measure on
-/// hardware; a late decision sends the scan request back instead of the scan
-/// response.
+/// The scan request checks run within the interframe space, with up to two
+/// address resolutions on the ECB for the filter accept list, which may not
+/// fit on the 16 MHz Cortex-M0. So once the request's access address came,
+/// the radio points at the scan response, and anything but a scan request
+/// stops the turnaround at once: a late decision sends the scan response,
+/// never the request back (see [`late_scan_decisions`]).
 fn on_channel(
     radio: &mut Radio<'_>,
     clock: &Clock<'_>,
@@ -426,20 +439,27 @@ fn on_channel(
         radio.disable();
         return None;
     }
+    // The reception latched `rx`: the pointer now applies to the answer.
+    // SAFETY: the radio only reads the scan response, borrowed for this
+    // event, and is disabled before it returns.
+    let () = unsafe { radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut()) };
+    radio.clear_ready();
     radio.wait_end();
     let end = clock.end_time();
     let valid = radio.crc_ok();
-    if valid
-        && let Some(scanner) = scan_request(rx, settings.own)
-        && settings.accepts_scan(scanner)
-    {
-        // SAFETY: the radio only reads the scan response, borrowed for this
-        // event, and is disabled before it returns.
-        let () = unsafe { radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut()) };
-        radio.wait_switched();
-        radio.set_turnaround(Turnaround::None);
-        radio.wait_end();
-        radio.wait_disabled();
+    if valid && rx.first().copied().is_some_and(is_scan_request) {
+        let answer = scan_request(rx, settings.own).is_some_and(|scanner| settings.accepts_scan(scanner));
+        if radio.tx_started() {
+            LATE_SCAN_DECISIONS.store(late_scan_decisions().wrapping_add(1), Ordering::Relaxed);
+        }
+        if answer {
+            radio.wait_switched();
+            radio.set_turnaround(Turnaround::None);
+            radio.wait_end();
+            radio.wait_disabled();
+            return None;
+        }
+        radio.disable();
         return None;
     }
     // The switch would answer the packet: it is stopped before.

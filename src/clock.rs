@@ -390,6 +390,12 @@ impl<'peripherals> Clock<'peripherals> {
         matches!(select(Timer::after_micros(u64::from(ahead)), interrupt).await, Either::First(()))
     }
 
+    /// Whether TIMER0 runs, so that [`Self::now`] counts microseconds
+    /// rather than RTC ticks.
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn is_running(&self) -> bool { self.paused.is_none() }
+
     /// Number of restarts at which the crystal was not running yet.
     #[inline]
     #[must_use = "the count is only read"]

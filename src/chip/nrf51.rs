@@ -59,6 +59,17 @@ const DATA_S1_BITS: u8 = 3;
 /// Busy-wait iterations for a decryption to finish after the packet end:
 /// about the 250 us of the nRF52832's 2000 on the 16 MHz Cortex-M0.
 pub const DECRYPT_WAIT: u32 = 400;
+/// Busy-wait iterations for sealing a PDU ahead of its event, whose key
+/// stream the CCM generates first: about 1 ms on the 16 MHz Cortex-M0, far
+/// above the time it takes.
+#[cfg_attr(test, expect(dead_code, reason = "the host tests seal with a stand-in"))]
+pub const SEAL_WAIT: u32 = 1600;
+/// Whether the next PDU is prepared, and sealed, while our answer goes out,
+/// so that one connection event carries several PDUs of ours. Not on the
+/// nRF51 until the time it takes on the 16 MHz Cortex-M0 is measured (the
+/// prepare time of the 10 s report): it prepares between events only, and
+/// sends one new PDU per event.
+pub const PREPARE_IN_EVENT: bool = false;
 /// Largest payload the radio accepts on any channel, for the size of the
 /// packet buffers: an advertising payload, as a data payload with its MIC
 /// takes 31 octets at most.

@@ -332,6 +332,12 @@ pub fn scan_request(pdu: &[u8], advertiser: Peer) -> Option<Peer> {
         .then(|| Peer::new(scanner, header & TX_ADD_RANDOM != 0))
 }
 
+/// Whether an advertising channel PDU header is that of a scan request,
+/// whatever else the packet holds.
+#[inline]
+#[must_use = "the type is only checked"]
+pub const fn is_scan_request(header: u8) -> bool { header & PDU_TYPE_MASK == SCAN_REQ }
+
 /// `N` bytes of `bytes` from `offset`, if present.
 #[inline]
 #[must_use = "the bytes are only copied"]

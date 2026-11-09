@@ -160,6 +160,14 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub fn clear_address(&mut self) { REGS.events_address().write_value(0); }
 
+    /// Clears the ready event, so that [`Self::tx_started`] tells of the
+    /// next ramp-up only.
+    #[inline]
+    pub fn clear_ready(&mut self) {
+        REGS.events_ready().write_value(0);
+        compiler_fence(Ordering::SeqCst);
+    }
+
     /// Whether the last received packet had a valid CRC.
     #[inline]
     #[must_use = "the CRC status is only read"]
@@ -282,6 +290,14 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub fn receive(&mut self) { REGS.tasks_rxen().write_value(1); }
 
+    /// The packet layout, interframe space and whitening as the radio holds
+    /// them: PCNF0, PCNF1, TIFS and DATAWHITEIV, for the log.
+    #[inline]
+    #[must_use = "the registers are only read"]
+    pub fn registers(&self) -> [u32; 4] {
+        [REGS.pcnf0().read().0, REGS.pcnf1().read().0, REGS.tifs().read().0, REGS.datawhiteiv().read().0]
+    }
+
     /// Received signal strength of the last packet in -dBm, measured when
     /// its access address arrived.
     #[inline]
@@ -367,9 +383,26 @@ impl<'peripherals> Radio<'peripherals> {
         interrupt::RADIO.unpend();
     }
 
+    /// The radio's state as the STATE register holds it, for the log.
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub fn state(&self) -> u8 { REGS.state().read().state().to_bits() }
+
     /// Starts sending now.
     #[inline]
     pub fn transmit(&mut self) { REGS.tasks_txen().write_value(1); }
+
+    /// Whether a transmission ramped up since [`Self::clear_ready`]: its
+    /// READY event, which starts it through the shortcut and so latches the
+    /// packet pointer, or the radio sending already. Read after setting the
+    /// buffer of an answer, it tells whether the answer came too late and
+    /// the radio sends the buffer it pointed at before.
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub fn tx_started(&self) -> bool {
+        compiler_fence(Ordering::SeqCst);
+        REGS.events_ready().read() != 0 || matches!(REGS.state().read().state(), State::TxIdle | State::Tx)
+    }
 
     /// Sleeps until an access address arrives or `expired` holds, which is
     /// checked on every wake: it must depend on an event that wakes the CPU,
