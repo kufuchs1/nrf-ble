@@ -162,10 +162,10 @@ fn the_spotlight_pairs_discoverably_with_its_name() {
     let head = [2, 0x01, 0x06, 5, 0x03, 0x12, 0x18, 0x0F, 0x18, 3, 0x19, 0xC1, 0x03];
     assert_eq!(adv[..head.len()], head);
     if option_env!("SPOTLIGHT_DEVICE_NAME").is_none() {
-        // "Presenter Zuhause" (17 octets) leaves 16 in the advertising: the
+        // "Presenter Unterwegs" (19 octets) leaves 16 in the advertising: the
         // name is shortened there and complete in the scan response.
-        assert_eq!(adv[head.len()..], *[&[17, AD_SHORT_NAME][..], b"Presenter Zuhaus"].concat());
-        assert_eq!(advertising.scan().as_bytes(), [&[18, AD_NAME][..], b"Presenter Zuhause"].concat());
+        assert_eq!(adv[head.len()..], *[&[17, AD_SHORT_NAME][..], b"Presenter Unterw"].concat());
+        assert_eq!(advertising.scan().as_bytes(), [&[20, AD_NAME][..], b"Presenter Unterwegs"].concat());
     }
     assert!(advertising.schedule() == &SPOTLIGHT_PAIRING);
     assert!(advertising.mode().pairable() && advertising.mode().discoverable());

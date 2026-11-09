@@ -33,12 +33,12 @@ use crate::link::ParamRange;
 ///
 /// It is the Device Name characteristic and the advertised name (shortened
 /// there to what fits, complete in the scan response). The default is
-/// "Presenter Zuhause", as "Tastatur Zuhause" and "Maus Zuhause"; set
+/// "Presenter Unterwegs", next to "Tastatur Zuhause" and "Maus Zuhause"; set
 /// `SPOTLIGHT_DEVICE_NAME` when building to use another one, for example
 /// `SPOTLIGHT_DEVICE_NAME="Presenter Büro" cargo make run`.
 pub const NAME: &[u8] = match option_env!("SPOTLIGHT_DEVICE_NAME") {
     Some(name) => name.as_bytes(),
-    None => b"Presenter Zuhause",
+    None => b"Presenter Unterwegs",
 };
 const _: () = assert!(
     !NAME.is_empty() && NAME.len() <= 29,
