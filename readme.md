@@ -34,8 +34,12 @@ What is done so far:
   (`host::signal`: the connection parameter update request and command rejects), the ATT server at MTU 23
   (`host::att`) and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state, a constant table hash and the
   Spotlight table in `host::gatt::spotlight`).
-- In the doc comments of the other modules, what each of the next stages puts into them. The bond, the engine (which
-  wires the code above to a running connection), the identity and advertising do not exist yet.
+- Our identity (`host::identity`: the address and identity resolving key derived from the device secret the way the MX
+  firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
+  phases, and their setup of the link layer's accept list, resolving list and privacy) and the bond (`host::bond`: the
+  record of the one central with its fixed 50 octet stored form).
+- In the doc comments of the other modules, what each of the next stages puts into them. The engine, which wires the
+  code above to a running connection, and the async advertise call do not exist yet.
 
 ## The typed link API
 

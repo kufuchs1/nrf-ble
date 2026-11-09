@@ -23,7 +23,21 @@
 //!   pairing's burst.
 //! - Give the ATT server, for each request, the security of the link as the
 //!   request was received ([`crate::link::AclIn::encrypted`] and the key the
-//!   host handed over with [`crate::link::Link::ltk_reply`]), and wipe the
-//!   Diffie-Hellman key, the `MacKey` and the long term key once they are no
-//!   longer needed ([`crate::host::smp::ecc`] and [`crate::host::smp::toolbox`]
-//!   wipe their own).
+//!   host handed over with [`crate::link::Link::ltk_reply`]).
+//! - Wipe the copies of the long term key it makes: the
+//!   [`crate::host::smp::Bonded`] a pairing ends with is `Copy`, so wipe it
+//!   once the [`crate::host::bond::Bond`] is built from it. The
+//!   [`crate::host::smp::Responder`] wipes its own Diffie-Hellman key, `MacKey`
+//!   and long term key; [`crate::host::smp::ecc`] and
+//!   [`crate::host::smp::toolbox`] leave theirs to their callers.
+//! - Give the [`crate::host::smp::Responder`] the same
+//!   [`crate::host::identity::LocalIdentity`] that [`crate::host::adv`] set up
+//!   the link layer with ([`crate::host::smp::Responder::set_identity`]), so
+//!   pairing distributes the identity our resolvable private address was made
+//!   from. A new pairing advertises under the next generation
+//!   ([`crate::host::identity::Variant::next_generation`]).
+//! - Build the bond from the pairing's outcome: the central's identity from
+//!   [`crate::host::smp::Bonded::identity`], or its address on the air when it
+//!   sent none, and our variant. Store it, then replace pairing mode's
+//!   resolving list entry, which carries our key under an all zero central
+//!   address, by the reconnect mode's entry for the bonded central.
