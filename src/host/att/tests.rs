@@ -181,7 +181,7 @@ fn the_bluez_first_connection_gets_these_answers() {
     golden(s, &app, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B], &join(&[&[0x09, 0x12, 0x0A, 0x00], &hash]));
 
     // GAP: the name, the appearance and the preferred parameters.
-    golden(s, &app, &[0x0A, 0x03, 0x00], &join(&[&[0x0B], b"Spotlight"]));
+    golden(s, &app, &[0x0A, 0x03, 0x00], &join(&[&[0x0B], spotlight::NAME]));
     golden(s, &app, &[0x0A, 0x05, 0x00], &[0x0B, 0xC1, 0x03]);
     golden(s, &app, &[0x0A, 0x07, 0x00], &join(&[&[0x0B], &ppcp(PARAMS)]));
     // Device information: the PnP ID.

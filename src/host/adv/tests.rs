@@ -158,12 +158,15 @@ fn a_long_name_is_shortened_at_a_character_boundary() {
 #[test]
 fn the_spotlight_pairs_discoverably_with_its_name() {
     let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
-    assert_eq!(advertising.data().as_bytes(), &[
-        2, 0x01, 0x06, 5, 0x03, 0x12, 0x18, 0x0F, 0x18, 3, 0x19, 0xC1, 0x03, 10, 0x09, b'S', b'p', b'o', b't', b'l',
-        b'i', b'g', b'h', b't',
-    ]);
-    // The name fits, so the scan response is empty.
-    assert!(advertising.scan().is_empty());
+    let adv = advertising.data().as_bytes();
+    let head = [2, 0x01, 0x06, 5, 0x03, 0x12, 0x18, 0x0F, 0x18, 3, 0x19, 0xC1, 0x03];
+    assert_eq!(adv[..head.len()], head);
+    if option_env!("SPOTLIGHT_DEVICE_NAME").is_none() {
+        // "Presenter Zuhause" (17 octets) leaves 16 in the advertising: the
+        // name is shortened there and complete in the scan response.
+        assert_eq!(adv[head.len()..], *[&[17, AD_SHORT_NAME][..], b"Presenter Zuhaus"].concat());
+        assert_eq!(advertising.scan().as_bytes(), [&[18, AD_NAME][..], b"Presenter Zuhause"].concat());
+    }
     assert!(advertising.schedule() == &SPOTLIGHT_PAIRING);
     assert!(advertising.mode().pairable() && advertising.mode().discoverable());
 }
@@ -333,4 +336,27 @@ fn the_link_layer_refuses_to_start_while_a_central_is_connected() {
     shared.set_connected(true);
     assert_eq!(advertising.start(&link, &SPOTLIGHT_PHASES[0]), Err(Error::Link(link::Error::Disallowed)));
     assert!(shared.advertising().is_none());
+}
+
+#[test]
+fn the_spotlight_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() {
+    let (adv, scan) = Content::SPOTLIGHT.data(true).unwrap();
+    let field = |data: &[u8], kind: u8| {
+        let mut rest = data;
+        while let [len, kind_here, tail @ ..] = rest {
+            let len = usize::from(*len);
+            let (value, next) = tail.split_at(len - 1);
+            if *kind_here == kind {
+                return Some(value.to_vec());
+            }
+            rest = next;
+        }
+        None
+    };
+    let complete = field(scan.as_bytes(), AD_NAME).unwrap_or_else(|| field(adv.as_bytes(), AD_NAME).unwrap());
+    assert_eq!(complete, spotlight::NAME);
+    if let Some(short) = field(adv.as_bytes(), AD_SHORT_NAME) {
+        assert!(spotlight::NAME.starts_with(&short));
+    }
+    assert!(adv.as_bytes().len() <= 31 && scan.as_bytes().len() <= 31);
 }

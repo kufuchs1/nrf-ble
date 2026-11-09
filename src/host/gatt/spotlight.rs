@@ -29,8 +29,21 @@
 use super::{Value, ValueId, ppcp};
 use crate::link::ParamRange;
 
-/// The device name.
-pub const NAME: &[u8] = b"Spotlight";
+/// The device name: German, like the user's other devices.
+///
+/// It is the Device Name characteristic and the advertised name (shortened
+/// there to what fits, complete in the scan response). The default is
+/// "Presenter Zuhause", as "Tastatur Zuhause" and "Maus Zuhause"; set
+/// `SPOTLIGHT_DEVICE_NAME` when building to use another one, for example
+/// `SPOTLIGHT_DEVICE_NAME="Presenter Büro" cargo make run`.
+pub const NAME: &[u8] = match option_env!("SPOTLIGHT_DEVICE_NAME") {
+    Some(name) => name.as_bytes(),
+    None => b"Presenter Zuhause",
+};
+const _: () = assert!(
+    !NAME.is_empty() && NAME.len() <= 29,
+    "SPOTLIGHT_DEVICE_NAME must hold 1 to 29 octets: the scan response carries it complete"
+);
 /// Appearance: a keyboard (0x03C1), least significant octet first.
 pub const APPEARANCE: [u8; 2] = [0xC1, 0x03];
 /// The connection parameters the remote asks for.
