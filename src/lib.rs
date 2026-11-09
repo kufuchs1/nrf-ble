@@ -38,7 +38,8 @@ pub mod health;
 /// The minimal host: L2CAP, ATT and GATT, the security manager, advertising.
 ///
 /// So far it has its AES seam, the pairing cryptography, L2CAP, signalling,
-/// ATT and GATT, and the plan of each other module.
+/// ATT and GATT, the identity, advertising and the bond, and the plan of each
+/// other module.
 pub mod host;
 /// The typed interface between the link layer and the host.
 pub mod link;
