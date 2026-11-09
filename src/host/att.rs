@@ -4,8 +4,9 @@
 //! table ([`crate::host::gatt::Db`]) with the error codes of the Core
 //! specification, and encodes notifications and indications. One request is
 //! outstanding at a time, so the engine keeps one response slot of
-//! [`MTU`] octets; one indication waits for its confirmation, for at most
-//! 30 s, which the engine times.
+//! [`MTU`] octets. One indication waits for its confirmation; the 30 s limit
+//! on that wait is for the engine to time, which does not send indications
+//! yet.
 //!
 //! It serves exactly these requests:
 //!
@@ -472,9 +473,11 @@ impl Server {
     /// A Service Changed indication of the whole table, written into `out`,
     /// if the table has the characteristic and the client wrote its
     /// configuration on this link with indications on, and no indication
-    /// waits. The engine asks for it only after the Write Response to that
+    /// waits. It is to be asked for only after the Write Response to that
     /// write went out, as BlueZ registers its handler only then; an earlier
-    /// indication would be confirmed and dropped.
+    /// indication would be confirmed and dropped. The engine does not ask
+    /// for it yet: that ordering is still to be done, with the 30 s timer
+    /// of the confirmation.
     #[inline]
     pub fn service_changed(&mut self, level: Sec, out: &mut [u8; MTU]) -> Option<usize> {
         let characteristic = self.db.service_changed()?;

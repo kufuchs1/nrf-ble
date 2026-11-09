@@ -23,10 +23,10 @@
 //!
 //! - [`Host::run`] feeds the [`engine::Engine`] with whatever comes first: the
 //!   link layer's next event or fragment, the engine's next deadline, the
-//!   return of room in the link layer's queue while output waits for it, or a
-//!   wake-up from another task. After each, it makes the calls of the link
-//!   layer the engine asks for and queues the fragments the engine has, as long
-//!   as there is room.
+//!   return of room in the link layer's queue or an acknowledgement while
+//!   output or the engine waits for one, or a wake-up from another task. After
+//!   each, it makes the calls of the link layer the engine asks for and queues
+//!   the fragments the engine has, as long as there is room.
 //! - [`Host::crypto`] runs the P-256 jobs of pairing, each a multiplication
 //!   that blocks the thread for about 3 s on the nRF51, with the firmware's
 //!   watchdog hook right before each multiplication and a yield between two
@@ -63,20 +63,36 @@
 //!
 //! # The Spotlight
 //!
-//! How the firmware wires the link layer, the host's tasks, advertising and
-//! the reports. In the firmware each `async fn` below is an
+//! How the firmware wires the link layer, the host's tasks, advertising, the
+//! bond and the reports. In the firmware each `async fn` below is an
 //! `#[embassy_executor::task]` of the thread executor, and the link layer's
 //! task, [`crate::controller::run`], runs in an interrupt executor on
 //! [`SHARED`](crate::link::Shared).
 //!
+//! The firmware keeps two records in flash: the bond ([`bond::BOND_LEN`]
+//! octets) and, apart from it, the generation of our identity that the last
+//! pairing mode took ([`identity::Variant`]). Pairing mode takes the next
+//! generation and stores it before it advertises, so it never brings back an
+//! identity Linux may still hold a bond with: not after the bond was cleared
+//! or lost, nor after a pairing Linux completed whose bond the device never
+//! stored. Erasing the bond never erases the generation.
+//!
+//! The application reads the link's events and the key presses in one task,
+//! so it stores each bond as it comes and sees the end of the link at once.
+//! It sends reports only after [`ConnEvent::Ready`] and a settle time, which
+//! gives BlueZ the moment it needs to create its input device; the settle
+//! time is to be measured on the hardware.
+//!
 //! ```no_run
+//! use embassy_futures::select::{Either, select};
+//! use embassy_time::{Duration, Timer};
 //! use nrf_ble::{
 //!     host::{
 //!         Battery,
-//!         Conn,
 //!         ConnEvent,
 //!         Hardware,
 //!         Host,
+//!         NotifyError,
 //!         adv::{Advertising, Mode},
 //!         bond::{BOND_LEN, Bond},
 //!         engine::Config,
@@ -93,8 +109,12 @@
 //!     Host::new(Link::new(&SHARED), &spotlight::DB, Config::SPOTLIGHT);
 //! /// The battery level, which the table reads and the host notifies.
 //! static BATTERY: Battery = Battery::new(spotlight::BATTERY_LEVEL, 100);
+//! /// The time BlueZ gets after [`ConnEvent::Ready`] before the first
+//! /// report: to be measured.
+//! const SETTLE: Duration = Duration::from_millis(200);
 //!
-//! /// The application's side of the table's dynamic values.
+//! /// The application's side of the table's dynamic values. It runs inside
+//! /// the host, so it never calls into it.
 //! struct App;
 //!
 //! impl Handler for App {
@@ -117,52 +137,67 @@
 //! /// The P-256 jobs of pairing.
 //! async fn crypto_task() -> ! { HOST.crypto(&mut Hardware::default(), feed_watchdog).await }
 //!
-//! /// Advertising, the bond and the reports.
-//! async fn app_task(stored: [u8; BOND_LEN]) {
+//! /// Advertising, the bond and the reports, from the two flash records.
+//! async fn app_task(stored: [u8; BOND_LEN], mut generation: u8) {
 //!     let secret = DeviceSecret::from_ficr();
 //!     let mut bond = Bond::from_bytes(&stored);
-//!     // A new pairing takes the next generation of our identity.
-//!     let mut pairing =
-//!         bond.as_ref().map_or(Variant::new(0, 0), |bond| bond.local.next_generation());
 //!     loop {
-//!         let (mode, variant) = match bond.as_ref() {
-//!             Some(bond) => (Mode::Reconnect(bond), bond.local),
-//!             None => (Mode::Pairing, pairing),
+//!         let variant = match bond.as_ref() {
+//!             Some(bond) => bond.local,
+//!             None => {
+//!                 // Pairing mode: a new generation, stored before it is
+//!                 // used.
+//!                 generation = generation.wrapping_add(1);
+//!                 store_generation(generation);
+//!                 Variant::new(0, generation)
+//!             },
 //!         };
+//!         let mode = bond.as_ref().map_or(Mode::Pairing, Mode::Reconnect);
 //!         let identity = LocalIdentity::derive(&Hardware::default(), &secret, variant);
 //!         let Ok(advertising) = Advertising::spotlight(mode, None) else { return };
 //!         let Ok(conn) = HOST.advertise(&advertising, &identity).await else {
 //!             wait_for_key_press().await;
 //!             continue;
 //!         };
+//!         // The press that woke the device waits for discovery.
+//!         let mut ready = false;
+//!         let mut waiting = None;
 //!         loop {
-//!             match conn.next().await {
-//!                 ConnEvent::Bonded(new) | ConnEvent::BondUpdated(new) => {
-//!                     store(&new.to_bytes());
-//!                     pairing = new.local.next_generation();
+//!             let report = match select(conn.next(), wait_for_key_press()).await {
+//!                 Either::First(ConnEvent::Bonded(new) | ConnEvent::BondUpdated(new)) => {
+//!                     store_bond(&new.to_bytes());
 //!                     bond = Some(new);
+//!                     continue;
 //!                 },
-//!                 ConnEvent::Ready => send_reports(&conn).await,
-//!                 ConnEvent::Disconnected(_) => break,
-//!                 _ => {},
+//!                 Either::First(ConnEvent::Ready) => {
+//!                     ready = true;
+//!                     Timer::after(SETTLE).await;
+//!                     let Some(report) = waiting.take() else { continue };
+//!                     report
+//!                 },
+//!                 Either::First(ConnEvent::Disconnected(_)) => break,
+//!                 Either::First(_) => continue,
+//!                 Either::Second(report) if !ready => {
+//!                     waiting = Some(report);
+//!                     continue;
+//!                 },
+//!                 Either::Second(report) => report,
+//!             };
+//!             // A report nobody subscribed to, or one the link is not yet
+//!             // secure enough for, is skipped; only the end of the link ends
+//!             // the reports.
+//!             if conn.notify(spotlight::KEYBOARD, &report).await == Err(NotifyError::Disconnected)
+//!             {
+//!                 break;
 //!             }
+//!             let _ = BATTERY.update(&conn, measure_battery()).await;
 //!         }
-//!     }
-//! }
-//!
-//! /// The reports, from the key presses, and the battery level.
-//! async fn send_reports(conn: &Conn<'static, Link<'static>>) {
-//!     loop {
-//!         let report = wait_for_key_press().await;
-//!         if conn.notify(spotlight::KEYBOARD, &report).await.is_err() {
-//!             return;
-//!         }
-//!         let _ = BATTERY.update(conn, measure_battery()).await;
 //!     }
 //! }
 //!
 //! # fn feed_watchdog() {}
-//! # fn store(_bytes: &[u8; BOND_LEN]) {}
+//! # fn store_bond(_bytes: &[u8; BOND_LEN]) {}
+//! # fn store_generation(_generation: u8) {}
 //! # fn measure_battery() -> u8 { 90 }
 //! # async fn wait_for_key_press() -> [u8; 8] { [0; 8] }
 //! # fn main() {}
@@ -364,6 +399,19 @@ struct State {
     notify_waiting: bool,
 }
 
+/// What an advertising call finds before it sets anything up.
+enum Before {
+    /// No link: it advertises.
+    Free,
+    /// A link kept from a call whose future was dropped: it returns it.
+    Kept(Epoch),
+    /// A link the call cannot take yet: it is ending, or the run task has
+    /// not given it to the engine. The call waits.
+    Pending,
+    /// A link an earlier call returned: the call fails.
+    Returned,
+}
+
 /// Ends the wait of an advertising call, also when its future is dropped:
 /// stops advertising and lets the engine keep or end a link that arrived
 /// for nobody.
@@ -522,7 +570,10 @@ where
     /// and pairing distributes `identity`; in reconnection mode only the
     /// bonded central connects and may encrypt with the bond's key. A link
     /// kept from a call whose future was dropped is returned at once,
-    /// without advertising. One call at a time.
+    /// without advertising. Before it sets anything up, the call waits for
+    /// a link that nobody returned and that is ending, and for a connection
+    /// the link layer made that the run task has not taken yet, so a link
+    /// never sees the setup of a later call. One call at a time.
     ///
     /// # Errors
     ///
@@ -535,11 +586,32 @@ where
         advertising: &Advertising<'_>,
         identity: &LocalIdentity,
     ) -> Result<Conn<'_, P>, AdvertiseError> {
-        if let Some(epoch) = self.with(|state| state.engine.claim()) {
-            return Ok(Conn { epoch, host: self });
-        }
-        if self.with(|state| state.engine.has_link()) {
-            return Err(AdvertiseError::Connected);
+        loop {
+            let before = self.with(|state| {
+                let engine = &mut state.engine;
+                engine.claim().map_or_else(
+                    || {
+                        if engine.has_claimed_link() {
+                            Before::Returned
+                        } else if engine.has_link() || self.port.info().is_some() {
+                            // A link that is ending, or one the run task has
+                            // not given the engine yet: setting the engine up
+                            // for this call now would change it under that
+                            // link.
+                            Before::Pending
+                        } else {
+                            Before::Free
+                        }
+                    },
+                    Before::Kept,
+                )
+            });
+            match before {
+                Before::Free => break,
+                Before::Kept(epoch) => return Ok(Conn { epoch, host: self }),
+                Before::Pending => self.advertised.wait().await,
+                Before::Returned => return Err(AdvertiseError::Connected),
+            }
         }
         let mode = advertising.mode();
         let bond = match mode {
@@ -562,9 +634,13 @@ where
                 Err(error) => return Err(AdvertiseError::Setup(error)),
             }
             end = end.checked_add(phase.duration).unwrap_or(Instant::MAX);
-            if let Either::First(epoch) = select(self.link_arrived(), self.port.sleep_until(end)).await {
-                waiting.linked = true;
-                return Ok(Conn { epoch, host: self });
+            match select(self.link_arrived(advertising, phase), self.port.sleep_until(end)).await {
+                Either::First(Ok(epoch)) => {
+                    waiting.linked = true;
+                    return Ok(Conn { epoch, host: self });
+                },
+                Either::First(Err(error)) => return Err(AdvertiseError::Setup(error)),
+                Either::Second(()) => {},
             }
         }
         Err(AdvertiseError::Timeout)
@@ -636,12 +712,30 @@ where
     }
 
     /// Waits until a link arrived for the advertising call, and claims it.
-    async fn link_arrived(&self) -> Epoch {
+    /// The link layer stops advertising when a central connects: if that
+    /// link ended before the run task gave it to the engine, or before the
+    /// call claimed it, it advertises again for the rest of `phase`.
+    ///
+    /// # Errors
+    ///
+    /// If the link layer refused to advertise again.
+    async fn link_arrived(&self, advertising: &Advertising<'_>, phase: &adv::Phase) -> Result<Epoch, adv::Error> {
+        let mut woken = false;
         loop {
-            if let Some(epoch) = self.with(|state| state.engine.claim()) {
-                return epoch;
+            let (claimed, linkless) =
+                self.with(|state| (state.engine.claim(), !state.engine.has_link() && self.port.info().is_none()));
+            if let Some(epoch) = claimed {
+                return Ok(epoch);
+            }
+            if woken && linkless {
+                match advertising.start(&self.port, phase) {
+                    // Another central connected meanwhile.
+                    Ok(()) | Err(adv::Error::Link(link::Error::Disallowed)) => {},
+                    Err(error) => return Err(error),
+                }
             }
             self.advertised.wait().await;
+            woken = true;
         }
     }
 
@@ -700,6 +794,11 @@ where
     /// Runs the host: see the module documentation. `app` serves the table's
     /// dynamic values, `crypto` gives the security manager its random
     /// numbers and AES. Spawn it as a task of its own.
+    ///
+    /// `app` runs inside the host's state, so it must not call into the
+    /// host: no [`Conn`] method, no [`Battery::update`] and no other
+    /// [`Host`] method, or the second borrow of the state panics. It may read
+    /// and write atomics and signal other tasks, as [`Battery::read`] does.
     #[inline]
     pub async fn run<C>(&self, app: &dyn Handler, crypto: &mut C) -> !
     where

@@ -35,10 +35,15 @@
 //! # What it does on a link
 //!
 //! - It holds the peripheral latency off from the connection until discovery is
-//!   over: once the link is encrypted and ATT has been idle for [`READY_IDLE`],
-//!   it reports [`ConnEvent::Ready`] and lets the latency go. Linux reconnects
-//!   with the latency it stored, and every ATT round trip would otherwise wait
-//!   for it.
+//!   over, then reports [`ConnEvent::Ready`] and lets the latency go. Linux
+//!   reconnects with the latency it stored, and every ATT round trip would
+//!   otherwise wait for it. Discovery is over on an encrypted link once the
+//!   central acknowledged our Write Response to the write that left every input
+//!   report's client characteristic configuration written on this link, and ATT
+//!   has been idle for [`INPUTS_IDLE`] since: BlueZ creates its input device
+//!   only once it received that response, and drops the reports before it.
+//!   Without such a write, as with a table without input reports, ATT is to be
+//!   idle for [`READY_IDLE`] on the encrypted link.
 //! - Once ATT has been idle for [`PARAMS_IDLE`], it asks for the connection
 //!   parameters of its [`Config`] with the L2CAP request, once per link and
 //!   only if the link has others: the same constant as the Peripheral Preferred
@@ -65,10 +70,13 @@
 //!   resolvable private address was made from, and builds the bond from the
 //!   pairing's outcome: the central's identity from
 //!   [`crate::host::smp::Bonded::identity`], or its address when it sent none,
-//!   and our variant. The [`crate::host::smp::Bonded`] it gets is `Copy`, so
-//!   the engine overwrites its copy of the keys once the [`Bond`] holds them;
-//!   the security manager overwrites its own Diffie-Hellman key, `MacKey` and
-//!   long term key.
+//!   and our variant. It reports [`ConnEvent::Bonded`] only once the central
+//!   acknowledged every fragment sent so far, our Identity Address Information
+//!   among them: the kernel stores its bond only when that PDU arrives, and a
+//!   bond the firmware stored without it would make every reconnection fail.
+//!   The [`crate::host::smp::Bonded`] it gets is `Copy`, so the engine
+//!   overwrites its copy of the keys once the [`Bond`] holds them; the security
+//!   manager overwrites its own Diffie-Hellman key, `MacKey` and long term key.
 //! - It ends the link: [`SECURITY_FAILURE`] when the link is not encrypted
 //!   within the advertising schedule's security deadline, or when a pairing
 //!   failed (once our Pairing Failed was acknowledged, or after
@@ -88,16 +96,18 @@
 //! ([`Unclaimed`]): kept for the next advertising call, which returns it at
 //! once, or ended with [`REMOTE_USER`].
 //!
-//! Not served: indications (the Spotlight table has no Service Changed), the
-//! LE credit based channels and an MTU above 23.
+//! Not served: indications, with the Service Changed indication, its ordering
+//! after the Write Response and its 30 s confirmation timer (the Spotlight
+//! table has no Service Changed); the LE credit based channels; and an MTU
+//! above 23.
 
 use crate::{
     crypto::wipe,
     host::{
         Aes,
-        att::{MTU, NotifyError as AttNotifyError, Server, WRITE_COMMAND, WRITE_REQUEST},
+        att::{MTU, NotifyError as AttNotifyError, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
         bond::Bond,
-        gatt::{Char, Db, Handler, Sec, spotlight},
+        gatt::{CCCD_MAX, Char, Db, Handler, Kind, PROP_NOTIFY, Sec, Uuid, Value, spotlight},
         identity::{LocalIdentity, Variant},
         l2cap::{Channel, Fragment, RX_MAX, Reassembly, Segmenter},
         signal::{self, Action, Signalling},
@@ -109,9 +119,19 @@ use crate::{
 use core::fmt;
 use embassy_time::{Duration, Instant};
 
-/// The time ATT is to be idle on an encrypted link before discovery counts
-/// as over: [`ConnEvent::Ready`], and the latency hold ends.
-pub const READY_IDLE: Duration = Duration::from_millis(500);
+/// The time ATT is to be idle before discovery counts as over.
+///
+/// It counts on an encrypted link once the central acknowledged the Write
+/// Response that completed the input reports' configuration; then comes
+/// [`ConnEvent::Ready`], and the latency hold ends.
+pub const INPUTS_IDLE: Duration = Duration::from_millis(100);
+/// The time ATT is to be idle before discovery counts as over without that
+/// write.
+///
+/// It is the fallback of [`INPUTS_IDLE`] on an encrypted link, longer than
+/// the gaps of BlueZ's discovery, so a reconnection whose writes come late
+/// still waits for them.
+pub const READY_IDLE: Duration = Duration::from_millis(1000);
 /// The time ATT is to be idle before the connection parameters are asked
 /// for.
 pub const PARAMS_IDLE: Duration = Duration::from_millis(1500);
@@ -139,6 +159,8 @@ const EV_BOND_UPDATED: u8 = 0x10;
 const EV_PARAMS: u8 = 0x20;
 /// Event flag: discovery is over.
 const EV_READY: u8 = 0x40;
+/// The characteristic UUID of a HID report.
+const REPORT: u16 = 0x2A4D;
 
 /// A call of the link layer the engine asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,7 +276,8 @@ pub enum ConnEvent {
     /// The bonded central changed its subscriptions: the bond to store in
     /// place of the stored one.
     BondUpdated(Bond),
-    /// A pairing made this bond, which the firmware stores.
+    /// A pairing made this bond, which the firmware stores: reported once
+    /// the central acknowledged our identity keys.
     Bonded(Bond),
     /// The link ended, with the reason; 0 if it is no longer known.
     Disconnected(u8),
@@ -267,9 +290,27 @@ pub enum ConnEvent {
     PairingFailed(Reason),
     /// The connection parameters changed to these.
     ParamsUpdated(ConnectionParams),
-    /// Discovery is over: the link is encrypted and ATT has been idle for
-    /// [`READY_IDLE`].
+    /// Discovery is over: the link is encrypted, the central has our
+    /// response to its last input report configuration write, and ATT has
+    /// been idle for [`INPUTS_IDLE`] since (or, without such a write, for
+    /// [`READY_IDLE`]). BlueZ still needs a moment to create its input
+    /// device: the application waits a settle time, measured on the hardware,
+    /// before its first report.
     Ready,
+}
+
+/// Where the link is with the configuration of its input reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Inputs {
+    /// The central acknowledged the Write Response that completed it.
+    Acked,
+    /// The Write Response that completes it waits in the response slot.
+    Answering,
+    /// Not complete on this link yet.
+    Open,
+    /// The Write Response that completed it was queued: the next time
+    /// nothing is in flight, the central has it.
+    Sent,
 }
 
 /// Which key the host gave the link layer for the link.
@@ -290,6 +331,9 @@ struct LinkState {
     asked:     bool,
     /// When our connection parameter request times out.
     asking:    Option<Instant>,
+    /// Whether a pairing bonded and [`ConnEvent::Bonded`] waits until
+    /// nothing is in flight.
+    bonding:   bool,
     /// Whether an advertising call returned the link.
     claimed:   bool,
     /// Whether the disconnection was asked for; the link layer's event
@@ -305,6 +349,8 @@ struct LinkState {
     failing:   bool,
     /// What the link layer said about the link.
     info:      Info,
+    /// The configuration of the input reports on this link.
+    inputs:    Inputs,
     /// The key the host gave for the link.
     key:       Option<Key>,
     /// The connection parameters.
@@ -425,6 +471,14 @@ impl Engine {
         if let Some(len) = self.att.handle(pdu, level, app, &mut out) {
             if self.response.is_none() {
                 self.response = Some(Slot { bytes: out, len: u8::try_from(len).unwrap_or_default() });
+                if pdu.first() == Some(&WRITE_REQUEST)
+                    && out.first() == Some(&WRITE_RESPONSE)
+                    && self.inputs_written()
+                    && let Some(answering) = self.link.as_mut()
+                    && answering.inputs == Inputs::Open
+                {
+                    answering.inputs = Inputs::Answering;
+                }
             } else {
                 // A client waits for each response before its next request.
                 info!("att: a request before the response to the previous one");
@@ -450,7 +504,7 @@ impl Engine {
     }
 
     /// Returns the link that arrived for the advertising call that waits, or
-    /// for a call that was dropped, once.
+    /// for a call that was dropped, once; never one that is ending.
     #[inline]
     pub fn claim(&mut self) -> Option<Epoch> {
         let link = self.link.as_mut().filter(|link| !link.claimed && !link.closing && link.ending.is_none())?;
@@ -472,12 +526,14 @@ impl Engine {
             activity:  now,
             asked:     false,
             asking:    None,
+            bonding:   false,
             claimed:   false,
             closing:   false,
             encrypted: false,
             ending:    None,
             failing:   false,
             info:      *info,
+            inputs:    Inputs::Open,
             key:       None,
             params:    info.params,
             ready:     false,
@@ -491,7 +547,6 @@ impl Engine {
             info!("a link nobody waits for ends");
             self.commands.disconnect = Some((info.epoch, REMOTE_USER));
             if let Some(link) = self.link.as_mut() {
-                link.claimed = true;
                 link.closing = true;
             }
         }
@@ -565,6 +620,9 @@ impl Engine {
                 self.response = None;
                 if let Some(link) = self.link.as_mut() {
                     link.activity = now;
+                    if link.inputs == Inputs::Answering {
+                        link.inputs = Inputs::Sent;
+                    }
                 }
             },
             Source::Reply => self.sig_reply = None,
@@ -588,6 +646,16 @@ impl Engine {
         }
     }
 
+    /// Whether a link exists that an advertising call returned.
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn has_claimed_link(&self) -> bool {
+        match self.link.as_ref() {
+            Some(link) => link.claimed,
+            None => false,
+        }
+    }
+
     /// Whether a job waits for the crypto task.
     #[inline]
     #[must_use = "the state is only read"]
@@ -603,14 +671,18 @@ impl Engine {
     #[must_use = "the state is only read"]
     pub const fn has_link(&self) -> bool { self.link.is_some() }
 
-    /// Whether output waits for room in the link layer's queue, or a
-    /// disconnection for the fragments in flight to be acknowledged: then
-    /// the glue also waits for [`crate::link::Link::tx_room_changed`].
+    /// Whether output waits for room in the link layer's queue, or something
+    /// waits for the fragments in flight to be acknowledged (a
+    /// disconnection, [`ConnEvent::Bonded`], the end of discovery): then the
+    /// glue also waits for [`crate::link::Link::tx_room_changed`], which an
+    /// acknowledgement wakes too.
     #[inline]
     #[must_use = "the state is only read"]
     pub fn has_output(&self) -> bool {
         self.link.as_ref().is_some_and(|link| {
             link.ending.is_some()
+                || link.bonding
+                || link.inputs == Inputs::Sent
                 || self.sending.is_some()
                 || self.smp.has_output()
                 || self.response.is_some()
@@ -627,6 +699,15 @@ impl Engine {
         let mut info = link.info;
         info.params = link.params;
         Some(info)
+    }
+
+    /// Whether the client wrote, on this link, the configuration of every
+    /// input report of the table that notifies; false for a table without
+    /// one.
+    fn inputs_written(&self) -> bool {
+        let inputs = input_reports(self.db);
+        let subscriptions = self.att.subscriptions();
+        inputs != 0 && (0..CCCD_MAX).all(|index| (inputs >> index) & 1 == 0 || subscriptions.is_written(index))
     }
 
     /// Whether the client of the link `epoch` enabled notifications of
@@ -698,7 +779,7 @@ impl Engine {
     #[must_use = "the deadline is only read"]
     pub fn next_deadline(&self) -> Option<Instant> {
         let link = self.link.as_ref()?;
-        let ready = (link.encrypted && !link.ready).then(|| link.activity.checked_add(READY_IDLE));
+        let ready = (link.encrypted && !link.ready).then(|| link.activity.checked_add(link.ready_idle()));
         let params =
             (link.ready && !link.asked && self.config.params.is_some()).then(|| link.activity.checked_add(PARAMS_IDLE));
         [
@@ -863,7 +944,7 @@ impl Engine {
             self.signal.cancel();
         }
         let idle = now.checked_duration_since(link.activity).unwrap_or(Duration::MIN);
-        if link.encrypted && !link.ready && idle >= READY_IDLE {
+        if link.encrypted && !link.ready && idle >= link.ready_idle() {
             link.ready = true;
             self.events.flags |= EV_READY;
             self.events.changed = true;
@@ -898,7 +979,9 @@ impl Engine {
                 self.bond = Some(bond);
                 link.key = Some(Key::Bond);
                 link.restored = true;
-                self.events.flags |= EV_BONDED;
+                // Reported once the central has our identity: see
+                // `take_command`.
+                link.bonding = true;
             },
             Outcome::Failed { by_central, reason } => {
                 self.events.flags |= EV_PAIRING_FAILED;
@@ -976,18 +1059,32 @@ impl Engine {
         if self.config.unclaimed == Unclaimed::Disconnect
             && let Some(link) = self.link.as_mut()
             && !link.claimed
+            && !link.closing
         {
             info!("a link nobody waits for ends");
-            link.claimed = true;
             link.closing = true;
             self.commands.disconnect = Some((link.info.epoch, REMOTE_USER));
         }
     }
 
     /// The next call of the link layer to make, given the fragments of the
-    /// link `in_flight` and the time, `now`.
+    /// link `in_flight` and the time, `now`. With nothing in flight, what
+    /// waited for the central's acknowledgement goes on: the end of
+    /// discovery counts from then, and [`ConnEvent::Bonded`] is reported.
     #[inline]
     pub fn take_command(&mut self, in_flight: usize, now: Instant) -> Option<Command> {
+        if in_flight == 0
+            && let Some(link) = self.link.as_mut()
+        {
+            if link.inputs == Inputs::Sent {
+                link.inputs = Inputs::Acked;
+            }
+            if link.bonding {
+                link.bonding = false;
+                self.events.flags |= EV_BONDED;
+                self.events.changed = true;
+            }
+        }
         if let Some(hold) = self.commands.hold.take() {
             return Some(Command::HoldLatency(hold));
         }
@@ -1053,18 +1150,19 @@ impl Engine {
     pub fn take_job(&mut self) -> Option<Job> { self.smp.take_job() }
 
     /// Puts the live subscriptions into the bond, if the link is encrypted
-    /// with its key and they changed.
+    /// with its key and they changed. A bond not yet reported carries them
+    /// in [`ConnEvent::Bonded`].
     fn update_bond(&mut self) {
-        if self.link.as_ref().is_none_or(|link| link.key != Some(Key::Bond)) {
-            return;
-        }
+        let Some(link) = self.link.as_ref().filter(|link| link.key == Some(Key::Bond)) else { return };
         let bits = self.att.subscriptions().bits();
         if let Some(bond) = self.bond.as_mut()
             && bond.cccd != bits
         {
             bond.cccd = bits;
-            self.events.flags |= EV_BOND_UPDATED;
-            self.events.changed = true;
+            if !link.bonding {
+                self.events.flags |= EV_BOND_UPDATED;
+                self.events.changed = true;
+            }
         }
     }
 }
@@ -1097,6 +1195,16 @@ impl From<AttNotifyError> for NotifyError {
     }
 }
 
+impl LinkState {
+    /// The time ATT is to be idle before discovery counts as over.
+    const fn ready_idle(&self) -> Duration {
+        match self.inputs {
+            Inputs::Acked => INPUTS_IDLE,
+            Inputs::Answering | Inputs::Open | Inputs::Sent => READY_IDLE,
+        }
+    }
+}
+
 impl Source {
     /// The channel its PDUs go to.
     const fn channel(self) -> Channel {
@@ -1106,6 +1214,25 @@ impl Source {
             Self::Smp => Channel::SecurityManager,
         }
     }
+}
+
+/// The client characteristic configuration descriptors of the input reports
+/// of `db` that notify, one bit for each index: the HID reports (0x2A4D) with
+/// the notify property, as BlueZ subscribes to each of them.
+fn input_reports(db: &Db) -> u16 {
+    let mut inputs = 0_u16;
+    let mut report = false;
+    for attr in db.attrs() {
+        match (attr.kind(), attr.value_source()) {
+            (Kind::Characteristic(props), _) => report = attr.uuid() == Uuid::U16(REPORT) && props & PROP_NOTIFY != 0,
+            (Kind::Service, _) => report = false,
+            (Kind::Descriptor(_), Value::Cccd(index)) if report => {
+                inputs |= 1_u16.checked_shl(u32::from(index)).unwrap_or(0);
+            },
+            _ => {},
+        }
+    }
+    inputs
 }
 
 /// Whether the connection parameters `params` are those of `range`.

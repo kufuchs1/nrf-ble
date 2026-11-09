@@ -131,6 +131,7 @@ impl MockLink {
     /// The link ends for `reason`.
     fn disconnect_link(&self, reason: u8) {
         self.connected.set(false);
+        self.info.set(None);
         self.queue.borrow_mut().clear();
         self.unacked.set(0);
         self.room.set(true);
@@ -457,26 +458,31 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     assert_eq!(request(link, &mut tasks, &[0x0A, 0x1A, 0x00]), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
     // The configuration of the battery and of the three reports: the bond
     // takes it.
-    for cccd in [0x0E_u8, 0x1B, 0x1F, 0x23] {
+    for cccd in [0x0E_u8, 0x1B, 0x1F] {
         assert_eq!(request(link, &mut tasks, &[0x12, cccd, 0x00, 0x01, 0x00]), [0x13]);
     }
+    // The last input report's: its Write Response goes on the air, and
+    // the central does not acknowledge it yet.
+    link.send(CID_ATT, &[0x12, 0x23, 0x00, 0x01, 0x00], true);
+    tasks.step();
+    assert_eq!(link.transmit().len(), 1);
     let ConnEvent::BondUpdated(updated) = next!(conn) else { panic!("no update") };
     assert_eq!(updated.cccd, 0b0101_0101);
     assert!(poll(pin!(conn.next())).is_pending());
 
-    // The latency is held until ATT has been idle for half a second.
-    assert!(link.calls().is_empty());
-    link.advance(499);
+    // The latency is held until the central has that response and ATT has
+    // been idle for 100 ms since it was queued.
+    link.advance(200);
     tasks.step();
     assert!(link.calls().is_empty());
-    link.advance(1);
+    link.ack();
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(false)]);
     assert_eq!(next!(conn), ConnEvent::Ready);
 
     // The parameters are asked for once ATT has been idle for 1.5 s: the
     // same as the table's preferred ones.
-    link.advance(999);
+    link.advance(1299);
     tasks.step();
     assert!(link.deliver().is_empty());
     link.advance(1);
@@ -558,6 +564,14 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
     let conn = ready(advertise.as_mut()).unwrap();
     assert_eq!(link.calls(), [Seen::Hold(true)]);
 
+    // Before the encryption the bond's subscriptions are not the link's:
+    // nothing is notified.
+    assert!(!conn.is_subscribed(spotlight::BATTERY_LEVEL));
+    assert!(!conn.is_subscribed(spotlight::KEYBOARD));
+    assert_eq!(conn.try_notify(spotlight::BATTERY_LEVEL, &[50]), Err(NotifyError::NotSubscribed));
+    assert!(conn.try_notify(spotlight::KEYBOARD, &[0; 8]).is_err());
+    assert!(link.deliver().is_empty());
+
     // Only EDIV 0 and Rand 0 get the bond's key.
     link.event(Event::LtkRequest { ediv: 0x1234, rand: [0; 8] });
     tasks.step();
@@ -630,7 +644,7 @@ fn only_the_bonded_central_gets_the_bond_s_key() {
 }
 
 #[test]
-fn notifications_keep_one_in_flight_and_one_place_free() {
+fn notifications_keep_two_in_flight_and_one_place_free() {
     let host = host(Unclaimed::Keep);
     let link = host.port();
     tasks!(host, tasks, multiplications);
@@ -802,6 +816,222 @@ fn a_pairing_that_stalls_times_out_and_a_failed_one_ends_once_flushed() {
 }
 
 #[test]
+fn a_pairing_failed_that_is_never_acknowledged_ends_the_link_after_a_second() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // A request without Secure Connections; our Pairing Failed goes on the
+    // air and the central never acknowledges it.
+    link.send(CID_SECURITY_MANAGER, &[0x01, 0x04, 0x00, 0x05, 0x10, 0x07, 0x07], false);
+    tasks.step();
+    assert_eq!(link.transmit(), [(true, vec![2, 0, 6, 0, 0x05, 0x03])]);
+    link.advance(999);
+    tasks.step();
+    assert!(link.calls().is_empty());
+    link.advance(1);
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
+    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::AUTHENTICATION_REQUIREMENTS));
+    assert_eq!(multiplications.get(), 1);
+}
+
+#[test]
+fn a_pairing_failed_from_the_central_ends_the_link_at_once() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    let local = local_rpa();
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    let central = Central::new(linux_request(true, true), local);
+    assert_eq!(smp(link, &mut tasks, &central.request, false).len(), 1);
+    // The central gives up: never answered, and the link ends.
+    assert!(smp(link, &mut tasks, &[0x05, 0x08], false).is_empty());
+    assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
+    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::UNSPECIFIED));
+    assert_eq!(multiplications.get(), 1);
+}
+
+#[test]
+fn a_pairing_request_while_reconnecting_is_refused_and_ends_the_link() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let bond = bond(&identity);
+    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // The bonded central lost its keys and pairs again: the slot is taken.
+    let central = Central::new(linux_request(true, true), local_rpa());
+    assert_eq!(smp(link, &mut tasks, &central.request, false), [vec![0x05, 0x05]]);
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
+    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::PAIRING_NOT_SUPPORTED));
+    link.disconnect_link(0x16);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Disconnected(0x16));
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[test]
+fn a_rejected_parameter_request_is_not_repeated() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    // Without input report writes, discovery is over after a second of
+    // idle ATT, and the request follows half a second later.
+    link.advance(1000);
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Hold(false)]);
+    assert_eq!(next!(conn), ConnEvent::Ready);
+    link.advance(500);
+    tasks.step();
+    let request = link.deliver();
+    assert_eq!(request, [(Channel::Signalling, vec![0x12, 0x01, 0x08, 0x00, 12, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    // The central refuses: the link keeps its parameters and goes on.
+    link.send(CID_SIGNALLING, &[0x13, 0x01, 0x02, 0x00, 0x01, 0x00], false);
+    tasks.step();
+    link.advance(60_000);
+    tasks.step();
+    assert!(link.deliver().is_empty());
+    assert!(link.calls().is_empty());
+    assert!(poll(pin!(conn.next())).is_pending());
+    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[0; 8]), Ok(()));
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[test]
+fn a_bond_is_reported_only_once_the_central_has_our_identity() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let local = local_rpa();
+    for acknowledged in [false, true] {
+        let mut advertise = pin!(host.advertise(&advertising, &identity));
+        assert!(poll(advertise.as_mut()).is_pending());
+        tasks.step();
+        assert!(poll(advertise.as_mut()).is_pending());
+        link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+        tasks.step();
+        let conn = ready(advertise.as_mut()).unwrap();
+        // BlueZ's default: the central distributes no identity of its own.
+        let mut central = Central::new(linux_request(false, true), local);
+        smp(link, &mut tasks, &central.request, false);
+        let answer = smp(link, &mut tasks, &central.public_key(), false);
+        central.take_public_key(&answer[0]);
+        central.take_confirm(&answer[1]);
+        let random = smp(link, &mut tasks, &central.random(), false);
+        central.take_random(&random[0]);
+        smp(link, &mut tasks, &central.check(), false);
+        link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+        link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+        tasks.step();
+        // Our identity keys are on the air, not yet acknowledged.
+        assert_eq!(link.transmit().len(), 2);
+        assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
+        assert!(poll(pin!(conn.next())).is_pending());
+        if acknowledged {
+            link.ack();
+            tasks.step();
+            let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
+            assert!(bond.peer == Peer::new(CENTRAL_ADDRESS, false));
+        } else {
+            // The link ends first: the central may never have learned our
+            // identity, and nothing is to be stored.
+            link.disconnect_link(0x08);
+            tasks.step();
+            assert_eq!(next!(conn), ConnEvent::Disconnected(0x08));
+        }
+        link.disconnect_link(0x13);
+        tasks.step();
+        link.calls();
+    }
+    assert_eq!(multiplications.get(), 4);
+}
+
+#[test]
+fn a_call_waits_for_a_link_the_run_task_has_not_taken_yet() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let pairing = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    {
+        let mut advertise = pin!(host.advertise(&pairing, &identity));
+        assert!(poll(advertise.as_mut()).is_pending());
+        tasks.step();
+        assert!(poll(advertise.as_mut()).is_pending());
+    }
+    link.calls();
+    // A central connected to the dropped call; the run task has not read
+    // the event when the application asks for reconnection.
+    let epoch = link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    let bond = bond(&identity);
+    let reconnect = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let mut advertise = pin!(host.advertise(&reconnect, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    // The link from the pairing call comes back, and nothing was set up
+    // for the new call under it.
+    let conn = ready(advertise.as_mut()).unwrap();
+    assert_eq!(conn.epoch(), epoch);
+    assert_eq!(link.calls(), [Seen::Hold(true)]);
+    assert_eq!(multiplications.get(), 1);
+}
+
+#[test]
+fn advertising_starts_again_when_a_link_ends_before_the_host_took_it() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 0)));
+    // The link layer stopped advertising for a connection that failed to
+    // be established before the run task read it.
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    link.disconnect_link(0x3E);
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls(), [Seen::Advertise(32, 0)]);
+    // The next central is served.
+    let epoch = link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    tasks.step();
+    assert_eq!(ready(advertise.as_mut()).unwrap().epoch(), epoch);
+    assert_eq!(multiplications.get(), 1);
+}
+
+#[test]
 fn a_central_that_connects_after_the_advertising_call_was_dropped_is_kept() {
     let host = host(Unclaimed::Keep);
     let link = host.port();
@@ -860,10 +1090,17 @@ fn a_central_that_connects_after_the_advertising_call_was_dropped_can_be_ended()
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(true), Seen::Disconnect(0x13)]);
-    // The link is nobody's: the next call waits for its end.
-    assert!(matches!(ready(pin!(host.advertise(&advertising, &identity))), Err(AdvertiseError::Connected)));
-    link.disconnect_link(0x16);
-    tasks.step();
+    // The link is nobody's: the next call waits for its end, then
+    // advertises.
+    {
+        let mut advertise = pin!(host.advertise(&advertising, &identity));
+        assert!(poll(advertise.as_mut()).is_pending());
+        assert!(link.calls().is_empty());
+        link.disconnect_link(0x16);
+        tasks.step();
+        assert!(poll(advertise.as_mut()).is_pending());
+        assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 0)));
+    }
     link.calls();
 
     // The same when the link arrived before the call's future was dropped.
@@ -913,7 +1150,7 @@ fn disconnected_comes_after_every_other_event_of_its_link() {
     // link ends meanwhile.
     link.event(Event::ParamsUpdated { params: ConnectionParams::new(6, 0, 100), status: 0 });
     link.event(Event::ParamsUpdated { params: ConnectionParams::new(12, 30, 600), status: 0 });
-    link.advance(500);
+    link.advance(1000);
     tasks.step();
     link.disconnect_link(0x08);
     tasks.step();

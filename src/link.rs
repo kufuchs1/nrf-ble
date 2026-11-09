@@ -47,9 +47,9 @@
 //! waiting, [`Link::send`] waits for room. [`Link::tx_room`] gives the free
 //! room, [`Link::tx_room_changed`] waits until the link layer took a fragment
 //! from the queue or the central acknowledged some, and [`Link::in_flight`]
-//! counts the fragments of the link
-//! that the central has not acknowledged yet, so the host can keep at most
-//! one notification unacknowledged.
+//! counts the fragments of the link that the central has not acknowledged
+//! yet, so the host can keep at most two fragments in flight and learn when
+//! the central received what it sent.
 //!
 //! # Peripheral latency
 //!
@@ -600,7 +600,8 @@ pub struct Shared {
     rssi:            AtomicI8,
     /// Host state.
     state:           Mutex<CriticalSectionRawMutex, RefCell<HostState>>,
-    /// The link layer took a fragment from the host's queue.
+    /// The link layer took a fragment from the host's queue, or the central
+    /// acknowledged fragments.
     tx_room:         Signal<CriticalSectionRawMutex, ()>,
     /// Something for the connection arrived from the host.
     wakeup:          Signal<CriticalSectionRawMutex, ()>,

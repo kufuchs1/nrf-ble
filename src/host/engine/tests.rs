@@ -125,9 +125,10 @@ fn the_parameter_request_leaves_the_last_place_to_responses() {
     assert_eq!(engine.take_command(0, at(0)), None);
     engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, at(10));
     assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: true }));
-    assert_eq!(engine.next_deadline(), Some(at(510)));
-    engine.on_time(at(510));
-    assert_eq!(engine.take_command(0, at(510)), Some(Command::HoldLatency(false)));
+    // No input report configuration was written: the fallback.
+    assert_eq!(engine.next_deadline(), Some(at(1010)));
+    engine.on_time(at(1010));
+    assert_eq!(engine.take_command(0, at(1010)), Some(Command::HoldLatency(false)));
     assert_eq!(engine.take_event(epoch), Some(ConnEvent::Ready));
     assert_eq!(engine.next_deadline(), Some(at(1510)));
     engine.on_time(at(1510));
@@ -189,12 +190,26 @@ fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity(
     assert_eq!(engine.take_command(0, at(0)), Some(Command::LtkReply { epoch, key: Some(ltk) }));
     engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, at(0));
     // Our identity keys go out, and the bond is made: the central sends
-    // none of its own.
+    // none of its own. It is reported only once the central acknowledged
+    // them, as the kernel stores its bond only when they arrive.
     assert_eq!(drain(&mut engine, 4, at(0)).len(), 2);
     assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: false }));
+    assert_eq!(engine.take_event(epoch), None);
+    assert!(engine.has_output(), "the glue waits for the acknowledgement");
+    assert_eq!(engine.take_command(2, at(0)), None);
+    assert_eq!(engine.take_event(epoch), None);
+    assert_eq!(engine.take_command(0, at(0)), None);
+    assert!(!engine.has_output());
     let Some(ConnEvent::Bonded(bond)) = engine.take_event(epoch) else { panic!("no bond") };
     assert!(bond.peer == peer);
     assert_eq!(bond.peer_irk, None);
     assert_eq!(bond.ltk, ltk);
     assert_eq!(bond.local, identity.variant());
+}
+
+#[test]
+fn the_input_reports_are_the_notifying_hid_reports() {
+    // The keyboard's, the consumer control's and the mouse's
+    // configuration, not the battery's.
+    assert_eq!(input_reports(&spotlight::DB), 0b1110);
 }

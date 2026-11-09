@@ -76,8 +76,8 @@ Nothing has run on hardware or against BlueZ yet.
   check does not depend on when the host learns of the encryption.
 - **Sending:** `try_send` and `send` queue one fragment of up to 27 octets (251 with `data-length`), `tx_room` gives
   the free room, `tx_room_changed` waits until the link layer took a fragment or the central acknowledged some, and
-  `in_flight` counts the fragments the central has not acknowledged, so the host can keep at most one notification
-  unacknowledged.
+  `in_flight` counts the fragments the central has not acknowledged, so the host can keep at most two fragments in
+  flight and learn when the central received what it sent.
 - **Link information:** `Link::info` gives the central's address on the air with its type, its resolved identity
   separately, our own address on the air (the resolvable private address or the identity), the parameters and the
   central's clock accuracy: pairing uses the addresses on the air.

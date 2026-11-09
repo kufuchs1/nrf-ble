@@ -16,10 +16,12 @@
 //! table's own hash ([`Value::Hash`]).
 //!
 //! The Service Changed characteristic (0x2A05) is optional: the Spotlight
-//! table has none. Where it is present, the server sends its indication only
+//! table has none. Where it is present, the server builds its indication only
 //! once that link has written its client characteristic configuration, as
-//! BlueZ registers its handler only then; the engine asks for it only after
-//! the Write Response went out.
+//! BlueZ registers its handler only then. The engine does not send
+//! indications yet: asking for this one only after the Write Response went
+//! out, and timing its confirmation, are still to be done for a table that
+//! has the characteristic.
 //!
 //! Read By Group Type reports the real end handle of the last service, never
 //! 0xFFFF: BlueZ keeps a cached service whose start handle, UUID and number of
@@ -388,6 +390,13 @@ pub struct ValueId(u8);
 pub struct AttError(u8);
 
 /// The application's side of the dynamic values ([`Value::Dynamic`]).
+///
+/// The host calls it from [`crate::host::Host::run`] while it holds its own
+/// state, so an implementation must not call into the host: no
+/// [`crate::host::Conn`] method, no [`crate::host::Battery::update`] and no
+/// other [`crate::host::Host`] method, or the second borrow of the state
+/// panics. It may read and write atomics and signal other tasks, which then
+/// call the host.
 pub trait Handler {
     /// Writes the value `id` into `out` and returns its length, at most
     /// [`DYNAMIC_MAX`].

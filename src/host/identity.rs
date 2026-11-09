@@ -17,11 +17,23 @@
 //! knows the identity of one variant cannot tell that of another from it.
 //!
 //! The variant is a slot number in its low octet and a generation in its high
-//! one. The Spotlight has one slot, 0. A new pairing bumps the generation
-//! ([`Variant::next_generation`]), so the device pairs again under a new
-//! identity and BlueZ, which keeps the old bond under the old address, needs
-//! no `remove` first: it refuses a second Just Works pairing with a device it
-//! has a bond with. The generation wraps after 256 pairings.
+//! one. The Spotlight has one slot, 0. Each time the device enters pairing
+//! mode it takes the next generation ([`Variant::next_generation`]), so it
+//! pairs again under a new identity and BlueZ, which keeps the old bond under
+//! the old address, needs no `remove` first: it refuses a second Just Works
+//! pairing with a device it has a bond with, and it would resolve the
+//! resolvable private address of an old identity, connect and encrypt with
+//! the old key, which the device no longer has.
+//!
+//! So the firmware stores the generation in flash apart from the bond, never
+//! erased with it, and bumps and stores it before it advertises in pairing
+//! mode, not when the pairing bonds. A bond that was cleared or lost, by a
+//! torn write or a power failure before it was stored, then never brings back
+//! a generation BlueZ may hold a bond with; nor does a pairing BlueZ
+//! completed whose bond the device never stored. The bond itself keeps the
+//! variant it was made under ([`crate::host::bond::Bond::local`]), which
+//! reconnection advertises with. The generation wraps after 256 pairing
+//! modes.
 //!
 //! The identity resolving key is kept least significant octet first, the
 //! order the Identity Information PDU carries it in and
@@ -172,7 +184,7 @@ impl Variant {
     #[must_use = "the variant is only built"]
     pub const fn from_bits(bits: u16) -> Self { Self(bits) }
 
-    /// The generation, which each new pairing bumps.
+    /// The generation, which each pairing mode bumps.
     #[inline]
     #[must_use = "the generation is only read"]
     pub const fn generation(self) -> u8 {
@@ -185,8 +197,8 @@ impl Variant {
     #[must_use = "the variant is only built"]
     pub const fn new(slot: u8, generation: u8) -> Self { Self(u16::from_le_bytes([slot, generation])) }
 
-    /// The same slot in the next generation, for a new pairing; after 255
-    /// comes 0.
+    /// The same slot in the next generation, for a new pairing mode; after
+    /// 255 comes 0.
     #[inline]
     #[must_use = "the variant is only built"]
     pub const fn next_generation(self) -> Self { Self::new(self.slot(), self.generation().wrapping_add(1)) }
