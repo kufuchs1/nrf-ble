@@ -11,6 +11,7 @@ use core::future::pending;
 use core::{
     cell::Cell,
     future::{Future, poll_fn},
+    sync::atomic::{AtomicBool, Ordering},
     task::Poll,
 };
 use embassy_futures::select::{Either, select};
@@ -61,6 +62,10 @@ const PPI_GROUP_CALIBRATE: usize = 0;
 const PPI_GROUP_SYNC: usize = 1;
 /// Wakes the calibration when the clock interrupt reports it done.
 static CALIBRATION_DONE: AtomicWaker = AtomicWaker::new();
+/// Whether the firmware paused the calibration ([`pause_calibration`]).
+static CALIBRATION_PAUSED: AtomicBool = AtomicBool::new(false);
+/// Wakes the calibration task when it is paused or resumed.
+static CALIBRATION_STEERED: AtomicWaker = AtomicWaker::new();
 /// Wakes the radio task when the high frequency crystal has started.
 static CRYSTAL_STARTED: AtomicWaker = AtomicWaker::new();
 /// Wakes the calibration task after a die temperature measurement.
@@ -650,7 +655,9 @@ fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_o
 ///
 /// As Nordic specifies it, the temperature is checked every
 /// `CALIBRATION_INTERVAL`, and the oscillator calibrated when it changed by
-/// 0.5 °C, or at the latest every second interval.
+/// 0.5 °C, or at the latest every second interval. [`pause_calibration`]
+/// stops both while the radio idles for long, and [`resume_calibration`]
+/// starts them again with a calibration at once.
 #[inline]
 pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>) -> ! {
     #[cfg(feature = "nrf51")]
@@ -663,6 +670,13 @@ pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>
     let mut calibrated_at = None;
     let mut skipped = 0_u8;
     loop {
+        if CALIBRATION_PAUSED.load(Ordering::Relaxed) {
+            info!("RC calibration paused");
+            calibration_paused(false).await;
+            info!("RC calibration resumed");
+            // The temperature may have changed by any amount meanwhile.
+            calibrated_at = None;
+        }
         let temperature = temperature().await;
         let changed = calibrated_at.is_none_or(|last: i32| last.abs_diff(temperature) >= CALIBRATION_TEMP_CHANGE);
         if changed || skipped >= CALIBRATION_SKIPS_MAX {
@@ -675,8 +689,45 @@ pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>
         } else {
             skipped = skipped.saturating_add(1);
         }
-        Timer::after(CALIBRATION_INTERVAL).await;
+        // A pause ends the wait at once; a calibration under way finishes
+        // first, as the pause is only seen here.
+        select(Timer::after(CALIBRATION_INTERVAL), calibration_paused(true)).await;
     }
+}
+
+/// Waits until the calibration is paused (`paused`) or runs.
+async fn calibration_paused(paused: bool) {
+    poll_fn(|cx| {
+        CALIBRATION_STEERED.register(cx.waker());
+        if CALIBRATION_PAUSED.load(Ordering::Relaxed) == paused { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+}
+
+/// Pauses [`calibrate_rc`] while the radio has no role for a long time.
+///
+/// In a firmware's light sleep, say, it then measures no temperature and
+/// starts no crystal, and with the link layer idle the high frequency
+/// crystal stays off. A calibration under way finishes first. Call
+/// [`resume_calibration`] before advertising again: the link layer counts on
+/// [`RC_PPM`], which an RC oscillator left alone through a temperature change
+/// no longer meets.
+#[inline]
+pub fn pause_calibration() {
+    CALIBRATION_PAUSED.store(true, Ordering::Relaxed);
+    CALIBRATION_STEERED.wake();
+}
+
+/// Ends a [`pause_calibration`].
+///
+/// The task measures the temperature and calibrates at once, whatever the
+/// temperature, within about the crystal's start and the calibration's time
+/// (a few milliseconds), and then as before. Without a pause it changes
+/// nothing.
+#[inline]
+pub fn resume_calibration() {
+    CALIBRATION_PAUSED.store(false, Ordering::Relaxed);
+    CALIBRATION_STEERED.wake();
 }
 
 /// Calibrates the RC oscillator once against the high frequency crystal.

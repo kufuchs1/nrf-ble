@@ -199,7 +199,10 @@ channel capturing the timer at an RTC tick disables itself after the first compa
 (anomaly 179). `clock::calibrate_rc` takes the `TEMP` peripheral and is driven by interrupts only: bind and enable
 `TEMP` to `clock::on_temperature_interrupt` and `CLOCK_POWER` to `clock::on_clock_interrupt`, or it waits forever for
 its first temperature. A calibration whose crystal or end does not come within 100 ms is retried at the next interval.
-Dropping the calibration future releases the crystal. The crystal is shared through a reference count that changes with
+Dropping the calibration future releases the crystal. A firmware whose radio idles for long (a light sleep without
+advertising or a link) calls `clock::pause_calibration`: the task finishes a calibration under way, then measures no
+temperature and starts no crystal, so the crystal stays off; `clock::resume_calibration` before advertising again
+measures and calibrates at once, whatever the temperature, as the RC oscillator may have drifted meanwhile. The crystal is shared through a reference count that changes with
 its start and stop task in one critical section, and a connection event that finds the crystal stopped starts it again
 before it listens.
 
