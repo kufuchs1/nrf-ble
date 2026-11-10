@@ -1078,6 +1078,8 @@ fn pair_with_passkey(io: u8, passkey: u32, passkey_first: bool) -> Bonded {
     };
     assert_eq!(bond.ltk, reversed(&central.ltk));
     assert!(!responder.is_authenticating());
+    // No digit of the passkey stays.
+    assert_eq!(responder.passkey, super::NO_PASSKEY);
     bond
 }
 
@@ -1115,6 +1117,7 @@ fn a_wrong_passkey_fails_with_confirm_value_failed_in_the_round_of_its_bit() {
         assert!(!responder.is_pairing());
         assert!(!responder.has_output());
         assert_eq!(responder.ltk_request(0, [0; 8]), None);
+        assert_eq!(responder.passkey, super::NO_PASSKEY);
     }
 }
 

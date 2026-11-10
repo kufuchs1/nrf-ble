@@ -145,6 +145,11 @@ pub mod toolbox;
 
 use crate::{crypto::wipe, host::Aes, link::Info, pdu::Peer};
 use core::fmt;
+#[cfg(feature = "passkey")]
+use core::{
+    hint::black_box,
+    sync::atomic::{Ordering, compiler_fence},
+};
 use ecc::{KEY_LEN, KeyError, KeyPair, PUBLIC_KEY_LEN, check_public_key};
 use embassy_time::{Duration, Instant};
 use toolbox::{address, f4, f5, f6};
@@ -191,6 +196,9 @@ pub const PASSKEY_MAX: u32 = 999_999;
 /// The rounds of Passkey Entry: one for each of the passkey's 20 bits.
 #[cfg(feature = "passkey")]
 const PASSKEY_ROUNDS: u8 = 20;
+/// No passkey: above [`PASSKEY_MAX`], so never one the user gave.
+#[cfg(feature = "passkey")]
+pub(crate) const NO_PASSKEY: u32 = u32::MAX;
 /// `AuthReq` bit: bonding.
 pub const AUTH_BONDING: u8 = 0x01;
 /// `AuthReq` bit: protection against a man in the middle.
@@ -440,9 +448,10 @@ pub struct Responder {
     pair:           Option<KeyPair>,
     /// Whether a Pairing Request is taken.
     pairable:       bool,
-    /// The passkey of Passkey Entry, once the user gave it.
+    /// The passkey of Passkey Entry, once the user gave it; otherwise
+    /// [`NO_PASSKEY`], which overwrites all of its digits.
     #[cfg(feature = "passkey")]
-    passkey:        Option<u32>,
+    passkey:        u32,
     /// The central's confirm value of the round of Passkey Entry, most
     /// significant octet first.
     #[cfg(feature = "passkey")]
@@ -687,7 +696,7 @@ impl Responder {
     #[inline]
     #[must_use = "the state is only read"]
     pub const fn awaits_passkey(&self) -> bool {
-        self.authenticating && self.passkey.is_none() && matches!(self.state, State::Confirm(0) | State::Input)
+        self.authenticating && self.passkey == NO_PASSKEY && matches!(self.state, State::Confirm(0) | State::Input)
     }
 
     /// Starts on a new link, with the addresses on the air of
@@ -769,7 +778,7 @@ impl Responder {
         #[cfg(feature = "passkey")]
         {
             self.authenticating = false;
-            self.passkey = None;
+            forget(&mut self.passkey, NO_PASSKEY);
             wipe(&mut self.peer_confirm);
         }
     }
@@ -968,7 +977,7 @@ impl Responder {
             pair: None,
             pairable: false,
             #[cfg(feature = "passkey")]
-            passkey: None,
+            passkey: NO_PASSKEY,
             #[cfg(feature = "passkey")]
             peer_confirm: [0; 16],
             peer_identity: None,
@@ -1050,12 +1059,12 @@ impl Responder {
         }
         self.peer_confirm =
             reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
-        if self.passkey.is_some() {
-            self.send_confirm(crypto, round);
-        } else {
+        if self.passkey == NO_PASSKEY {
             // The user has the time of the timer from now.
             self.state = State::Input;
             self.deadline = Some(now.checked_add(TIMEOUT).unwrap_or(Instant::MAX));
+        } else {
+            self.send_confirm(crypto, round);
         }
         Ok(None)
     }
@@ -1154,7 +1163,7 @@ impl Responder {
         if value > PASSKEY_MAX {
             return Err(PasskeyError::Invalid);
         }
-        self.passkey = Some(value);
+        self.passkey = value;
         self.deadline = Some(now.checked_add(TIMEOUT).unwrap_or(Instant::MAX));
         if self.state == State::Input {
             self.send_confirm(crypto, 0);
@@ -1166,7 +1175,8 @@ impl Responder {
     /// of the round, the least significant in round 0.
     #[cfg(feature = "passkey")]
     fn passkey_bit(&self, round: u8) -> u8 {
-        let bit = self.passkey.unwrap_or_default().checked_shr(u32::from(round)).unwrap_or_default() & 1;
+        let passkey = if self.passkey == NO_PASSKEY { 0 } else { self.passkey };
+        let bit = passkey.checked_shr(u32::from(round)).unwrap_or_default() & 1;
         0x80 | u8::from(bit != 0)
     }
 
@@ -1208,7 +1218,7 @@ impl Responder {
             self.deadline = Some(now.checked_add(TIMEOUT).unwrap_or(Instant::MAX));
         }
         #[cfg(feature = "passkey")]
-        if self.state == State::Confirm(0) && self.passkey.is_none() {
+        if self.state == State::Confirm(0) && self.passkey == NO_PASSKEY {
             // Both sides may wait for their users: the timer runs again
             // from the central's first confirm value or the passkey.
             self.deadline = None;
@@ -1258,10 +1268,10 @@ impl Responder {
     const fn r_value(&self) -> [u8; 16] {
         let mut value = R_ZERO;
         if self.authenticating
-            && let Some(passkey) = self.passkey
+            && self.passkey != NO_PASSKEY
             && let Some(low) = value.last_chunk_mut::<4>()
         {
-            *low = passkey.to_be_bytes();
+            *low = self.passkey.to_be_bytes();
         }
         value
     }
@@ -1388,17 +1398,24 @@ impl Responder {
         #[cfg(not(feature = "passkey"))]
         let (r_value, io_cap_b) = (&R_ZERO, IO_CAP_B);
         #[cfg(feature = "passkey")]
-        let (r_value, io_cap_b) = (&self.r_value(), [self.security.auth_req(), 0, self.security.io_capability.code()]);
+        let (mut r_passkey, io_cap_b) =
+            (self.r_value(), [self.security.auth_req(), 0, self.security.io_capability.code()]);
+        #[cfg(feature = "passkey")]
+        let r_value = &r_passkey;
         let (mut mac_key, mut ltk) = f5(aes, &self.dh_key, (&self.na, &self.nb), (&addr_a, &addr_b));
         wipe(&mut self.dh_key);
         let expected = f6(aes, &mac_key, (&self.na, &self.nb), r_value, self.io_cap, (&addr_a, &addr_b));
         if !same(&expected, &self.check) {
             wipe(&mut mac_key);
             wipe(&mut ltk);
+            #[cfg(feature = "passkey")]
+            wipe(&mut r_passkey);
             return Err(Reason::DHKEY_CHECK_FAILED);
         }
         self.check = f6(aes, &mac_key, (&self.nb, &self.na), r_value, io_cap_b, (&addr_b, &addr_a));
         wipe(&mut mac_key);
+        #[cfg(feature = "passkey")]
+        wipe(&mut r_passkey);
         self.ltk = reversed(&ltk);
         wipe(&mut ltk);
         self.pending |= OUT_CHECK;
@@ -1468,6 +1485,17 @@ fn flip_coordinates(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] {
         coordinate.reverse();
     }
     out
+}
+
+/// Overwrites a passkey with `blank`, out of the range of passkeys, once it
+/// is no longer needed, so its digits do not outlive their use in RAM, as
+/// [`wipe`] does with key material.
+#[cfg(feature = "passkey")]
+pub(crate) fn forget(passkey: &mut u32, blank: u32) {
+    *passkey = blank;
+    // Keeps the compiler from dropping the store.
+    black_box(passkey);
+    compiler_fence(Ordering::SeqCst);
 }
 
 /// `value` in the other byte order.

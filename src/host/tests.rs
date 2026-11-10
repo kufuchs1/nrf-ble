@@ -1610,6 +1610,62 @@ fn a_reconnection_is_authenticated_only_with_an_authenticated_bond() {
 
 #[cfg(feature = "passkey")]
 #[test]
+fn a_just_works_key_stays_unauthenticated_when_a_passkey_pairing_starts_on_its_link() {
+    use super::{
+        gatt::Sec,
+        smp::{IoCapability, Security, tests::request_with_io},
+    };
+    // Passkey Entry where the central can take part, Just Works otherwise.
+    let config = Config::new(Some(example::PARAMS), Unclaimed::Keep)
+        .with_security(Security::new(IoCapability::KeyboardOnly, false));
+    let host = Host::new(MockLink::new(), &keyboard::DB, config);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    let local = local_rpa();
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // A central without input or output: Just Works.
+    let mut central = Central::new(request_with_io(0x03), local);
+    central.io_cap_b = [0x0D, 0x00, 0x02];
+    assert_eq!(smp(link, &mut tasks, &central.request, false), [vec![0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]]);
+    let answer = smp(link, &mut tasks, &central.public_key(), false);
+    assert_eq!(answer.len(), 2);
+    central.take_public_key(&answer[0]);
+    central.take_confirm(&answer[1]);
+    let random = smp(link, &mut tasks, &central.random(), false);
+    central.take_random(&random[0]);
+    let check = central.check();
+    assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    link.calls();
+    assert_eq!(link.deliver().len(), 2);
+    assert_eq!(conn.security(), Some(Sec::Encrypted));
+    // In place of its identity keys, a Pairing Request, which fails the
+    // pairing under way; then one claiming a display, which starts Passkey
+    // Entry on the link still encrypted with the Just Works key.
+    let display = Central::new(request_with_io(0x04), local);
+    assert_eq!(smp(link, &mut tasks, &display.request, true), [vec![0x05, 0x08]]);
+    assert_eq!(smp(link, &mut tasks, &display.request, true), [vec![0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]]);
+    // The key of the link is still that of Just Works.
+    assert_eq!(conn.security(), Some(Sec::Encrypted));
+    assert_eq!(request(link, &mut tasks, &[0x0A, 0x03, 0x00]), [0x01, 0x0A, 0x03, 0x00, 0x05]);
+    // The failed pairing ends the link; no report goes out meanwhile.
+    assert!(conn.try_notify(keyboard::KEYS, &[0; 8]).is_err());
+    assert!(multiplications.get() >= 1);
+}
+
+#[cfg(feature = "passkey")]
+#[test]
 #[should_panic(expected = "authenticated attributes")]
 fn a_table_with_authenticated_attributes_needs_passkey_entry() {
     let _host = Host::new(MockLink::new(), &keyboard::DB, Config::new(None, Unclaimed::Keep));

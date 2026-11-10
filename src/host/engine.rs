@@ -176,6 +176,10 @@ const EV_KEY_MISSING: Flags = 0x100;
 const EV_PASSKEY: Flags = 0x200;
 /// The characteristic UUID of a HID report.
 const REPORT: u16 = 0x2A4D;
+/// What the user typed for Passkey Entry when they gave up: out of the
+/// range of passkeys, as [`smp::NO_PASSKEY`] is.
+#[cfg(feature = "passkey")]
+const REFUSED: u32 = smp::NO_PASSKEY - 1;
 
 /// The events waiting, one `EV_` bit each: eight fit without the optional
 /// events.
@@ -252,10 +256,11 @@ pub struct Engine {
     events:        Events,
     /// The link, while one exists.
     link:          Option<LinkState>,
-    /// The passkey the application gave, until the run task hands it to
-    /// the security manager.
+    /// The passkey the application gave, or [`REFUSED`], until the run task
+    /// hands it to the security manager; otherwise [`smp::NO_PASSKEY`],
+    /// which overwrites all of its digits.
     #[cfg(feature = "passkey")]
-    passkey_input: Option<Typed>,
+    passkey_input: u32,
     /// The ATT response waiting to be sent.
     response:      Option<Slot>,
     /// The reassembly of received fragments.
@@ -378,6 +383,11 @@ enum Key {
     Bond,
     /// The pairing's under way.
     Pairing,
+    /// The pairing's under way, which is Passkey Entry: recorded when the
+    /// key went to the link layer, so a later Pairing Request on the link
+    /// cannot change it.
+    #[cfg(feature = "passkey")]
+    Passkey,
 }
 
 /// The state of the link.
@@ -449,16 +459,6 @@ enum Source {
     Request,
     /// The security manager.
     Smp,
-}
-
-/// What the user typed for Passkey Entry.
-#[cfg(feature = "passkey")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Typed {
-    /// The passkey.
-    Passkey(u32),
-    /// Nothing: the user gave up.
-    Refused,
 }
 
 /// What happens to a link that arrives while no advertising call waits for
@@ -589,14 +589,14 @@ impl Engine {
     }
 
     /// Whether the link is encrypted with a key of authenticated pairing:
-    /// the pairing's under way, if it is Passkey Entry, or the bond's, if
-    /// its pairing was.
+    /// that of a Passkey Entry pairing, as it was when the key went to the
+    /// link layer, or the bond's, if its pairing was.
     #[cfg(feature = "passkey")]
     fn authenticated(&self) -> bool {
         match self.link.as_ref().and_then(|link| link.key) {
             Some(Key::Bond) => self.bond.as_ref().is_some_and(|bond| bond.authenticated),
-            Some(Key::Pairing) => self.smp.is_authenticating(),
-            None => false,
+            Some(Key::Passkey) => true,
+            Some(Key::Pairing) | None => false,
         }
     }
 
@@ -680,7 +680,7 @@ impl Engine {
         self.sig_reply = None;
         self.sig_req = None;
         #[cfg(feature = "passkey")]
-        self.passkey_input.take();
+        smp::forget(&mut self.passkey_input, smp::NO_PASSKEY);
         self.commands.disconnect = None;
         if let Some(entry) = self.commands.ltk.as_mut()
             && let Some(key) = entry.1.as_mut()
@@ -751,13 +751,13 @@ impl Engine {
             .as_ref()
             .filter(|link| link.info.epoch == epoch && !link.closing && link.ending.is_none())
             .ok_or(smp::PasskeyError::Gone)?;
-        if self.passkey_input.is_some() || !self.smp.awaits_passkey() {
+        if self.passkey_input != smp::NO_PASSKEY || !self.smp.awaits_passkey() {
             return Err(smp::PasskeyError::NotWaiting);
         }
         if passkey.is_some_and(|value| value > smp::PASSKEY_MAX) {
             return Err(smp::PasskeyError::Invalid);
         }
-        self.passkey_input = Some(passkey.map_or(Typed::Refused, Typed::Passkey));
+        self.passkey_input = passkey.unwrap_or(REFUSED);
         Ok(())
     }
 
@@ -892,7 +892,14 @@ impl Engine {
 
     /// Answers the link layer's long term key request.
     fn ltk_request(&mut self, ediv: u16, rand: [u8; 8]) {
+        #[cfg(not(feature = "passkey"))]
         let pairing = self.smp.ltk_request(ediv, rand).map(|key| (key, Key::Pairing));
+        // Passkey Entry or not, as it is now: a later Pairing Request on the
+        // link cannot change it.
+        #[cfg(feature = "passkey")]
+        let kind = if self.smp.is_authenticating() { Key::Passkey } else { Key::Pairing };
+        #[cfg(feature = "passkey")]
+        let pairing = self.smp.ltk_request(ediv, rand).map(|key| (key, kind));
         let answer = pairing.or_else(|| self.bond_key(ediv, rand).map(|key| (key, Key::Bond)));
         let Some(link) = self.link.as_mut() else { return };
         link.key = answer.map(|(_, source)| source);
@@ -923,7 +930,7 @@ impl Engine {
             },
             link: None,
             #[cfg(feature = "passkey")]
-            passkey_input: None,
+            passkey_input: smp::NO_PASSKEY,
             response: None,
             rx: Reassembly::new(),
             security: Duration::MAX,
@@ -1263,7 +1270,10 @@ impl Engine {
     }
 
     /// The security of the link `epoch`: encrypted once it is with a key the
-    /// host gave, `None` without the link.
+    /// host gave, `None` without the link. With the feature `passkey`,
+    /// [`Sec::Authenticated`] when that key is the one of a Passkey Entry
+    /// pairing, or of a bond whose `authenticated` is set; a reconnection
+    /// with an unauthenticated bond stays encrypted.
     #[inline]
     #[must_use = "the security is only read"]
     pub fn security(&self, epoch: Epoch) -> Option<Sec> {
@@ -1402,11 +1412,12 @@ impl Engine {
     where
         C: Aes + Random,
     {
-        let Some(typed) = self.passkey_input.take() else { return };
-        let passkey = match typed {
-            Typed::Passkey(passkey) => Some(passkey),
-            Typed::Refused => None,
-        };
+        let typed = self.passkey_input;
+        if typed == smp::NO_PASSKEY {
+            return;
+        }
+        smp::forget(&mut self.passkey_input, smp::NO_PASSKEY);
+        let passkey = (typed != REFUSED).then_some(typed);
         let outcome = self.smp.passkey(crypto, passkey, now).unwrap_or_default();
         self.outcome(outcome, now);
     }
