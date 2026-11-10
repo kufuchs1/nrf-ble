@@ -338,9 +338,12 @@ described in [Optional features](#optional-features); they work on both chips.
 
 The crate follows the main branch of every dependency (the default branch, master, where a repository has none), and
 commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
-`Cargo.lock` keeps them until `cargo update`. Its requirements only name the major version the code is written for; the
-`[patch.crates-io]` section of [`Cargo.toml`](Cargo.toml) takes each crate from its branch, so that the crates the
-dependencies pull from crates.io resolve to that same copy. Patches apply only to the workspace being built, so a
+`Cargo.lock` keeps them until `cargo update`. Its own dependencies name their git source and branch, not a version: with
+only a version requirement Cargo can quietly fall back to an older crates.io release when a main branch drops a feature
+that is asked for (Embassy main removed embassy-nrf's `gpiote` feature, and a firmware asking for it got embassy-nrf
+0.10 from crates.io beside nrf-ble's 0.11 from git); a git source fails loudly instead. The `[patch.crates-io]` section
+of [`Cargo.toml`](Cargo.toml) takes each crate from its branch, so that the crates the dependencies pull from crates.io
+resolve to that same copy. Patches apply only to the workspace being built, so a
 firmware repeats them in its own `Cargo.toml`. Two crates come from the revision Embassy's main branch names, as Cargo
 cannot patch a Git dependency with another branch of the same repository: `nrf-pac` and `unitrait`, both at the head of
 their main branch when this was written.

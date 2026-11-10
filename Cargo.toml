@@ -40,36 +40,38 @@ key-missing = []
 passkey = []
 
 # Every dependency follows the main branch of its repository (the default
-# branch where it has no main), through the patches at the end: the
-# requirements here only name the major version the code is written for, and
-# no Cargo.lock is committed: a fresh checkout resolves the latest commits of
+# branch where it has no main): the crate's own dependencies name their git
+# source (a version requirement alone would let Cargo fall back to an older
+# crates.io release when a branch drops a requested feature), the patches at
+# the end take what the dependencies pull from crates.io from the same
+# branches, and no Cargo.lock is committed: a fresh checkout resolves the latest commits of
 # the branches, and the local, ignored Cargo.lock keeps them until
 # `cargo update`.
 [dependencies]
-cortex-m = "0"
-defmt = { version = "1", optional = true }
-embassy-futures = "0"
-embassy-nrf = { version = "0", features = ["unstable-pac"] }
-embassy-sync = "0"
-embassy-time = "0"
+cortex-m = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
+defmt = { git = "https://github.com/knurling-rs/defmt", branch = "main", version = "1", optional = true }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["unstable-pac"] }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 # P-256 for LE Secure Connections pairing: field and point arithmetic only,
 # with a scalar multiplication loop of our own (src/host/smp/ecc.rs).
-p256 = { version = "0", default-features = false, features = ["arithmetic"] }
+p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master", default-features = false, features = ["arithmetic"] }
 
 [dev-dependencies]
 # Software AES for the host tests, in place of the hardware ECB.
-aes = "0"
+aes = { git = "https://github.com/RustCrypto/block-ciphers", branch = "master" }
 # The Diffie-Hellman of the p256 crate, to check our own scalar
 # multiplication against in the host tests.
-p256 = { version = "0", default-features = false, features = ["arithmetic", "ecdh"] }
+p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master", default-features = false, features = ["arithmetic", "ecdh"] }
 # The RTC time driver only provides the time symbols for the host tests; no
 # test starts it. The chip comes from the chip feature: features unify, and
 # naming one here would build both chips for the other.
-embassy-nrf = { version = "0", features = ["time", "time-driver-rtc1", "unstable-pac"] }
-embassy-time = { version = "0", features = ["tick-hz-32_768"] }
+embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["time", "time-driver-rtc1", "unstable-pac"] }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["tick-hz-32_768"] }
 
 [target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
-critical-section = { version = "1", features = ["std"] }
+critical-section = { git = "https://github.com/rust-embedded/critical-section", branch = "main", features = ["std"] }
 
 # Standalone: not a member of the workspace of a firmware that uses it.
 [workspace]
