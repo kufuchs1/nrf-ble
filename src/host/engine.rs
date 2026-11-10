@@ -171,15 +171,18 @@ const EV_PARAMS_REJECTED: Flags = 0x80;
 /// Event flag: the bonded central asked for a key the host does not have.
 #[cfg(feature = "key-missing")]
 const EV_KEY_MISSING: Flags = 0x100;
+/// Event flag: Passkey Entry asks for the passkey.
+#[cfg(feature = "passkey")]
+const EV_PASSKEY: Flags = 0x200;
 /// The characteristic UUID of a HID report.
 const REPORT: u16 = 0x2A4D;
 
 /// The events waiting, one `EV_` bit each: eight fit without the optional
 /// events.
-#[cfg(not(feature = "key-missing"))]
+#[cfg(not(any(feature = "key-missing", feature = "passkey")))]
 type Flags = u8;
 /// The events waiting, one `EV_` bit each.
-#[cfg(feature = "key-missing")]
+#[cfg(any(feature = "key-missing", feature = "passkey"))]
 type Flags = u16;
 
 /// A call of the link layer the engine asks for.
@@ -223,6 +226,10 @@ pub struct Config {
     /// The connection parameters to ask for once ATT is idle, `None` to keep
     /// the central's.
     pub params:    Option<ParamRange>,
+    /// What pairing protects against: Just Works by default, Passkey Entry
+    /// as a keyboard with [`Self::with_security`].
+    #[cfg(feature = "passkey")]
+    pub security:  smp::Security,
     /// What happens to a link that arrives while no advertising call waits.
     pub unclaimed: Unclaimed,
 }
@@ -231,40 +238,44 @@ pub struct Config {
 #[non_exhaustive]
 pub struct Engine {
     /// The attribute server of the link.
-    att:       Server,
+    att:           Server,
     /// The bond: the one the advertising was set up with, or the one the
     /// pairing on the link made.
-    bond:      Option<Bond>,
+    bond:          Option<Bond>,
     /// The calls of the link layer that wait.
-    commands:  Commands,
+    commands:      Commands,
     /// What the engine does.
-    config:    Config,
+    config:        Config,
     /// The table.
-    db:        &'static Db,
+    db:            &'static Db,
     /// The events for the application.
-    events:    Events,
+    events:        Events,
     /// The link, while one exists.
-    link:      Option<LinkState>,
+    link:          Option<LinkState>,
+    /// The passkey the application gave, until the run task hands it to
+    /// the security manager.
+    #[cfg(feature = "passkey")]
+    passkey_input: Option<Typed>,
     /// The ATT response waiting to be sent.
-    response:  Option<Slot>,
+    response:      Option<Slot>,
     /// The reassembly of received fragments.
-    rx:        Reassembly,
+    rx:            Reassembly,
     /// Time from a connection until it has to be encrypted.
-    security:  Duration,
+    security:      Duration,
     /// The PDU being sent, with its fragments so far.
-    sending:   Option<(Source, Segmenter)>,
+    sending:       Option<(Source, Segmenter)>,
     /// Our signalling reply waiting to be sent.
-    sig_reply: Option<signal::Command>,
+    sig_reply:     Option<signal::Command>,
     /// Our connection parameter request waiting to be sent.
-    sig_req:   Option<signal::Command>,
+    sig_req:       Option<signal::Command>,
     /// The signalling channel.
-    signal:    Signalling,
+    signal:        Signalling,
     /// The security manager.
-    smp:       Responder,
+    smp:           Responder,
     /// The variant of our identity the advertising was set up with.
-    variant:   Variant,
+    variant:       Variant,
     /// Whether an advertising call waits for a link.
-    waiting:   bool,
+    waiting:       bool,
 }
 
 /// The events for the application, of the link that last connected.
@@ -316,10 +327,12 @@ pub enum ConnEvent {
     KeyMissing,
     /// A pairing failed, with the reason; the link ends.
     PairingFailed(Reason),
-    /// The central rejected a connection parameter request, the engine's
-    /// own ([`Config::params`]) or one of
-    /// [`crate::host::Conn::request_params`]: with a Connection Parameter
-    /// Update Response that refuses it, or a Command Reject. An accepted
+    /// The central rejected a connection parameter request.
+    ///
+    /// The request was the engine's own ([`Config::params`]) or one of
+    /// [`crate::host::Conn::request_params`], and the central answered with
+    /// a Connection Parameter Update Response that refuses it, or a Command
+    /// Reject. An accepted
     /// request has no event of its own: [`Self::ParamsUpdated`] follows once
     /// the central updated the link. A request the central never answers
     /// gives neither; after [`SIGNALLING_TIMEOUT`] the next one may go out.
@@ -327,6 +340,14 @@ pub enum ConnEvent {
     ParamsRejected,
     /// The connection parameters changed to these.
     ParamsUpdated(ConnectionParams),
+    /// Passkey Entry asks for the passkey the central displays.
+    ///
+    /// The user types it on the device; give it with
+    /// [`crate::host::Conn::enter_passkey`], or `None` to refuse. It comes
+    /// first among the link's events; [`Self::PairingFailed`] or the end of
+    /// the link ends the entry.
+    #[cfg(feature = "passkey")]
+    PasskeyRequested,
     /// Discovery is over: the link is encrypted, the central has our
     /// response to its last input report configuration write, and ATT has
     /// been idle for [`INPUTS_IDLE`] since (or, without such a write, for
@@ -430,6 +451,16 @@ enum Source {
     Smp,
 }
 
+/// What the user typed for Passkey Entry.
+#[cfg(feature = "passkey")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Typed {
+    /// The passkey.
+    Passkey(u32),
+    /// Nothing: the user gave up.
+    Refused,
+}
+
 /// What happens to a link that arrives while no advertising call waits for
 /// one, because the call's future was dropped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -483,7 +514,22 @@ impl Config {
     /// for as `unclaimed` says.
     #[inline]
     #[must_use = "the configuration is only built"]
-    pub const fn new(params: Option<ParamRange>, unclaimed: Unclaimed) -> Self { Self { params, unclaimed } }
+    pub const fn new(params: Option<ParamRange>, unclaimed: Unclaimed) -> Self {
+        Self {
+            params,
+            #[cfg(feature = "passkey")]
+            security: smp::Security::JUST_WORKS,
+            unclaimed,
+        }
+    }
+
+    /// This configuration, pairing with `security`: for a keyboard,
+    /// `Security::new(IoCapability::KeyboardOnly, true)`, Passkey Entry
+    /// only.
+    #[cfg(feature = "passkey")]
+    #[inline]
+    #[must_use = "the configuration is only built"]
+    pub const fn with_security(self, security: smp::Security) -> Self { Self { security, ..self } }
 }
 
 impl Engine {
@@ -517,6 +563,9 @@ impl Engine {
             link.security = None;
             self.restore();
         }
+        #[cfg(feature = "passkey")]
+        #[expect(clippy::shadow_reuse, reason = "the same level, raised for a key of authenticated pairing")]
+        let level = self.raised(level);
         let mut out = [0_u8; MTU];
         if let Some(len) = self.att.handle(pdu, level, app, &mut out) {
             if self.response.is_none() {
@@ -536,6 +585,18 @@ impl Engine {
         }
         if matches!(pdu.first(), Some(&(WRITE_REQUEST | WRITE_COMMAND))) {
             self.update_bond();
+        }
+    }
+
+    /// Whether the link is encrypted with a key of authenticated pairing:
+    /// the pairing's under way, if it is Passkey Entry, or the bond's, if
+    /// its pairing was.
+    #[cfg(feature = "passkey")]
+    fn authenticated(&self) -> bool {
+        match self.link.as_ref().and_then(|link| link.key) {
+            Some(Key::Bond) => self.bond.as_ref().is_some_and(|bond| bond.authenticated),
+            Some(Key::Pairing) => self.smp.is_authenticating(),
+            None => false,
         }
     }
 
@@ -618,6 +679,8 @@ impl Engine {
         self.sending = None;
         self.sig_reply = None;
         self.sig_req = None;
+        #[cfg(feature = "passkey")]
+        self.passkey_input.take();
         self.commands.disconnect = None;
         if let Some(entry) = self.commands.ltk.as_mut()
             && let Some(key) = entry.1.as_mut()
@@ -667,6 +730,35 @@ impl Engine {
             self.events.changed = true;
         }
         self.outcome(outcome, now);
+    }
+
+    /// Takes the passkey the user typed for the pairing on the link `epoch`.
+    ///
+    /// `None` means the user gave up, which fails the pairing with Passkey
+    /// Entry Failed (0x01). The security manager gets it from
+    /// [`Self::take_passkey`].
+    ///
+    /// # Errors
+    ///
+    /// [`smp::PasskeyError::Gone`] without the link,
+    /// [`smp::PasskeyError::NotWaiting`] unless the pairing waits for the
+    /// passkey and has none yet, [`smp::PasskeyError::Invalid`] above
+    /// [`smp::PASSKEY_MAX`].
+    #[cfg(feature = "passkey")]
+    #[inline]
+    pub fn enter_passkey(&mut self, epoch: Epoch, passkey: Option<u32>) -> Result<(), smp::PasskeyError> {
+        self.link
+            .as_ref()
+            .filter(|link| link.info.epoch == epoch && !link.closing && link.ending.is_none())
+            .ok_or(smp::PasskeyError::Gone)?;
+        if self.passkey_input.is_some() || !self.smp.awaits_passkey() {
+            return Err(smp::PasskeyError::NotWaiting);
+        }
+        if passkey.is_some_and(|value| value > smp::PASSKEY_MAX) {
+            return Err(smp::PasskeyError::Invalid);
+        }
+        self.passkey_input = Some(passkey.map_or(Typed::Refused, Typed::Passkey));
+        Ok(())
     }
 
     /// The link, if one exists.
@@ -830,6 +922,8 @@ impl Engine {
                 reason:  Reason::UNSPECIFIED,
             },
             link: None,
+            #[cfg(feature = "passkey")]
+            passkey_input: None,
             response: None,
             rx: Reassembly::new(),
             security: Duration::MAX,
@@ -837,7 +931,10 @@ impl Engine {
             signal: Signalling::new(),
             sig_reply: None,
             sig_req: None,
+            #[cfg(not(feature = "passkey"))]
             smp: Responder::new(),
+            #[cfg(feature = "passkey")]
+            smp: Responder::with_security(config.security),
             variant: Variant::new(0, 0),
             waiting: false,
         }
@@ -905,6 +1002,9 @@ impl Engine {
             .filter(|link| link.info.epoch == epoch && !link.closing && link.ending.is_none())
             .ok_or(NotifyError::Disconnected)?;
         let level = if link.encrypted { Sec::Encrypted } else { Sec::Open };
+        #[cfg(feature = "passkey")]
+        #[expect(clippy::shadow_reuse, reason = "the same level, raised for a key of authenticated pairing")]
+        let level = self.raised(level);
         let mut out = [0_u8; MTU];
         let len = self.att.notify(characteristic, data, level, &mut out).map_err(NotifyError::from)?;
         if self.sending.is_some_and(|(_, segmenter)| segmenter.is_mid_pdu()) {
@@ -1046,6 +1146,11 @@ impl Engine {
                 };
                 let mut bond = Bond::new(peer, irk, bonded.ltk, self.variant, self.db);
                 bond.cccd = self.att.subscriptions().bits();
+                #[cfg(feature = "passkey")]
+                #[expect(clippy::semicolon_outside_block, reason = "a statement of the feature alone")]
+                {
+                    bond.authenticated = bonded.authenticated;
+                }
                 wipe(&mut bonded.ltk);
                 if let Some(identity) = bonded.identity.as_mut() {
                     wipe(&mut identity.irk);
@@ -1065,6 +1170,11 @@ impl Engine {
                 } else {
                     link.failing = true;
                 }
+            },
+            #[cfg(feature = "passkey")]
+            Outcome::PasskeyRequested => {
+                info!("pairing: the passkey is asked for");
+                self.events.flags |= EV_PASSKEY;
             },
             Outcome::Started => info!("pairing"),
             Outcome::TimedOut => {
@@ -1100,6 +1210,13 @@ impl Engine {
         payload.bytes.get_mut(..len)?.copy_from_slice(bytes.get(..len)?);
         payload.len = len;
         Some(payload)
+    }
+
+    /// `level`, raised to authenticated if the key of the link is one of
+    /// authenticated pairing.
+    #[cfg(feature = "passkey")]
+    fn raised(&self, level: Sec) -> Sec {
+        if level == Sec::Encrypted && self.authenticated() { Sec::Authenticated } else { level }
     }
 
     /// Asks the central of the link `epoch` for the connection parameters
@@ -1151,7 +1268,11 @@ impl Engine {
     #[must_use = "the security is only read"]
     pub fn security(&self, epoch: Epoch) -> Option<Sec> {
         let link = self.link.as_ref().filter(|link| link.info.epoch == epoch)?;
-        Some(if link.encrypted { Sec::Encrypted } else { Sec::Open })
+        let level = if link.encrypted { Sec::Encrypted } else { Sec::Open };
+        #[cfg(feature = "passkey")]
+        #[expect(clippy::shadow_reuse, reason = "the same level, raised for a key of authenticated pairing")]
+        let level = self.raised(level);
+        Some(level)
     }
 
     /// Notes that no advertising call waits for a link any more: the call
@@ -1217,6 +1338,8 @@ impl Engine {
         if self.events.epoch == Some(epoch) {
             let flags = &mut self.events.flags;
             for flag in [
+                #[cfg(feature = "passkey")]
+                EV_PASSKEY,
                 EV_PAIRING_FAILED,
                 #[cfg(feature = "key-missing")]
                 EV_KEY_MISSING,
@@ -1244,6 +1367,8 @@ impl Engine {
                     EV_BONDED => self.bond.clone().map(ConnEvent::Bonded),
                     EV_BOND_UPDATED => self.bond.clone().map(ConnEvent::BondUpdated),
                     EV_PARAMS => Some(ConnEvent::ParamsUpdated(self.events.params)),
+                    #[cfg(feature = "passkey")]
+                    EV_PASSKEY => Some(ConnEvent::PasskeyRequested),
                     #[cfg(feature = "param-requests")]
                     EV_PARAMS_REJECTED => Some(ConnEvent::ParamsRejected),
                     _ => Some(ConnEvent::Ready),
@@ -1267,6 +1392,24 @@ impl Engine {
     /// The next job for the crypto task, if one waits.
     #[inline]
     pub fn take_job(&mut self) -> Option<Job> { self.smp.take_job() }
+
+    /// Hands the passkey of [`Self::enter_passkey`] to the security manager,
+    /// with `crypto` for its confirm value, at `now`. A passkey whose
+    /// pairing ended meanwhile is dropped.
+    #[cfg(feature = "passkey")]
+    #[inline]
+    pub fn take_passkey<C>(&mut self, crypto: &mut C, now: Instant)
+    where
+        C: Aes + Random,
+    {
+        let Some(typed) = self.passkey_input.take() else { return };
+        let passkey = match typed {
+            Typed::Passkey(passkey) => Some(passkey),
+            Typed::Refused => None,
+        };
+        let outcome = self.smp.passkey(crypto, passkey, now).unwrap_or_default();
+        self.outcome(outcome, now);
+    }
 
     /// Puts the live subscriptions into the bond, if the link is encrypted
     /// with its key and they changed. A bond not yet reported carries them
@@ -1301,6 +1444,8 @@ impl fmt::Debug for ConnEvent {
             #[cfg(feature = "param-requests")]
             Self::ParamsRejected => formatter.write_str("ParamsRejected"),
             Self::ParamsUpdated(params) => formatter.debug_tuple("ParamsUpdated").field(&params).finish(),
+            #[cfg(feature = "passkey")]
+            Self::PasskeyRequested => formatter.write_str("PasskeyRequested"),
             Self::Ready => formatter.write_str("Ready"),
         }
     }

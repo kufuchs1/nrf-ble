@@ -92,14 +92,23 @@
 //! const CCCDS: u8 = DB.cccds();
 //! ```
 //!
-//! Nor does a table with an attribute that needs authentication
-//! (`authenticated`): the host pairs with Just Works only, so no link ever
-//! has it, and BlueZ, answered Insufficient Authentication, would pair again
-//! with protection against a man in the middle required, which fails (see
-//! [`Db::new`]):
+//! Nor does a host whose table has an attribute that needs authentication
+//! (`authenticated`) unless it pairs with Passkey Entry: without the feature
+//! `passkey` the table itself is refused, as no link ever has it, and BlueZ,
+//! answered Insufficient Authentication, would pair again with protection
+//! against a man in the middle required, which fails (see [`Db::new`]); with
+//! it, a host whose configuration pairs with Just Works only is refused
+//! (`Host::new`):
 //!
 //! ```compile_fail
-//! use nrf_ble::host::gatt::Value;
+//! use nrf_ble::{
+//!     host::{
+//!         Host,
+//!         engine::{Config, Unclaimed},
+//!         gatt::Value,
+//!     },
+//!     link::{Link, Shared},
+//! };
 //!
 //! nrf_ble::gatt! {
 //!     const DB;
@@ -108,7 +117,9 @@
 //!     }
 //! }
 //!
-//! const CCCDS: u8 = DB.cccds();
+//! static SHARED: Shared = Shared::new();
+//! static HOST: Host<Link<'static>> =
+//!     Host::new(Link::new(&SHARED), &DB, Config::new(None, Unclaimed::Keep));
 //! ```
 
 /// The constant hash of the table's layout.
@@ -639,18 +650,35 @@ impl Db {
     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "checked by new to fit")]
     pub const fn last_handle(&self) -> u16 { self.attrs.len() as u16 }
 
+    /// Whether an attribute of the table needs an authenticated link.
+    #[cfg(feature = "passkey")]
+    #[inline]
+    #[must_use = "the answer is only computed"]
+    pub const fn needs_authentication(&self) -> bool {
+        let mut rest = self.attrs;
+        while let Some((attr, tail)) = rest.split_first() {
+            if needs_authentication(attr.kind) {
+                return true;
+            }
+            rest = tail;
+        }
+        false
+    }
+
     /// The table `attrs`, with its hash. Meant for constants: it panics,
     /// failing the build, if a characteristic that notifies or indicates
     /// lacks its client characteristic configuration descriptor, if
     /// another has one, if the descriptor indices do not count up from 0,
-    /// if an attribute needs authentication ([`Sec::Authenticated`]), or
-    /// if the table is too large.
+    /// if an attribute needs authentication ([`Sec::Authenticated`])
+    /// without the feature `passkey`, or if the table is too large.
     ///
-    /// The host pairs with Just Works only, so no link is ever
-    /// authenticated: an attribute that needs it would answer Insufficient
-    /// Authentication (0x05) on every link, on which BlueZ pairs again
-    /// with protection against a man in the middle required, and that
-    /// pairing fails.
+    /// Without the feature `passkey` the host pairs with Just Works only,
+    /// so no link is ever authenticated: an attribute that needs it would
+    /// answer Insufficient Authentication (0x05) on every link, on which
+    /// BlueZ pairs again with protection against a man in the middle
+    /// required, and that pairing fails. With the feature, `Host::new`
+    /// refuses such a table unless its configuration pairs with Passkey
+    /// Entry.
     ///
     /// # Panics
     ///
@@ -838,6 +866,7 @@ const fn check(attrs: &[Attr]) -> u8 {
     let mut has_cccd = false;
     let mut rest = attrs;
     while let Some((attr, tail)) = rest.split_first() {
+        #[cfg(not(feature = "passkey"))]
         assert!(
             !needs_authentication(attr.kind),
             "no attribute may need authentication: the host pairs with Just Works"

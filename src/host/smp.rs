@@ -1,6 +1,9 @@
 //! The security manager: LE Secure Connections pairing as responder, with
 //! Just Works and bonding.
 //!
+//! With the feature `passkey`, also Passkey Entry: see [Passkey
+//! Entry](#passkey-entry).
+//!
 //! [`Responder`] is a state machine without input or output of its own: the
 //! engine gives it the PDUs of the security manager channel (CID 6), the
 //! link's encryption, the time and the results of the P-256 jobs, and takes
@@ -90,8 +93,49 @@
 //! and out. The long term key and the identity resolving keys stay least
 //! significant octet first, as the link layer takes them.
 //!
-//! Not supported: legacy pairing, passkey entry, numeric comparison, out of
-//! band data, the Security Request, Keypress Notifications and signing keys.
+//! # Passkey Entry
+//!
+//! With the feature `passkey` and a `Security` of
+//! `IoCapability::KeyboardOnly` (the engine's
+//! `crate::host::engine::Config::with_security`), the responder is a
+//! keyboard: the Pairing Response carries IO capability 0x02 and `AuthReq`
+//! 0x0D (bonding, protection against a man in the middle and Secure
+//! Connections), and the method follows the Core specification, volume 3,
+//! part H, section 2.3.5.1: a central with a display or a keyboard
+//! (DisplayOnly, DisplayYesNo, KeyboardOnly, KeyboardDisplay) pairs with
+//! Passkey Entry, the user typing on the device the passkey the central
+//! displays (or both typing the same); a central without input or output
+//! pairs with Just Works, or, with `Security::require_mitm`, is refused
+//! with Authentication Requirements (0x03) at its Pairing Request.
+//!
+//! Passkey Entry (section 2.3.5.6.3) follows the exchange of the public keys:
+//!
+//! 1. Our public key goes out alone, and `Outcome::PasskeyRequested` asks the
+//!    application for the six digits (`Responder::passkey`). The Diffie-Hellman
+//!    job starts at once, so it runs while the user types.
+//! 2. Twenty rounds, one for each bit `r_i` of the passkey, least significant
+//!    first: the central's confirm value `Cai`, answered with ours, `Cbi =
+//!    f4(PKbx, PKax, Nbi, 0x80 | r_i)` with a fresh nonce `Nbi`; then the
+//!    central's nonce `Nai`, which has to give `Cai = f4(PKax, PKbx, Nai, 0x80
+//!    | r_i)`, or the pairing fails with Confirm Value Failed (0x04) in that
+//!    round, answered with `Nbi`. The first `Cai` may arrive before the
+//!    passkey: it waits for it.
+//! 3. The `DHKey` checks as with Just Works, with the nonces of the last round
+//!    and R the passkey as a 128-bit value, in place of zero.
+//!
+//! The pairing's bond is then authenticated (`Bonded::authenticated`). No
+//! passkey (`Responder::passkey` with `None`) fails it with Passkey Entry
+//! Failed (0x01). The timer pauses while the device waits for the user
+//! before the central's first confirm value: the central may wait for its own
+//! user too. It runs again from that confirm value and from the passkey, so
+//! the user has [`TIMEOUT`] from the central's first confirm value; the
+//! advertising schedule's security deadline still bounds the whole pairing.
+//! Keypress Notifications are never asked for; one the central sends during
+//! Passkey Entry is ignored.
+//!
+//! Not supported: legacy pairing, numeric comparison, out of band data, the
+//! Security Request, sending Keypress Notifications and signing keys; without
+//! the feature `passkey`, Passkey Entry.
 
 /// P-256: the key pair, the check of the central's public key and the
 /// Diffie-Hellman key.
@@ -139,6 +183,14 @@ pub const PDU_MAX: usize = 1 + PUBLIC_KEY_LEN;
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// IO capability: no input and no output, which makes pairing Just Works.
 pub const NO_INPUT_NO_OUTPUT: u8 = 0x03;
+/// IO capability: a keyboard without a display.
+pub const KEYBOARD_ONLY: u8 = 0x02;
+/// The largest passkey: six decimal digits.
+#[cfg(feature = "passkey")]
+pub const PASSKEY_MAX: u32 = 999_999;
+/// The rounds of Passkey Entry: one for each of the passkey's 20 bits.
+#[cfg(feature = "passkey")]
+const PASSKEY_ROUNDS: u8 = 20;
 /// `AuthReq` bit: bonding.
 pub const AUTH_BONDING: u8 = 0x01;
 /// `AuthReq` bit: protection against a man in the middle.
@@ -152,6 +204,7 @@ pub const KEY_SIZE: u8 = 16;
 /// Our `AuthReq`: bonding and Secure Connections, without MITM.
 const AUTH_REQ: u8 = AUTH_BONDING | AUTH_SECURE_CONNECTIONS;
 /// Our `IOcap` for f6: `AuthReq`, OOB data flag, IO capability.
+#[cfg(not(feature = "passkey"))]
 const IO_CAP_B: [u8; 3] = [AUTH_REQ, 0, NO_INPUT_NO_OUTPUT];
 /// The largest IO capability: keyboard and display.
 const IO_CAPABILITY_MAX: u8 = 0x04;
@@ -183,13 +236,17 @@ const OUT_FAILED: u8 = 0x80;
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Bonded {
+    /// Whether the pairing protected against a man in the middle: Passkey
+    /// Entry.
+    #[cfg(feature = "passkey")]
+    pub authenticated: bool,
     /// The central's identity, if it distributed one that is public or
     /// static random. Without it the central is known by its address on
     /// the air.
-    pub identity: Option<Identity>,
+    pub identity:      Option<Identity>,
     /// The long term key, least significant octet first, as
     /// [`crate::link::Link::ltk_reply`] takes it.
-    pub ltk:      [u8; 16],
+    pub ltk:           [u8; 16],
 }
 
 /// Whether the Diffie-Hellman key of the pairing was asked for.
@@ -214,6 +271,19 @@ pub struct Identity {
     /// The identity resolving key, least significant octet first, as
     /// [`crate::link::Link::add_peer`] takes it.
     pub irk:     [u8; 16],
+}
+
+/// Our IO capability, as the Pairing Response gives it.
+#[cfg(feature = "passkey")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum IoCapability {
+    /// A keyboard without a display (0x02): Passkey Entry with any central
+    /// that has a display or a keyboard.
+    KeyboardOnly,
+    /// No input and no output (0x03): Just Works only.
+    NoInputNoOutput,
 }
 
 /// A P-256 job for the firmware's crypto task: run it with [`Self::run`]
@@ -273,6 +343,10 @@ pub enum Outcome {
         /// The reason.
         reason:     Reason,
     },
+    /// Passkey Entry needs the passkey the user types: give it with
+    /// [`Responder::passkey`].
+    #[cfg(feature = "passkey")]
+    PasskeyRequested,
     /// A Pairing Request was taken: pairing has started.
     Started,
     /// The 30 s timer expired: the security manager sends nothing more on
@@ -290,6 +364,21 @@ pub struct Output {
     len:  u8,
 }
 
+/// Why a passkey was not taken.
+#[cfg(feature = "passkey")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum PasskeyError {
+    /// The link ended, or is ending.
+    Gone,
+    /// The passkey has more than six decimal digits.
+    Invalid,
+    /// No pairing waits for a passkey: none asked for one, it was given
+    /// already, or the pairing ended.
+    NotWaiting,
+}
+
 /// A reason of a Pairing Failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -302,69 +391,101 @@ pub struct Reason(u8);
 pub struct Responder {
     /// Our own static random identity address, least significant octet
     /// first.
-    address:       [u8; 6],
+    address:        [u8; 6],
+    /// Whether the pairing under way is Passkey Entry.
+    #[cfg(feature = "passkey")]
+    authenticating: bool,
     /// The central's address on the air: A of f5 and f6.
-    central:       Peer,
+    central:        Peer,
     /// The central's `DHKey` check Ea, most significant octet first, until
     /// it is verified; then ours, Eb.
-    check:         [u8; 16],
+    check:          [u8; 16],
     /// Our confirm value Cb, most significant octet first.
-    confirm:       [u8; 16],
+    confirm:        [u8; 16],
     /// When the pairing times out.
-    deadline:      Option<Instant>,
+    deadline:       Option<Instant>,
     /// Whether the Diffie-Hellman key was asked for.
-    dh:            Dh,
+    dh:             Dh,
     /// The Diffie-Hellman key, most significant octet first, once
     /// [`Self::dh`] is ready, until f5 used it.
-    dh_key:        [u8; KEY_LEN],
+    dh_key:         [u8; KEY_LEN],
     /// The central's identity keys the pairing distributes: 0 or
     /// [`KEY_DIST_ID`].
-    init_dist:     u8,
+    init_dist:      u8,
     /// The central's `IOcap` for f6: `AuthReq`, OOB data flag, IO
     /// capability.
-    io_cap:        [u8; 3],
+    io_cap:         [u8; 3],
     /// Our own identity resolving key, least significant octet first.
-    irk:           [u8; 16],
+    irk:            [u8; 16],
     /// The job waiting to be taken.
-    job:           Option<Task>,
+    job:            Option<Task>,
     /// The output whose PDU is being sent, 0 or one bit: it stays the next
     /// PDU until [`Self::pdu_sent`], so its fragments never change.
-    latched:       u8,
+    latched:        u8,
     /// Our own address on the air: B of f5 and f6.
-    local:         Peer,
+    local:          Peer,
     /// The long term key, least significant octet first, from the `DHKey`
     /// check until the pairing ends.
-    ltk:           [u8; 16],
+    ltk:            [u8; 16],
     /// The central's nonce Na, most significant octet first.
-    na:            [u8; 16],
+    na:             [u8; 16],
     /// Our nonce Nb, most significant octet first.
-    nb:            [u8; 16],
+    nb:             [u8; 16],
+    /// The X coordinate of our public key, most significant octet first, for
+    /// the confirm values of Passkey Entry, once the key pair went to the
+    /// Diffie-Hellman job.
+    #[cfg(feature = "passkey")]
+    own_x:          [u8; KEY_LEN],
     /// Our key pair, between its job and the Diffie-Hellman job.
-    pair:          Option<KeyPair>,
+    pair:           Option<KeyPair>,
     /// Whether a Pairing Request is taken.
-    pairable:      bool,
+    pairable:       bool,
+    /// The passkey of Passkey Entry, once the user gave it.
+    #[cfg(feature = "passkey")]
+    passkey:        Option<u32>,
+    /// The central's confirm value of the round of Passkey Entry, most
+    /// significant octet first.
+    #[cfg(feature = "passkey")]
+    peer_confirm:   [u8; 16],
     /// The central's identity address, once it arrived.
-    peer_identity: Option<Peer>,
+    peer_identity:  Option<Peer>,
     /// The central's identity resolving key, least significant octet
     /// first, once it arrived.
-    peer_irk:      [u8; 16],
+    peer_irk:       [u8; 16],
     /// The central's public key, X then Y, most significant octet first.
-    peer_key:      [u8; PUBLIC_KEY_LEN],
+    peer_key:       [u8; PUBLIC_KEY_LEN],
     /// The PDUs to send, one bit each, sent from the lowest bit up.
-    pending:       u8,
+    pending:        u8,
     /// The reason of our Pairing Failed.
-    reason:        Reason,
+    reason:         Reason,
     /// The central's identity keys received: [`ID_INFO`] and
     /// [`ID_ADDRESS`].
-    received:      u8,
+    received:       u8,
     /// Our identity keys the pairing distributes: 0 or [`KEY_DIST_ID`].
-    resp_dist:     u8,
+    resp_dist:      u8,
     /// The job being run, with its number.
-    running:       Option<(Task, u8)>,
+    running:        Option<(Task, u8)>,
+    /// What our side of pairing protects against.
+    #[cfg(feature = "passkey")]
+    security:       Security,
     /// The number of the last Diffie-Hellman job.
-    serial:        u8,
+    serial:         u8,
     /// Where the pairing stands.
-    state:         State,
+    state:          State,
+}
+
+/// What our side of pairing can protect against, and what it requires.
+#[cfg(feature = "passkey")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub struct Security {
+    /// Our IO capability.
+    pub io_capability: IoCapability,
+    /// Whether a pairing without protection against a man in the middle is
+    /// refused: a central without input or output then gets Authentication
+    /// Requirements (0x03) at its Pairing Request.
+    pub require_mitm:  bool,
 }
 
 /// Where a pairing stands.
@@ -374,16 +495,28 @@ enum State {
     /// Diffie-Hellman key, whichever is still missing; with whether the
     /// check arrived.
     Check(bool),
+    /// Passkey Entry, round 0 to 19: waiting for the central's confirm value
+    /// of the round, and in round 0 for the passkey too, if it is missing.
+    #[cfg(feature = "passkey")]
+    Confirm(u8),
     /// Eb is queued: waiting for the central to encrypt the link with the
     /// long term key.
     Encryption,
     /// No pairing on the link.
     Idle,
+    /// Passkey Entry: the central's first confirm value arrived before the
+    /// passkey, which the pairing waits for.
+    #[cfg(feature = "passkey")]
+    Input,
     /// The central's public key arrived before our key pair.
     KeyPair,
     /// The link is encrypted with the new key: the identity keys go both
     /// ways.
     Keys,
+    /// Passkey Entry: our confirm value of the round is queued; waiting for
+    /// the central's nonce.
+    #[cfg(feature = "passkey")]
+    Nonce(u8),
     /// The Pairing Response is queued: waiting for the central's public
     /// key.
     PublicKey,
@@ -500,6 +633,8 @@ impl Reason {
     pub const OOB_NOT_AVAILABLE: Self = Self(0x02);
     /// Pairing is not allowed now.
     pub const PAIRING_NOT_SUPPORTED: Self = Self(0x05);
+    /// The user gave no passkey.
+    pub const PASSKEY_ENTRY_FAILED: Self = Self(0x01);
     /// Too many pairing attempts in too short a time.
     pub const REPEATED_ATTEMPTS: Self = Self(0x09);
     /// A PDU the security manager does not expect now.
@@ -529,12 +664,30 @@ impl Responder {
             return Err(Reason::DHKEY_CHECK_FAILED);
         }
         let own_x = pair.public_key().first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
+        #[cfg(feature = "passkey")]
+        if self.authenticating {
+            // Passkey Entry: our public key alone; the confirm values follow
+            // in the rounds.
+            self.own_x = *own_x;
+            self.pending |= OUT_PUBLIC_KEY;
+            self.state = State::Confirm(0);
+            return Ok(Some(Outcome::PasskeyRequested));
+        }
         let peer_x = self.peer_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
         crypto.fill(&mut self.nb);
         self.confirm = f4(&*crypto, own_x, peer_x, &self.nb, 0);
         self.pending |= OUT_PUBLIC_KEY | OUT_CONFIRM;
         self.state = State::Random;
         Ok(None)
+    }
+
+    /// Whether the pairing waits for the user's passkey:
+    /// [`Outcome::PasskeyRequested`] came, and [`Self::passkey`] did not yet.
+    #[cfg(feature = "passkey")]
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn awaits_passkey(&self) -> bool {
+        self.authenticating && self.passkey.is_none() && matches!(self.state, State::Confirm(0) | State::Input)
     }
 
     /// Starts on a new link, with the addresses on the air of
@@ -613,6 +766,12 @@ impl Responder {
         }
         self.deadline = None;
         self.state = State::Idle;
+        #[cfg(feature = "passkey")]
+        {
+            self.authenticating = false;
+            self.passkey = None;
+            wipe(&mut self.peer_confirm);
+        }
     }
 
     /// Fails the pairing for `reason`: our Pairing Failed follows the PDU
@@ -635,7 +794,12 @@ impl Responder {
             return None;
         }
         let identity = self.peer_identity.map(|address| Identity { address, irk: self.peer_irk });
-        let bonded = Bonded { identity, ltk: self.ltk };
+        let bonded = Bonded {
+            identity,
+            ltk: self.ltk,
+            #[cfg(feature = "passkey")]
+            authenticated: self.authenticating,
+        };
         self.end();
         Some(Outcome::Bonded(bonded))
     }
@@ -693,6 +857,13 @@ impl Responder {
         Ok(None)
     }
 
+    /// Whether the pairing under way is Passkey Entry, which protects
+    /// against a man in the middle; false once it ended.
+    #[cfg(feature = "passkey")]
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn is_authenticating(&self) -> bool { self.authenticating }
+
     /// Whether a Pairing Request is taken.
     #[cfg(feature = "key-missing")]
     #[inline]
@@ -727,7 +898,7 @@ impl Responder {
                 if current {
                     self.running = None;
                 }
-                let waiting = current && self.dh == Dh::Asked && matches!(self.state, State::Random | State::Check(_));
+                let waiting = current && self.dh == Dh::Asked && self.keys_exchanged();
                 let answer = match key.as_ref() {
                     Ok(dh_key) if waiting => {
                         self.dh_key = *dh_key;
@@ -746,6 +917,18 @@ impl Responder {
         self.settle(answer)
     }
 
+    /// Whether both public keys are known, so the Diffie-Hellman key may be
+    /// computed and its result is awaited.
+    #[cfg(not(feature = "passkey"))]
+    const fn keys_exchanged(&self) -> bool { matches!(self.state, State::Random | State::Check(_)) }
+
+    /// Whether both public keys are known, so the Diffie-Hellman key may be
+    /// computed and its result is awaited.
+    #[cfg(feature = "passkey")]
+    const fn keys_exchanged(&self) -> bool {
+        matches!(self.state, State::Random | State::Check(_) | State::Confirm(_) | State::Input | State::Nonce(_))
+    }
+
     /// The long term key for the link layer's request with `ediv` and
     /// `rand`, least significant octet first: the key of the pairing under
     /// way, for EDIV 0 and Rand 0 only, from our `DHKey` check on. Otherwise
@@ -762,34 +945,44 @@ impl Responder {
     #[must_use = "the security manager is only built"]
     pub const fn new() -> Self {
         Self {
-            address:       [0; 6],
-            central:       Peer::new([0; 6], false),
-            check:         [0; 16],
-            confirm:       [0; 16],
-            deadline:      None,
-            dh:            Dh::Unasked,
-            dh_key:        [0; KEY_LEN],
-            init_dist:     0,
-            io_cap:        [0; 3],
-            irk:           [0; 16],
-            job:           None,
-            latched:       0,
-            local:         Peer::new([0; 6], false),
-            ltk:           [0; 16],
-            na:            [0; 16],
-            nb:            [0; 16],
-            pair:          None,
-            pairable:      false,
+            address: [0; 6],
+            #[cfg(feature = "passkey")]
+            authenticating: false,
+            central: Peer::new([0; 6], false),
+            check: [0; 16],
+            confirm: [0; 16],
+            deadline: None,
+            dh: Dh::Unasked,
+            dh_key: [0; KEY_LEN],
+            init_dist: 0,
+            io_cap: [0; 3],
+            irk: [0; 16],
+            job: None,
+            latched: 0,
+            local: Peer::new([0; 6], false),
+            ltk: [0; 16],
+            na: [0; 16],
+            nb: [0; 16],
+            #[cfg(feature = "passkey")]
+            own_x: [0; KEY_LEN],
+            pair: None,
+            pairable: false,
+            #[cfg(feature = "passkey")]
+            passkey: None,
+            #[cfg(feature = "passkey")]
+            peer_confirm: [0; 16],
             peer_identity: None,
-            peer_irk:      [0; 16],
-            peer_key:      [0; PUBLIC_KEY_LEN],
-            pending:       0,
-            reason:        Reason::UNSPECIFIED,
-            received:      0,
-            resp_dist:     0,
-            running:       None,
-            serial:        0,
-            state:         State::Idle,
+            peer_irk: [0; 16],
+            peer_key: [0; PUBLIC_KEY_LEN],
+            pending: 0,
+            reason: Reason::UNSPECIFIED,
+            received: 0,
+            resp_dist: 0,
+            running: None,
+            #[cfg(feature = "passkey")]
+            security: Security::JUST_WORKS,
+            serial: 0,
+            state: State::Idle,
         }
     }
 
@@ -803,9 +996,15 @@ impl Responder {
         }
         match self.latched {
             OUT_RESPONSE => Some(Output::new(PAIRING_RESPONSE, &[&[
+                #[cfg(not(feature = "passkey"))]
                 NO_INPUT_NO_OUTPUT,
+                #[cfg(feature = "passkey")]
+                self.security.io_capability.code(),
                 0,
+                #[cfg(not(feature = "passkey"))]
                 AUTH_REQ,
+                #[cfg(feature = "passkey")]
+                self.security.auth_req(),
                 KEY_SIZE,
                 self.init_dist,
                 self.resp_dist,
@@ -834,6 +1033,31 @@ impl Responder {
         self.state = State::TimedOut;
         self.pending &= self.latched;
         Some(Outcome::TimedOut)
+    }
+
+    /// Takes the central's confirm value of a round of Passkey Entry, at
+    /// `now`, and answers it with ours once the passkey is there.
+    #[cfg(feature = "passkey")]
+    fn pairing_confirm<C>(&mut self, crypto: &mut C, params: &[u8], now: Instant) -> Result<Option<Outcome>, Reason>
+    where
+        C: Aes + Random,
+    {
+        // Each confirm value follows our nonce of the round before, and the
+        // first our public key.
+        let State::Confirm(round) = self.state else { return Err(Reason::UNSPECIFIED) };
+        if self.queued(OUT_PUBLIC_KEY | OUT_RANDOM) {
+            return Err(Reason::UNSPECIFIED);
+        }
+        self.peer_confirm =
+            reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+        if self.passkey.is_some() {
+            self.send_confirm(crypto, round);
+        } else {
+            // The user has the time of the timer from now.
+            self.state = State::Input;
+            self.deadline = Some(now.checked_add(TIMEOUT).unwrap_or(Instant::MAX));
+        }
+        Ok(None)
     }
 
     /// Takes the central's Pairing Failed: the pairing ends, unanswered.
@@ -872,7 +1096,21 @@ impl Responder {
             // enough for that method, which we cannot follow.
             return Err(Reason::OOB_NOT_AVAILABLE);
         }
+        // With Secure Connections and our MITM flag, the IO capabilities
+        // choose the method: Passkey Entry unless the central has neither
+        // input nor output.
+        #[cfg(feature = "passkey")]
+        let authenticating = self.security.protects() && io != NO_INPUT_NO_OUTPUT;
+        #[cfg(feature = "passkey")]
+        if self.security.require_mitm && !authenticating {
+            return Err(Reason::AUTHENTICATION_REQUIREMENTS);
+        }
         self.end();
+        #[cfg(feature = "passkey")]
+        #[expect(clippy::semicolon_outside_block, reason = "a statement of the feature alone")]
+        {
+            self.authenticating = authenticating;
+        }
         // Only the PDU being sent stays from an earlier pairing.
         self.pending &= self.latched;
         self.io_cap = [auth, oob, io];
@@ -889,6 +1127,74 @@ impl Responder {
         Ok(Some(Outcome::Started))
     }
 
+    /// Takes the passkey the user typed, at `now`, with `crypto` for our
+    /// first confirm value, or `None` if the user gave up, which fails the
+    /// pairing with Passkey Entry Failed (0x01). The outcome is that of the
+    /// pairing: [`Outcome::Failed`] for `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`PasskeyError::NotWaiting`] unless [`Self::awaits_passkey`],
+    /// [`PasskeyError::Invalid`] above [`PASSKEY_MAX`].
+    #[cfg(feature = "passkey")]
+    #[inline]
+    pub fn passkey<C>(
+        &mut self,
+        crypto: &mut C,
+        passkey: Option<u32>,
+        now: Instant,
+    ) -> Result<Option<Outcome>, PasskeyError>
+    where
+        C: Aes + Random,
+    {
+        if !self.awaits_passkey() {
+            return Err(PasskeyError::NotWaiting);
+        }
+        let Some(value) = passkey else { return Ok(self.fail(Reason::PASSKEY_ENTRY_FAILED, true)) };
+        if value > PASSKEY_MAX {
+            return Err(PasskeyError::Invalid);
+        }
+        self.passkey = Some(value);
+        self.deadline = Some(now.checked_add(TIMEOUT).unwrap_or(Instant::MAX));
+        if self.state == State::Input {
+            self.send_confirm(crypto, 0);
+        }
+        Ok(None)
+    }
+
+    /// The Z of f4 in `round` of Passkey Entry: 0x80 with the passkey's bit
+    /// of the round, the least significant in round 0.
+    #[cfg(feature = "passkey")]
+    fn passkey_bit(&self, round: u8) -> u8 {
+        let bit = self.passkey.unwrap_or_default().checked_shr(u32::from(round)).unwrap_or_default() & 1;
+        0x80 | u8::from(bit != 0)
+    }
+
+    /// Takes the central's nonce of a round of Passkey Entry: checks its
+    /// confirm value of the round with it and answers with our nonce.
+    #[cfg(feature = "passkey")]
+    fn passkey_random<A>(&mut self, aes: &A, params: &[u8]) -> Result<Option<Outcome>, Reason>
+    where
+        A: Aes,
+    {
+        let State::Nonce(round) = self.state else { return Err(Reason::UNSPECIFIED) };
+        if self.queued(OUT_CONFIRM) {
+            return Err(Reason::UNSPECIFIED);
+        }
+        let na =
+            reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+        let peer_x = self.peer_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
+        let expected = f4(aes, peer_x, &self.own_x, &na, self.passkey_bit(round));
+        if !same(&expected, &self.peer_confirm) {
+            return Err(Reason::CONFIRM_VALUE_FAILED);
+        }
+        self.na = na;
+        self.pending |= OUT_RANDOM;
+        let next = round.saturating_add(1);
+        self.state = if next < PASSKEY_ROUNDS { State::Confirm(next) } else { State::Check(false) };
+        Ok(None)
+    }
+
     /// Notes that the PDU [`Self::next_pdu`] gave was queued whole, at
     /// `now`, which restarts the pairing's timer.
     #[inline]
@@ -901,10 +1207,13 @@ impl Responder {
         if self.is_pairing() {
             self.deadline = Some(now.checked_add(TIMEOUT).unwrap_or(Instant::MAX));
         }
-        if matches!(self.state, State::Random | State::Check(_))
-            && self.dh == Dh::Unasked
-            && !self.queued(OUT_PUBLIC_KEY | OUT_CONFIRM)
-        {
+        #[cfg(feature = "passkey")]
+        if self.state == State::Confirm(0) && self.passkey.is_none() {
+            // Both sides may wait for their users: the timer runs again
+            // from the central's first confirm value or the passkey.
+            self.deadline = None;
+        }
+        if self.keys_exchanged() && self.dh == Dh::Unasked && !self.queued(OUT_PUBLIC_KEY | OUT_CONFIRM) {
             self.dh = Dh::Asked;
             self.job = Some(Task::DhKey);
         }
@@ -943,6 +1252,20 @@ impl Responder {
     /// Whether an output of `bits` is queued or being sent.
     const fn queued(&self, bits: u8) -> bool { (self.pending | self.latched) & bits != 0 }
 
+    /// R of f6: the passkey as a 128-bit value for Passkey Entry, zero for
+    /// Just Works; most significant octet first.
+    #[cfg(feature = "passkey")]
+    const fn r_value(&self) -> [u8; 16] {
+        let mut value = R_ZERO;
+        if self.authenticating
+            && let Some(passkey) = self.passkey
+            && let Some(low) = value.last_chunk_mut::<4>()
+        {
+            *low = passkey.to_be_bytes();
+        }
+        value
+    }
+
     /// Takes the central's nonce.
     fn random(&mut self, params: &[u8]) -> Result<Option<Outcome>, Reason> {
         if self.state != State::Random || self.queued(OUT_PUBLIC_KEY | OUT_CONFIRM) {
@@ -971,6 +1294,12 @@ impl Responder {
         let answer = match code {
             PAIRING_REQUEST => self.pairing_request(params, now),
             PAIRING_PUBLIC_KEY => self.public_key(crypto, params),
+            #[cfg(feature = "passkey")]
+            PAIRING_CONFIRM if self.authenticating => self.pairing_confirm(crypto, params, now),
+            #[cfg(feature = "passkey")]
+            PAIRING_RANDOM if self.authenticating => self.passkey_random(&*crypto, params),
+            #[cfg(feature = "passkey")]
+            KEYPRESS_NOTIFICATION if self.authenticating && !self.queued(OUT_FAILED) => return None,
             PAIRING_RANDOM => self.random(params),
             PAIRING_DHKEY_CHECK => self.dhkey_check(&*crypto, params),
             IDENTITY_INFORMATION => self.identity_information(params, encrypted),
@@ -986,6 +1315,22 @@ impl Responder {
             _ => Err(Reason::COMMAND_NOT_SUPPORTED),
         };
         answer.unwrap_or_else(|reason| self.fail(reason, report))
+    }
+
+    /// Queues our confirm value of `round` of Passkey Entry, with a fresh
+    /// nonce: `Cbi = f4(PKbx, PKax, Nbi, 0x80 | r_i)`.
+    #[cfg(feature = "passkey")]
+    fn send_confirm<C>(&mut self, crypto: &mut C, round: u8)
+    where
+        C: Aes + Random,
+    {
+        crypto.fill(&mut self.nb);
+        let bit = self.passkey_bit(round);
+        if let Some(peer_x) = self.peer_key.first_chunk::<KEY_LEN>() {
+            self.confirm = f4(&*crypto, &self.own_x, peer_x, &self.nb, bit);
+        }
+        self.pending |= OUT_CONFIRM;
+        self.state = State::Nonce(round);
     }
 
     /// Sets our own identity, which pairing distributes: the identity
@@ -1040,15 +1385,19 @@ impl Responder {
         A: Aes,
     {
         let (addr_a, addr_b) = (address(self.central), address(self.local));
+        #[cfg(not(feature = "passkey"))]
+        let (r_value, io_cap_b) = (&R_ZERO, IO_CAP_B);
+        #[cfg(feature = "passkey")]
+        let (r_value, io_cap_b) = (&self.r_value(), [self.security.auth_req(), 0, self.security.io_capability.code()]);
         let (mut mac_key, mut ltk) = f5(aes, &self.dh_key, (&self.na, &self.nb), (&addr_a, &addr_b));
         wipe(&mut self.dh_key);
-        let expected = f6(aes, &mac_key, (&self.na, &self.nb), &R_ZERO, self.io_cap, (&addr_a, &addr_b));
+        let expected = f6(aes, &mac_key, (&self.na, &self.nb), r_value, self.io_cap, (&addr_a, &addr_b));
         if !same(&expected, &self.check) {
             wipe(&mut mac_key);
             wipe(&mut ltk);
             return Err(Reason::DHKEY_CHECK_FAILED);
         }
-        self.check = f6(aes, &mac_key, (&self.nb, &self.na), &R_ZERO, IO_CAP_B, (&addr_b, &addr_a));
+        self.check = f6(aes, &mac_key, (&self.nb, &self.na), r_value, io_cap_b, (&addr_b, &addr_a));
         wipe(&mut mac_key);
         self.ltk = reversed(&ltk);
         wipe(&mut ltk);
@@ -1056,6 +1405,54 @@ impl Responder {
         self.state = State::Encryption;
         Ok(None)
     }
+
+    /// A security manager as [`Self::new`], with the IO capability and
+    /// requirements of `security`.
+    #[cfg(feature = "passkey")]
+    #[inline]
+    #[must_use = "the security manager is only built"]
+    pub const fn with_security(security: Security) -> Self {
+        let mut responder = Self::new();
+        responder.security = security;
+        responder
+    }
+}
+
+#[cfg(feature = "passkey")]
+impl IoCapability {
+    /// The IO capability's code in the Pairing Response.
+    #[inline]
+    #[must_use = "the code is only read"]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::KeyboardOnly => KEYBOARD_ONLY,
+            Self::NoInputNoOutput => NO_INPUT_NO_OUTPUT,
+        }
+    }
+}
+
+#[cfg(feature = "passkey")]
+impl Security {
+    /// No input and no output: Just Works only, the default.
+    pub const JUST_WORKS: Self = Self { io_capability: IoCapability::NoInputNoOutput, require_mitm: false };
+
+    /// Our `AuthReq`: bonding and Secure Connections, and protection against
+    /// a man in the middle if we can give it.
+    #[inline]
+    #[must_use = "the value is only read"]
+    pub const fn auth_req(self) -> u8 { if self.protects() { AUTH_REQ | AUTH_MITM } else { AUTH_REQ } }
+
+    /// A setting of `io_capability`, which refuses pairing without
+    /// protection against a man in the middle if `require_mitm`.
+    #[inline]
+    #[must_use = "the setting is only built"]
+    pub const fn new(io_capability: IoCapability, require_mitm: bool) -> Self { Self { io_capability, require_mitm } }
+
+    /// Whether we can protect against a man in the middle: Passkey Entry
+    /// with a central that has a display or a keyboard.
+    #[inline]
+    #[must_use = "the value is only read"]
+    pub const fn protects(self) -> bool { matches!(self.io_capability, IoCapability::KeyboardOnly) }
 }
 
 impl Default for Responder {

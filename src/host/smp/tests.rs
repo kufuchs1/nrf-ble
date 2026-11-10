@@ -87,6 +87,10 @@ pub(crate) struct Central {
     pub(crate) pair:      KeyPair,
     /// Our public key as received, most significant octet first.
     pub(crate) peer_key:  [u8; PUBLIC_KEY_LEN],
+    /// Our `IOcap` for f6, as our Pairing Response gave it.
+    pub(crate) io_cap_b:  [u8; 3],
+    /// R of f6: zero, or the passkey of Passkey Entry.
+    pub(crate) r:         [u8; 16],
     /// Its Pairing Request.
     pub(crate) request:   [u8; 7],
     /// Our address as the central sees it: B.
@@ -101,14 +105,14 @@ impl Central {
         let (a, b) = (address(self.address), address(self.responder));
         (self.mac_key, self.ltk) = f5(&Software, &dh_key, (&self.na, &self.nb), (&a, &b));
         let io_cap = [self.request[3], self.request[2], self.request[1]];
-        let ea = f6(&Software, &self.mac_key, (&self.na, &self.nb), &[0; 16], io_cap, (&a, &b));
+        let ea = f6(&Software, &self.mac_key, (&self.na, &self.nb), &self.r, io_cap, (&a, &b));
         pdu(PAIRING_DHKEY_CHECK, &reversed(&ea))
     }
 
     /// Our Pairing DHKey Check as it must be.
     pub(crate) fn expected_check(&self) -> [u8; 17] {
         let (a, b) = (address(self.address), address(self.responder));
-        let eb = f6(&Software, &self.mac_key, (&self.nb, &self.na), &[0; 16], [0x09, 0x00, 0x03], (&b, &a));
+        let eb = f6(&Software, &self.mac_key, (&self.nb, &self.na), &self.r, self.io_cap_b, (&b, &a));
         pdu(PAIRING_DHKEY_CHECK, &reversed(&eb))
     }
 
@@ -121,12 +125,14 @@ impl Central {
         Self {
             address: Peer::new(CENTRAL_ADDRESS, false),
             confirm: [0; 16],
+            io_cap_b: [0x09, 0x00, 0x03],
             ltk: [0; 16],
             mac_key: [0; 16],
             na: hex("d5cb8454 d177733e ffffb2ec 712baeab"),
             nb: [0; 16],
             pair: KeyPair::generate(&mut secret, || ()).expect("a valid private key"),
             peer_key: [0; PUBLIC_KEY_LEN],
+            r: [0; 16],
             request,
             responder,
         }
@@ -921,13 +927,347 @@ fn reasons_carry_their_codes() {
 
 #[test]
 fn debug_output_leaves_the_keys_out() {
-    let bond =
-        Bonded { identity: Some(Identity { address: Peer::new([1; 6], true), irk: [0xEE; 16] }), ltk: [0xDD; 16] };
+    let bond = Bonded {
+        #[cfg(feature = "passkey")]
+        authenticated: true,
+        identity: Some(Identity { address: Peer::new([1; 6], true), irk: [0xEE; 16] }),
+        ltk: [0xDD; 16],
+    };
     let mut text = Text::default();
     core::fmt::write(&mut text, format_args!("{:?}", Outcome::Bonded(bond))).unwrap();
     let written = core::str::from_utf8(&text.bytes[..text.len]).unwrap();
     assert!(written.contains("address"), "{written}");
     assert!(!written.contains("221") && !written.contains("238"), "{written}");
+}
+
+/// The keyboard of the Passkey Entry tests: KeyboardOnly, refusing Just
+/// Works.
+#[cfg(feature = "passkey")]
+pub(crate) const KEYBOARD: Security = Security::new(IoCapability::KeyboardOnly, true);
+
+/// The request of a Linux central with IO capability `io`: no OOB data,
+/// `AuthReq` 0x2D, 16 octets, the identity keys both ways.
+#[cfg(feature = "passkey")]
+pub(crate) const fn request_with_io(io: u8) -> [u8; 6] { [io, 0x00, LINUX_AUTH, 0x10, 0x07, 0x07] }
+
+#[cfg(feature = "passkey")]
+impl Central {
+    /// Takes the passkey as R of f6, and our `IOcap` as a keyboard.
+    pub(crate) fn with_passkey(mut self, passkey: u32) -> Self {
+        self.r = [0; 16];
+        self.r[12..].copy_from_slice(&passkey.to_be_bytes());
+        self.io_cap_b = [0x0D, 0x00, 0x02];
+        self
+    }
+
+    /// Its Pairing Confirm of `round` with its own `passkey`, from a fresh
+    /// nonce: `Cai = f4(PKax, PKbx, Nai, 0x80 | r_i)`.
+    pub(crate) fn round_confirm(&mut self, round: u8, passkey: u32) -> [u8; 17] {
+        self.na[0] = round;
+        self.na[15] = round.wrapping_mul(7);
+        let own_x = self.pair.public_key()[..KEY_LEN].try_into().unwrap();
+        let peer_x = self.peer_key[..KEY_LEN].try_into().unwrap();
+        let confirm = f4(&Software, own_x, peer_x, &self.na, 0x80 | u8::from((passkey >> round) & 1 != 0));
+        pdu(PAIRING_CONFIRM, &reversed(&confirm))
+    }
+
+    /// Takes our Pairing Random of `round` and checks our confirm value of
+    /// the round with it: `Cbi = f4(PKbx, PKax, Nbi, 0x80 | r_i)`.
+    pub(crate) fn take_round_random(&mut self, pdu: &[u8], round: u8, passkey: u32) {
+        assert_eq!(pdu[0], PAIRING_RANDOM);
+        self.nb = reversed(pdu[1..].try_into().unwrap());
+        let own_x = self.pair.public_key()[..KEY_LEN].try_into().unwrap();
+        let peer_x = self.peer_key[..KEY_LEN].try_into().unwrap();
+        let z = 0x80 | u8::from((passkey >> round) & 1 != 0);
+        assert_eq!(self.confirm, f4(&Software, peer_x, own_x, &self.nb, z), "Cb of round {round}");
+    }
+}
+
+/// A keyboard's security manager, after the Pairing Request of a central
+/// with IO capability `io` and its public key: our public key is queued and
+/// sent, the key pair made before.
+#[cfg(feature = "passkey")]
+fn passkey_pairing(io: u8) -> (Responder, Device, Central) {
+    let local = local_rpa();
+    let mut responder = Responder::with_security(KEYBOARD);
+    responder.set_identity(OUR_IRK, OUR_ADDRESS);
+    responder.set_pairable(true);
+    responder.connected(&info(Peer::new(CENTRAL_ADDRESS, false), local));
+    let mut device = Device(0x5555_AAAA_0F0F_F0F0);
+    responder.prepare_key_pair();
+    run_jobs(&mut responder, &mut device);
+    let mut central = Central::new(request_with_io(io), local);
+    assert_eq!(responder.receive(&mut device, &central.request, false, at(START)), Some(Outcome::Started));
+    // A keyboard: IO capability 0x02, `AuthReq` with MITM.
+    assert_eq!(out(&mut responder, at(START)).0.bytes(), &[0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]);
+    // Our public key alone, and the passkey is asked for.
+    let outcome = responder.receive(&mut device, &central.public_key(), false, at(START + 10));
+    assert_eq!(outcome, Some(Outcome::PasskeyRequested));
+    assert!(responder.awaits_passkey());
+    let (public_key, _) = out(&mut responder, at(START + 20));
+    central.take_public_key(public_key.bytes());
+    assert!(!responder.has_output());
+    // The Diffie-Hellman job starts at once, while the user types.
+    assert!(responder.has_job());
+    (responder, device, central)
+}
+
+/// Runs the rounds `from..20` of Passkey Entry with the central's
+/// `central_key` and returns the outcome of the round that failed, if one
+/// did, with its number.
+#[cfg(feature = "passkey")]
+fn rounds(
+    responder: &mut Responder,
+    device: &mut Device,
+    central: &mut Central,
+    from: u8,
+    central_key: u32,
+) -> Option<(u8, Option<Outcome>)> {
+    for round in from..20 {
+        if round > from {
+            assert_eq!(responder.receive(device, &central.round_confirm(round, central_key), false, at(START)), None);
+        }
+        let (confirm, _) = out(responder, at(START));
+        central.take_confirm(confirm.bytes());
+        let outcome = responder.receive(device, &central.random(), false, at(START));
+        if outcome.is_some() {
+            return Some((round, outcome));
+        }
+        let (random, _) = out(responder, at(START));
+        central.take_round_random(random.bytes(), round, central_key);
+        assert!(!responder.has_output());
+    }
+    None
+}
+
+/// Pairs with Passkey Entry and `passkey` to the end, the central's
+/// `DHKey` check, ours and the bond included, and returns the bond.
+#[cfg(feature = "passkey")]
+fn pair_with_passkey(io: u8, passkey: u32, passkey_first: bool) -> Bonded {
+    let (mut responder, mut device, central) = passkey_pairing(io);
+    let mut central = central.with_passkey(passkey);
+    run_jobs(&mut responder, &mut device);
+    if passkey_first {
+        assert_eq!(responder.passkey(&mut device, Some(passkey), at(START + 30)), Ok(None));
+        assert!(!responder.has_output(), "Cb1 waits for Ca1");
+        assert_eq!(responder.receive(&mut device, &central.round_confirm(0, passkey), false, at(START + 40)), None);
+    } else {
+        // The central's first confirm value before the user typed.
+        assert_eq!(responder.receive(&mut device, &central.round_confirm(0, passkey), false, at(START + 30)), None);
+        assert!(!responder.has_output());
+        assert!(responder.awaits_passkey());
+        assert_eq!(responder.passkey(&mut device, Some(passkey), at(START + 40)), Ok(None));
+    }
+    assert!(!responder.awaits_passkey());
+    assert_eq!(rounds(&mut responder, &mut device, &mut central, 0, passkey), None);
+    // The checks of f6 with R the passkey and both IO capabilities.
+    let check = central.check();
+    assert_eq!(responder.receive(&mut device, &check, false, at(START + 50)), None);
+    let (our_check, _) = out(&mut responder, at(START + 60));
+    assert_eq!(our_check.bytes(), &central.expected_check());
+    assert_eq!(responder.ltk_request(0, [0; 8]), Some(reversed(&central.ltk)));
+    assert!(responder.is_authenticating());
+    assert_eq!(responder.encryption_changed(true), None);
+    out(&mut responder, at(START + 70));
+    out(&mut responder, at(START + 70));
+    responder.receive(&mut device, &pdu::<17>(IDENTITY_INFORMATION, &CENTRAL_IRK), true, at(START + 80));
+    let mut address = [IDENTITY_ADDRESS_INFORMATION, 0x00, 0, 0, 0, 0, 0, 0];
+    address[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    let Some(Outcome::Bonded(bond)) = responder.receive(&mut device, &address, true, at(START + 80)) else {
+        panic!("no bond")
+    };
+    assert_eq!(bond.ltk, reversed(&central.ltk));
+    assert!(!responder.is_authenticating());
+    bond
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn passkey_entry_pairs_in_twenty_rounds_and_bonds_authenticated() {
+    // KeyboardDisplay (Linux), DisplayOnly, DisplayYesNo and KeyboardOnly
+    // centrals; the passkey before and after the first confirm value; the
+    // smallest, largest and an ordinary passkey.
+    for (io, passkey, first) in
+        [(0x04, 123_456, false), (0x04, 123_456, true), (0x00, 0, false), (0x01, 999_999, true), (0x02, 654_321, false)]
+    {
+        let bond = pair_with_passkey(io, passkey, first);
+        assert!(bond.authenticated, "io {io}, passkey {passkey}");
+    }
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_wrong_passkey_fails_with_confirm_value_failed_in_the_round_of_its_bit() {
+    for bit in [0_u8, 7, 19] {
+        let passkey = 123_456;
+        let wrong = passkey ^ (1 << bit);
+        let (mut responder, mut device, mut central) = passkey_pairing(0x04);
+        run_jobs(&mut responder, &mut device);
+        assert_eq!(responder.passkey(&mut device, Some(passkey), at(START + 30)), Ok(None));
+        responder.receive(&mut device, &central.round_confirm(0, wrong), false, at(START + 30));
+        let failed = rounds(&mut responder, &mut device, &mut central, 0, wrong);
+        assert_eq!(
+            failed,
+            Some((bit, Some(Outcome::Failed { by_central: false, reason: Reason::CONFIRM_VALUE_FAILED }))),
+            "bit {bit}"
+        );
+        assert_eq!(out(&mut responder, at(START)).0.bytes(), &[PAIRING_FAILED, 0x04]);
+        assert!(!responder.is_pairing());
+        assert!(!responder.has_output());
+        assert_eq!(responder.ltk_request(0, [0; 8]), None);
+    }
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn no_passkey_fails_with_passkey_entry_failed() {
+    for early in [false, true] {
+        let (mut responder, mut device, mut central) = passkey_pairing(0x04);
+        if early {
+            responder.receive(&mut device, &central.round_confirm(0, 1), false, at(START + 30));
+        }
+        let outcome = responder.passkey(&mut device, None, at(START + 40));
+        assert_eq!(outcome, Ok(Some(Outcome::Failed { by_central: false, reason: Reason::PASSKEY_ENTRY_FAILED })));
+        assert_eq!(out(&mut responder, at(START + 40)).0.bytes(), &[PAIRING_FAILED, 0x01]);
+        assert!(!responder.is_pairing());
+        assert_eq!(responder.passkey(&mut device, Some(1), at(START + 50)), Err(PasskeyError::NotWaiting));
+    }
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_passkey_is_taken_once_with_six_digits_and_only_when_asked_for() {
+    let (mut responder, mut device, _) = passkey_pairing(0x04);
+    assert_eq!(responder.passkey(&mut device, Some(1_000_000), at(START)), Err(PasskeyError::Invalid));
+    assert!(responder.awaits_passkey());
+    assert_eq!(responder.passkey(&mut device, Some(999_999), at(START)), Ok(None));
+    assert_eq!(responder.passkey(&mut device, Some(1), at(START)), Err(PasskeyError::NotWaiting));
+    // Not without a pairing, nor in Just Works.
+    let mut idle = Responder::with_security(KEYBOARD);
+    assert_eq!(idle.passkey(&mut device, Some(1), at(START)), Err(PasskeyError::NotWaiting));
+    let (mut just_works, mut device, _) = pairing_at(1);
+    assert_eq!(just_works.passkey(&mut device, Some(1), at(START)), Err(PasskeyError::NotWaiting));
+    assert!(!just_works.is_authenticating());
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_central_without_input_or_output_is_refused_or_pairs_just_works() {
+    // Refused when protection against a man in the middle is required.
+    let mut responder = Responder::with_security(KEYBOARD);
+    responder.set_pairable(true);
+    responder.connected(&info(Peer::new(CENTRAL_ADDRESS, false), local_rpa()));
+    let (outcome, answer) = refused(&mut responder, &pdu::<7>(PAIRING_REQUEST, &request_with_io(0x03)));
+    assert_eq!(outcome, Some(Outcome::Failed { by_central: false, reason: Reason::AUTHENTICATION_REQUIREMENTS }));
+    assert_eq!(answer.bytes(), &[PAIRING_FAILED, 0x03]);
+    assert!(!responder.has_job());
+
+    // Just Works otherwise, with our keyboard's IOcap in Eb, unauthenticated.
+    let local = local_rpa();
+    let mut responder = Responder::with_security(Security::new(IoCapability::KeyboardOnly, false));
+    responder.set_identity(OUR_IRK, OUR_ADDRESS);
+    responder.set_pairable(true);
+    responder.connected(&info(Peer::new(CENTRAL_ADDRESS, false), local));
+    let mut device = Device(21);
+    let mut central = Central::new(request_with_io(0x03), local);
+    central.io_cap_b = [0x0D, 0x00, 0x02];
+    responder.prepare_key_pair();
+    run_jobs(&mut responder, &mut device);
+    responder.receive(&mut device, &central.request, false, at(0));
+    assert_eq!(out(&mut responder, at(0)).0.bytes(), &[0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]);
+    assert_eq!(responder.receive(&mut device, &central.public_key(), false, at(0)), None);
+    central.take_public_key(out(&mut responder, at(0)).0.bytes());
+    central.take_confirm(out(&mut responder, at(0)).0.bytes());
+    run_jobs(&mut responder, &mut device);
+    responder.receive(&mut device, &central.random(), false, at(0));
+    central.take_random(out(&mut responder, at(0)).0.bytes());
+    responder.receive(&mut device, &central.check(), false, at(0));
+    assert_eq!(out(&mut responder, at(0)).0.bytes(), &central.expected_check());
+    assert!(!responder.is_authenticating());
+    responder.encryption_changed(true);
+    out(&mut responder, at(0));
+    out(&mut responder, at(0));
+    responder.receive(&mut device, &pdu::<17>(IDENTITY_INFORMATION, &CENTRAL_IRK), true, at(0));
+    let mut address = [IDENTITY_ADDRESS_INFORMATION, 0x00, 0, 0, 0, 0, 0, 0];
+    address[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    let Some(Outcome::Bonded(bond)) = responder.receive(&mut device, &address, true, at(0)) else { panic!("no bond") };
+    assert!(!bond.authenticated);
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn the_timer_pauses_for_the_user_until_the_central_s_first_confirm() {
+    // Our public key went out at START + 20: the timer pauses while both
+    // sides may wait for their users.
+    let (mut responder, mut device, mut central) = passkey_pairing(0x02);
+    assert_eq!(responder.deadline(), None);
+    assert_eq!(responder.on_time(at(START + 100_000)), None);
+    // The central's first confirm value starts it: the user has 30 s.
+    responder.receive(&mut device, &central.round_confirm(0, 42), false, at(START + 100_000));
+    assert_eq!(responder.deadline(), Some(at(START + 130_000)));
+    assert_eq!(responder.on_time(at(START + 129_999)), None);
+    assert_eq!(responder.on_time(at(START + 130_000)), Some(Outcome::TimedOut));
+    assert!(!responder.is_pairing());
+    assert_eq!(responder.passkey(&mut device, Some(42), at(START + 130_001)), Err(PasskeyError::NotWaiting));
+
+    // The passkey restarts it, then each PDU queued does.
+    let (mut responder, mut device, mut central) = passkey_pairing(0x04);
+    assert_eq!(responder.passkey(&mut device, Some(42), at(START + 5_000)), Ok(None));
+    assert_eq!(responder.deadline(), Some(at(START + 35_000)));
+    responder.receive(&mut device, &central.round_confirm(0, 42), false, at(START + 6_000));
+    out(&mut responder, at(START + 7_000));
+    assert_eq!(responder.deadline(), Some(at(START + 37_000)));
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn passkey_entry_pdus_out_of_turn_fail_the_pairing() {
+    // A confirm value of the next round before our nonce went out.
+    let (mut responder, mut device, mut central) = passkey_pairing(0x04);
+    run_jobs(&mut responder, &mut device);
+    responder.passkey(&mut device, Some(5), at(START)).unwrap();
+    responder.receive(&mut device, &central.round_confirm(0, 5), false, at(START));
+    central.take_confirm(out(&mut responder, at(START)).0.bytes());
+    assert_eq!(responder.receive(&mut device, &central.random(), false, at(START)), None);
+    let outcome = responder.receive(&mut device, &central.round_confirm(1, 5), false, at(START));
+    assert_eq!(outcome, Some(Outcome::Failed { by_central: false, reason: Reason::UNSPECIFIED }));
+    // The Pairing Failed replaces our nonce, which was still queued.
+    assert_eq!(out(&mut responder, at(START)).0.bytes(), &[PAIRING_FAILED, 0x08]);
+    assert!(!responder.has_output());
+
+    // A nonce before our confirm value, and a `DHKey` check in the rounds.
+    let (mut responder, mut device, central) = passkey_pairing(0x04);
+    let outcome = responder.receive(&mut device, &central.random(), false, at(START));
+    assert_eq!(outcome, Some(Outcome::Failed { by_central: false, reason: Reason::UNSPECIFIED }));
+    let (mut responder, mut device, _) = passkey_pairing(0x04);
+    let outcome = responder.receive(&mut device, &pdu::<17>(PAIRING_DHKEY_CHECK, &[0; 16]), false, at(START));
+    assert_eq!(outcome, Some(Outcome::Failed { by_central: false, reason: Reason::UNSPECIFIED }));
+    // A confirm value of the wrong length.
+    let (mut responder, mut device, _) = passkey_pairing(0x04);
+    let outcome = responder.receive(&mut device, &[PAIRING_CONFIRM; 16], false, at(START));
+    assert_eq!(outcome, Some(Outcome::Failed { by_central: false, reason: Reason::INVALID_PARAMETERS }));
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn keypress_notifications_of_the_central_are_ignored_during_passkey_entry() {
+    let (mut responder, mut device, mut central) = passkey_pairing(0x02);
+    for kind in 0..=4 {
+        assert_eq!(responder.receive(&mut device, &[KEYPRESS_NOTIFICATION, kind], false, at(START)), None);
+    }
+    assert!(!responder.has_output());
+    assert!(responder.awaits_passkey());
+    responder.receive(&mut device, &central.round_confirm(0, 7), false, at(START));
+    assert_eq!(responder.receive(&mut device, &[KEYPRESS_NOTIFICATION, 4], false, at(START)), None);
+    assert!(responder.awaits_passkey());
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_just_works_responder_with_the_feature_answers_as_without_it() {
+    // The default security: the response and checks of Just Works.
+    let (.., bond) = pair(BOTH_WAYS);
+    assert!(!bond.authenticated);
 }
 
 /// A fixed buffer for formatted text.

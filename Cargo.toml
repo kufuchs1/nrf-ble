@@ -33,6 +33,11 @@ param-requests = []
 # not have ends at once (`ConnEvent::KeyMissing`, reason 0x05), instead of at
 # the advertising schedule's security deadline.
 key-missing = []
+# `passkey`: LE Secure Connections Passkey Entry as responder, for a keyboard
+# that types the passkey the central displays (`host::smp::Security`,
+# `ConnEvent::PasskeyRequested`, `host::Conn::enter_passkey`), and attributes
+# that need an authenticated link.
+passkey = []
 
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main), through the patches at the end: the
