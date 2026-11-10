@@ -173,6 +173,19 @@ impl MockLink {
         }
     }
 
+    /// The central sends `payload` on the security manager channel and
+    /// receives what the host answers.
+    #[cfg(feature = "passkey")]
+    fn send_and_deliver<R: Future, K: Future>(
+        &self,
+        payload: &[u8],
+        tasks: &mut Tasks<'_, R, K>,
+    ) -> Vec<(Channel, Vec<u8>)> {
+        self.send(CID_SECURITY_MANAGER, payload, false);
+        tasks.step();
+        self.deliver()
+    }
+
     /// The link layer takes every queued fragment for the air.
     fn transmit(&self) -> Vec<(bool, Vec<u8>)> {
         let taken: Vec<_> = self.queue.borrow_mut().drain(..).collect();
@@ -915,6 +928,8 @@ fn a_rejected_parameter_request_is_not_repeated() {
     tasks.step();
     assert!(link.deliver().is_empty());
     assert!(link.calls().is_empty());
+    #[cfg(feature = "param-requests")]
+    assert_eq!(next!(conn), ConnEvent::ParamsRejected);
     assert!(poll(pin!(conn.next())).is_pending());
     assert_eq!(conn.try_notify(example::KEYBOARD, &[0; 8]), Ok(()));
     assert_eq!(multiplications.get(), 0);
@@ -1214,4 +1229,444 @@ fn software_aes_matches_fips_197() {
     let plain = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
     let cipher = [0x69, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30, 0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4, 0xC5, 0x5A];
     assert_eq!(Software.encrypt(key, plain), cipher);
+}
+
+/// The fallback range of the parameter request tests: 11.25 to 15 ms, a
+/// latency of 30 events, 6 s.
+#[cfg(feature = "param-requests")]
+const FALLBACK: link::ParamRange = link::ParamRange::new(9, 12, 30, 600);
+
+#[cfg(feature = "param-requests")]
+#[test]
+fn the_application_asks_for_parameters_and_learns_of_a_rejection() {
+    use super::RequestError;
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    // A request goes out at once as a signalling PDU, with the first
+    // identifier of the link.
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x01, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    // One at a time: a second waits for the response to the first.
+    assert_eq!(conn.request_params(example::PARAMS), Err(RequestError::Busy));
+    // The central refuses it: the application learns it.
+    link.send(CID_SIGNALLING, &[0x13, 0x01, 0x02, 0x00, 0x01, 0x00], false);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::ParamsRejected);
+    assert!(poll(pin!(conn.next())).is_pending());
+    // The next request has a fresh identifier; a Command Reject of it
+    // rejects it too.
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x02, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    link.send(CID_SIGNALLING, &[0x01, 0x02, 0x02, 0x00, 0x00, 0x00], false);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::ParamsRejected);
+    // An accepted request has no event of its own: the update follows.
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver().len(), 1);
+    link.send(CID_SIGNALLING, &[0x13, 0x03, 0x02, 0x00, 0x00, 0x00], false);
+    tasks.step();
+    assert!(poll(pin!(conn.next())).is_pending());
+    link.event(Event::ParamsUpdated { params: ConnectionParams::new(12, 30, 600), status: 0 });
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::ParamsUpdated(ConnectionParams::new(12, 30, 600)));
+    // The engine's own request is not made after the application's.
+    link.advance(1000);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Ready);
+    link.advance(60_000);
+    tasks.step();
+    assert!(link.deliver().is_empty(), "no automatic request after a manual one");
+    // A range out of the specification's is refused.
+    assert_eq!(conn.request_params(link::ParamRange::new(12, 9, 30, 600)), Err(RequestError::Invalid));
+    assert_eq!(conn.request_params(link::ParamRange::new(5, 12, 30, 600)), Err(RequestError::Invalid));
+    assert_eq!(conn.request_params(link::ParamRange::new(12, 12, 30, 10)), Err(RequestError::Invalid));
+    assert!(link.deliver().is_empty());
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "param-requests")]
+#[test]
+fn the_end_of_the_link_clears_a_pending_parameter_request() {
+    use super::RequestError;
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver().len(), 1);
+    link.disconnect_link(0x13);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Disconnected(0x13));
+    assert_eq!(conn.request_params(FALLBACK), Err(RequestError::Gone));
+    // The next link asks again from the first identifier; a late response
+    // of the old link's request would be dropped.
+    let identity = identity(1);
+    let bond = bond(&identity);
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(bond.peer, None, local_rpa());
+    tasks.step();
+    let next = ready(advertise.as_mut()).unwrap();
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(next!(next), ConnEvent::Encrypted { bonded: true });
+    assert_eq!(next.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x01, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    // A request the central never answers lets the next go out after the
+    // signalling timeout, without an event.
+    link.advance(29_999);
+    tasks.step();
+    assert_eq!(next.request_params(FALLBACK), Err(RequestError::Busy));
+    link.advance(1);
+    tasks.step();
+    assert_eq!(next!(next), ConnEvent::Ready);
+    assert!(poll(pin!(next.next())).is_pending());
+    assert_eq!(next.request_params(FALLBACK), Ok(()));
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "param-requests")]
+#[test]
+fn the_engine_s_own_rejected_request_is_reported_too() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    link.advance(1000);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Ready);
+    link.advance(500);
+    tasks.step();
+    assert_eq!(link.deliver().len(), 1);
+    link.send(CID_SIGNALLING, &[0x13, 0x01, 0x02, 0x00, 0x01, 0x00], false);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::ParamsRejected);
+    // The application's fallback goes out as the second request.
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x02, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "key-missing")]
+#[test]
+fn a_reconnection_without_the_bond_s_key_ends_at_once() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let bond = bond(&identity);
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // The central asks for a key of another pairing: the negative reply,
+    // which the link layer reports as a failed encryption, and the link
+    // ends at once instead of 20 s later.
+    link.event(Event::LtkRequest { ediv: 0x1234, rand: [7; 8] });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(None)]);
+    link.event(Event::Encryption { on: false, refresh: false, status: 0x06 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
+    assert_eq!(next!(conn), ConnEvent::KeyMissing);
+    assert!(poll(pin!(conn.next())).is_pending());
+    // Once only, and the end of the link follows.
+    link.advance(20_000);
+    tasks.step();
+    assert!(link.calls().is_empty());
+    link.disconnect_link(0x16);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Disconnected(0x16));
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "key-missing")]
+#[test]
+fn a_pairable_link_without_a_key_waits_for_a_pairing() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // A central with a stale key of ours: in pairing mode it may still pair,
+    // so the link goes on.
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: false, refresh: false, status: 0x06 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(None)]);
+    assert!(poll(pin!(conn.next())).is_pending());
+    let central = Central::new(linux_request(true, true), local_rpa());
+    assert_eq!(smp(link, &mut tasks, &central.request, false).len(), 1);
+    assert_eq!(multiplications.get(), 1);
+}
+
+/// A keyboard's table for the Passkey Entry tests: an input report that
+/// needs an authenticated link.
+#[cfg(feature = "passkey")]
+mod keyboard {
+    use crate::host::gatt::Value;
+
+    crate::gatt! {
+        /// The table.
+        pub const DB;
+        service 0x1812 {
+            /// The keyboard input report.
+            char KEYS: 0x2A4D [read, notify; authenticated] = Value::Zeros(8);
+            ccc;
+        }
+    }
+}
+
+/// A keyboard's host: Passkey Entry only.
+#[cfg(feature = "passkey")]
+fn keyboard_host() -> Host<MockLink> {
+    let config = Config::new(Some(example::PARAMS), Unclaimed::Keep).with_security(super::smp::tests::KEYBOARD);
+    Host::new(MockLink::new(), &keyboard::DB, config)
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_keyboard_pairs_with_the_passkey_the_user_types_and_its_link_is_authenticated() {
+    use super::{PasskeyError, gatt::Sec, smp::tests::request_with_io};
+    let host = keyboard_host();
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    let local = local_rpa();
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // Nothing to enter before the pairing asks for it.
+    assert_eq!(conn.enter_passkey(Some(1)), Err(PasskeyError::NotWaiting));
+
+    let passkey = 314_159;
+    let mut central = Central::new(request_with_io(0x04), local).with_passkey(passkey);
+    assert_eq!(smp(link, &mut tasks, &central.request, false), [vec![0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]]);
+    let answer = smp(link, &mut tasks, &central.public_key(), false);
+    assert_eq!(answer.len(), 1, "our public key alone");
+    central.take_public_key(&answer[0]);
+    assert_eq!(next!(conn), ConnEvent::PasskeyRequested);
+    // The Diffie-Hellman key is computed while the user types.
+    assert_eq!(multiplications.get(), 2);
+    // The central's first confirm value comes first; then the passkey.
+    assert!(smp(link, &mut tasks, &central.round_confirm(0, passkey), false).is_empty());
+    assert_eq!(conn.enter_passkey(Some(1_000_000)), Err(PasskeyError::Invalid));
+    assert_eq!(conn.enter_passkey(Some(passkey)), Ok(()));
+    assert_eq!(conn.enter_passkey(Some(passkey)), Err(PasskeyError::NotWaiting));
+    tasks.step();
+    let mut confirm = link.deliver();
+    for round in 0..20 {
+        assert_eq!(confirm.len(), 1, "round {round}");
+        central.take_confirm(&confirm.remove(0).1);
+        let random = smp(link, &mut tasks, &central.random(), false);
+        central.take_round_random(&random[0], round, passkey);
+        if round < 19 {
+            confirm = link.send_and_deliver(&central.round_confirm(round + 1, passkey), &mut tasks);
+        }
+    }
+    let check = central.check();
+    assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
+    let mut ltk = central.ltk;
+    ltk.reverse();
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(Some(ltk))]);
+    assert_eq!(conn.security(), Some(Sec::Authenticated));
+    // Our identity keys.
+    assert_eq!(link.deliver().len(), 2);
+    // The report that needs authentication is served on this link.
+    assert_eq!(request(link, &mut tasks, &[0x0A, 0x03, 0x00]), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true).is_empty());
+    let mut central_identity = [0x09, 0x00, 0, 0, 0, 0, 0, 0];
+    central_identity[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    assert!(smp(link, &mut tasks, &central_identity, true).is_empty());
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
+    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
+    assert!(bond.authenticated);
+    assert!(Bond::from_bytes(&bond.to_bytes()).is_some_and(|stored| stored.authenticated));
+    assert_eq!(conn.security(), Some(Sec::Authenticated));
+    assert_eq!(request(link, &mut tasks, &[0x0A, 0x03, 0x00]), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(multiplications.get(), 2);
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_passkey_refused_by_the_user_fails_the_pairing_and_ends_the_link() {
+    use super::{PasskeyError, smp::tests::request_with_io};
+    let host = keyboard_host();
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    let local = local_rpa();
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    let central = Central::new(request_with_io(0x04), local);
+    smp(link, &mut tasks, &central.request, false);
+    smp(link, &mut tasks, &central.public_key(), false);
+    assert_eq!(next!(conn), ConnEvent::PasskeyRequested);
+    assert_eq!(conn.enter_passkey(None), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::SecurityManager, vec![0x05, 0x01])]);
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
+    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::PASSKEY_ENTRY_FAILED));
+    link.disconnect_link(0x16);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Disconnected(0x16));
+    assert_eq!(conn.enter_passkey(Some(1)), Err(PasskeyError::Gone));
+
+    // A central without input or output is refused at its request.
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    let central = Central::new(request_with_io(0x03), local);
+    assert_eq!(smp(link, &mut tasks, &central.request, false), [vec![0x05, 0x03]]);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::AUTHENTICATION_REQUIREMENTS));
+    assert!(multiplications.get() >= 1);
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_reconnection_is_authenticated_only_with_an_authenticated_bond() {
+    use super::gatt::Sec;
+    for authenticated in [false, true] {
+        let host = keyboard_host();
+        let link = host.port();
+        tasks!(host, tasks, multiplications);
+        let identity = identity(1);
+        let mut bond = Bond::new(
+            Peer::new(CENTRAL_IDENTITY, false),
+            Some(CENTRAL_IRK),
+            [0x5C; 16],
+            identity.variant(),
+            &keyboard::DB,
+        );
+        bond.authenticated = authenticated;
+        bond.cccd = 0b01;
+        let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+        let mut advertise = pin!(host.advertise(&advertising, &identity));
+        assert!(poll(advertise.as_mut()).is_pending());
+        link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+        tasks.step();
+        let conn = ready(advertise.as_mut()).unwrap();
+        link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+        link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+        tasks.step();
+        assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
+        let read = request(link, &mut tasks, &[0x0A, 0x03, 0x00]);
+        if authenticated {
+            assert_eq!(conn.security(), Some(Sec::Authenticated));
+            assert_eq!(read, [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(conn.try_notify(keyboard::KEYS, &[0; 8]), Ok(()));
+        } else {
+            // Insufficient Authentication, and no report.
+            assert_eq!(conn.security(), Some(Sec::Encrypted));
+            assert_eq!(read, [0x01, 0x0A, 0x03, 0x00, 0x05]);
+            assert_eq!(conn.try_notify(keyboard::KEYS, &[0; 8]), Err(NotifyError::Insecure));
+        }
+        assert_eq!(multiplications.get(), 0);
+    }
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_just_works_key_stays_unauthenticated_when_a_passkey_pairing_starts_on_its_link() {
+    use super::{
+        gatt::Sec,
+        smp::{IoCapability, Security, tests::request_with_io},
+    };
+    // Passkey Entry where the central can take part, Just Works otherwise.
+    let config = Config::new(Some(example::PARAMS), Unclaimed::Keep)
+        .with_security(Security::new(IoCapability::KeyboardOnly, false));
+    let host = Host::new(MockLink::new(), &keyboard::DB, config);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    let local = local_rpa();
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // A central without input or output: Just Works.
+    let mut central = Central::new(request_with_io(0x03), local);
+    central.io_cap_b = [0x0D, 0x00, 0x02];
+    assert_eq!(smp(link, &mut tasks, &central.request, false), [vec![0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]]);
+    let answer = smp(link, &mut tasks, &central.public_key(), false);
+    assert_eq!(answer.len(), 2);
+    central.take_public_key(&answer[0]);
+    central.take_confirm(&answer[1]);
+    let random = smp(link, &mut tasks, &central.random(), false);
+    central.take_random(&random[0]);
+    let check = central.check();
+    assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    link.calls();
+    assert_eq!(link.deliver().len(), 2);
+    assert_eq!(conn.security(), Some(Sec::Encrypted));
+    // In place of its identity keys, a Pairing Request, which fails the
+    // pairing under way; then one claiming a display, which starts Passkey
+    // Entry on the link still encrypted with the Just Works key.
+    let display = Central::new(request_with_io(0x04), local);
+    assert_eq!(smp(link, &mut tasks, &display.request, true), [vec![0x05, 0x08]]);
+    assert_eq!(smp(link, &mut tasks, &display.request, true), [vec![0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]]);
+    // The key of the link is still that of Just Works.
+    assert_eq!(conn.security(), Some(Sec::Encrypted));
+    assert_eq!(request(link, &mut tasks, &[0x0A, 0x03, 0x00]), [0x01, 0x0A, 0x03, 0x00, 0x05]);
+    // The failed pairing ends the link; no report goes out meanwhile.
+    assert!(conn.try_notify(keyboard::KEYS, &[0; 8]).is_err());
+    assert!(multiplications.get() >= 1);
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+#[should_panic(expected = "authenticated attributes")]
+fn a_table_with_authenticated_attributes_needs_passkey_entry() {
+    let _host = Host::new(MockLink::new(), &keyboard::DB, Config::new(None, Unclaimed::Keep));
 }

@@ -2,8 +2,9 @@
 
 A Bluetooth LE link layer for the nRF52832 and the nRF51, written in Rust on Embassy, together with a minimal host for
 Linux and BlueZ in the same crate. The link layer drives the radio directly; the host serves one central as a
-peripheral. The nRF51 support, for an nRF51802, builds and passes the host tests but has not run on hardware yet: see
-[nRF51](#nrf51).
+peripheral. The nRF51 path, for an nRF51802, runs on hardware with BlueZ in the firmware of a presentation remote (see
+[nRF51](#nrf51)); the nRF52832 path builds and passes the host tests but has not run on hardware since the fork from
+nrf-ll.
 
 ## Status
 
@@ -33,7 +34,8 @@ What is done so far:
 - The security manager (`host::smp::Responder`): LE Secure Connections Just Works pairing as responder, with bonding and
   the identity keys both ways, as a state machine without input or output of its own. The P-256 multiplications are
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
-  reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout.
+  reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
+  feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
 - L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer, fragmenting on demand), LE signalling
   (`host::signal`: the connection parameter update request and command rejects), the ATT server at MTU 23
   (`host::att`) and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state and a constant table hash; the
@@ -64,7 +66,44 @@ On the nRF51 (thumbv6m, measured with `-Zprint-type-sizes`) the static `Host<Lin
 engine (368 the security manager), the `Host::run` future 136 bytes, the `Host::crypto` future 32, a `Host::advertise`
 future 96 and a `Conn::notify` future 48.
 
-Nothing has run on hardware or against BlueZ yet.
+What has run on hardware: the nRF51 path, with BlueZ, in the presentation remote's firmware. The nRF52832 path has not:
+since the fork from nrf-ll its link layer changed (the answer within the interframe space from two prepared slots,
+the next PDU prepared during the sleep, the latency hold after traffic), and the first nRF52832 firmware on nrf-ble is
+its first run. The optional features below have not run on hardware yet.
+
+## Optional features
+
+Each is off by default, so a device without it builds exactly as without the feature (the presentation remote's
+release build keeps its size to the byte):
+
+- **`param-requests`**: the firmware drives its own connection parameter policy. `Conn::request_params(range)` sends
+  an L2CAP Connection Parameter Update Request (`RequestError::Busy` while one waits for its response, at most 30 s,
+  `Gone` once the link ended, `Invalid` out of the specification's ranges), and `ConnEvent::ParamsRejected` reports a
+  rejection, of the engine's own request of `Config::params` too. An accepted request has no event:
+  `ConnEvent::ParamsUpdated` follows once the central updated the link. A request of the application stands in for the
+  engine's own on that link, so the two never race. A fallback range or a second request for the latency is the
+  firmware's, with its own timers and `Conn::info`.
+- **`key-missing`**: in reconnection mode, a central that asks to encrypt with a key the host does not have gets the
+  negative reply as before, and the link then ends at once with reason 0x05 and `ConnEvent::KeyMissing`, instead of at
+  the schedule's security deadline. A pairable link goes on, as the central may still pair.
+- **`passkey`**: LE Secure Connections Passkey Entry as responder, for a keyboard. `Config::with_security(
+  Security::new(IoCapability::KeyboardOnly, require_mitm))` answers with IO capability 0x02 and `AuthReq` 0x0D; a
+  central with a display or a keyboard pairs with Passkey Entry, one without input or output with Just Works, or is
+  refused with Authentication Requirements (0x03) when `require_mitm` is set. `ConnEvent::PasskeyRequested` asks for
+  the six digits the central displays, which the firmware gives with `Conn::enter_passkey(Some(passkey))`, or
+  `enter_passkey(None)` to refuse (Passkey Entry Failed, 0x01). The twenty rounds of commitments follow the Core
+  specification, volume 3, part H, section 2.3.5.6.3: a wrong passkey fails with Confirm Value Failed (0x04) in the
+  round of its first wrong bit. The Diffie-Hellman job runs while the user types. The 30 s timer pauses while the
+  device waits for its user before the central's first confirm value, then gives the user 30 s from it; the schedule's
+  security deadline still bounds the pairing. The bond of a Passkey Entry pairing is `authenticated`, and a link
+  encrypted with it, or with that pairing's key, has `Sec::Authenticated`: the table may then hold attributes that need
+  it (`authenticated` in `gatt!`), which `Host::new` refuses with a configuration that cannot pair with Passkey Entry.
+  Keypress Notifications are never asked for; those of a central are ignored. It is tested against the reference
+  central with known passkeys, end to end through the host, with every failure, the timer and the toolbox's sample
+  data of f4, f5, f6 and g2.
+
+A firmware enables the features it needs: a mouse, for example, `param-requests` and `key-missing`, a keyboard also
+`passkey`.
 
 ## The typed link API
 
@@ -294,13 +333,17 @@ nrf-ble = { git = "https://github.com/kufuchs1/nrf-ble", branch = "main" }
 
 Enable the `defmt` feature for logs, and on the nRF52832 `data-length` for payloads of up to 251 octets. That feature
 costs about 1.5 KB more static RAM, which on the nRF52832 comes out of the stack; without it the link layer answers a
-central's data length request with the 27-octet default.
+central's data length request with the 27-octet default. The host's `param-requests`, `key-missing` and `passkey` are
+described in [Optional features](#optional-features); they work on both chips.
 
 The crate follows the main branch of every dependency (the default branch, master, where a repository has none), and
 commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
-`Cargo.lock` keeps them until `cargo update`. Its requirements only name the major version the code is written for; the
-`[patch.crates-io]` section of [`Cargo.toml`](Cargo.toml) takes each crate from its branch, so that the crates the
-dependencies pull from crates.io resolve to that same copy. Patches apply only to the workspace being built, so a
+`Cargo.lock` keeps them until `cargo update`. Its own dependencies name their git source and branch, not a version: with
+only a version requirement Cargo can quietly fall back to an older crates.io release when a main branch drops a feature
+that is asked for (Embassy main removed embassy-nrf's `gpiote` feature, and a firmware asking for it got embassy-nrf
+0.10 from crates.io beside nrf-ble's 0.11 from git); a git source fails loudly instead. The `[patch.crates-io]` section
+of [`Cargo.toml`](Cargo.toml) takes each crate from its branch, so that the crates the dependencies pull from crates.io
+resolve to that same copy. Patches apply only to the workspace being built, so a
 firmware repeats them in its own `Cargo.toml`. Two crates come from the revision Embassy's main branch names, as Cargo
 cannot patch a Git dependency with another branch of the same repository: `nrf-pac` and `unitrait`, both at the head of
 their main branch when this was written.

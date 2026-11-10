@@ -3,8 +3,18 @@
 //! The host serves one connection as a peripheral: L2CAP with the fixed
 //! channels for ATT, signalling and the security manager, a GATT server over
 //! a constant attribute table, LE Secure Connections pairing as responder
-//! (Just Works) with bonding, and connectable advertising. It talks to the
-//! link layer through the typed API of [`crate::link`], not through HCI.
+//! (Just Works, and with the feature `passkey` Passkey Entry as a keyboard)
+//! with bonding, and connectable advertising. It talks to the link layer
+//! through the typed API of [`crate::link`], not through HCI.
+//!
+//! Three optional features add to the host, each off by default so a device
+//! without it builds as before: `param-requests` (the application's own
+//! connection parameter requests, `Conn::request_params`, and
+//! `ConnEvent::ParamsRejected`), `key-missing` (a reconnection whose central
+//! has no key of the bond ends at once, `ConnEvent::KeyMissing`) and
+//! `passkey` (Passkey Entry: [`engine::Config`]'s security,
+//! `ConnEvent::PasskeyRequested`, `Conn::enter_passkey`, and attributes that
+//! need an authenticated link).
 //!
 //! The protocol core ([`l2cap`], [`signal`], [`att`], [`gatt`], [`smp`], with
 //! its cryptography in [`smp::toolbox`] and [`smp::ecc`], and the [`engine`]
@@ -341,7 +351,11 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::{blocking_mutex::Mutex, mutex::Mutex as AsyncMutex, signal::Signal};
 use embassy_time::{Instant, Timer};
+#[cfg(feature = "param-requests")]
+pub use engine::RequestError;
 pub use engine::{ConnEvent, NotifyError};
+#[cfg(feature = "passkey")]
+pub use smp::PasskeyError;
 
 /// The mutex around the host's state: a thread mode mutex on the chip, so no
 /// critical section ever holds off the link layer for the engine's work.
@@ -583,6 +597,28 @@ where
     #[inline]
     pub fn disconnect(&self) -> Result<(), link::Error> { self.host.port.disconnect(self.epoch, engine::REMOTE_USER) }
 
+    /// Gives the passkey the user typed after [`ConnEvent::PasskeyRequested`].
+    ///
+    /// The six digits as a number, or `None` if the user gave up, which
+    /// fails the pairing with Passkey Entry Failed (0x01):
+    /// [`ConnEvent::PairingFailed`] follows. The run task hands it to the
+    /// security manager, which then goes on with Passkey Entry.
+    ///
+    /// # Errors
+    ///
+    /// [`PasskeyError::Gone`] once the link ended or is ending,
+    /// [`PasskeyError::NotWaiting`] unless the pairing waits for the passkey
+    /// and has none yet, [`PasskeyError::Invalid`] above 999 999.
+    #[cfg(feature = "passkey")]
+    #[inline]
+    pub fn enter_passkey(&self, passkey: Option<u32>) -> Result<(), PasskeyError> {
+        let result = self.host.with(|state| state.engine.enter_passkey(self.epoch, passkey));
+        if result.is_ok() {
+            self.host.wake.signal(());
+        }
+        result
+    }
+
     /// The link.
     #[inline]
     #[must_use = "the link is only read"]
@@ -634,8 +670,51 @@ where
         }
     }
 
+    /// Asks the central for the connection parameters `range` with the
+    /// L2CAP Connection Parameter Update Request, as
+    /// [`engine::Engine::request_params`] says: the engine's own request of
+    /// [`engine::Config::params`] is then not made on this link. The central
+    /// answers with [`ConnEvent::ParamsRejected`], or updates the link,
+    /// which [`ConnEvent::ParamsUpdated`] reports. The policy is the
+    /// firmware's: a fallback range after a rejection or an interval that
+    /// stays too long, a second request for the latency, with its own
+    /// timers.
+    ///
+    /// ```no_run
+    /// # use nrf_ble::{host::{ConnEvent, Conn, Port}, link::ParamRange};
+    /// /// 11.25 to 15 ms, a latency of 30 events, 6 s.
+    /// const FALLBACK: ParamRange = ParamRange::new(9, 12, 30, 600);
+    ///
+    /// async fn on_event<P: Port>(conn: &Conn<'_, P>, event: ConnEvent) {
+    ///     if event == ConnEvent::ParamsRejected {
+    ///         // Busy only while a request waits: the rejected one is done.
+    ///         let _ = conn.request_params(FALLBACK);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError::Gone`] once the link ended or is ending,
+    /// [`RequestError::Invalid`] for a range out of the specification's,
+    /// [`RequestError::Busy`] while an earlier request, the engine's or this
+    /// one's, waits for its response.
+    #[cfg(feature = "param-requests")]
+    #[inline]
+    pub fn request_params(&self, range: link::ParamRange) -> Result<(), RequestError> {
+        let result = self.host.with(|state| state.engine.request_params(self.epoch, range));
+        if result.is_ok() {
+            // The run task queues it.
+            self.host.wake.signal(());
+        }
+        result
+    }
+
     /// The security of the link: encrypted once it is with a key the host
-    /// gave, `None` once it ended.
+    /// gave, `None` once it ended. With the feature `passkey`,
+    /// [`Sec::Authenticated`] when that key is the one of a Passkey Entry
+    /// pairing, or of a bond whose `authenticated` is set; a reconnection
+    /// with an unauthenticated bond stays encrypted.
     #[inline]
     #[must_use = "the security is only read"]
     pub fn security(&self) -> Option<Sec> { self.host.with(|state| state.engine.security(self.epoch)) }
@@ -833,9 +912,20 @@ where
     }
 
     /// The host over `port`, with the table `db`, doing as `config` says.
+    ///
+    /// # Panics
+    ///
+    /// With the feature `passkey`, if the table has an attribute that needs
+    /// authentication and `config` pairs with Just Works only: the attribute
+    /// could never be reached. In a `static`, this fails the build.
     #[inline]
     #[must_use = "the host is only built"]
     pub const fn new(port: P, db: &'static Db, config: engine::Config) -> Self {
+        #[cfg(feature = "passkey")]
+        assert!(
+            !db.needs_authentication() || config.security.protects(),
+            "a table with authenticated attributes needs a configuration that pairs with Passkey Entry"
+        );
         Self {
             advertised: Signal::new(),
             events: Signal::new(),
@@ -898,6 +988,9 @@ where
         C: Aes + Random,
     {
         loop {
+            // The passkey the application gave, for the security manager.
+            #[cfg(feature = "passkey")]
+            self.with(|state| state.engine.take_passkey(crypto, self.port.now()));
             let (deadline, room) = self.with(|state| self.flush(state));
             let timer = async {
                 match deadline {

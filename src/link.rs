@@ -211,7 +211,7 @@ impl ParamRange {
 
     /// Whether the range is within the ranges of the specification: an
     /// interval of 7.5 ms to 4 s, a latency and a timeout that fit it.
-    fn is_valid(self) -> bool {
+    pub(crate) fn is_valid(self) -> bool {
         self.interval_min <= self.interval_max
             && self.interval_min >= 6
             && valid_connection_parameters(self.interval_max, self.latency, self.timeout, 1, 0)
