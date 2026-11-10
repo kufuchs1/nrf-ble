@@ -711,7 +711,10 @@ where
     }
 
     /// The security of the link: encrypted once it is with a key the host
-    /// gave, `None` once it ended.
+    /// gave, `None` once it ended. With the feature `passkey`,
+    /// [`Sec::Authenticated`] when that key is the one of a Passkey Entry
+    /// pairing, or of a bond whose `authenticated` is set; a reconnection
+    /// with an unauthenticated bond stays encrypted.
     #[inline]
     #[must_use = "the security is only read"]
     pub fn security(&self) -> Option<Sec> { self.host.with(|state| state.engine.security(self.epoch)) }

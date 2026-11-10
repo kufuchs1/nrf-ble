@@ -102,8 +102,8 @@ release build keeps its size to the byte):
   central with known passkeys, end to end through the host, with every failure, the timer and the toolbox's sample
   data of f4, f5, f6 and g2.
 
-The MX firmwares take `param-requests` and `key-missing`, the keyboard also `passkey`. They depend on this crate's
-`main` branch, which has these features once the pull request with them is merged.
+A firmware enables the features it needs: a mouse, for example, `param-requests` and `key-missing`, a keyboard also
+`passkey`.
 
 ## The typed link API
 
