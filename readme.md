@@ -16,9 +16,10 @@ to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs). It
 
 The crate is device-agnostic: it holds no device's attribute table, name, appearance, connection parameters or
 advertising. Each firmware defines those itself with the crate's building blocks, as [A device](#a-device) shows; the
-first such firmware is that of a presentation remote on an nRF51802, later the MX firmwares. The design is
-in [`docs/host/design.md`](../docs/host/design.md), with the fixes of its reviews; it was written for a separate host
-crate and an HCI adapter, and this crate replaces both with one crate and the typed API.
+first such firmware is that of a presentation remote on an nRF51802, later the MX firmwares. The design is not in this
+repository: it is `docs/host/design.md` in the repository of that first firmware,
+[kufuchs1/spotlight_rust](https://github.com/kufuchs1/spotlight_rust), with the fixes of its reviews. It was written
+for a separate host crate and an HCI adapter, and this crate replaces both with one crate and the typed API.
 
 What is done so far:
 
