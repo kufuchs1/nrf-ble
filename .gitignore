@@ -1,1 +1,3 @@
 target
+# No lock: every build resolves the main branches of the dependencies anew.
+Cargo.lock
