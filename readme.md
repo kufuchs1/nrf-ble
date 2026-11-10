@@ -287,15 +287,23 @@ Embassy assumes 128 KB of flash on the nRF51, so its `Nvmc` cannot write the upp
 
 ```toml
 [dependencies]
-nrf-ble = { path = "../nrf-ble" }
+nrf-ble = { git = "https://github.com/kufuchs1/nrf-ble", branch = "main" }
 # On an nRF51:
-# nrf-ble = { path = "../nrf-ble", default-features = false, features = ["nrf51"] }
+# nrf-ble = { git = "https://github.com/kufuchs1/nrf-ble", branch = "main", default-features = false, features = ["nrf51"] }
 ```
 
 Enable the `defmt` feature for logs, and on the nRF52832 `data-length` for payloads of up to 251 octets. That feature
 costs about 1.5 KB more static RAM, which on the nRF52832 comes out of the stack; without it the link layer answers a
-central's data length request with the 27-octet default. The crate follows Embassy's main branch: patch the Embassy
-crates to it as in [`Cargo.toml`](Cargo.toml).
+central's data length request with the 27-octet default.
+
+The crate follows the main branch of every dependency (the default branch, master, where a repository has none), and
+commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
+`Cargo.lock` keeps them until `cargo update`. Its requirements only name the major version the code is written for; the
+`[patch.crates-io]` section of [`Cargo.toml`](Cargo.toml) takes each crate from its branch, so that the crates the
+dependencies pull from crates.io resolve to that same copy. Patches apply only to the workspace being built, so a
+firmware repeats them in its own `Cargo.toml`. Two crates come from the revision Embassy's main branch names, as Cargo
+cannot patch a Git dependency with another branch of the same repository: `nrf-pac` and `unitrait`, both at the head of
+their main branch when this was written.
 
 ## A device
 

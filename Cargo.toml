@@ -24,6 +24,12 @@ data-length = []
 # report count those events, and the link goes on as with a lost answer.
 ifs-delay-test = []
 
+# Every dependency follows the main branch of its repository (the default
+# branch where it has no main), through the patches at the end: the
+# requirements here only name the major version the code is written for, and
+# no Cargo.lock is committed: a fresh checkout resolves the latest commits of
+# the branches, and the local, ignored Cargo.lock keeps them until
+# `cargo update`.
 [dependencies]
 cortex-m = "0"
 defmt = { version = "1", optional = true }
@@ -33,14 +39,14 @@ embassy-sync = "0"
 embassy-time = "0"
 # P-256 for LE Secure Connections pairing: field and point arithmetic only,
 # with a scalar multiplication loop of our own (src/host/smp/ecc.rs).
-p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic"] }
+p256 = { version = "0", default-features = false, features = ["arithmetic"] }
 
 [dev-dependencies]
 # Software AES for the host tests, in place of the hardware ECB.
 aes = "0"
 # The Diffie-Hellman of the p256 crate, to check our own scalar
 # multiplication against in the host tests.
-p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic", "ecdh"] }
+p256 = { version = "0", default-features = false, features = ["arithmetic", "ecdh"] }
 # The RTC time driver only provides the time symbols for the host tests; no
 # test starts it. The chip comes from the chip feature: features unify, and
 # naming one here would build both chips for the other.
@@ -57,8 +63,23 @@ critical-section = { version = "1", features = ["std"] }
 test = true
 bench = false
 
-# Embassy from its main branch, as for the firmware.
+# Every crate of the graph from the main branch of its repository, or from
+# its default branch where it has no main (master), so that the crates the
+# dependencies pull from crates.io resolve to the same copy. A patch applies
+# only to the requirements its branch's version satisfies, so a few crates
+# stay on crates.io where a dependency needs an older major version than the
+# one on the branch: bitflags 1 (defmt), embedded-hal 0.2 and nb 0.1
+# (cortex-m, Embassy), embedded-io and embedded-io-async 0.6
+# (embassy-usb-driver), syn 2 (unitrait-macros, at the unitrait revision
+# Embassy names), and bare-metal 0.2, bitfield 0.13, rustc_version 0.2,
+# semver 0.9 and semver-parser 0.7 under cortex-m 0.7. Likewise futures-core and futures-sink 0.3 (Embassy), hash32
+# 0.3 (heapless) and libc 0.2 (cpufeatures): their main branches carry
+# unreleased pre-releases of the next major version (futures-core 1.0 and
+# futures-sink 0.4 alphas, hash32 1.0, libc 1.0 alphas). nrf-pac and unitrait
+# come from the revision Embassy's main branch names: Cargo refuses a patch
+# of a Git dependency from the same repository.
 [patch.crates-io]
+# Embassy, as for the firmware.
 embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
@@ -66,6 +87,73 @@ embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" 
 embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+# RustCrypto: P-256 and the traits, field and integer arithmetic below it.
+p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
+primefield = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
+primeorder = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
+wnaf = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
+cipher = { git = "https://github.com/RustCrypto/traits", branch = "master" }
+crypto-common = { git = "https://github.com/RustCrypto/traits", branch = "master" }
+digest = { git = "https://github.com/RustCrypto/traits", branch = "master" }
+elliptic-curve = { git = "https://github.com/RustCrypto/traits", branch = "master" }
+aes = { git = "https://github.com/RustCrypto/block-ciphers", branch = "master" }
+crypto-bigint = { git = "https://github.com/RustCrypto/crypto-bigint", branch = "master" }
+hybrid-array = { git = "https://github.com/RustCrypto/hybrid-array", branch = "master" }
+base16ct = { git = "https://github.com/RustCrypto/formats", branch = "master" }
+const-oid = { git = "https://github.com/RustCrypto/formats", branch = "master" }
+der = { git = "https://github.com/RustCrypto/formats", branch = "master" }
+sec1 = { git = "https://github.com/RustCrypto/formats", branch = "master" }
+hkdf = { git = "https://github.com/RustCrypto/KDFs", branch = "master" }
+hmac = { git = "https://github.com/RustCrypto/MACs", branch = "master" }
+block-buffer = { git = "https://github.com/RustCrypto/utils", branch = "master" }
+cmov = { git = "https://github.com/RustCrypto/utils", branch = "master" }
+cpubits = { git = "https://github.com/RustCrypto/utils", branch = "master" }
+cpufeatures = { git = "https://github.com/RustCrypto/utils", branch = "master" }
+ctutils = { git = "https://github.com/RustCrypto/utils", branch = "master" }
+inout = { git = "https://github.com/RustCrypto/utils", branch = "master" }
+zeroize = { git = "https://github.com/RustCrypto/utils", branch = "master" }
+ff = { git = "https://github.com/zkcrypto/ff", branch = "main" }
+group = { git = "https://github.com/zkcrypto/group", branch = "main" }
+rand_core = { git = "https://github.com/rust-random/rand_core", branch = "master" }
+# Its main branch is at 2.6.0: 2.6.1 on crates.io was released from another
+# branch and only drops an unused import.
+subtle = { git = "https://github.com/dalek-cryptography/subtle", branch = "main" }
+typenum = { git = "https://github.com/paholg/typenum", branch = "main" }
+# Embedded Rust and defmt.
+cortex-m = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
+cortex-m-macros = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
+cortex-m-rt = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
+cortex-m-rt-macros = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
+critical-section = { git = "https://github.com/rust-embedded/critical-section", branch = "main" }
+embedded-hal = { git = "https://github.com/rust-embedded/embedded-hal", branch = "master" }
+embedded-hal-async = { git = "https://github.com/rust-embedded/embedded-hal", branch = "master" }
+embedded-io = { git = "https://github.com/rust-embedded/embedded-hal", branch = "master" }
+embedded-io-async = { git = "https://github.com/rust-embedded/embedded-hal", branch = "master" }
+heapless = { git = "https://github.com/rust-embedded/heapless", branch = "main" }
+nb = { git = "https://github.com/rust-embedded/nb", branch = "master" }
+volatile-register = { git = "https://github.com/rust-embedded/volatile-register", branch = "master" }
+vcell = { git = "https://github.com/japaric/vcell", branch = "master" }
+embedded-storage = { git = "https://github.com/rust-embedded-community/embedded-storage", branch = "master" }
+embedded-storage-async = { git = "https://github.com/rust-embedded-community/embedded-storage", branch = "master" }
+# The repository also holds defmt 0.3, a shim over 1.
+defmt = { git = "https://github.com/knurling-rs/defmt", branch = "main", version = "1" }
+defmt-macros = { git = "https://github.com/knurling-rs/defmt", branch = "main" }
+defmt-parser = { git = "https://github.com/knurling-rs/defmt", branch = "main" }
+# Build-time and general crates.
+proc-macro2 = { git = "https://github.com/dtolnay/proc-macro2", branch = "master" }
+quote = { git = "https://github.com/dtolnay/quote", branch = "master" }
+syn = { git = "https://github.com/dtolnay/syn", branch = "master" }
+unicode-ident = { git = "https://github.com/dtolnay/unicode-ident", branch = "master" }
+thiserror = { git = "https://github.com/dtolnay/thiserror", branch = "master" }
+thiserror-impl = { git = "https://github.com/dtolnay/thiserror", branch = "master" }
+autocfg = { git = "https://github.com/cuviper/autocfg", branch = "master" }
+bitflags = { git = "https://github.com/bitflags/bitflags", branch = "main" }
+byteorder = { git = "https://github.com/BurntSushi/byteorder", branch = "master" }
+document-features = { git = "https://github.com/slint-ui/document-features", branch = "master" }
+litrs = { git = "https://github.com/LukasKalbertodt/litrs", branch = "main" }
+num-traits = { git = "https://github.com/rust-num/num-traits", branch = "main" }
+stable_deref_trait = { git = "https://github.com/storyyeller/stable_deref_trait", branch = "master" }
+void = { git = "https://github.com/reem/rust-void", branch = "master" }
 
 [lints.rust]
 warnings = "deny"
