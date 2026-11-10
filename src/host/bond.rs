@@ -7,8 +7,8 @@
 //! ([`crate::host::gatt::Subscriptions::bits`]) and, only for a table with the
 //! Service Changed characteristic, part of the table's layout hash.
 //!
-//! The Spotlight table has no Service Changed characteristic, so its bonds
-//! keep no layout: [`Bond::new`] takes it from the table, and
+//! A table without the Service Changed characteristic makes bonds that keep
+//! no layout: [`Bond::new`] takes it from the table, and
 //! [`Bond::layout_known`] holds for such a table whatever the bond keeps.
 //!
 //! The firmware stores a bond in flash as [`BOND_LEN`] octets

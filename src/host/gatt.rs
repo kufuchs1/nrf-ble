@@ -15,11 +15,11 @@
 //! keeps for each link in [`Subscriptions`] and restores from the bond, or the
 //! table's own hash ([`Value::Hash`]).
 //!
-//! The Service Changed characteristic (0x2A05) is optional: the Spotlight
-//! table has none. Where it is present, the server builds its indication only
-//! once that link has written its client characteristic configuration, as
-//! BlueZ registers its handler only then. The engine does not send
-//! indications yet: asking for this one only after the Write Response went
+//! The Service Changed characteristic (0x2A05) is optional, and a table that
+//! never changes its layout needs none. Where it is present, the server builds
+//! its indication only once that link has written its client characteristic
+//! configuration, as BlueZ registers its handler only then. The engine does not
+//! send indications yet: asking for this one only after the Write Response went
 //! out, and timing its confirmation, are still to be done for a table that
 //! has the characteristic.
 //!
@@ -113,8 +113,6 @@
 
 /// The constant hash of the table's layout.
 pub mod hash;
-/// The table of the Spotlight remote.
-pub mod spotlight;
 
 use crate::link::ParamRange;
 

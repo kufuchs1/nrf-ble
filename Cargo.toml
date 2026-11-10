@@ -50,7 +50,7 @@ embassy-time = { version = "0", features = ["tick-hz-32_768"] }
 [target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
 critical-section = { version = "1", features = ["std"] }
 
-# Standalone: not a member of the spotlight_rust root package or of fw.
+# Standalone: not a member of the workspace of a firmware that uses it.
 [workspace]
 
 [lib]

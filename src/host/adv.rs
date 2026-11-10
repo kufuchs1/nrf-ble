@@ -5,12 +5,12 @@
 //! the appearance, the complete list of 16-bit service UUIDs and the TX power
 //! level. A structure that does not fit is refused with [`Overflow`] and
 //! leaves the data as it was. [`Content`] builds both sets of a device from its
-//! name, appearance and services, with [`Content::SPOTLIGHT`] for the
-//! Spotlight remote.
+//! name, appearance and services, which the device defines
+//! ([`Content::new`]).
 //!
 //! # Modes
 //!
-//! The Spotlight advertises in one of two [`Mode`]s, connectable and
+//! A device advertises in one of two [`Mode`]s, connectable and
 //! undirected in both, and always from a resolvable private address made with
 //! its own identity resolving key, which the link layer renews every
 //! [`RPA_TIMEOUT_S`] seconds:
@@ -39,10 +39,49 @@
 //!
 //! A [`Schedule`] is data: the phases of advertising, each an interval and how
 //! long it lasts, and the time a connection gets to become encrypted. The
-//! Spotlight's ([`SPOTLIGHT_PAIRING`] and [`SPOTLIGHT_RECONNECT`]) are those of
-//! the MX firmwares: 20 ms for 3 s, so a central that waits connects at once,
-//! then 50 ms for 12 s and 400 ms for 45 s, one minute in all; 60 s to pair,
-//! and 20 s for the bonded central to encrypt, which it does at once.
+//! device defines one for each mode and passes it to [`Advertising::new`]
+//! with its [`Content`]. A remote for instance advertises at 20 ms for 3 s,
+//! so a central that waits connects at once, then at 50 ms for 12 s and at
+//! 400 ms for 45 s, one minute in all, and gives 60 s to pair and 20 s for
+//! the bonded central to encrypt, which it does at once:
+//!
+//! ```
+//! use embassy_time::Duration;
+//! use nrf_ble::host::adv::{
+//!     Advertising,
+//!     BATTERY_SERVICE,
+//!     Content,
+//!     HID_SERVICE,
+//!     Mode,
+//!     Overflow,
+//!     Phase,
+//!     Schedule,
+//! };
+//!
+//! /// 20 ms for 3 s, 50 ms for 12 s, 400 ms for 45 s.
+//! const PHASES: [Phase; 3] = [
+//!     Phase::new(32, Duration::from_secs(3)),
+//!     Phase::new(80, Duration::from_secs(12)),
+//!     Phase::new(640, Duration::from_secs(45)),
+//! ];
+//! /// Pairing: 60 s to pair.
+//! const PAIRING: Schedule = Schedule::new(&PHASES, Duration::from_secs(60));
+//! /// Reconnection: 20 s for the bonded central to encrypt.
+//! const RECONNECT: Schedule = Schedule::new(&PHASES, Duration::from_secs(20));
+//! /// The name, a keyboard's appearance, the HID and Battery services.
+//! const CONTENT: Content<'static> =
+//!     Content::new(b"My Remote", 0x03C1, &[HID_SERVICE, BATTERY_SERVICE]);
+//!
+//! /// The advertising of `mode`.
+//! fn advertising(mode: Mode<'_>) -> Result<Advertising<'_>, Overflow> {
+//!     let schedule = if mode.pairable() { &PAIRING } else { &RECONNECT };
+//!     Advertising::new(mode, schedule, &CONTENT)
+//! }
+//!
+//! let pairing = advertising(Mode::Pairing).unwrap();
+//! assert_eq!(pairing.scan().as_bytes(), b"");
+//! assert_eq!(&pairing.data().as_bytes()[13..], b"\x0A\x09My Remote");
+//! ```
 //!
 //! # The advertising call
 //!
@@ -55,7 +94,7 @@
 
 use crate::{
     advertiser::legacy::{self, Kind},
-    host::{bond::Bond, gatt::spotlight, identity::LocalIdentity},
+    host::{bond::Bond, identity::LocalIdentity},
     link::{self, AdvParams, Link},
     pdu::Peer,
 };
@@ -93,18 +132,6 @@ const FILTER_BONDED: u8 = 0x03;
 /// The identity of the resolving list entry that only carries our own key
 /// in [`Mode::Pairing`]: no central has this address.
 const NO_PEER: Peer = Peer::new([0; 6], false);
-
-/// The Spotlight's phases: 20 ms for 3 s, 50 ms for 12 s, 400 ms for 45 s.
-pub const SPOTLIGHT_PHASES: [Phase; 3] = [
-    Phase::new(32, Duration::from_secs(3)),
-    Phase::new(80, Duration::from_secs(12)),
-    Phase::new(640, Duration::from_secs(45)),
-];
-/// The Spotlight's pairing: [`SPOTLIGHT_PHASES`], and 60 s to pair.
-pub const SPOTLIGHT_PAIRING: Schedule = Schedule::new(&SPOTLIGHT_PHASES, Duration::from_secs(60));
-/// The Spotlight's reconnection: [`SPOTLIGHT_PHASES`], and 20 s for the
-/// bonded central to encrypt.
-pub const SPOTLIGHT_RECONNECT: Schedule = Schedule::new(&SPOTLIGHT_PHASES, Duration::from_secs(20));
 
 /// One mode's advertising: the mode, its schedule, and the advertising and
 /// scan response data.
@@ -337,21 +364,6 @@ impl<'bond> Advertising<'bond> {
     #[must_use = "the schedule is only read"]
     pub const fn schedule(&self) -> &'static Schedule { self.schedule }
 
-    /// The Spotlight's advertising in `mode`: [`Content::SPOTLIGHT`] with
-    /// `tx_power`, on [`SPOTLIGHT_PAIRING`] or [`SPOTLIGHT_RECONNECT`].
-    ///
-    /// # Errors
-    ///
-    /// [`Overflow`] if the TX power level does not fit.
-    #[inline]
-    pub fn spotlight(mode: Mode<'bond>, tx_power: Option<i8>) -> Result<Self, Overflow> {
-        let schedule = match mode {
-            Mode::Pairing => &SPOTLIGHT_PAIRING,
-            Mode::Reconnect(_) => &SPOTLIGHT_RECONNECT,
-        };
-        Self::new(mode, schedule, &Content { tx_power, ..Content::SPOTLIGHT })
-    }
-
     /// Advertises with `phase`'s interval until a central connects, or
     /// until [`Link::stop_advertising`] or another call replaces it. The
     /// mode is to be [`Self::configure`]d first.
@@ -370,17 +382,7 @@ impl<'bond> Advertising<'bond> {
     }
 }
 
-impl Content<'_> {
-    /// The Spotlight: its name and appearance from its table
-    /// ([`spotlight::NAME`] and [`spotlight::APPEARANCE`]), the HID and
-    /// Battery services, no TX power level.
-    pub const SPOTLIGHT: Content<'static> = Content {
-        appearance: u16::from_le_bytes(spotlight::APPEARANCE),
-        name:       spotlight::NAME,
-        services:   &[HID_SERVICE, BATTERY_SERVICE],
-        tx_power:   None,
-    };
-
+impl<'name> Content<'name> {
     /// The advertising and the scan response data, `discoverable` or not.
     ///
     /// The advertising data holds the flags (LE General Discoverable only
@@ -409,6 +411,22 @@ impl Content<'_> {
         }
         Ok((adv, scan))
     }
+
+    /// The content of a device named `name` (its complete local name, UTF-8,
+    /// as its Device Name characteristic holds it) with `appearance` (the
+    /// value of its Appearance characteristic) and the 16-bit UUIDs of
+    /// `services` in the order to list them, without a TX power level.
+    #[inline]
+    #[must_use = "the content is only built"]
+    pub const fn new(name: &'name [u8], appearance: u16, services: &'name [u16]) -> Self {
+        Self { appearance, name, services, tx_power: None }
+    }
+
+    /// The same content with the TX power level `tx_power` in dBm, or
+    /// without one.
+    #[inline]
+    #[must_use = "the content is only built"]
+    pub const fn with_tx_power(self, tx_power: Option<i8>) -> Self { Self { tx_power, ..self } }
 }
 
 impl Data {

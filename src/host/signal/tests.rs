@@ -1,9 +1,9 @@
 //! Tests of the LE signalling channel.
 
 use super::*;
-use crate::host::gatt::{ppcp, spotlight::PARAMS};
+use crate::host::{example::PARAMS, gatt::ppcp};
 
-/// Sends a request for the Spotlight parameters and returns its identifier.
+/// Sends a request for the example parameters and returns its identifier.
 fn request(signalling: &mut Signalling) -> u8 {
     let command = signalling.request_params(PARAMS).unwrap();
     command.bytes()[1]

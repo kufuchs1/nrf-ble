@@ -1,7 +1,7 @@
 //! Tests of the bond and its stored form.
 
 use super::*;
-use crate::host::gatt::{Value, spotlight};
+use crate::host::{example, gatt::Value};
 
 crate::gatt! {
     /// A table with Service Changed and one more descriptor.
@@ -21,15 +21,15 @@ const LTK: [u8; 16] = [0x11; 16];
 /// A central's identity resolving key.
 const IRK: [u8; 16] = [0x22; 16];
 
-/// A bond with BlueZ's public identity and no key of its, on the Spotlight
+/// A bond with BlueZ's public identity and no key of its, on the example
 /// table.
-fn spotlight_bond() -> Bond {
-    Bond::new(Peer::new([1, 2, 3, 4, 5, 6], false), None, LTK, Variant::new(0, 3), &spotlight::DB)
+fn example_bond() -> Bond {
+    Bond::new(Peer::new([1, 2, 3, 4, 5, 6], false), None, LTK, Variant::new(0, 3), &example::DB)
 }
 
 #[test]
 fn the_stored_form_has_the_documented_layout() {
-    let mut bond = spotlight_bond();
+    let mut bond = example_bond();
     bond.cccd = 0x0000_0155;
     let bytes = bond.to_bytes();
     assert_eq!(bytes.len(), BOND_LEN);
@@ -66,14 +66,14 @@ fn every_field_survives_the_round_trip() {
 fn erased_flash_zeros_and_other_versions_are_refused() {
     assert!(Bond::from_bytes(&[0xFF; BOND_LEN]).is_none());
     assert!(Bond::from_bytes(&[0; BOND_LEN]).is_none());
-    let mut bytes = spotlight_bond().to_bytes();
+    let mut bytes = example_bond().to_bytes();
     bytes[0] = BOND_VERSION + 1;
     assert!(Bond::from_bytes(&bytes).is_none());
 }
 
 #[test]
 fn contradicting_fields_are_refused() {
-    let good = spotlight_bond().to_bytes();
+    let good = example_bond().to_bytes();
     let refused = |change: &dyn Fn(&mut [u8; BOND_LEN])| {
         let mut bytes = good;
         change(&mut bytes);
@@ -106,15 +106,15 @@ fn contradicting_fields_are_refused() {
 }
 
 #[test]
-fn the_spotlight_bond_keeps_no_layout() {
-    let bond = spotlight_bond();
-    assert_eq!(spotlight::DB.service_changed(), None);
+fn the_example_bond_keeps_no_layout() {
+    let bond = example_bond();
+    assert_eq!(example::DB.service_changed(), None);
     assert_eq!(bond.layout, None);
-    assert!(bond.layout_known(&spotlight::DB));
+    assert!(bond.layout_known(&example::DB));
     // Even a bond with a layout knows a table without Service Changed.
-    let mut other = spotlight_bond();
+    let mut other = example_bond();
     other.layout = Some(7);
-    assert!(other.layout_known(&spotlight::DB));
+    assert!(other.layout_known(&example::DB));
 }
 
 #[test]
@@ -130,12 +130,12 @@ fn a_table_with_service_changed_compares_the_layout() {
 
 #[test]
 fn subscriptions_past_the_tables_descriptors_are_left_out() {
-    let mut bond = spotlight_bond();
+    let mut bond = example_bond();
     bond.cccd = u32::MAX;
-    let cccds = u32::from(spotlight::DB.cccds());
-    assert_eq!(bond.subscriptions(&spotlight::DB).bits(), (1 << (2 * cccds)) - 1);
+    let cccds = u32::from(example::DB.cccds());
+    assert_eq!(bond.subscriptions(&example::DB).bits(), (1 << (2 * cccds)) - 1);
     bond.cccd = 0b01_00_01;
-    assert_eq!(bond.subscriptions(&spotlight::DB).bits(), 0b01_00_01);
-    assert!(bond.subscriptions(&spotlight::DB).notifying(2));
+    assert_eq!(bond.subscriptions(&example::DB).bits(), 0b01_00_01);
+    assert!(bond.subscriptions(&example::DB).notifying(2));
     assert_eq!(bond.subscriptions(&CHANGED_DB).bits(), 0b00_01);
 }

@@ -12,8 +12,11 @@ and the MX Master 3S mouse, which talks to a host stack such as [TrouBLE](https:
 HCI. nrf-ll stays as it is, and the MX firmwares keep using it until they move here.
 
 This crate has no HCI: no bt-hci, no TrouBLE, and no command or event encoded into bytes. The host (`src/host`) talks
-to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs). Its only target is Linux with BlueZ,
-and its first user is the firmware of the Logitech Spotlight remote (an nRF51802), later the MX firmwares. The design is
+to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs). Its only target is Linux with BlueZ.
+
+The crate is device-agnostic: it holds no device's attribute table, name, appearance, connection parameters or
+advertising. Each firmware defines those itself with the crate's building blocks, as [A device](#a-device) shows; the
+first such firmware is that of a presentation remote on an nRF51802, later the MX firmwares. The design is
 in [`docs/host/design.md`](../docs/host/design.md), with the fixes of its reviews; it was written for a separate host
 crate and an HCI adapter, and this crate replaces both with one crate and the typed API.
 
@@ -32,8 +35,8 @@ What is done so far:
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout.
 - L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer, fragmenting on demand), LE signalling
   (`host::signal`: the connection parameter update request and command rejects), the ATT server at MTU 23
-  (`host::att`) and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state, a constant table hash and the
-  Spotlight table in `host::gatt::spotlight`).
+  (`host::att`) and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state and a constant table hash; the
+  table itself is the device's).
 - Our identity (`host::identity`: the address and identity resolving key derived from the device secret the way the MX
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
   phases, and their setup of the link layer's accept list, resolving list and privacy) and the bond (`host::bond`: the
@@ -54,7 +57,7 @@ What is done so far:
   phases and keeps or ends a link that arrives after its future was dropped; `Conn::notify` paces by acknowledgement,
   with at most two fragments in flight and one place of the queue kept free. The link layer is reached through the
   `host::Port` trait, which `link::Link` implements; the host tests drive the whole host over a stand-in link layer.
-  The module documentation of `host` shows how the Spotlight firmware wires it.
+  The module documentation of `host` shows how a device's firmware wires it.
 
 On the nRF51 (thumbv6m, measured with `-Zprint-type-sizes`) the static `Host<Link>` takes 896 bytes, 800 of them the
 engine (368 the security manager), the `Host::run` future 136 bytes, the `Host::crypto` future 32, a `Host::advertise`
@@ -259,7 +262,7 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   copying and rotating the PDU queue within the interframe space, so the radio sent the received packet back: the
   central never got `LL_FEATURE_RSP` and ended the link after the 40 s procedure timeout. The answer now takes about
   400 to 600 cycles from the start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up
-  at the END (emulated on the Spotlight firmware's release build). The 10 s report and the end of each link log its
+  at the END (emulated on an nRF51 firmware's release build). The 10 s report and the end of each link log its
   counters: `R retx (A with ack), K acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback,
   prepare max P us`, where `late` counts answers in place only after the radio started sending, `answer max` the
   time from the END until the answer was in place, `retx with ack` the central's retransmissions that acknowledged
@@ -293,10 +296,110 @@ costs about 1.5 KB more static RAM, which on the nRF52832 comes out of the stack
 central's data length request with the 27-octet default. The crate follows Embassy's main branch: patch the Embassy
 crates to it as in [`Cargo.toml`](Cargo.toml).
 
+## A device
+
+Everything that makes a device what it is lives in the device's own crate, typically in one module of its firmware:
+
+- **The attribute table**, built at compile time with the exported `nrf_ble::gatt!` macro from `host::gatt`'s
+  `Value`s (constant bytes, zeros, a write sink, the table's hash, or a `ValueId` the application's `Handler` reads
+  and writes). Each named `char` becomes a `Char` constant to notify; the macro checks the client characteristic
+  configuration descriptors while it compiles.
+- **The name and appearance**, as constants the table and the advertising both take, so they never disagree. A device
+  that wants its name set at build time reads it with `option_env!` and checks its length in a `const` assertion: the
+  scan response carries at most 29 octets of it.
+- **The connection parameters** (`link::ParamRange`): the Peripheral Preferred Connection Parameters characteristic
+  takes their bytes with `host::gatt::ppcp`, and the host's `engine::Config::new` the same constant for its L2CAP
+  request.
+- **The advertising**: what it advertises (`host::adv::Content::new`: name, appearance, services, and optionally the
+  TX power level with `Content::with_tx_power`) and on which schedules (`host::adv::Schedule::new` over its
+  `host::adv::Phase`s, one for pairing and one for reconnecting), joined by `host::adv::Advertising::new` for each
+  mode.
+
+```rust
+use embassy_time::Duration;
+use nrf_ble::{
+    host::{
+        adv::{Advertising, BATTERY_SERVICE, Content, HID_SERVICE, Mode, Overflow, Phase, Schedule},
+        engine::{Config, Unclaimed},
+        gatt::{Value, ValueId, ppcp},
+    },
+    link::ParamRange,
+};
+
+/// The name: the Device Name characteristic and the advertised name.
+pub const NAME: &[u8] = match option_env!("MY_DEVICE_NAME") {
+    Some(name) => name.as_bytes(),
+    None => b"My Remote",
+};
+const _: () = assert!(!NAME.is_empty() && NAME.len() <= 29, "the scan response carries the name complete");
+/// Appearance: a keyboard.
+pub const APPEARANCE: u16 = 0x03C1;
+/// 15 ms, a latency of 30 events, 6 s.
+pub const PARAMS: ParamRange = ParamRange::new(12, 12, 30, 600);
+/// The battery level, read through the application's handler.
+pub const BATTERY_LEVEL_VALUE: ValueId = ValueId::new(0);
+const PPCP: [u8; 8] = ppcp(PARAMS);
+/// The HID report descriptor: a keyboard with report ID 1.
+const REPORT_MAP: &[u8] = &[0x05, 0x01, 0x09, 0x06 /* and the rest of it */];
+
+nrf_ble::gatt! {
+    /// The attribute table.
+    pub const DB;
+    service 0x1800 {
+        char 0x2A00 [read] = Value::Const(NAME);
+        char 0x2A01 [read] = Value::Const(&APPEARANCE.to_le_bytes());
+        char 0x2A04 [read] = Value::Const(&PPCP);
+    }
+    service 0x1801 {
+        char 0x2B2A [read] = Value::Hash;
+    }
+    service 0x180F {
+        /// The battery level, which the application notifies.
+        char BATTERY_LEVEL: 0x2A19 [read, notify] = Value::Dynamic(BATTERY_LEVEL_VALUE);
+        ccc;
+    }
+    service 0x1812 {
+        char 0x2A4A [read] = Value::Const(&[0x11, 0x01, 0x00, 0x03]);
+        char 0x2A4B [read] = Value::Const(REPORT_MAP);
+        char 0x2A4C [write_without_response] = Value::Sink;
+        /// The keyboard input report, ID 1.
+        char KEYBOARD: 0x2A4D [read, notify; encrypted] = Value::Zeros(8);
+        ccc;
+        desc 0x2908 [read] = Value::Const(&[1, 1]);
+    }
+}
+
+/// 20 ms for 3 s, 50 ms for 12 s, 400 ms for 45 s.
+const PHASES: [Phase; 3] = [
+    Phase::new(32, Duration::from_secs(3)),
+    Phase::new(80, Duration::from_secs(12)),
+    Phase::new(640, Duration::from_secs(45)),
+];
+/// 60 s to pair; 20 s for the bonded central to encrypt.
+const PAIRING: Schedule = Schedule::new(&PHASES, Duration::from_secs(60));
+const RECONNECT: Schedule = Schedule::new(&PHASES, Duration::from_secs(20));
+const CONTENT: Content<'static> = Content::new(NAME, APPEARANCE, &[HID_SERVICE, BATTERY_SERVICE]);
+/// The host's configuration: ask for PARAMS, keep a link nobody waits for.
+pub const CONFIG: Config = Config::new(Some(PARAMS), Unclaimed::Keep);
+
+/// The advertising of `mode`.
+pub fn advertising(mode: Mode<'_>) -> Result<Advertising<'_>, Overflow> {
+    let schedule = if mode.pairable() { &PAIRING } else { &RECONNECT };
+    Advertising::new(mode, schedule, &CONTENT)
+}
+```
+
+The firmware then builds its host as `Host::new(Link::new(&SHARED), &DB, CONFIG)`, advertises with
+`HOST.advertise(&advertising(mode)?, &identity)` and notifies with `conn.notify(KEYBOARD, &report)`; the module
+documentation of `host` shows the whole wiring. The crate's own tests use such a device too, a remote with a keyboard,
+consumer control and a mouse over HID, a battery and device information (`src/host/example.rs`, test builds only), and
+`tests/device.rs` builds one from outside the crate.
+
 ## Checks
 
-The spotlight_rust repository builds for thumbv6m-none-eabi by default; this crate's own `.cargo/config.toml` sets the
-host as the default target again, so `cargo test` runs on the PC.
+A firmware repository around this crate may build for thumbv6m-none-eabi by default, and Cargo applies its
+`.cargo/config.toml` to the directories below it; this crate's own `.cargo/config.toml` sets the host as the default
+target again, so `cargo test` runs on the PC.
 
 ```sh
 cargo test                                         # host tests, also with --features data-length

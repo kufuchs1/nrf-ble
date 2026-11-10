@@ -1,32 +1,30 @@
-//! Tests of the table builder, the Spotlight table and the layout hash.
+//! Tests of the table builder, the example table and the layout hash.
 
-use super::{
-    spotlight::{self, DB, PARAMS, REPORT_MAP, REPORT_MAP_LEN},
-    *,
-};
+use super::*;
+use crate::host::example::{self, DB, PARAMS, REPORT_MAP, REPORT_MAP_LEN};
 
-/// The Spotlight table again, with `$map` as its Report Map.
-macro_rules! spotlight_with {
+/// The example table again, with `$map` as its Report Map.
+macro_rules! example_with {
     ($name:ident, $map:expr) => {
         crate::gatt! {
             const $name;
             service 0x1800 {
-                char 0x2A00 [read] = Value::Const(spotlight::NAME);
-                char 0x2A01 [read] = Value::Const(&spotlight::APPEARANCE);
+                char 0x2A00 [read] = Value::Const(example::NAME);
+                char 0x2A01 [read] = Value::Const(&example::APPEARANCE);
                 char 0x2A04 [read] = Value::Const(&ppcp(PARAMS));
             }
             service 0x1801 {
                 char 0x2B2A [read] = Value::Hash;
             }
             service 0x180F {
-                char 0x2A19 [read, notify] = Value::Dynamic(spotlight::BATTERY_LEVEL_VALUE);
+                char 0x2A19 [read, notify] = Value::Dynamic(example::BATTERY_LEVEL_VALUE);
                 ccc;
             }
             service 0x180A {
-                char 0x2A50 [read] = Value::Const(&spotlight::PNP_ID);
+                char 0x2A50 [read] = Value::Const(&example::PNP_ID);
             }
             service 0x1812 {
-                char 0x2A4A [read] = Value::Const(&spotlight::HID_INFORMATION);
+                char 0x2A4A [read] = Value::Const(&example::HID_INFORMATION);
                 char 0x2A4B [read] = Value::Const(&$map);
                 char 0x2A4C [write_without_response] = Value::Sink;
                 char 0x2A4D [read, notify; encrypted] = Value::Zeros(8);
@@ -50,26 +48,26 @@ const ALTERED_MAP: [u8; REPORT_MAP_LEN] = {
     map
 };
 
-spotlight_with!(SAME, REPORT_MAP);
-spotlight_with!(ALTERED, ALTERED_MAP);
+example_with!(SAME, REPORT_MAP);
+example_with!(ALTERED, ALTERED_MAP);
 
 #[test]
-fn the_spotlight_table_has_its_handles() {
+fn the_example_table_has_its_handles() {
     assert_eq!(DB.last_handle(), 36);
     assert_eq!(DB.attrs().len(), 36);
     assert_eq!(DB.cccds(), 4);
     assert_eq!(DB.service_changed(), None);
-    assert_eq!(spotlight::BATTERY_LEVEL.handle(), 13);
-    assert_eq!(spotlight::BATTERY_LEVEL.cccd(), Some(0));
-    assert_eq!(spotlight::BATTERY_LEVEL.sec(), Sec::Open);
-    assert_eq!(spotlight::KEYBOARD.handle(), 26);
-    assert_eq!(spotlight::KEYBOARD.cccd(), Some(1));
-    assert_eq!(spotlight::KEYBOARD.sec(), Sec::Encrypted);
-    assert_eq!(spotlight::KEYBOARD.props(), PROP_READ | PROP_NOTIFY);
-    assert_eq!(spotlight::CONSUMER.handle(), 30);
-    assert_eq!(spotlight::CONSUMER.cccd(), Some(2));
-    assert_eq!(spotlight::MOUSE.handle(), 34);
-    assert_eq!(spotlight::MOUSE.cccd(), Some(3));
+    assert_eq!(example::BATTERY_LEVEL.handle(), 13);
+    assert_eq!(example::BATTERY_LEVEL.cccd(), Some(0));
+    assert_eq!(example::BATTERY_LEVEL.sec(), Sec::Open);
+    assert_eq!(example::KEYBOARD.handle(), 26);
+    assert_eq!(example::KEYBOARD.cccd(), Some(1));
+    assert_eq!(example::KEYBOARD.sec(), Sec::Encrypted);
+    assert_eq!(example::KEYBOARD.props(), PROP_READ | PROP_NOTIFY);
+    assert_eq!(example::CONSUMER.handle(), 30);
+    assert_eq!(example::CONSUMER.cccd(), Some(2));
+    assert_eq!(example::MOUSE.handle(), 34);
+    assert_eq!(example::MOUSE.cccd(), Some(3));
     let services: [u16; 5] = [1, 8, 11, 15, 18];
     let ends: [u16; 5] = [7, 10, 14, 17, 36];
     for (start, end) in services.into_iter().zip(ends) {
@@ -81,11 +79,11 @@ fn the_spotlight_table_has_its_handles() {
 }
 
 #[test]
-fn the_spotlight_values_are_as_the_firmware_design_gives_them() {
+fn the_example_values_are_as_given() {
     assert_eq!(ppcp(PARAMS), [0x0C, 0x00, 0x0C, 0x00, 0x1E, 0x00, 0x58, 0x02]);
-    assert_eq!(spotlight::PNP_ID, [0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01]);
-    assert_eq!(spotlight::HID_INFORMATION, [0x11, 0x01, 0x00, 0x03]);
-    assert_eq!(spotlight::APPEARANCE, 0x03C1_u16.to_le_bytes());
+    assert_eq!(example::PNP_ID, [0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01]);
+    assert_eq!(example::HID_INFORMATION, [0x11, 0x01, 0x00, 0x03]);
+    assert_eq!(example::APPEARANCE, 0x03C1_u16.to_le_bytes());
     assert_eq!(REPORT_MAP.len(), 126);
     let ppcp_value = ppcp(PARAMS);
     let Value::Const(bytes) = DB.attr(7).unwrap().value_source() else { panic!("the PPCP is no constant") };
@@ -129,9 +127,9 @@ fn input_reports(map: &[u8]) -> [(u8, u32); 3] {
 fn the_report_map_declares_the_three_input_reports_with_their_lengths() {
     let reports = input_reports(&REPORT_MAP);
     assert_eq!(reports, [
-        (spotlight::KEYBOARD_REPORT_ID, u32::from(spotlight::KEYBOARD_REPORT_LEN) * 8),
-        (spotlight::CONSUMER_REPORT_ID, u32::from(spotlight::CONSUMER_REPORT_LEN) * 8),
-        (spotlight::MOUSE_REPORT_ID, u32::from(spotlight::MOUSE_REPORT_LEN) * 8),
+        (example::KEYBOARD_REPORT_ID, u32::from(example::KEYBOARD_REPORT_LEN) * 8),
+        (example::CONSUMER_REPORT_ID, u32::from(example::CONSUMER_REPORT_LEN) * 8),
+        (example::MOUSE_REPORT_ID, u32::from(example::MOUSE_REPORT_LEN) * 8),
     ]);
 }
 

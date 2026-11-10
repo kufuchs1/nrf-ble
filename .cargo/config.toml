@@ -1,5 +1,6 @@
-# The spotlight_rust root's .cargo/config.toml builds for thumbv6m-none-eabi by
-# default, and Cargo applies it to every package below it. This crate builds
+# A firmware repository around this crate may build for thumbv6m-none-eabi by
+# default in its .cargo/config.toml, which Cargo applies to every package below
+# it. This crate builds
 # and tests on the host by default, as nrf-ll does: name the target with
 # --target for the chips.
 [build]

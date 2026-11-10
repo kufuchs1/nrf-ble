@@ -6,6 +6,7 @@ use super::*;
 use crate::{
     host::{
         bond::Bond,
+        example,
         gatt::{AttError, ValueId},
         identity::DeviceSecret,
         smp::tests::{CENTRAL_ADDRESS, CENTRAL_IDENTITY, Central, Device, linux_request, local_rpa},
@@ -74,7 +75,7 @@ fn drain(engine: &mut Engine, room: usize, now: Instant) -> std::vec::Vec<Fragme
 
 #[test]
 fn a_notification_never_interleaves_with_the_fragments_of_a_public_key() {
-    let mut engine = Engine::new(&spotlight::DB, Config::SPOTLIGHT);
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
     let mut device = Device(5);
     engine.advertise(true, &identity(), None, Duration::from_secs(60));
     let job = engine.take_job().unwrap();
@@ -85,7 +86,7 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_public_key() {
     receive(&mut engine, &mut device, 4, &[0x12, 0x0E, 0x00, 0x01, 0x00], at(0));
     assert_eq!(drain(&mut engine, 4, at(0)).len(), 1);
     let epoch = engine.epoch().unwrap();
-    assert!(engine.notification(epoch, spotlight::BATTERY_LEVEL, &[50]).is_ok());
+    assert!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]).is_ok());
 
     let central = Central::new(linux_request(true, true), local_rpa());
     receive(&mut engine, &mut device, 6, &central.request, at(1));
@@ -96,24 +97,24 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_public_key() {
     let first = engine.next_fragment(4).unwrap();
     assert!(first.start());
     engine.fragment_sent(at(2));
-    assert_eq!(engine.notification(epoch, spotlight::BATTERY_LEVEL, &[50]), Err(NotifyError::Busy));
+    assert_eq!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]), Err(NotifyError::Busy));
     let rest = drain(&mut engine, 4, at(2));
     assert_eq!(rest.iter().map(|fragment| (fragment.start(), fragment.bytes().len())).collect::<std::vec::Vec<_>>(), [
         (false, 27),
         (false, 15),
         (true, 21)
     ]);
-    let fragment = engine.notification(epoch, spotlight::BATTERY_LEVEL, &[50]).unwrap();
+    let fragment = engine.notification(epoch, example::BATTERY_LEVEL, &[50]).unwrap();
     assert_eq!(fragment.bytes(), [4, 0, 4, 0, 0x1B, 0x0D, 0x00, 50]);
     // The input reports need the encryption the link lacks.
-    assert_eq!(engine.notification(epoch, spotlight::KEYBOARD, &[0; 8]), Err(NotifyError::NotSubscribed));
+    assert_eq!(engine.notification(epoch, example::KEYBOARD, &[0; 8]), Err(NotifyError::NotSubscribed));
 }
 
 #[test]
 fn the_parameter_request_leaves_the_last_place_to_responses() {
     let identity = identity();
-    let bond = Bond::new(Peer::new(CENTRAL_IDENTITY, false), None, [0x77; 16], identity.variant(), &spotlight::DB);
-    let mut engine = Engine::new(&spotlight::DB, Config::SPOTLIGHT);
+    let bond = Bond::new(Peer::new(CENTRAL_IDENTITY, false), None, [0x77; 16], identity.variant(), &example::DB);
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
     engine.advertise(false, &identity, Some(bond), Duration::from_secs(20));
     assert!(!engine.has_job(), "no key pair for a reconnection");
     engine.connected(&info(Peer::new([3; 6], true), Some(Peer::new(CENTRAL_IDENTITY, false))), at(0));
@@ -151,7 +152,7 @@ fn the_parameter_request_leaves_the_last_place_to_responses() {
 
 #[test]
 fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity() {
-    let mut engine = Engine::new(&spotlight::DB, Config::SPOTLIGHT);
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
     let mut device = Device(9);
     let identity = identity();
     engine.advertise(true, &identity, None, Duration::from_secs(60));
@@ -211,5 +212,5 @@ fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity(
 fn the_input_reports_are_the_notifying_hid_reports() {
     // The keyboard's, the consumer control's and the mouse's
     // configuration, not the battery's.
-    assert_eq!(input_reports(&spotlight::DB), 0b1110);
+    assert_eq!(input_reports(&example::DB), 0b1110);
 }

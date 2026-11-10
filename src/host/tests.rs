@@ -13,10 +13,11 @@ use super::{
     Host,
     NotifyError,
     Port,
-    adv::{Advertising, Call, Control, Mode},
+    adv::{Call, Control, Mode},
     bond::Bond,
     engine::{Config, Unclaimed},
-    gatt::{AttError, Handler, ValueId, spotlight},
+    example,
+    gatt::{AttError, Handler, ValueId},
     identity::{DeviceSecret, LocalIdentity, Variant},
     l2cap::{CID_ATT, CID_SECURITY_MANAGER, CID_SIGNALLING, Channel, Reassembly},
     smp::tests::{CENTRAL_ADDRESS, CENTRAL_IDENTITY, CENTRAL_IRK, Central, Device, linux_request, local_rpa, pdu},
@@ -255,7 +256,7 @@ struct App;
 
 impl Handler for App {
     fn read(&self, id: ValueId, out: &mut [u8]) -> Result<usize, AttError> {
-        assert_eq!(id, spotlight::BATTERY_LEVEL_VALUE);
+        assert_eq!(id, example::BATTERY_LEVEL_VALUE);
         out[0] = 90;
         Ok(1)
     }
@@ -294,9 +295,9 @@ fn ready<F: Future>(future: Pin<&mut F>) -> F::Output {
     }
 }
 
-/// The host over a stand-in link layer, with the Spotlight table.
+/// The host over a stand-in link layer, with the example table.
 fn host(unclaimed: Unclaimed) -> Host<MockLink> {
-    Host::new(MockLink::new(), &spotlight::DB, Config::new(Some(spotlight::PARAMS), unclaimed))
+    Host::new(MockLink::new(), &example::DB, Config::new(Some(example::PARAMS), unclaimed))
 }
 
 /// Our identity in generation `generation`.
@@ -307,13 +308,8 @@ fn identity(generation: u8) -> LocalIdentity {
 /// A bond with the central of the SMP tests, made under `identity`, with
 /// the battery's and the keyboard's notifications on.
 fn bond(identity: &LocalIdentity) -> Bond {
-    let mut bond = Bond::new(
-        Peer::new(CENTRAL_IDENTITY, false),
-        Some(CENTRAL_IRK),
-        [0x5C; 16],
-        identity.variant(),
-        &spotlight::DB,
-    );
+    let mut bond =
+        Bond::new(Peer::new(CENTRAL_IDENTITY, false), Some(CENTRAL_IRK), [0x5C; 16], identity.variant(), &example::DB);
     bond.cccd = 0b0101;
     bond
 }
@@ -373,7 +369,7 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
 
     // Pairable advertising waits for the key pair, made at once.
@@ -453,7 +449,7 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     ]);
     assert_eq!(request(link, &mut tasks, &[0x0A, 0x0D, 0x00]), [0x0B, 90]);
     let report_map = request(link, &mut tasks, &[0x0A, 0x16, 0x00]);
-    assert_eq!(&report_map[1..], &spotlight::REPORT_MAP[..22]);
+    assert_eq!(&report_map[1..], &example::REPORT_MAP[..22]);
     // The input reports need the encryption, which the request had.
     assert_eq!(request(link, &mut tasks, &[0x0A, 0x1A, 0x00]), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
     // The configuration of the battery and of the three reports: the bond
@@ -499,7 +495,7 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
 
     // A report goes out as one fragment.
     let report = [0, 0, 0x4B, 0, 0, 0, 0, 0];
-    assert_eq!(ready(pin!(conn.notify(spotlight::KEYBOARD, &report))), Ok(()));
+    assert_eq!(ready(pin!(conn.notify(example::KEYBOARD, &report))), Ok(()));
     let mut notification = vec![0x1B, 0x1A, 0x00];
     notification.extend_from_slice(&report);
     assert_eq!(link.deliver(), [(Channel::Att, notification)]);
@@ -509,7 +505,7 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x13));
     assert_eq!(link.calls(), [Seen::Hold(false)]);
-    assert_eq!(ready(pin!(conn.notify(spotlight::KEYBOARD, &report))), Err(NotifyError::Disconnected));
+    assert_eq!(ready(pin!(conn.notify(example::KEYBOARD, &report))), Err(NotifyError::Disconnected));
     assert_eq!(multiplications.get(), 2);
 }
 
@@ -519,7 +515,7 @@ macro_rules! reconnected {
     ($host:expr, $link:expr, $tasks:ident, $conn:ident) => {
         let identity = identity(1);
         let bond = bond(&identity);
-        let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+        let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
         let mut advertise = pin!($host.advertise(&advertising, &identity));
         // No key pair for a reconnection.
         assert!(poll(advertise.as_mut()).is_pending());
@@ -550,7 +546,7 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -566,10 +562,10 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
 
     // Before the encryption the bond's subscriptions are not the link's:
     // nothing is notified.
-    assert!(!conn.is_subscribed(spotlight::BATTERY_LEVEL));
-    assert!(!conn.is_subscribed(spotlight::KEYBOARD));
-    assert_eq!(conn.try_notify(spotlight::BATTERY_LEVEL, &[50]), Err(NotifyError::NotSubscribed));
-    assert!(conn.try_notify(spotlight::KEYBOARD, &[0; 8]).is_err());
+    assert!(!conn.is_subscribed(example::BATTERY_LEVEL));
+    assert!(!conn.is_subscribed(example::KEYBOARD));
+    assert_eq!(conn.try_notify(example::BATTERY_LEVEL, &[50]), Err(NotifyError::NotSubscribed));
+    assert!(conn.try_notify(example::KEYBOARD, &[0; 8]).is_err());
     assert!(link.deliver().is_empty());
 
     // Only EDIV 0 and Rand 0 get the bond's key.
@@ -587,8 +583,8 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
     // as encrypted, with the bond's subscriptions restored.
     assert_eq!(request(link, &mut tasks, &[0x0A, 0x1B, 0x00]), [0x0B, 0x01, 0x00]);
     assert_eq!(request(link, &mut tasks, &[0x0A, 0x0E, 0x00]), [0x0B, 0x01, 0x00]);
-    assert!(conn.is_subscribed(spotlight::KEYBOARD));
-    assert!(!conn.is_subscribed(spotlight::MOUSE));
+    assert!(conn.is_subscribed(example::KEYBOARD));
+    assert!(!conn.is_subscribed(example::MOUSE));
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
@@ -600,8 +596,8 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
     }
     assert!(poll(pin!(conn.next())).is_pending());
     // A report on the restored subscription.
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[0; 8]), Ok(()));
-    assert_eq!(conn.try_notify(spotlight::MOUSE, &[0; 5]), Err(NotifyError::NotSubscribed));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[0; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::MOUSE, &[0; 5]), Err(NotifyError::NotSubscribed));
     assert_eq!(link.deliver().len(), 1);
 }
 
@@ -612,7 +608,7 @@ fn only_the_bonded_central_gets_the_bond_s_key() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.calls();
@@ -651,16 +647,16 @@ fn notifications_keep_two_in_flight_and_one_place_free() {
     reconnected!(host, link, tasks, conn);
 
     // Two may be in flight, no third.
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[1; 8]), Ok(()));
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[2; 8]), Ok(()));
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[3; 8]), Err(NotifyError::Busy));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[1; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[2; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[3; 8]), Err(NotifyError::Busy));
     // On the air, still unacknowledged: still two in flight.
     assert_eq!(link.transmit().len(), 2);
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[3; 8]), Err(NotifyError::Busy));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[3; 8]), Err(NotifyError::Busy));
 
     // A waiting notification goes out when the acknowledgement returns
     // room, which wakes the run task.
-    let mut notify = pin!(conn.notify(spotlight::KEYBOARD, &[3; 8]));
+    let mut notify = pin!(conn.notify(example::KEYBOARD, &[3; 8]));
     assert!(poll(notify.as_mut()).is_pending());
     tasks.step();
     assert!(poll(notify.as_mut()).is_pending());
@@ -675,11 +671,11 @@ fn notifications_keep_two_in_flight_and_one_place_free() {
     link.queue.borrow_mut().push_back((true, vec![0; 4]));
     link.unacked.set(0);
     assert_eq!(link.in_flight(conn.epoch()), 1);
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[4; 8]), Err(NotifyError::Busy));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[4; 8]), Err(NotifyError::Busy));
     // An ATT response still takes that place.
     assert_eq!(request_queued(link, &mut tasks, &[0x0A, 0x0D, 0x00]), 2);
     link.deliver();
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[4; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[4; 8]), Ok(()));
     assert_eq!(multiplications.get(), 0);
 }
 
@@ -697,7 +693,7 @@ fn output_waiting_for_room_goes_out_when_the_link_layer_takes_a_fragment() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -740,7 +736,7 @@ fn a_link_not_encrypted_in_time_ends_with_an_authentication_failure() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
@@ -768,7 +764,7 @@ fn a_pairing_that_stalls_times_out_and_a_failed_one_ends_once_flushed() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let local = local_rpa();
 
     // A central that stops after the Pairing Request: 30 s later the
@@ -821,7 +817,7 @@ fn a_pairing_failed_that_is_never_acknowledged_ends_the_link_after_a_second() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -851,7 +847,7 @@ fn a_pairing_failed_from_the_central_ends_the_link_at_once() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -877,7 +873,7 @@ fn a_pairing_request_while_reconnecting_is_refused_and_ends_the_link() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
@@ -920,7 +916,7 @@ fn a_rejected_parameter_request_is_not_repeated() {
     assert!(link.deliver().is_empty());
     assert!(link.calls().is_empty());
     assert!(poll(pin!(conn.next())).is_pending());
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[0; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[0; 8]), Ok(()));
     assert_eq!(multiplications.get(), 0);
 }
 
@@ -930,7 +926,7 @@ fn a_bond_is_reported_only_once_the_central_has_our_identity() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let local = local_rpa();
     for acknowledged in [false, true] {
         let mut advertise = pin!(host.advertise(&advertising, &identity));
@@ -981,7 +977,7 @@ fn a_call_waits_for_a_link_the_run_task_has_not_taken_yet() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let pairing = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let pairing = example::advertising(Mode::Pairing, None).unwrap();
     {
         let mut advertise = pin!(host.advertise(&pairing, &identity));
         assert!(poll(advertise.as_mut()).is_pending());
@@ -993,7 +989,7 @@ fn a_call_waits_for_a_link_the_run_task_has_not_taken_yet() {
     // the event when the application asks for reconnection.
     let epoch = link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     let bond = bond(&identity);
-    let reconnect = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let reconnect = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&reconnect, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1011,7 +1007,7 @@ fn advertising_starts_again_when_a_link_ends_before_the_host_took_it() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1037,7 +1033,7 @@ fn a_central_that_connects_after_the_advertising_call_was_dropped_is_kept() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     {
         let mut advertise = pin!(host.advertise(&advertising, &identity));
         assert!(poll(advertise.as_mut()).is_pending());
@@ -1079,7 +1075,7 @@ fn a_central_that_connects_after_the_advertising_call_was_dropped_can_be_ended()
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     {
         let mut advertise = pin!(host.advertise(&advertising, &identity));
         assert!(poll(advertise.as_mut()).is_pending());
@@ -1122,7 +1118,7 @@ fn advertising_runs_its_phases_and_then_times_out() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1162,7 +1158,7 @@ fn disconnected_comes_after_every_other_event_of_its_link() {
     // A link that ended before the next one still tells its reason.
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(bond.peer, None, local_rpa());
@@ -1170,7 +1166,7 @@ fn disconnected_comes_after_every_other_event_of_its_link() {
     let next = ready(advertise.as_mut()).unwrap();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x08));
     assert!(poll(pin!(next.next())).is_pending());
-    assert_eq!(conn.try_notify(spotlight::KEYBOARD, &[0; 8]), Err(NotifyError::Disconnected));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[0; 8]), Err(NotifyError::Disconnected));
     link.disconnect_link(0x13);
     tasks.step();
     assert_eq!(next!(next), ConnEvent::Disconnected(0x13));
@@ -1185,7 +1181,7 @@ fn the_battery_level_is_notified_when_it_changes() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     reconnected!(host, link, tasks, conn);
-    let battery = super::Battery::new(spotlight::BATTERY_LEVEL, 90);
+    let battery = super::Battery::new(example::BATTERY_LEVEL, 90);
     let mut out = [0; 2];
     assert_eq!(battery.read(&mut out), Ok(1));
     assert_eq!(out[0], 90);

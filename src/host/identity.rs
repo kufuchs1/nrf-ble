@@ -17,13 +17,14 @@
 //! knows the identity of one variant cannot tell that of another from it.
 //!
 //! The variant is a slot number in its low octet and a generation in its high
-//! one. The Spotlight has one slot, 0. Each time the device enters pairing
-//! mode it takes the next generation ([`Variant::next_generation`]), so it
-//! pairs again under a new identity and BlueZ, which keeps the old bond under
-//! the old address, needs no `remove` first: it refuses a second Just Works
-//! pairing with a device it has a bond with, and it would resolve the
-//! resolvable private address of an old identity, connect and encrypt with
-//! the old key, which the device no longer has.
+//! one; a device that bonds with one central uses slot 0. Each time the
+//! device enters pairing mode it takes the next generation
+//! ([`Variant::next_generation`]), so it pairs again under a new identity
+//! and BlueZ, which keeps the old bond under the old address, needs no
+//! `remove` first: it refuses a second Just Works pairing with a device it
+//! has a bond with, and it would resolve the resolvable private address of
+//! an old identity, connect and encrypt with the old key, which the device
+//! no longer has.
 //!
 //! So the firmware stores the generation in flash apart from the bond, never
 //! erased with it, and bumps and stores it before it advertises in pairing

@@ -1,12 +1,10 @@
 //! Tests of the attribute server: the whole BlueZ first connection as golden
-//! PDUs against the Spotlight table, and the error cases.
+//! PDUs against the example table, and the error cases.
 
 use super::*;
-use crate::host::gatt::{
-    Value,
-    ValueId,
-    ppcp,
-    spotlight::{self, BATTERY_LEVEL_VALUE, DB, PARAMS, REPORT_MAP},
+use crate::host::{
+    example::{self, BATTERY_LEVEL_VALUE, DB, PARAMS, REPORT_MAP},
+    gatt::{Value, ValueId, ppcp},
 };
 use core::{cell::Cell, ops::Deref};
 
@@ -181,7 +179,7 @@ fn the_bluez_first_connection_gets_these_answers() {
     golden(s, &app, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B], &join(&[&[0x09, 0x12, 0x0A, 0x00], &hash]));
 
     // GAP: the name, the appearance and the preferred parameters.
-    golden(s, &app, &[0x0A, 0x03, 0x00], &join(&[&[0x0B], spotlight::NAME]));
+    golden(s, &app, &[0x0A, 0x03, 0x00], &join(&[&[0x0B], example::NAME]));
     golden(s, &app, &[0x0A, 0x05, 0x00], &[0x0B, 0xC1, 0x03]);
     golden(s, &app, &[0x0A, 0x07, 0x00], &join(&[&[0x0B], &ppcp(PARAMS)]));
     // Device information: the PnP ID.
@@ -218,13 +216,13 @@ fn the_bluez_first_connection_gets_these_answers() {
     // Every input report and the battery now notify.
     let mut out = [0_u8; MTU];
     let report = [0, 0, 0x4B, 0, 0, 0, 0, 0];
-    let len = s.notify(spotlight::KEYBOARD, &report, Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(example::KEYBOARD, &report, Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &*join(&[&[0x1B, 0x1A, 0x00], &report]));
-    let len = s.notify(spotlight::CONSUMER, &[0xE9, 0x00], Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(example::CONSUMER, &[0xE9, 0x00], Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &[0x1B, 0x1E, 0x00, 0xE9, 0x00]);
-    let len = s.notify(spotlight::MOUSE, &[0, 1, 0, 0xFF, 0xFF], Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(example::MOUSE, &[0, 1, 0, 0xFF, 0xFF], Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &[0x1B, 0x22, 0x00, 0, 1, 0, 0xFF, 0xFF]);
-    let len = s.notify(spotlight::BATTERY_LEVEL, &[89], Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(example::BATTERY_LEVEL, &[89], Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &[0x1B, 0x0D, 0x00, 89]);
     assert_eq!(s.subscriptions().bits(), 0b0101_0101);
     assert_eq!(BATTERY_LEVEL_VALUE.index(), 0);
@@ -268,8 +266,8 @@ fn an_unencrypted_request_for_a_report_gets_insufficient_encryption() {
     // A notification needs the encryption too.
     let mut out = [0_u8; MTU];
     server.restore(crate::host::gatt::Subscriptions::from_bits(0b0101_0101));
-    assert_eq!(server.notify(spotlight::KEYBOARD, &[0; 8], Sec::Open, &mut out), Err(NotifyError::Insecure));
-    assert!(server.notify(spotlight::BATTERY_LEVEL, &[1], Sec::Open, &mut out).is_ok());
+    assert_eq!(server.notify(example::KEYBOARD, &[0; 8], Sec::Open, &mut out), Err(NotifyError::Insecure));
+    assert!(server.notify(example::BATTERY_LEVEL, &[1], Sec::Open, &mut out).is_ok());
 }
 
 #[test]
@@ -418,16 +416,13 @@ fn notifications_need_a_subscription_and_fit_the_mtu() {
     let app = App::new();
     let mut server = Server::new(&DB);
     let mut out = [0_u8; MTU];
-    assert_eq!(server.notify(spotlight::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
+    assert_eq!(server.notify(example::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
     golden(&mut server, &app, &[0x12, 0x1B, 0x00, 0x01, 0x00], &[0x13]);
-    assert!(server.notify(spotlight::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out).is_ok());
-    assert!(server.notify(spotlight::KEYBOARD, &[0; 20], Sec::Encrypted, &mut out).is_ok());
-    assert_eq!(server.notify(spotlight::KEYBOARD, &[0; 21], Sec::Encrypted, &mut out), Err(NotifyError::TooLong));
+    assert!(server.notify(example::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out).is_ok());
+    assert!(server.notify(example::KEYBOARD, &[0; 20], Sec::Encrypted, &mut out).is_ok());
+    assert_eq!(server.notify(example::KEYBOARD, &[0; 21], Sec::Encrypted, &mut out), Err(NotifyError::TooLong));
     // Only notifications were enabled.
-    assert_eq!(
-        server.indicate(spotlight::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out),
-        Err(NotifyError::NotSubscribed)
-    );
+    assert_eq!(server.indicate(example::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
     assert_eq!(server.service_changed(Sec::Encrypted, &mut out), None);
 }
 

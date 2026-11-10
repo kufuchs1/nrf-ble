@@ -61,10 +61,17 @@
 //! may connect after the call's future was dropped: [`engine::Config`] says
 //! whether that link is kept for the next call or ended.
 //!
-//! # The Spotlight
+//! # A device
 //!
-//! How the firmware wires the link layer, the host's tasks, advertising, the
-//! bond and the reports. In the firmware each `async fn` below is an
+//! The device crate defines what is its own, which this crate knows nothing
+//! about: its attribute table with the [`gatt!`](crate::gatt) macro, its
+//! name and appearance, its connection parameters, what it advertises
+//! ([`adv::Content`]) and on which schedules ([`adv::Schedule`]), and the
+//! [`engine::Config`] of its host. The example below keeps them in a module
+//! `my_device`, as a firmware keeps them in a module of its own.
+//!
+//! It then wires the link layer, the host's tasks, advertising, the bond and
+//! the reports as shown. In the firmware each `async fn` below is an
 //! `#[embassy_executor::task]` of the thread executor, and the link layer's
 //! task, [`crate::controller::run`], runs in an interrupt executor on
 //! [`SHARED`](crate::link::Shared).
@@ -93,22 +100,108 @@
 //!         Hardware,
 //!         Host,
 //!         NotifyError,
-//!         adv::{Advertising, Mode},
+//!         adv::Mode,
 //!         bond::{BOND_LEN, Bond},
-//!         engine::Config,
-//!         gatt::{AttError, Handler, ValueId, spotlight},
+//!         gatt::{AttError, Handler, ValueId},
 //!         identity::{DeviceSecret, LocalIdentity, Variant},
 //!     },
 //!     link::{Link, Shared},
 //! };
 //!
+//! /// What is the device's own: its table, advertising and configuration.
+//! mod my_device {
+//!     use embassy_time::Duration;
+//!     use nrf_ble::{
+//!         host::{
+//!             adv::{
+//!                 Advertising,
+//!                 BATTERY_SERVICE,
+//!                 Content,
+//!                 HID_SERVICE,
+//!                 Mode,
+//!                 Overflow,
+//!                 Phase,
+//!                 Schedule,
+//!             },
+//!             engine::{Config, Unclaimed},
+//!             gatt::{Value, ValueId, ppcp},
+//!         },
+//!         link::ParamRange,
+//!     };
+//!
+//!     /// The device name: the Device Name characteristic and the advertised
+//!     /// name.
+//!     pub const NAME: &[u8] = b"My Remote";
+//!     /// Appearance: a keyboard (0x03C1).
+//!     pub const APPEARANCE: u16 = 0x03C1;
+//!     /// The connection parameters it asks for: 15 ms, a latency of 30
+//!     /// events, 6 s.
+//!     pub const PARAMS: ParamRange = ParamRange::new(12, 12, 30, 600);
+//!     /// The battery level, which the application's handler reads.
+//!     pub const BATTERY_LEVEL_VALUE: ValueId = ValueId::new(0);
+//!     /// The Peripheral Preferred Connection Parameters of [`PARAMS`].
+//!     const PPCP: [u8; 8] = ppcp(PARAMS);
+//!     /// The HID report descriptor: a keyboard, report ID 1.
+//!     const REPORT_MAP: [u8; 2] = [0x05, 0x01]; // and the rest of it
+//!
+//!     nrf_ble::gatt! {
+//!         /// The attribute table.
+//!         pub const DB;
+//!         service 0x1800 {
+//!             char 0x2A00 [read] = Value::Const(NAME);
+//!             char 0x2A01 [read] = Value::Const(&APPEARANCE.to_le_bytes());
+//!             char 0x2A04 [read] = Value::Const(&PPCP);
+//!         }
+//!         service 0x1801 {
+//!             char 0x2B2A [read] = Value::Hash;
+//!         }
+//!         service 0x180F {
+//!             /// The battery level, which the application notifies.
+//!             char BATTERY_LEVEL: 0x2A19 [read, notify] = Value::Dynamic(BATTERY_LEVEL_VALUE);
+//!             ccc;
+//!         }
+//!         service 0x1812 {
+//!             char 0x2A4A [read] = Value::Const(&[0x11, 0x01, 0x00, 0x03]);
+//!             char 0x2A4B [read] = Value::Const(&REPORT_MAP);
+//!             char 0x2A4C [write_without_response] = Value::Sink;
+//!             /// The keyboard input report, ID 1.
+//!             char KEYBOARD: 0x2A4D [read, notify; encrypted] = Value::Zeros(8);
+//!             ccc;
+//!             desc 0x2908 [read] = Value::Const(&[1, 1]);
+//!         }
+//!     }
+//!
+//!     /// 20 ms for 3 s, 50 ms for 12 s, 400 ms for 45 s.
+//!     const PHASES: [Phase; 3] = [
+//!         Phase::new(32, Duration::from_secs(3)),
+//!         Phase::new(80, Duration::from_secs(12)),
+//!         Phase::new(640, Duration::from_secs(45)),
+//!     ];
+//!     /// Pairing: 60 s to pair.
+//!     const PAIRING: Schedule = Schedule::new(&PHASES, Duration::from_secs(60));
+//!     /// Reconnection: 20 s for the bonded central to encrypt.
+//!     const RECONNECT: Schedule = Schedule::new(&PHASES, Duration::from_secs(20));
+//!     /// What it advertises.
+//!     const CONTENT: Content<'static> =
+//!         Content::new(NAME, APPEARANCE, &[HID_SERVICE, BATTERY_SERVICE]);
+//!     /// The host's configuration: ask for [`PARAMS`], keep a link nobody
+//!     /// waits for.
+//!     pub const CONFIG: Config = Config::new(Some(PARAMS), Unclaimed::Keep);
+//!
+//!     /// The advertising of `mode`.
+//!     pub fn advertising(mode: Mode<'_>) -> Result<Advertising<'_>, Overflow> {
+//!         let schedule = if mode.pairable() { &PAIRING } else { &RECONNECT };
+//!         Advertising::new(mode, schedule, &CONTENT)
+//!     }
+//! }
+//!
 //! /// The state the link layer task and the host share.
 //! static SHARED: Shared = Shared::new();
-//! /// The host over the link layer, with the Spotlight's table.
+//! /// The host over the link layer, with the device's table.
 //! static HOST: Host<Link<'static>> =
-//!     Host::new(Link::new(&SHARED), &spotlight::DB, Config::SPOTLIGHT);
+//!     Host::new(Link::new(&SHARED), &my_device::DB, my_device::CONFIG);
 //! /// The battery level, which the table reads and the host notifies.
-//! static BATTERY: Battery = Battery::new(spotlight::BATTERY_LEVEL, 100);
+//! static BATTERY: Battery = Battery::new(my_device::BATTERY_LEVEL, 100);
 //! /// The time BlueZ gets after [`ConnEvent::Ready`] before the first
 //! /// report: to be measured.
 //! const SETTLE: Duration = Duration::from_millis(200);
@@ -119,7 +212,7 @@
 //!
 //! impl Handler for App {
 //!     fn read(&self, id: ValueId, out: &mut [u8]) -> Result<usize, AttError> {
-//!         if id == spotlight::BATTERY_LEVEL_VALUE {
+//!         if id == my_device::BATTERY_LEVEL_VALUE {
 //!             BATTERY.read(out)
 //!         } else {
 //!             Err(AttError::UNLIKELY_ERROR)
@@ -154,7 +247,7 @@
 //!         };
 //!         let mode = bond.as_ref().map_or(Mode::Pairing, Mode::Reconnect);
 //!         let identity = LocalIdentity::derive(&Hardware::default(), &secret, variant);
-//!         let Ok(advertising) = Advertising::spotlight(mode, None) else { return };
+//!         let Ok(advertising) = my_device::advertising(mode) else { return };
 //!         let Ok(conn) = HOST.advertise(&advertising, &identity).await else {
 //!             wait_for_key_press().await;
 //!             continue;
@@ -186,7 +279,7 @@
 //!             // A report nobody subscribed to, or one the link is not yet
 //!             // secure enough for, is skipped; only the end of the link ends
 //!             // the reports.
-//!             if conn.notify(spotlight::KEYBOARD, &report).await == Err(NotifyError::Disconnected)
+//!             if conn.notify(my_device::KEYBOARD, &report).await == Err(NotifyError::Disconnected)
 //!             {
 //!                 break;
 //!             }
@@ -938,4 +1031,5 @@ pub(crate) mod test_aes {
     }
 }
 
+#[cfg(test)] mod example;
 #[cfg(test)] mod tests;

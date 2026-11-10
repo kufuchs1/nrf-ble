@@ -1,4 +1,6 @@
-//! The attribute table of the Spotlight remote, for Linux and BlueZ.
+//! The tests' example device: a remote with a keyboard, consumer control
+//! and a mouse over HID, a battery and device information, defined as a
+//! device crate defines its own (see the readme), for the host tests only.
 //!
 //! | Handle | Attribute |
 //! |---|---|
@@ -21,40 +23,31 @@
 //! | 33 to 36 | Mouse input report 0x2A4D (ID 3, 5 octets): the same |
 //!
 //! The input reports need an encrypted link to be read, configured or
-//! notified, and read as zeros: the application sends their data as
-//! notifications. There is no Service Changed characteristic (BlueZ gains
-//! nothing from it, see [`crate::host::gatt`]), no Protocol Mode and no boot
-//! report: BlueZ needs neither.
+//! notified, and read as zeros. There is no Service Changed characteristic,
+//! no Protocol Mode and no boot report.
 
-use super::{Value, ValueId, ppcp};
-use crate::link::ParamRange;
-
-/// The device name: German, like the user's other devices.
-///
-/// It is the Device Name characteristic and the advertised name (shortened
-/// there to what fits, complete in the scan response). The default is
-/// "Presenter Unterwegs", next to "Tastatur Zuhause" and "Maus Zuhause"; set
-/// `SPOTLIGHT_DEVICE_NAME` when building to use another one, for example
-/// `SPOTLIGHT_DEVICE_NAME="Presenter Büro" cargo make run`.
-pub const NAME: &[u8] = match option_env!("SPOTLIGHT_DEVICE_NAME") {
-    Some(name) => name.as_bytes(),
-    None => b"Presenter Unterwegs",
+use crate::{
+    host::{
+        adv::{Advertising, BATTERY_SERVICE, Content, HID_SERVICE, Mode, Overflow, Phase, Schedule},
+        engine::{Config, Unclaimed},
+        gatt::{Value, ValueId, ppcp},
+    },
+    link::ParamRange,
 };
-const _: () = assert!(
-    !NAME.is_empty() && NAME.len() <= 29,
-    "SPOTLIGHT_DEVICE_NAME must hold 1 to 29 octets: the scan response carries it complete"
-);
+use embassy_time::Duration;
+
+/// The device name: 18 octets, so the advertising data shortens it.
+pub const NAME: &[u8] = b"Example HID Remote";
 /// Appearance: a keyboard (0x03C1), least significant octet first.
 pub const APPEARANCE: [u8; 2] = [0xC1, 0x03];
-/// The connection parameters the remote asks for.
+/// The connection parameters the device asks for.
 ///
 /// The Peripheral Preferred Connection Parameters characteristic and the
 /// L2CAP connection parameter update request both take them: an interval of
 /// 15 ms (12 units), a latency of 30 events and a timeout of 6 s.
 pub const PARAMS: ParamRange = ParamRange::new(12, 12, 30, 600);
 /// The `PnP` ID: vendor ID source 2 (USB), vendor 0x1209 (pid.codes), product
-/// 0x0001 and version 0x0100, each least significant octet first. The
-/// vendor makes Linux bind hid-generic.
+/// 0x0001 (a test ID) and version 0x0100, each least significant octet first.
 pub const PNP_ID: [u8; 7] = [0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01];
 /// HID Information: HID version 1.11, no country code, flags remote wake
 /// and normally connectable.
@@ -191,4 +184,32 @@ crate::gatt! {
         ccc;
         desc 0x2908 [read] = Value::Const(&[MOUSE_REPORT_ID, INPUT_REPORT]);
     }
+}
+
+/// The advertising phases: 20 ms for 3 s, 50 ms for 12 s, 400 ms for 45 s.
+pub const PHASES: [Phase; 3] = [
+    Phase::new(32, Duration::from_secs(3)),
+    Phase::new(80, Duration::from_secs(12)),
+    Phase::new(640, Duration::from_secs(45)),
+];
+/// Pairing: [`PHASES`], and 60 s to pair.
+pub const PAIRING: Schedule = Schedule::new(&PHASES, Duration::from_secs(60));
+/// Reconnection: [`PHASES`], and 20 s for the bonded central to encrypt.
+pub const RECONNECT: Schedule = Schedule::new(&PHASES, Duration::from_secs(20));
+/// What the device advertises: its name and appearance, the HID and Battery
+/// services, no TX power level.
+pub const CONTENT: Content<'static> =
+    Content::new(NAME, u16::from_le_bytes(APPEARANCE), &[HID_SERVICE, BATTERY_SERVICE]);
+/// The engine's configuration: [`PARAMS`], and a link nobody waits for is
+/// kept.
+pub const CONFIG: Config = Config::new(Some(PARAMS), Unclaimed::Keep);
+
+/// The advertising in `mode`: [`CONTENT`] with `tx_power`, on [`PAIRING`] or
+/// [`RECONNECT`].
+pub fn advertising(mode: Mode<'_>, tx_power: Option<i8>) -> Result<Advertising<'_>, Overflow> {
+    let schedule = match mode {
+        Mode::Pairing => &PAIRING,
+        Mode::Reconnect(_) => &RECONNECT,
+    };
+    Advertising::new(mode, schedule, &CONTENT.with_tx_power(tx_power))
 }

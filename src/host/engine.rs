@@ -97,8 +97,8 @@
 //! once, or ended with [`REMOTE_USER`].
 //!
 //! Not served: indications, with the Service Changed indication, its ordering
-//! after the Write Response and its 30 s confirmation timer (the Spotlight
-//! table has no Service Changed); the LE credit based channels; and an MTU
+//! after the Write Response and its 30 s confirmation timer (for a table
+//! with Service Changed); the LE credit based channels; and an MTU
 //! above 23.
 
 use crate::{
@@ -107,7 +107,7 @@ use crate::{
         Aes,
         att::{MTU, NotifyError as AttNotifyError, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
         bond::Bond,
-        gatt::{CCCD_MAX, Char, Db, Handler, Kind, PROP_NOTIFY, Sec, Uuid, Value, spotlight},
+        gatt::{CCCD_MAX, Char, Db, Handler, Kind, PROP_NOTIFY, Sec, Uuid, Value},
         identity::{LocalIdentity, Variant},
         l2cap::{Channel, Fragment, RX_MAX, Reassembly, Segmenter},
         signal::{self, Action, Signalling},
@@ -425,10 +425,6 @@ pub enum NotifyError {
 }
 
 impl Config {
-    /// The Spotlight's: [`spotlight::PARAMS`], and a link nobody waits for
-    /// is kept.
-    pub const SPOTLIGHT: Self = Self::new(Some(spotlight::PARAMS), Unclaimed::Keep);
-
     /// A configuration asking for `params` and treating a link nobody waits
     /// for as `unclaimed` says.
     #[inline]

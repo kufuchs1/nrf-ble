@@ -4,7 +4,7 @@
 use super::*;
 use crate::{
     host::{
-        gatt::spotlight::DB,
+        example::{self, DB},
         identity::{DeviceSecret, Variant},
         test_aes::Software,
     },
@@ -140,7 +140,7 @@ fn a_structure_that_does_not_fit_is_refused_and_changes_nothing() {
 #[test]
 fn a_long_name_is_shortened_at_a_character_boundary() {
     let mut data = Data::new();
-    assert_eq!(data.name_fitting(b"Spotlight"), Ok(false));
+    assert_eq!(data.name_fitting(b"My remote"), Ok(false));
     assert_eq!(data.as_bytes()[..2], [10, AD_NAME]);
     // 27 octets of data leave room for a name of 2 octets: "a" and the
     // first octet of a two octet character would be cut before the latter.
@@ -156,34 +156,32 @@ fn a_long_name_is_shortened_at_a_character_boundary() {
 }
 
 #[test]
-fn the_spotlight_pairs_discoverably_with_its_name() {
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+fn pairing_is_discoverable_with_the_name() {
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     let adv = advertising.data().as_bytes();
     let head = [2, 0x01, 0x06, 5, 0x03, 0x12, 0x18, 0x0F, 0x18, 3, 0x19, 0xC1, 0x03];
     assert_eq!(adv[..head.len()], head);
-    if option_env!("SPOTLIGHT_DEVICE_NAME").is_none() {
-        // "Presenter Unterwegs" (19 octets) leaves 16 in the advertising: the
-        // name is shortened there and complete in the scan response.
-        assert_eq!(adv[head.len()..], *[&[17, AD_SHORT_NAME][..], b"Presenter Unterw"].concat());
-        assert_eq!(advertising.scan().as_bytes(), [&[20, AD_NAME][..], b"Presenter Unterwegs"].concat());
-    }
-    assert!(advertising.schedule() == &SPOTLIGHT_PAIRING);
+    // "Example HID Remote" (18 octets) leaves 16 in the advertising: the
+    // name is shortened there and complete in the scan response.
+    assert_eq!(adv[head.len()..], *[&[17, AD_SHORT_NAME][..], b"Example HID Remo"].concat());
+    assert_eq!(advertising.scan().as_bytes(), [&[19, AD_NAME][..], b"Example HID Remote"].concat());
+    assert!(advertising.schedule() == &example::PAIRING);
     assert!(advertising.mode().pairable() && advertising.mode().discoverable());
 }
 
 #[test]
-fn the_spotlight_reconnects_without_name_or_discoverability() {
+fn reconnection_is_without_name_or_discoverability() {
     let bond = bond(false);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), Some(-8)).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), Some(-8)).unwrap();
     assert_eq!(advertising.data().as_bytes(), &[2, 0x01, 0x04, 5, 0x03, 0x12, 0x18, 0x0F, 0x18, 3, 0x19, 0xC1, 0x03]);
     assert_eq!(advertising.scan().as_bytes(), &[2, AD_TX_POWER, 0xF8]);
-    assert!(advertising.schedule() == &SPOTLIGHT_RECONNECT);
+    assert!(advertising.schedule() == &example::RECONNECT);
     assert!(!advertising.mode().pairable() && !advertising.mode().discoverable());
 }
 
 #[test]
 fn a_name_too_long_for_the_advertising_data_is_complete_in_the_scan_response() {
-    let content = Content { name: b"A remote with a long name", ..Content::SPOTLIGHT };
+    let content = Content { name: b"A remote with a long name", ..example::CONTENT };
     let (adv, scan) = content.data(true).unwrap();
     assert_eq!(adv.len(), DATA_MAX);
     assert_eq!(adv.as_bytes()[13..15], [17, AD_SHORT_NAME]);
@@ -191,18 +189,18 @@ fn a_name_too_long_for_the_advertising_data_is_complete_in_the_scan_response() {
     assert_eq!(scan.as_bytes()[..2], [26, AD_NAME]);
     assert_eq!(&scan.as_bytes()[2..], b"A remote with a long name");
     // A name that fits neither is refused.
-    let content = Content { name: &[b'x'; 30], ..Content::SPOTLIGHT };
+    let content = Content { name: &[b'x'; 30], ..example::CONTENT };
     assert_eq!(content.data(true).err(), Some(Overflow::TooLong));
     // Without discoverability the name does not matter.
     assert!(content.data(false).is_ok());
 }
 
 #[test]
-fn the_spotlight_phases_take_a_minute() {
-    let schedule = SPOTLIGHT_PAIRING;
+fn the_example_phases_take_a_minute() {
+    let schedule = example::PAIRING;
     assert_eq!(schedule.total(), Duration::from_secs(60));
     assert_eq!(schedule.security_deadline, Duration::from_secs(60));
-    assert_eq!(SPOTLIGHT_RECONNECT.security_deadline, Duration::from_secs(20));
+    assert_eq!(example::RECONNECT.security_deadline, Duration::from_secs(20));
     let interval = |millis| schedule.phase_at(Duration::from_millis(millis)).map(|phase| phase.interval);
     assert_eq!(interval(0), Some(32));
     assert_eq!(interval(2_999), Some(32));
@@ -212,13 +210,13 @@ fn the_spotlight_phases_take_a_minute() {
     assert_eq!(interval(59_999), Some(640));
     assert_eq!(interval(60_000), None);
     // 20 ms, 50 ms and 400 ms.
-    assert_eq!(SPOTLIGHT_PHASES.map(|phase| u32::from(phase.interval) * 625), [20_000, 50_000, 400_000]);
+    assert_eq!(example::PHASES.map(|phase| u32::from(phase.interval) * 625), [20_000, 50_000, 400_000]);
 }
 
 #[test]
 fn reconnection_filters_on_the_accept_list_and_both_modes_are_private() {
     let bond = bond(false);
-    let phase = SPOTLIGHT_PHASES[1];
+    let phase = example::PHASES[1];
     let pairing = Mode::Pairing.params(&phase);
     assert!(pairing.filter_policy == 0 && pairing.private && pairing.interval == 80);
     let reconnect = Mode::Reconnect(&bond).params(&phase);
@@ -229,7 +227,7 @@ fn reconnection_filters_on_the_accept_list_and_both_modes_are_private() {
 fn pairing_sets_our_key_and_no_central() {
     let recorder = Recorder::new();
     let identity = identity(1);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     advertising.configure(&recorder, &identity).unwrap();
     assert!(recorder.saw(&[
         Seen::StopAdvertising,
@@ -247,7 +245,7 @@ fn reconnection_lets_only_the_bonded_central_in_through_the_resolving_list() {
     let recorder = Recorder::new();
     let identity = identity(1);
     let bond = bond(true);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     advertising.configure(&recorder, &identity).unwrap();
     assert!(recorder.saw(&[
         Seen::StopAdvertising,
@@ -267,7 +265,7 @@ fn reconnection_lets_only_the_bonded_central_in_through_the_resolving_list() {
 fn a_bond_of_another_identity_is_refused_before_any_call() {
     let recorder = Recorder::new();
     let bond = bond(false);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     assert_eq!(advertising.configure(&recorder, &identity(2)), Err(Error::WrongIdentity));
     assert!(recorder.saw(&[]));
 }
@@ -275,7 +273,7 @@ fn a_bond_of_another_identity_is_refused_before_any_call() {
 #[test]
 fn a_refused_call_ends_the_setup() {
     let recorder = Recorder { fail_at: Some(2), ..Recorder::new() };
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     assert_eq!(advertising.configure(&recorder, &identity(0)), Err(Error::Link(link::Error::Disallowed)));
     assert!(recorder.saw(&[Seen::StopAdvertising, Seen::SetAddressResolution(false)]));
 }
@@ -284,8 +282,8 @@ fn a_refused_call_ends_the_setup() {
 fn each_phase_starts_with_its_interval_and_the_modes_data() {
     let recorder = Recorder::new();
     let bond = bond(false);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
-    for phase in &SPOTLIGHT_PHASES {
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    for phase in &example::PHASES {
         advertising.start(&recorder, phase).unwrap();
     }
     let seen = |interval| Seen::Advertise(0x03, interval, true, *advertising.data(), *advertising.scan());
@@ -298,11 +296,11 @@ fn the_link_layer_takes_the_reconnection_setup() {
     let link = Link::new(&shared);
     let identity = identity(1);
     let bond = bond(true);
-    let advertising = Advertising::spotlight(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     advertising.configure(&link, &identity).unwrap();
     // A private address needs the chip's RNG and AES, so the link layer is
     // checked advertising from the identity address.
-    let params = advertising.mode().params(&SPOTLIGHT_PHASES[0]).private(false);
+    let params = advertising.mode().params(&example::PHASES[0]).private(false);
     link.advertise(&params, advertising.data().as_bytes(), advertising.scan().as_bytes()).unwrap();
     let settings = shared.advertising().unwrap();
     assert!(settings.address == identity.peer() && settings.own == identity.peer());
@@ -313,10 +311,10 @@ fn the_link_layer_takes_the_reconnection_setup() {
     assert_eq!(settings.interval, 20_000);
     // Setting up again stops the advertising first, and pairing forgets the
     // central.
-    let pairing = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let pairing = example::advertising(Mode::Pairing, None).unwrap();
     pairing.configure(&link, &identity).unwrap();
     assert!(shared.advertising().is_none());
-    link.advertise(&pairing.mode().params(&SPOTLIGHT_PHASES[0]).private(false), &[], &[]).unwrap();
+    link.advertise(&pairing.mode().params(&example::PHASES[0]).private(false), &[], &[]).unwrap();
     let settings = shared.advertising().unwrap();
     assert_eq!(settings.filter_policy, 0);
     assert!(!settings.filter.contains(CENTRAL));
@@ -329,18 +327,18 @@ fn the_link_layer_takes_the_reconnection_setup() {
 fn the_link_layer_refuses_to_start_while_a_central_is_connected() {
     let shared = Shared::new();
     let link = Link::new(&shared);
-    let advertising = Advertising::spotlight(Mode::Pairing, None).unwrap();
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
     // Without an identity address.
-    assert_eq!(advertising.start(&link, &SPOTLIGHT_PHASES[0]), Err(Error::Link(link::Error::Invalid)));
+    assert_eq!(advertising.start(&link, &example::PHASES[0]), Err(Error::Link(link::Error::Invalid)));
     advertising.configure(&link, &identity(0)).unwrap();
     shared.set_connected(true);
-    assert_eq!(advertising.start(&link, &SPOTLIGHT_PHASES[0]), Err(Error::Link(link::Error::Disallowed)));
+    assert_eq!(advertising.start(&link, &example::PHASES[0]), Err(Error::Link(link::Error::Disallowed)));
     assert!(shared.advertising().is_none());
 }
 
 #[test]
-fn the_spotlight_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() {
-    let (adv, scan) = Content::SPOTLIGHT.data(true).unwrap();
+fn the_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() {
+    let (adv, scan) = example::CONTENT.data(true).unwrap();
     let field = |data: &[u8], kind: u8| {
         let mut rest = data;
         while let [len, kind_here, tail @ ..] = rest {
@@ -354,9 +352,9 @@ fn the_spotlight_name_is_shortened_in_the_advertising_and_complete_in_the_scan_r
         None
     };
     let complete = field(scan.as_bytes(), AD_NAME).unwrap_or_else(|| field(adv.as_bytes(), AD_NAME).unwrap());
-    assert_eq!(complete, spotlight::NAME);
+    assert_eq!(complete, example::NAME);
     if let Some(short) = field(adv.as_bytes(), AD_SHORT_NAME) {
-        assert!(spotlight::NAME.starts_with(&short));
+        assert!(example::NAME.starts_with(&short));
     }
     assert!(adv.as_bytes().len() <= 31 && scan.as_bytes().len() <= 31);
 }
