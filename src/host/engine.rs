@@ -48,7 +48,11 @@
 //!   parameters of its [`Config`] with the L2CAP request, once per link and
 //!   only if the link has others: the same constant as the Peripheral Preferred
 //!   Connection Parameters, so BlueZ never finds the two disagreeing. Asked
-//!   earlier, the update would stretch discovery.
+//!   earlier, the update would stretch discovery. With the feature
+//!   `param-requests` the application may ask itself
+//!   (`host::Conn::request_params`), for a fallback or a second try, and learns
+//!   of each rejection (`ConnEvent::ParamsRejected`); the engine's own request
+//!   is then not made on that link.
 //! - It answers a long term key request with EDIV 0 and Rand 0 only: with the
 //!   key of the pairing under way, or with the bond's if the central is the
 //!   bonded one, by its resolved identity or its identity address on the air.
@@ -146,21 +150,27 @@ pub const SECURITY_FAILURE: u8 = 0x05;
 pub const REMOTE_USER: u8 = 0x13;
 
 /// Event flag: a pairing failed.
-const EV_PAIRING_FAILED: u8 = 0x01;
+const EV_PAIRING_FAILED: Flags = 0x01;
 /// Event flag: the link is encrypted.
-const EV_ENCRYPTED: u8 = 0x02;
+const EV_ENCRYPTED: Flags = 0x02;
 /// Event flag, with [`EV_ENCRYPTED`]: with the bond's key.
-const EV_WITH_BOND: u8 = 0x04;
+const EV_WITH_BOND: Flags = 0x04;
 /// Event flag: a pairing made a bond.
-const EV_BONDED: u8 = 0x08;
+const EV_BONDED: Flags = 0x08;
 /// Event flag: the bond's subscriptions changed.
-const EV_BOND_UPDATED: u8 = 0x10;
+const EV_BOND_UPDATED: Flags = 0x10;
 /// Event flag: the connection parameters changed.
-const EV_PARAMS: u8 = 0x20;
+const EV_PARAMS: Flags = 0x20;
 /// Event flag: discovery is over.
-const EV_READY: u8 = 0x40;
+const EV_READY: Flags = 0x40;
+/// Event flag: the central rejected a connection parameter request.
+#[cfg(feature = "param-requests")]
+const EV_PARAMS_REJECTED: Flags = 0x80;
 /// The characteristic UUID of a HID report.
 const REPORT: u16 = 0x2A4D;
+
+/// The events waiting, one `EV_` bit each.
+type Flags = u8;
 
 /// A call of the link layer the engine asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,7 +266,7 @@ struct Events {
     /// The link the events belong to.
     epoch:   Option<Epoch>,
     /// The events waiting, as `EV_` flags.
-    flags:   u8,
+    flags:   Flags,
     /// The connection parameters of [`EV_PARAMS`].
     params:  ConnectionParams,
     /// The reason of [`EV_PAIRING_FAILED`].
@@ -267,8 +277,10 @@ struct Events {
 /// or [`crate::host::Conn::next`].
 ///
 /// Events of one kind coalesce until they are taken. They come in this
-/// order: [`Self::PairingFailed`], [`Self::Encrypted`], [`Self::Bonded`],
-/// [`Self::BondUpdated`], [`Self::ParamsUpdated`], [`Self::Ready`], and
+/// order: `PasskeyRequested` (feature `passkey`), [`Self::PairingFailed`],
+/// `KeyMissing` (feature `key-missing`), [`Self::Encrypted`],
+/// [`Self::Bonded`], [`Self::BondUpdated`], [`Self::ParamsUpdated`],
+/// `ParamsRejected` (feature `param-requests`), [`Self::Ready`], and
 /// [`Self::Disconnected`] last, after every other event of its link.
 #[derive(Clone, Eq, PartialEq)]
 #[non_exhaustive]
@@ -288,6 +300,15 @@ pub enum ConnEvent {
     },
     /// A pairing failed, with the reason; the link ends.
     PairingFailed(Reason),
+    /// The central rejected a connection parameter request, the engine's
+    /// own ([`Config::params`]) or one of
+    /// [`crate::host::Conn::request_params`]: with a Connection Parameter
+    /// Update Response that refuses it, or a Command Reject. An accepted
+    /// request has no event of its own: [`Self::ParamsUpdated`] follows once
+    /// the central updated the link. A request the central never answers
+    /// gives neither; after [`SIGNALLING_TIMEOUT`] the next one may go out.
+    #[cfg(feature = "param-requests")]
+    ParamsRejected,
     /// The connection parameters changed to these.
     ParamsUpdated(ConnectionParams),
     /// Discovery is over: the link is encrypted, the central has our
@@ -403,6 +424,23 @@ pub enum Unclaimed {
     Disconnect,
     /// The next advertising call returns it without advertising.
     Keep,
+}
+
+/// Why [`Engine::request_params`] sent no request.
+#[cfg(feature = "param-requests")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum RequestError {
+    /// A request waits for its response, or for its place in the link
+    /// layer's queue: one at a time.
+    Busy,
+    /// The link ended, or is ending.
+    Gone,
+    /// The range is out of the specification's ranges: an interval of 7.5 ms
+    /// to 4 s, the shortest at most the longest, and a latency and timeout
+    /// that fit the longest.
+    Invalid,
 }
 
 /// Why a notification cannot be sent now, or at all.
@@ -880,6 +918,11 @@ impl Engine {
                     }
                     if outcome == signal::Outcome::Rejected {
                         info!("the central rejected our connection parameters");
+                        #[cfg(feature = "param-requests")]
+                        {
+                            self.events.flags |= EV_PARAMS_REJECTED;
+                            self.events.changed = true;
+                        }
                     }
                 },
                 None => {},
@@ -1024,6 +1067,36 @@ impl Engine {
         Some(payload)
     }
 
+    /// Asks the central of the link `epoch` for the connection parameters
+    /// `range` with the L2CAP Connection Parameter Update Request, whatever
+    /// the link has now. The engine's own request of [`Config::params`] is
+    /// then not made on this link, so the two never race. The outcome comes
+    /// as [`ConnEvent::ParamsRejected`], or as [`ConnEvent::ParamsUpdated`]
+    /// once the central updated the link.
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError::Gone`] without the link, [`RequestError::Invalid`] for
+    /// a range out of the specification's, [`RequestError::Busy`] while an
+    /// earlier request waits for its response (at most
+    /// [`SIGNALLING_TIMEOUT`]).
+    #[cfg(feature = "param-requests")]
+    #[inline]
+    pub fn request_params(&mut self, epoch: Epoch, range: ParamRange) -> Result<(), RequestError> {
+        let link = self
+            .link
+            .as_mut()
+            .filter(|link| link.info.epoch == epoch && !link.closing && link.ending.is_none())
+            .ok_or(RequestError::Gone)?;
+        if !range.is_valid() {
+            return Err(RequestError::Invalid);
+        }
+        let command = self.signal.request_params(range).ok_or(RequestError::Busy)?;
+        self.sig_req = Some(command);
+        link.asked = true;
+        Ok(())
+    }
+
     /// Restores the bond's subscriptions, once the link is encrypted with
     /// the bond's key.
     fn restore(&mut self) {
@@ -1108,7 +1181,16 @@ impl Engine {
         let ended = self.events.ended.filter(|&(ended, _)| ended == epoch).map(|(_, reason)| reason);
         if self.events.epoch == Some(epoch) {
             let flags = &mut self.events.flags;
-            for flag in [EV_PAIRING_FAILED, EV_ENCRYPTED, EV_BONDED, EV_BOND_UPDATED, EV_PARAMS, EV_READY] {
+            for flag in [
+                EV_PAIRING_FAILED,
+                EV_ENCRYPTED,
+                EV_BONDED,
+                EV_BOND_UPDATED,
+                EV_PARAMS,
+                #[cfg(feature = "param-requests")]
+                EV_PARAMS_REJECTED,
+                EV_READY,
+            ] {
                 if *flags & flag == 0 {
                     continue;
                 }
@@ -1123,6 +1205,8 @@ impl Engine {
                     EV_BONDED => self.bond.clone().map(ConnEvent::Bonded),
                     EV_BOND_UPDATED => self.bond.clone().map(ConnEvent::BondUpdated),
                     EV_PARAMS => Some(ConnEvent::ParamsUpdated(self.events.params)),
+                    #[cfg(feature = "param-requests")]
+                    EV_PARAMS_REJECTED => Some(ConnEvent::ParamsRejected),
                     _ => Some(ConnEvent::Ready),
                 };
                 if event.is_some() {
@@ -1173,6 +1257,8 @@ impl fmt::Debug for ConnEvent {
             Self::Disconnected(reason) => formatter.debug_tuple("Disconnected").field(&reason).finish(),
             Self::Encrypted { bonded } => formatter.debug_struct("Encrypted").field("bonded", &bonded).finish(),
             Self::PairingFailed(reason) => formatter.debug_tuple("PairingFailed").field(&reason).finish(),
+            #[cfg(feature = "param-requests")]
+            Self::ParamsRejected => formatter.write_str("ParamsRejected"),
             Self::ParamsUpdated(params) => formatter.debug_tuple("ParamsUpdated").field(&params).finish(),
             Self::Ready => formatter.write_str("Ready"),
         }

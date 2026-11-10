@@ -341,6 +341,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::{blocking_mutex::Mutex, mutex::Mutex as AsyncMutex, signal::Signal};
 use embassy_time::{Instant, Timer};
+#[cfg(feature = "param-requests")]
+pub use engine::RequestError;
 pub use engine::{ConnEvent, NotifyError};
 
 /// The mutex around the host's state: a thread mode mutex on the chip, so no
@@ -632,6 +634,46 @@ where
             self.host.wake.signal(());
             self.host.room.wait().await;
         }
+    }
+
+    /// Asks the central for the connection parameters `range` with the
+    /// L2CAP Connection Parameter Update Request, as
+    /// [`engine::Engine::request_params`] says: the engine's own request of
+    /// [`engine::Config::params`] is then not made on this link. The central
+    /// answers with [`ConnEvent::ParamsRejected`], or updates the link,
+    /// which [`ConnEvent::ParamsUpdated`] reports. The policy is the
+    /// firmware's: a fallback range after a rejection or an interval that
+    /// stays too long, a second request for the latency, with its own
+    /// timers.
+    ///
+    /// ```no_run
+    /// # use nrf_ble::{host::{ConnEvent, Conn, Port}, link::ParamRange};
+    /// /// 11.25 to 15 ms, a latency of 30 events, 6 s.
+    /// const FALLBACK: ParamRange = ParamRange::new(9, 12, 30, 600);
+    ///
+    /// async fn on_event<P: Port>(conn: &Conn<'_, P>, event: ConnEvent) {
+    ///     if event == ConnEvent::ParamsRejected {
+    ///         // Busy only while a request waits: the rejected one is done.
+    ///         let _ = conn.request_params(FALLBACK);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError::Gone`] once the link ended or is ending,
+    /// [`RequestError::Invalid`] for a range out of the specification's,
+    /// [`RequestError::Busy`] while an earlier request, the engine's or this
+    /// one's, waits for its response.
+    #[cfg(feature = "param-requests")]
+    #[inline]
+    pub fn request_params(&self, range: link::ParamRange) -> Result<(), RequestError> {
+        let result = self.host.with(|state| state.engine.request_params(self.epoch, range));
+        if result.is_ok() {
+            // The run task queues it.
+            self.host.wake.signal(());
+        }
+        result
     }
 
     /// The security of the link: encrypted once it is with a key the host

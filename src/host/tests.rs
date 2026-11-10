@@ -915,6 +915,8 @@ fn a_rejected_parameter_request_is_not_repeated() {
     tasks.step();
     assert!(link.deliver().is_empty());
     assert!(link.calls().is_empty());
+    #[cfg(feature = "param-requests")]
+    assert_eq!(next!(conn), ConnEvent::ParamsRejected);
     assert!(poll(pin!(conn.next())).is_pending());
     assert_eq!(conn.try_notify(example::KEYBOARD, &[0; 8]), Ok(()));
     assert_eq!(multiplications.get(), 0);
@@ -1214,4 +1216,130 @@ fn software_aes_matches_fips_197() {
     let plain = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
     let cipher = [0x69, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30, 0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4, 0xC5, 0x5A];
     assert_eq!(Software.encrypt(key, plain), cipher);
+}
+
+/// The fallback range of the parameter request tests: 11.25 to 15 ms, a
+/// latency of 30 events, 6 s.
+#[cfg(feature = "param-requests")]
+const FALLBACK: link::ParamRange = link::ParamRange::new(9, 12, 30, 600);
+
+#[cfg(feature = "param-requests")]
+#[test]
+fn the_application_asks_for_parameters_and_learns_of_a_rejection() {
+    use super::RequestError;
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    // A request goes out at once as a signalling PDU, with the first
+    // identifier of the link.
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x01, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    // One at a time: a second waits for the response to the first.
+    assert_eq!(conn.request_params(example::PARAMS), Err(RequestError::Busy));
+    // The central refuses it: the application learns it.
+    link.send(CID_SIGNALLING, &[0x13, 0x01, 0x02, 0x00, 0x01, 0x00], false);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::ParamsRejected);
+    assert!(poll(pin!(conn.next())).is_pending());
+    // The next request has a fresh identifier; a Command Reject of it
+    // rejects it too.
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x02, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    link.send(CID_SIGNALLING, &[0x01, 0x02, 0x02, 0x00, 0x00, 0x00], false);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::ParamsRejected);
+    // An accepted request has no event of its own: the update follows.
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver().len(), 1);
+    link.send(CID_SIGNALLING, &[0x13, 0x03, 0x02, 0x00, 0x00, 0x00], false);
+    tasks.step();
+    assert!(poll(pin!(conn.next())).is_pending());
+    link.event(Event::ParamsUpdated { params: ConnectionParams::new(12, 30, 600), status: 0 });
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::ParamsUpdated(ConnectionParams::new(12, 30, 600)));
+    // The engine's own request is not made after the application's.
+    link.advance(1000);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Ready);
+    link.advance(60_000);
+    tasks.step();
+    assert!(link.deliver().is_empty(), "no automatic request after a manual one");
+    // A range out of the specification's is refused.
+    assert_eq!(conn.request_params(link::ParamRange::new(12, 9, 30, 600)), Err(RequestError::Invalid));
+    assert_eq!(conn.request_params(link::ParamRange::new(5, 12, 30, 600)), Err(RequestError::Invalid));
+    assert_eq!(conn.request_params(link::ParamRange::new(12, 12, 30, 10)), Err(RequestError::Invalid));
+    assert!(link.deliver().is_empty());
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "param-requests")]
+#[test]
+fn the_end_of_the_link_clears_a_pending_parameter_request() {
+    use super::RequestError;
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver().len(), 1);
+    link.disconnect_link(0x13);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Disconnected(0x13));
+    assert_eq!(conn.request_params(FALLBACK), Err(RequestError::Gone));
+    // The next link asks again from the first identifier; a late response
+    // of the old link's request would be dropped.
+    let identity = identity(1);
+    let bond = bond(&identity);
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(bond.peer, None, local_rpa());
+    tasks.step();
+    let next = ready(advertise.as_mut()).unwrap();
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(next!(next), ConnEvent::Encrypted { bonded: true });
+    assert_eq!(next.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x01, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    // A request the central never answers lets the next go out after the
+    // signalling timeout, without an event.
+    link.advance(29_999);
+    tasks.step();
+    assert_eq!(next.request_params(FALLBACK), Err(RequestError::Busy));
+    link.advance(1);
+    tasks.step();
+    assert_eq!(next!(next), ConnEvent::Ready);
+    assert!(poll(pin!(next.next())).is_pending());
+    assert_eq!(next.request_params(FALLBACK), Ok(()));
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "param-requests")]
+#[test]
+fn the_engine_s_own_rejected_request_is_reported_too() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    link.advance(1000);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Ready);
+    link.advance(500);
+    tasks.step();
+    assert_eq!(link.deliver().len(), 1);
+    link.send(CID_SIGNALLING, &[0x13, 0x01, 0x02, 0x00, 0x01, 0x00], false);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::ParamsRejected);
+    // The application's fallback goes out as the second request.
+    assert_eq!(conn.request_params(FALLBACK), Ok(()));
+    tasks.step();
+    assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x02, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
+    assert_eq!(multiplications.get(), 0);
 }

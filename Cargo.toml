@@ -23,6 +23,12 @@ data-length = []
 # and the radio resends our previous PDU. The `late` counters of the 10 s
 # report count those events, and the link goes on as with a lost answer.
 ifs-delay-test = []
+# The host's optional parts, each off by default so a device without it builds
+# exactly as before. `param-requests`: the application asks for connection
+# parameters itself (`host::Conn::request_params`), beyond the one request of
+# `host::engine::Config`, and learns when the central rejects one
+# (`ConnEvent::ParamsRejected`).
+param-requests = []
 
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main), through the patches at the end: the
