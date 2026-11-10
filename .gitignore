@@ -1,3 +1,4 @@
 target
-# No lock: every build resolves the main branches of the dependencies anew.
+# No committed lock: a fresh checkout resolves the latest commits of the
+# dependencies' main branches; this local lock keeps them until `cargo update`.
 Cargo.lock

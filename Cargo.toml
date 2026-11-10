@@ -27,7 +27,9 @@ ifs-delay-test = []
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main), through the patches at the end: the
 # requirements here only name the major version the code is written for, and
-# there is no Cargo.lock, so each build resolves the branches anew.
+# no Cargo.lock is committed: a fresh checkout resolves the latest commits of
+# the branches, and the local, ignored Cargo.lock keeps them until
+# `cargo update`.
 [dependencies]
 cortex-m = "0"
 defmt = { version = "1", optional = true }
@@ -68,9 +70,9 @@ bench = false
 # stay on crates.io where a dependency needs an older major version than the
 # one on the branch: bitflags 1 (defmt), embedded-hal 0.2 and nb 0.1
 # (cortex-m, Embassy), embedded-io and embedded-io-async 0.6
-# (embassy-usb-driver), syn 2 (cortex-m-macros), and bare-metal 0.2,
-# bitfield 0.13, rustc_version 0.2, semver 0.9 and semver-parser 0.7 under
-# cortex-m 0.7. Likewise futures-core and futures-sink 0.3 (Embassy), hash32
+# (embassy-usb-driver), syn 2 (unitrait-macros, at the unitrait revision
+# Embassy names), and bare-metal 0.2, bitfield 0.13, rustc_version 0.2,
+# semver 0.9 and semver-parser 0.7 under cortex-m 0.7. Likewise futures-core and futures-sink 0.3 (Embassy), hash32
 # 0.3 (heapless) and libc 0.2 (cpufeatures): their main branches carry
 # unreleased pre-releases of the next major version (futures-core 1.0 and
 # futures-sink 0.4 alphas, hash32 1.0, libc 1.0 alphas). nrf-pac and unitrait
