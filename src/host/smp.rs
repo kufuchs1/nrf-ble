@@ -693,6 +693,12 @@ impl Responder {
         Ok(None)
     }
 
+    /// Whether a Pairing Request is taken.
+    #[cfg(feature = "key-missing")]
+    #[inline]
+    #[must_use = "the state is only read"]
+    pub const fn is_pairable(&self) -> bool { self.pairable }
+
     /// Whether a pairing is under way: from the Pairing Request until it
     /// bonds, fails or times out.
     #[inline]

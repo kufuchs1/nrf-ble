@@ -1343,3 +1343,67 @@ fn the_engine_s_own_rejected_request_is_reported_too() {
     assert_eq!(link.deliver(), [(Channel::Signalling, vec![0x12, 0x02, 0x08, 0x00, 9, 0, 12, 0, 30, 0, 0x58, 0x02])]);
     assert_eq!(multiplications.get(), 0);
 }
+
+#[cfg(feature = "key-missing")]
+#[test]
+fn a_reconnection_without_the_bond_s_key_ends_at_once() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let bond = bond(&identity);
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // The central asks for a key of another pairing: the negative reply,
+    // which the link layer reports as a failed encryption, and the link
+    // ends at once instead of 20 s later.
+    link.event(Event::LtkRequest { ediv: 0x1234, rand: [7; 8] });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(None)]);
+    link.event(Event::Encryption { on: false, refresh: false, status: 0x06 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
+    assert_eq!(next!(conn), ConnEvent::KeyMissing);
+    assert!(poll(pin!(conn.next())).is_pending());
+    // Once only, and the end of the link follows.
+    link.advance(20_000);
+    tasks.step();
+    assert!(link.calls().is_empty());
+    link.disconnect_link(0x16);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Disconnected(0x16));
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "key-missing")]
+#[test]
+fn a_pairable_link_without_a_key_waits_for_a_pairing() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // A central with a stale key of ours: in pairing mode it may still pair,
+    // so the link goes on.
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: false, refresh: false, status: 0x06 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(None)]);
+    assert!(poll(pin!(conn.next())).is_pending());
+    let central = Central::new(linux_request(true, true), local_rpa());
+    assert_eq!(smp(link, &mut tasks, &central.request, false).len(), 1);
+    assert_eq!(multiplications.get(), 1);
+}

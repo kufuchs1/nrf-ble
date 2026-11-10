@@ -29,6 +29,10 @@ ifs-delay-test = []
 # `host::engine::Config`, and learns when the central rejects one
 # (`ConnEvent::ParamsRejected`).
 param-requests = []
+# `key-missing`: a reconnection whose central asks for a key the host does
+# not have ends at once (`ConnEvent::KeyMissing`, reason 0x05), instead of at
+# the advertising schedule's security deadline.
+key-missing = []
 
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main), through the patches at the end: the

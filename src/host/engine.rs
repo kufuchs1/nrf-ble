@@ -82,9 +82,11 @@
 //!   overwrites its copy of the keys once the [`Bond`] holds them; the security
 //!   manager overwrites its own Diffie-Hellman key, `MacKey` and long term key.
 //! - It ends the link: [`SECURITY_FAILURE`] when the link is not encrypted
-//!   within the advertising schedule's security deadline, or when a pairing
-//!   failed (once our Pairing Failed was acknowledged, or after
-//!   [`FLUSH_TIMEOUT`]), and [`REMOTE_USER`] when the pairing timed out.
+//!   within the advertising schedule's security deadline (with the feature
+//!   `key-missing`, at once when the central of a reconnection asks for a key
+//!   the host does not have, `ConnEvent::KeyMissing`), or when a pairing failed
+//!   (once our Pairing Failed was acknowledged, or after [`FLUSH_TIMEOUT`]),
+//!   and [`REMOTE_USER`] when the pairing timed out.
 //!
 //! The bonded central's resolving list entry replaces the one of pairing
 //! mode, which carries our key under an all zero central address, when the
@@ -166,11 +168,19 @@ const EV_READY: Flags = 0x40;
 /// Event flag: the central rejected a connection parameter request.
 #[cfg(feature = "param-requests")]
 const EV_PARAMS_REJECTED: Flags = 0x80;
+/// Event flag: the bonded central asked for a key the host does not have.
+#[cfg(feature = "key-missing")]
+const EV_KEY_MISSING: Flags = 0x100;
 /// The characteristic UUID of a HID report.
 const REPORT: u16 = 0x2A4D;
 
-/// The events waiting, one `EV_` bit each.
+/// The events waiting, one `EV_` bit each: eight fit without the optional
+/// events.
+#[cfg(not(feature = "key-missing"))]
 type Flags = u8;
+/// The events waiting, one `EV_` bit each.
+#[cfg(feature = "key-missing")]
+type Flags = u16;
 
 /// A call of the link layer the engine asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +308,12 @@ pub enum ConnEvent {
         /// With the key of the bond the advertising was set up with.
         bonded: bool,
     },
+    /// The central of a reconnection asked to encrypt with a key the host
+    /// does not have: the bond's central lost its key, or holds one of
+    /// another pairing. The host answered with the negative reply and ends
+    /// the link at once with [`SECURITY_FAILURE`]; the bond stays as it is.
+    #[cfg(feature = "key-missing")]
+    KeyMissing,
     /// A pairing failed, with the reason; the link ends.
     PairingFailed(Reason),
     /// The central rejected a connection parameter request, the engine's
@@ -630,6 +646,25 @@ impl Engine {
             } else {
                 info!("encryption failed");
             }
+        }
+        #[cfg(feature = "key-missing")]
+        if !on
+            && !refresh
+            && !self.smp.is_pairable()
+            && self.bond.is_some()
+            && let Some(link) = self.link.as_mut()
+            && link.key.is_none()
+            && !link.closing
+        {
+            // A reconnection: only the bonded central connects, and it has
+            // no key the host knows. Waiting for the security deadline
+            // would only keep it connected without encryption.
+            info!("the central has no key of the bond: the link ends");
+            link.closing = true;
+            link.security = None;
+            self.commands.disconnect = Some((link.info.epoch, SECURITY_FAILURE));
+            self.events.flags |= EV_KEY_MISSING;
+            self.events.changed = true;
         }
         self.outcome(outcome, now);
     }
@@ -1183,6 +1218,8 @@ impl Engine {
             let flags = &mut self.events.flags;
             for flag in [
                 EV_PAIRING_FAILED,
+                #[cfg(feature = "key-missing")]
+                EV_KEY_MISSING,
                 EV_ENCRYPTED,
                 EV_BONDED,
                 EV_BOND_UPDATED,
@@ -1197,6 +1234,8 @@ impl Engine {
                 *flags &= !flag;
                 let event = match flag {
                     EV_PAIRING_FAILED => Some(ConnEvent::PairingFailed(self.events.reason)),
+                    #[cfg(feature = "key-missing")]
+                    EV_KEY_MISSING => Some(ConnEvent::KeyMissing),
                     EV_ENCRYPTED => {
                         let bonded = *flags & EV_WITH_BOND != 0;
                         *flags &= !EV_WITH_BOND;
@@ -1256,6 +1295,8 @@ impl fmt::Debug for ConnEvent {
             Self::Bonded(_) => formatter.debug_tuple("Bonded").finish_non_exhaustive(),
             Self::Disconnected(reason) => formatter.debug_tuple("Disconnected").field(&reason).finish(),
             Self::Encrypted { bonded } => formatter.debug_struct("Encrypted").field("bonded", &bonded).finish(),
+            #[cfg(feature = "key-missing")]
+            Self::KeyMissing => formatter.write_str("KeyMissing"),
             Self::PairingFailed(reason) => formatter.debug_tuple("PairingFailed").field(&reason).finish(),
             #[cfg(feature = "param-requests")]
             Self::ParamsRejected => formatter.write_str("ParamsRejected"),
