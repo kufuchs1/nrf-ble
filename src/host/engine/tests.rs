@@ -9,7 +9,11 @@ use crate::{
         example,
         gatt::{AttError, ValueId},
         identity::DeviceSecret,
-        smp::tests::{CENTRAL_ADDRESS, CENTRAL_IDENTITY, Central, Device, linux_request, local_rpa},
+        smp::{
+            IDENTITY_ADDRESS_INFORMATION,
+            IDENTITY_INFORMATION,
+            tests::{CENTRAL_ADDRESS, CENTRAL_IDENTITY, Central, Device, linux_request, local_rpa, pdu},
+        },
         test_aes::Software,
     },
     pdu::Peer,
@@ -51,12 +55,18 @@ fn info(peer: Peer, identity: Option<Peer>) -> Info {
 
 /// `payload` on `cid` as the fragments of a received PDU, unencrypted.
 fn receive(engine: &mut Engine, device: &mut Device, cid: u16, payload: &[u8], now: Instant) {
+    receive_as(engine, device, cid, payload, false, now);
+}
+
+/// `payload` on `cid` as the fragments of a received PDU, `encrypted` or
+/// not.
+fn receive_as(engine: &mut Engine, device: &mut Device, cid: u16, payload: &[u8], encrypted: bool, now: Instant) {
     let mut pdu = std::vec::Vec::new();
     pdu.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
     pdu.extend_from_slice(&cid.to_le_bytes());
     pdu.extend_from_slice(payload);
     for (index, chunk) in pdu.chunks(27).enumerate() {
-        engine.on_acl(device, &App, &AclIn::for_test(index == 0, false, chunk), now);
+        engine.on_acl(device, &App, &AclIn::for_test(index == 0, encrypted, chunk), now);
     }
 }
 
@@ -150,23 +160,27 @@ fn the_parameter_request_leaves_the_last_place_to_responses() {
     assert!(!engine.has_output());
 }
 
-#[test]
-fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity() {
-    let mut engine = Engine::new(&example::DB, example::CONFIG);
-    let mut device = Device(9);
-    let identity = identity();
-    engine.advertise(true, &identity, None, Duration::from_secs(60));
+/// Pairs `engine` with a Linux central at `peer` that is to send its
+/// identity keys if `central_id`, up to the encryption; returns the link's
+/// epoch and the key.
+fn pair(
+    engine: &mut Engine,
+    device: &mut Device,
+    identity: &LocalIdentity,
+    peer: Peer,
+    central_id: bool,
+) -> (Epoch, [u8; 16]) {
+    engine.advertise(true, identity, None, Duration::from_secs(60));
     let job = engine.take_job().unwrap();
     let result = job.run(&mut device.clone(), || ());
-    engine.job_done(&mut device, result, at(0));
-    let peer = Peer::new(CENTRAL_ADDRESS, false);
+    engine.job_done(device, result, at(0));
     engine.connected(&info(peer, None), at(0));
     let epoch = engine.epoch().unwrap();
-    let mut central = Central::new(linux_request(false, true), local_rpa());
-    receive(&mut engine, &mut device, 6, &central.request, at(0));
-    drain(&mut engine, 4, at(0));
-    receive(&mut engine, &mut device, 6, &central.public_key(), at(0));
-    let fragments = drain(&mut engine, 4, at(0));
+    let mut central = Central::new(linux_request(central_id, true), local_rpa());
+    receive(engine, device, 6, &central.request, at(0));
+    drain(engine, 4, at(0));
+    receive(engine, device, 6, &central.public_key(), at(0));
+    let fragments = drain(engine, 4, at(0));
     let mut reassembly = Reassembly::new();
     let pdus: std::vec::Vec<std::vec::Vec<u8>> = fragments
         .iter()
@@ -178,18 +192,28 @@ fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity(
     central.take_confirm(&pdus[1]);
     let job = engine.take_job().unwrap();
     let result = job.run(&mut device.clone(), || ());
-    engine.job_done(&mut device, result, at(0));
-    receive(&mut engine, &mut device, 6, &central.random(), at(0));
-    let random = drain(&mut engine, 4, at(0));
+    engine.job_done(device, result, at(0));
+    receive(engine, device, 6, &central.random(), at(0));
+    let random = drain(engine, 4, at(0));
     central.take_random(&random[0].bytes()[4..]);
-    receive(&mut engine, &mut device, 6, &central.check(), at(0));
-    drain(&mut engine, 4, at(0));
+    receive(engine, device, 6, &central.check(), at(0));
+    drain(engine, 4, at(0));
     engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, at(0));
     let mut ltk = central.ltk;
     ltk.reverse();
     assert_eq!(engine.take_command(0, at(0)), Some(Command::HoldLatency(true)));
     assert_eq!(engine.take_command(0, at(0)), Some(Command::LtkReply { epoch, key: Some(ltk) }));
     engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, at(0));
+    (epoch, ltk)
+}
+
+#[test]
+fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity() {
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(9);
+    let identity = identity();
+    let peer = Peer::new(CENTRAL_ADDRESS, false);
+    let (epoch, ltk) = pair(&mut engine, &mut device, &identity, peer, false);
     // Our identity keys go out, and the bond is made: the central sends
     // none of its own. It is reported only once the central acknowledged
     // them, as the kernel stores its bond only when they arrive.
@@ -206,6 +230,37 @@ fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity(
     assert_eq!(bond.peer_irk, None);
     assert_eq!(bond.ltk, ltk);
     assert_eq!(bond.local, identity.variant());
+}
+
+#[test]
+fn an_all_zero_key_from_the_central_is_no_key() {
+    // A central without an identity resolving key may send its identity
+    // address with an all-zero key: it scans from its identity address.
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(9);
+    let identity = identity();
+    let (epoch, ltk) = pair(&mut engine, &mut device, &identity, Peer::new(CENTRAL_ADDRESS, false), true);
+    // Our identity keys, then the central's.
+    assert_eq!(drain(&mut engine, 4, at(0)).len(), 2);
+    receive_as(&mut engine, &mut device, 6, &pdu::<17>(IDENTITY_INFORMATION, &[0; 16]), true, at(0));
+    let mut address = [IDENTITY_ADDRESS_INFORMATION, 0x00, 0, 0, 0, 0, 0, 0];
+    address[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    receive_as(&mut engine, &mut device, 6, &address, true, at(0));
+    assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: false }));
+    assert_eq!(engine.take_command(0, at(0)), None);
+    let Some(ConnEvent::Bonded(bond)) = engine.take_event(epoch) else { panic!("no bond") };
+    assert!(bond.peer == Peer::new(CENTRAL_IDENTITY, false));
+    assert_eq!(bond.peer_irk, None);
+    assert_eq!(bond.ltk, ltk);
+    // It is stored and read back, where a key flagged but all zero is
+    // refused.
+    assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond.clone()));
+    // A reconnection is directed to its identity.
+    #[cfg(feature = "directed-advertising")]
+    assert!(
+        crate::host::adv::Mode::Reconnect(&bond)
+            .directs(&crate::host::adv::Phase::directed(crate::host::adv::DIRECTED_MAX))
+    );
 }
 
 #[test]

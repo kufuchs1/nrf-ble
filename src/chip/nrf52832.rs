@@ -40,6 +40,12 @@ pub const DECRYPT_WAIT: u32 = 2000;
 /// the time it takes.
 #[cfg_attr(test, expect(dead_code, reason = "the host tests seal with a stand-in"))]
 pub const SEAL_WAIT: u32 = 8000;
+/// Whether host data queued while the crystal started for an event, after
+/// the sleep before it stopped listening for the host, is still prepared
+/// once TIMER0 restarted, within the [`crate::clock::SETUP_US`] before the
+/// radio's start: a preparation takes a few microseconds at 64 MHz, the
+/// radio's setup after it about as long.
+pub const PREPARE_AFTER_RESTART: bool = true;
 /// Whether the next PDU is prepared, and sealed, while our answer goes out,
 /// so that one connection event carries several PDUs of ours: a few
 /// microseconds at 64 MHz, well within our packet and the interframe space

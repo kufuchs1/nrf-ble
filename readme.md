@@ -42,13 +42,14 @@ What is done so far:
   table itself is the device's).
 - Our identity (`host::identity`: the address and identity resolving key derived from the device secret the way the MX
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
-  phases, and their setup of the link layer's accept list, resolving list and privacy) and the bond (`host::bond`: the
-  record of the one central with its fixed 50 octet stored form).
+  phases, an optional high duty cycle directed first phase of a reconnection with the feature `directed-advertising`,
+  and their setup of the link layer's accept list, resolving list and privacy) and the bond (`host::bond`: the record
+  of the one central with its fixed 50 octet stored form).
 - The engine (`host::engine::Engine`): all of the host's protocol state for one link, without futures. It takes the
   link layer's events and fragments, the time and the results of the P-256 jobs, and gives the fragments to send (pulled
   one at a time, the connection parameter request leaving one place of the link layer's queue free), the calls of the
   link layer, its next deadline, the jobs and the events for the application. It holds the peripheral latency off until
-  discovery is over (the link encrypted and ATT idle for 500 ms), asks for the table's preferred connection parameters
+  discovery is over (see [Discovery](#discovery)), asks for the table's preferred connection parameters
   with the L2CAP request once ATT has been idle for 1.5 s, answers a key request for EDIV 0 and Rand 0 only, with the
   pairing's key or the bond's for the bonded central, restores the bond's client characteristic configuration only once
   the link is encrypted with the bond's key, builds the bond from the pairing and keeps its subscriptions up to date,
@@ -57,8 +58,12 @@ What is done so far:
   critical section. `Host::run` waits for the link layer, the next deadline, room in the link layer's queue while output
   waits, or a wake-up; `Host::crypto` runs the P-256 jobs with the firmware's watchdog hook before each multiplication
   and a yield between jobs; `Host::advertise` waits for the key pair before pairable advertising, runs the schedule's
-  phases and keeps or ends a link that arrives after its future was dropped; `Conn::notify` paces by acknowledgement,
-  with at most two fragments in flight and one place of the queue kept free. The link layer is reached through the
+  phases and keeps or ends a link that arrives after its future was dropped;
+  `Conn::notify` paces by acknowledgement, with at most `engine::Config::notify_depth` fragments in flight (two by
+  default, three with `Config::with_notify_depth(3)`, which queues a button or key report behind the two movement
+  reports before it at no RAM cost, as the link layer's queue is the same: on the nRF52832 it can ride their connection
+  event if the central keeps the event open (MD), while the nRF51 sends one new PDU per event, so there it only waits
+  in the queue for a later event) and one place of the queue kept free. The link layer is reached through the
   `host::Port` trait, which `link::Link` implements; the host tests drive the whole host over a stand-in link layer.
   The module documentation of `host` shows how a device's firmware wires it.
 
@@ -70,6 +75,23 @@ What has run on hardware: the nRF51 path, with BlueZ, in the presentation remote
 since the fork from nrf-ll its link layer changed (the answer within the interframe space from two prepared slots,
 the next PDU prepared during the sleep, the latency hold after traffic), and the first nRF52832 firmware on nrf-ble is
 its first run. The optional features below have not run on hardware yet.
+
+### Discovery
+
+The engine holds the peripheral latency off from the connection until discovery is over, then reports
+`ConnEvent::Ready` and lets the latency go: Linux reconnects with the latency it stored, and every ATT round trip would
+otherwise wait for it. BlueZ creates its input device only once it has the Write Response to the last input report
+configuration write, and drops reports before it, so discovery counts as over:
+
+- once the central acknowledged that Write Response and ATT has been idle for `INPUTS_IDLE` (100 ms) since;
+- without such a write, once ATT has been idle for `READY_IDLE` (1 s) on the encrypted link;
+
+A bonded reconnection takes the first path too: BlueZ gives each connection a new GATT client, whose first
+notification registration of a characteristic writes its descriptor (`register_notify` in `shared/gatt-client.c`),
+and HoG reads each input report's descriptor, then registers (`ccc_read_cb` in `shared/hog.c`: "Enable notifications
+regardless, as the HID Device may not persist them"), so the bond's restored subscriptions never spare the write and
+a shorter idle for them would gain nothing with BlueZ. The 1 s fallback is for a table without input reports or a
+central that writes none of their descriptors.
 
 ## Optional features
 
@@ -101,6 +123,13 @@ release build keeps its size to the byte):
   Keypress Notifications are never asked for; those of a central are ignored. It is tested against the reference
   central with known passkeys, end to end through the host, with every failure, the timer and the toolbox's sample
   data of f4, f5, f6 and g2.
+- **`directed-advertising`**: a reconnection schedule may start with `Phase::directed(adv::DIRECTED_MAX)`, high duty
+  cycle directed advertising to the bonded central (see [A device](#a-device)). About 0.2 KB of flash.
+- **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
+  fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
+  that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
+  the coming event. The link layer then plans each event in `link::Shared`: about 0.5 KB of flash on the nRF52832,
+  0.4 KB on the nRF51, and 32 bytes of RAM.
 
 A firmware enables the features it needs: a mouse, for example, `param-requests` and `key-missing`, a keyboard also
 `passkey`.
@@ -119,8 +148,17 @@ A firmware enables the features it needs: a mouse, for example, `param-requests`
   check does not depend on when the host learns of the encryption.
 - **Sending:** `try_send` and `send` queue one fragment of up to 27 octets (251 with `data-length`), `tx_room` gives
   the free room, `tx_room_changed` waits until the link layer took a fragment or the central acknowledged some, and
-  `in_flight` counts the fragments the central has not acknowledged, so the host can keep at most two fragments in
-  flight and learn when the central received what it sent.
+  `in_flight` counts the fragments the central has not acknowledged, so the host can bound the fragments in flight
+  (two, or three with `engine::Config::with_notify_depth`) and learn when the central received what it sent.
+- **Connection event timing** (feature `event-timing`): `Link::next_connection_event(epoch)` gives a `NextEvent` in
+  Embassy's time: `start`, when the radio starts listening at the next event the link layer means to listen at,
+  `queue_by`, the latest time a fragment queued then still goes out at that event, and the `interval`, for a firmware
+  that takes its input just before an event and queues its report in time instead of at a random point of the
+  interval. The link layer plans each event before it sleeps towards it and stores the plan in a few words under the
+  lock; the host converts it when it asks. `queue_by` is 331 µs before `start` on the nRF52832 (TIMER0's restart,
+  which may come an RTC tick early), and 331 µs plus the crystal's current lead on the nRF51 (see the host data before
+  an event below). It is a best-effort bound: a crystal that comes up late, about one restart in fifty, can still
+  leave the data for the next event. A firmware reaches it through `Host::port()`.
 - **Link information:** `Link::info` gives the central's address on the air with its type, its resolved identity
   separately, our own address on the air (the resolvable private address or the identity), the parameters and the
   central's clock accuracy: pairing uses the addresses on the air.
@@ -192,13 +230,29 @@ A firmware enables the features it needs: a mouse, for example, `param-requests`
   never sends the received packet back; within the interframe space nothing writes to the buffer the radio points at
   but that header byte. The nRF52832 prepares the next PDU while its answer goes out, so an event carries several PDUs
   of ours; the nRF51 prepares between events only and sends one new PDU per event until its timing is measured.
+- **Host data before an event:** the next PDU is prepared before the link layer sleeps towards an event, and the sleep
+  wakes on the host's signal, so data the host queues meanwhile is prepared again and goes out at that event while at
+  least 500 µs remain. The sleep listens for the host only until the crystal starts, 300 µs plus the crystal's lead
+  before the radio. On the nRF52832, what the host queued since is prepared once TIMER0 runs again, 300 µs before the
+  radio, while 200 µs remain (the preparation takes a few microseconds there, the radio's setup about as long): data
+  queued until TIMER0's restart goes out at the coming event, a limit the crystal's lead, 0.3 to 1.5 ms, closer to it.
+  The same holds where TIMER0 kept running because the event follows the last one within 3 ms: the sleep then waits
+  on a timer and the host's signal until 300 µs before the radio, and a wake too late for the 500 µs rule is prepared
+  at that point instead of waiting a whole interval.
+  The nRF51 keeps the earlier limit: its 300 µs after the restart also take a late crystal and the radio's setup on
+  the 16 MHz Cortex-M0, and a preparation takes up to 68 µs there; the 10 s report's `setup max` measures the first
+  two, so that the nRF51 can follow once they are known.
 - **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
   instant; data from the host ends the skipping at the next connection event. It is also held off, so that every
   connection event is listened to: during the first second of a link, for 200 ms or 8 connection events, whichever is
   longer, after any PDU with a payload in either direction, and while the host asks for it with `Link::hold_latency`.
   Linux reconnects with the latency it stored from the very first event, so without the hold each ATT round trip of a
-  reconnection could wait up to the whole latency. The receive window widens with the time
-  since the last anchor, up to half the interval less the interframe space.
+  reconnection could wait up to the whole latency. After an event in which it heard nothing from the central (no
+  packet with a valid CRC), the link layer listens at every following event until it hears it again, and the latency
+  resumes after that event, as Zephyr's peripheral does: a lost anchor is found again one interval later rather than
+  after the whole latency, so a supervision timeout of a few latencies holds, such as 1 s at 15 ms and a latency of
+  30 across a fade of half a second. The receive window widens with the time since the last anchor, up to half the
+  interval less the interframe space.
 
 ## Crypto for the host
 
@@ -292,9 +346,9 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   priority bits, but Embassy builds the nRF51 with three, so `P0` and `P1`, `P2` and `P3`, `P4` and `P5`, and `P6` and
   `P7` are the same level: the link layer must be in a higher pair than everything else, such as `P2` over `P4` or `P1`
   over `P2`, not `P2` over `P3`.
-- **RAM:** without the data length extension a `Connection` takes 1240 bytes, `link::Shared` 840 and the link layer
-  task's future 2080 on thumbv6m (nrf-ll with HCI: 1224, 1040 and 2024), with packet buffers of 40 bytes and two
-  transmit slots of 76.
+- **RAM:** without the data length extension a `Connection` takes 1248 bytes, `link::Shared` 840 (872 with
+  `event-timing`) and the link layer task's future 2120 on thumbv6m (nrf-ll with HCI: 1224, 1040 and 2024), with
+  packet buffers of 40 bytes and two transmit slots of 76.
 - **Errata:** the nRF52832 workarounds are not applied. Of the nRF51's, only the sign of the temperature is fixed;
   the others wait for the nRF51802 errata document (see `src/chip/nrf51.rs`).
 - **Timing:** the radio latches the answer's packet pointer about 140 µs after the END of the central's packet, some
@@ -304,11 +358,13 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   400 to 600 cycles from the start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up
   at the END (emulated on an nRF51 firmware's release build). The 10 s report and the end of each link log its
   counters: `R retx (A with ack), K acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback,
-  prepare max P us`, where `late` counts answers in place only after the radio started sending, `answer max` the
-  time from the END until the answer was in place, `retx with ack` the central's retransmissions that acknowledged
-  ours, which also follow late answers without an acknowledgement (`late` less `on ack`), as those sent our PDU with
-  its previous flags, so that only a count beyond those points to an answer the central did not take, such as an echo
-  of its packet, and `prepare max` the time preparing and sealing the next PDU takes between events. The first eight events of a link log both headers of their first exchange, every
+  prepare max P us, setup max S us`, where `late` counts answers in place only after the radio started sending,
+  `answer max` the time from the END until the answer was in place, `retx with ack` the central's retransmissions that
+  acknowledged ours, which also follow late answers without an acknowledgement (`late` less `on ack`), as those sent
+  our PDU with its previous flags, so that only a count beyond those points to an answer the central did not take,
+  such as an echo of its packet, `prepare max` the time preparing and sealing the next PDU takes between events, and
+  `setup max` the time from TIMER0's restart, 300 µs before the radio's start, until that start is programmed: a late
+  crystal and the radio's setup. The first eight events of a link log both headers of their first exchange, every
   control PDU of ours logs when it is sent and acknowledged, and the radio's packet layout is logged once per link.
   The `ifs-delay-test` feature makes the answer to an acknowledgement late on purpose every 16th event, 160 µs after
   the END, past the radio's start but before our shortest packet ends, which `late` counts while the link goes on.
@@ -365,7 +421,17 @@ Everything that makes a device what it is lives in the device's own crate, typic
 - **The advertising**: what it advertises (`host::adv::Content::new`: name, appearance, services, and optionally the
   TX power level with `Content::with_tx_power`) and on which schedules (`host::adv::Schedule::new` over its
   `host::adv::Phase`s, one for pairing and one for reconnecting), joined by `host::adv::Advertising::new` for each
-  mode.
+  mode. With the feature `directed-advertising`, a reconnection schedule may start with
+  `Phase::directed(adv::DIRECTED_MAX)`: high duty cycle directed advertising (`ADV_DIRECT_IND` every 3.75 ms, at most
+  1.28 s) to the bonded central's identity address, then the undirected phases. The Linux kernel connects to directed
+  advertising from a device of its accept list whether BlueZ set it to auto-connect or only allows it to connect
+  (`check_pending_le_conn` in `net/bluetooth/hci_event.c`), which makes a reconnection about 30 to 50 ms faster than at
+  20 ms. It is opt-in, and not yet tried on hardware. A central with host privacy (`Privacy = device` in BlueZ's
+  `main.conf`) scans from a resolvable private address and would drop advertising directed at its identity; Linux
+  sends its identity resolving key at pairing only then, so a bond with the central's key is not directed to. The
+  all-zero key that a central without one may send with its identity address counts as none: its bond is directed to
+  and is stored. In pairing mode, for a bond with the central's key, and for one whose central has no identity
+  address, a directed phase advertises undirected at 20 ms instead, for the same time (`Mode::directs`).
 
 ```rust
 use embassy_time::Duration;
@@ -454,7 +520,8 @@ A firmware repository around this crate may build for thumbv6m-none-eabi by defa
 target again, so `cargo test` runs on the PC.
 
 ```sh
-cargo test                                         # host tests, also with --features data-length
+cargo test                                         # host tests, also with --features data-length, event-timing,
+                                                   # directed-advertising, param-requests,key-missing,passkey
 cargo test --no-default-features --features nrf51  # host tests for the nRF51
 cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt and data-length
 cargo clippy --target thumbv6m-none-eabi --no-default-features --features nrf51   # also with defmt

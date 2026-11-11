@@ -27,6 +27,26 @@
 //!   ignored. The entry is in device privacy mode, so the central may also
 //!   connect from its identity address, as BlueZ does without host privacy.
 //!
+//! With the feature `directed-advertising`, a phase in [`Mode::Reconnect`]
+//! may also be directed (`Phase::directed`): high duty cycle directed
+//! advertising, an `ADV_DIRECT_IND` to the bonded central every 3.75 ms for
+//! at most `DIRECTED_MAX`, connectable by that central only. Linux connects
+//! to it as to an undirected advertisement from a device of its accept list
+//! with auto-connect (and only to it for a device BlueZ merely allows to
+//! connect), so a first directed phase makes a reconnection about 30 to 50 ms
+//! faster than one at 20 ms. The target is the central's identity address,
+//! which a central scanning from its identity address takes: Linux without
+//! host privacy, which sends no identity resolving key at pairing. A central
+//! that sent one scans from resolvable private addresses (Linux with
+//! `Privacy = device`) and would drop an advertisement directed to its
+//! identity, so its bond is not directed to. Where a directed phase cannot be
+//! directed, in pairing mode, for a bond with the central's key and for one
+//! whose central has no identity address, public or static random, as right
+//! after pairing with a central that sent none (`Mode::directs`), it
+//! advertises undirected at 20 ms instead, for the same time. It is the
+//! firmware's choice, opt-in through the feature and its reconnection
+//! schedule.
+//!
 //! [`Advertising::configure`] sets the link layer up for a mode once, while it
 //! does not advertise: our identity address
 //! ([`crate::link::Link::set_identity`]), the resolving list
@@ -114,6 +134,16 @@ pub const AD_NAME: u8 = 0x09;
 pub const AD_TX_POWER: u8 = 0x0A;
 /// AD type: the appearance.
 pub const AD_APPEARANCE: u8 = 0x19;
+/// The longest a directed phase lasts: the link layer ends high duty cycle
+/// directed advertising after 1.28 s.
+#[cfg(feature = "directed-advertising")]
+pub const DIRECTED_MAX: Duration = Duration::from_millis(1280);
+/// The interval of a directed phase where it cannot be directed: 20 ms.
+///
+/// In units of 0.625 ms, for the undirected advertising that takes its place;
+/// the link layer keeps its own for directed advertising, 3.75 ms.
+#[cfg(feature = "directed-advertising")]
+pub const DIRECTED_FALLBACK: u16 = 32;
 /// Flag: LE General Discoverable Mode.
 pub const LE_GENERAL_DISCOVERABLE: u8 = 0x02;
 /// Flag: BR/EDR not supported.
@@ -129,6 +159,9 @@ pub const RPA_TIMEOUT_S: u16 = 900;
 /// Filter policy of [`Mode::Reconnect`]: scan and connection requests only
 /// from the filter accept list.
 const FILTER_BONDED: u8 = 0x03;
+/// The two most significant bits of a static random address.
+#[cfg(feature = "directed-advertising")]
+const STATIC_RANDOM: u8 = 0xC0;
 /// The identity of the resolving list entry that only carries our own key
 /// in [`Mode::Pairing`]: no central has this address.
 const NO_PEER: Peer = Peer::new([0; 6], false);
@@ -202,10 +235,17 @@ pub enum Overflow {
     TooLong,
 }
 
-/// One phase of advertising: its interval and how long it lasts.
+/// One phase of advertising: its interval and how long it lasts, and with
+/// the feature `directed-advertising` whether it is directed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Phase {
+    /// Whether it is high duty cycle directed advertising to the bonded
+    /// central ([`Self::directed`]), which takes its interval from the link
+    /// layer: `interval` is then that of the undirected advertising that
+    /// takes its place where it cannot be directed ([`Mode::directs`]).
+    #[cfg(feature = "directed-advertising")]
+    pub directed: bool,
     /// How long the phase lasts.
     pub duration: Duration,
     /// The advertising interval in units of 0.625 ms: 32 (20 ms) to 16384.
@@ -365,8 +405,9 @@ impl<'bond> Advertising<'bond> {
     pub const fn schedule(&self) -> &'static Schedule { self.schedule }
 
     /// Advertises with `phase`'s interval until a central connects, or
-    /// until [`Link::stop_advertising`] or another call replaces it. The
-    /// mode is to be [`Self::configure`]d first.
+    /// until [`Link::stop_advertising`] or another call replaces it; a
+    /// directed phase ends by itself after 1.28 s. The mode is to be
+    /// [`Self::configure`]d first.
     ///
     /// # Errors
     ///
@@ -585,6 +626,24 @@ impl Control for Link<'_> {
 }
 
 impl Mode<'_> {
+    /// Whether the mode advertises `phase` directed: a directed phase in
+    /// [`Self::Reconnect`] for a bond without the central's identity
+    /// resolving key, whose central therefore scans from its identity
+    /// address, and only if that is an identity address, public or static
+    /// random, which directed advertising can target. A central that sent its
+    /// key scans from resolvable private addresses and would drop an
+    /// advertisement directed to its identity. Elsewhere a directed phase
+    /// advertises undirected at its interval, 20 ms.
+    #[cfg(feature = "directed-advertising")]
+    #[inline]
+    #[must_use = "the property is only read"]
+    pub const fn directs(&self, phase: &Phase) -> bool {
+        match *self {
+            Self::Pairing => false,
+            Self::Reconnect(bond) => phase.directed && bond.peer_irk.is_none() && is_identity(bond.peer),
+        }
+    }
+
     /// Whether the mode is discoverable and carries the name.
     #[inline]
     #[must_use = "the property is only read"]
@@ -597,7 +656,10 @@ impl Mode<'_> {
 
     /// The link layer's parameters for `phase`: connectable undirected on
     /// all three channels, from a resolvable private address, filtered on the
-    /// filter accept list in [`Self::Reconnect`].
+    /// filter accept list in [`Self::Reconnect`]; with the feature
+    /// `directed-advertising`, for a phase the mode directs
+    /// (`Self::directs`), high duty cycle directed advertising to the bonded
+    /// central's identity, from the same private address.
     #[inline]
     #[must_use = "the parameters are only built"]
     pub const fn params(&self, phase: &Phase) -> AdvParams {
@@ -605,16 +667,44 @@ impl Mode<'_> {
             Self::Pairing => 0,
             Self::Reconnect(_) => FILTER_BONDED,
         };
-        AdvParams::new(Kind::ConnectableUndirected).interval(phase.interval).filter_policy(filter_policy).private(true)
+        let undirected = AdvParams::new(Kind::ConnectableUndirected)
+            .interval(phase.interval)
+            .filter_policy(filter_policy)
+            .private(true);
+        #[cfg(feature = "directed-advertising")]
+        if let Self::Reconnect(bond) = *self
+            && self.directs(phase)
+        {
+            return AdvParams { kind: Kind::DirectedHighDuty, peer: bond.peer, ..undirected };
+        }
+        undirected
     }
 }
 
 impl Phase {
+    /// A directed phase lasting `duration`, at most [`DIRECTED_MAX`]: high
+    /// duty cycle directed advertising to the bonded central, for the start
+    /// of a reconnection schedule (see the module documentation).
+    #[cfg(feature = "directed-advertising")]
+    #[inline]
+    #[must_use = "the phase is only built"]
+    pub const fn directed(duration: Duration) -> Self {
+        let longest = if duration.as_ticks() > DIRECTED_MAX.as_ticks() { DIRECTED_MAX } else { duration };
+        Self { directed: true, duration: longest, interval: DIRECTED_FALLBACK }
+    }
+
     /// A phase with the interval `interval` in units of 0.625 ms, lasting
     /// `duration`.
     #[inline]
     #[must_use = "the phase is only built"]
-    pub const fn new(interval: u16, duration: Duration) -> Self { Self { duration, interval } }
+    pub const fn new(interval: u16, duration: Duration) -> Self {
+        Self {
+            #[cfg(feature = "directed-advertising")]
+            directed: false,
+            duration,
+            interval,
+        }
+    }
 }
 
 impl Schedule {
@@ -638,13 +728,23 @@ impl Schedule {
         })
     }
 
-    /// The time all phases take together.
+    /// The time all phases take together, directed ones included.
     #[inline]
     #[must_use = "the time is only computed"]
     pub fn total(&self) -> Duration {
         self.phases
             .iter()
             .fold(Duration::from_ticks(0), |sum, phase| sum.checked_add(phase.duration).unwrap_or(Duration::MAX))
+    }
+}
+
+/// Whether `peer` is an identity address, which directed advertising can
+/// target: public, or static random.
+#[cfg(feature = "directed-advertising")]
+const fn is_identity(peer: Peer) -> bool {
+    match peer.address.last() {
+        Some(&top) => !peer.random || top & STATIC_RANDOM == STATIC_RANDOM,
+        None => false,
     }
 }
 

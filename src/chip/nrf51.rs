@@ -64,6 +64,14 @@ pub const DECRYPT_WAIT: u32 = 400;
 /// above the time it takes.
 #[cfg_attr(test, expect(dead_code, reason = "the host tests seal with a stand-in"))]
 pub const SEAL_WAIT: u32 = 1600;
+/// Whether host data queued while the crystal started for an event, after
+/// the sleep before it stopped listening for the host, is still prepared
+/// once TIMER0 restarted, within the [`crate::clock::SETUP_US`] before the
+/// radio's start. Not on the nRF51: those 300 us also take in a crystal
+/// that comes up late and the radio's setup on the 16 MHz Cortex-M0, which
+/// are not measured yet (the setup time of the 10 s report), and a
+/// preparation takes up to 68 us there; the data waits for the next event.
+pub const PREPARE_AFTER_RESTART: bool = false;
 /// Whether the next PDU is prepared, and sealed, while our answer goes out,
 /// so that one connection event carries several PDUs of ours. Not on the
 /// nRF51 until the time it takes on the 16 MHz Cortex-M0 is measured (the

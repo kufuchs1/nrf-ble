@@ -196,6 +196,13 @@ const IFS_DELAY_TEST_US: u32 = 160;
 /// Time preparing the next PDU again may take, copy and sealing included,
 /// after the host woke the sleep before an event, on top of [`SETUP_US`].
 const PREPARE_AGAIN_US: u32 = 200;
+/// Time that has to remain until the radio's start for preparing the next
+/// PDU once TIMER0 restarted for the event, where the chip does
+/// ([`chip::PREPARE_AFTER_RESTART`]): the preparation, 100 us, and the
+/// radio's setup after it, 100 us. TIMER0 restarts [`SETUP_US`] before the
+/// start, so a crystal that comes up more than about 100 us after the
+/// restart leaves the data for the next event.
+const PREPARE_LATE_US: u32 = 200;
 
 /// Why a connection ended.
 #[derive(Clone, Copy)]
@@ -260,6 +267,13 @@ pub struct Stats {
     /// [`Self::late_noack`]); only a count beyond `late_noack` points to an
     /// answer the central did not take, such as an echo of its packet.
     pub retx_with_ack:     u32,
+    /// Longest time from TIMER0's restart before an event, [`SETUP_US`]
+    /// ahead of the radio's start, until that start was programmed, in
+    /// microseconds: a late crystal or restart and the radio's setup, and on
+    /// the nRF52832 the preparation of data the host queued while the crystal
+    /// started. What it leaves of `SETUP_US` bounds what may still run after
+    /// the restart, such as that preparation on the nRF51.
+    pub setup_us_max:      u32,
     /// Connection events skipped with peripheral latency.
     pub skipped:           u32,
 }
@@ -270,7 +284,7 @@ impl Stats {
     #[cfg_attr(not(feature = "defmt"), expect(clippy::missing_const_for_fn, reason = "it only logs with defmt"))]
     pub fn log_answers(&self, label: &str) {
         info!(
-            "{=str}: {} retx ({} with ack), {} acked ({} data), {} late ({} on ack), answer max {} us (ack {} us), {} fallback, prepare max {} us",
+            "{=str}: {} retx ({} with ack), {} acked ({} data), {} late ({} on ack), answer max {} us (ack {} us), {} fallback, prepare max {} us, setup max {} us",
             label,
             self.retx,
             self.retx_with_ack,
@@ -281,7 +295,8 @@ impl Stats {
             self.answer_us_max,
             self.answer_ack_us_max,
             self.fallback,
-            self.prepare_us_max
+            self.prepare_us_max,
+            self.setup_us_max
         );
     }
 }
@@ -1235,8 +1250,16 @@ impl Connection {
         }
     }
 
-    /// Services host traffic before the next radio event.
+    /// Services host traffic before the next radio event, a termination the
+    /// host asked for first.
     fn drive_host(&mut self, now: u32, shared: &Shared, entropy: &Prefetch) {
+        if self.terminate.is_none()
+            && let Some(reason) = shared.take_disconnect()
+        {
+            self.enqueue(Llid::Control, &[OP_TERMINATE_IND, reason]);
+            self.terminate = Some((reason, false));
+            self.terminate_deadline = Some(now.wrapping_add(self.timeout));
+        }
         if self.hold_until.is_some_and(|until| reached(now, until)) {
             self.hold_until = None;
         }
@@ -1322,12 +1345,14 @@ impl Connection {
         if !self.arm_decryption(rx) {
             return None;
         }
-        if !clock.receive_at(enable) {
+        let Some(ahead) = clock.receive_ahead(enable) else {
             clock.cancel_start();
             radio.disable();
             crypto::disarm();
             return None;
-        }
+        };
+        // What the setup since TIMER0's restart left of `SETUP_US`.
+        self.stats.setup_us_max = self.stats.setup_us_max.max(SETUP_US.saturating_sub(ahead));
         clock.wait_started();
         if !Self::wait_address(radio, clock, deadline) {
             radio.disable();
@@ -1720,6 +1745,29 @@ impl Connection {
     /// the latency leaves.
     const fn listen_counter(&self) -> u16 { self.counter.wrapping_add(self.latency.saturating_sub(self.skipped)) }
 
+    /// Ends listening at an event that [`Self::listening`] began, with the
+    /// time of the last valid packet it returned. If no packet with a valid
+    /// CRC came from the central in the event, the next event is listened at
+    /// too, and every one after it until a packet comes, so that a lost
+    /// anchor is found again one interval later rather than after the whole
+    /// peripheral latency, which a short supervision timeout could not wait
+    /// for. Zephyr's peripheral does the same: it breaks the latency while
+    /// its supervision timer runs. The latency resumes after the first event
+    /// that hears the central.
+    const fn listened(&mut self, heard_before: u32) {
+        if self.last_valid == heard_before {
+            self.skipped = self.latency;
+        }
+    }
+
+    /// Begins listening at the current event: counts it as listened at for
+    /// the peripheral latency. Returns the time of the last valid packet,
+    /// which [`Self::listened`] takes after the event.
+    const fn listening(&mut self) -> u32 {
+        self.skipped = 0;
+        self.last_valid
+    }
+
     /// Logs what the event's trace holds: the control PDUs this side sent
     /// and the central acknowledged, and in the first events of the link
     /// the headers of the first exchange.
@@ -1913,6 +1961,23 @@ impl Connection {
         radio.clear_ready();
     }
 
+    /// Prepares the coming event again once TIMER0 restarted for it, at the
+    /// time `now` reads, for a radio start at `start`, if the host passed
+    /// something while the crystal started, or `refused`: a wake of the sleep
+    /// [`Self::prepare_after_wake`] refused, which took the host's signal. The
+    /// sleep listens for the host only until the crystal starts, or until
+    /// [`SETUP_US`] before the start where TIMER0 kept running, so the data
+    /// would otherwise wait for the next event. Only while
+    /// [`PREPARE_LATE_US`] remain, and only where the chip does it
+    /// ([`chip::PREPARE_AFTER_RESTART`]); elsewhere it does nothing, and the
+    /// host's signal stays for the next sleep. Returns whether it prepared
+    /// again.
+    fn prepare_after_restart(&mut self, refused: bool, now: impl FnOnce() -> u32, start: u32, shared: &Shared) -> bool {
+        chip::PREPARE_AFTER_RESTART
+            && (shared.take_wakeup() || refused)
+            && self.prepare_within(now(), PREPARE_LATE_US, start, shared)
+    }
+
     /// Prepares the coming event again after the host woke the sleep before
     /// it, at `now`, for a radio start at `start`: the host's data queued
     /// during the sleep, unless a PDU is prepared already, and the room its
@@ -1920,14 +1985,7 @@ impl Connection {
     /// otherwise the data waits for the next event. Returns whether it
     /// prepared again.
     fn prepare_after_wake(&mut self, now: u32, start: u32, shared: &Shared) -> bool {
-        if reached(now.wrapping_add(SETUP_US).wrapping_add(PREPARE_AGAIN_US), start) {
-            return false;
-        }
-        if !self.next_ready {
-            self.prepare_next(shared);
-        }
-        self.prepare_room(shared);
-        true
+        self.prepare_within(now, SETUP_US.saturating_add(PREPARE_AGAIN_US), start, shared)
     }
 
     /// Prepares the coming event outside the interframe space, so that the
@@ -1954,6 +2012,21 @@ impl Connection {
         let acl = if self.notifications.iter().flatten().any(Event::is_connected) { 0 } else { shared.acl_room() };
         self.room =
             Room { acl: u8::try_from(acl).unwrap_or(u8::MAX), control: u8::try_from(free).unwrap_or(u8::MAX) };
+    }
+
+    /// Prepares the coming event again at `now` for a radio start at
+    /// `start`, if more than `needed` microseconds remain until it: the
+    /// host's data, unless a PDU is prepared already, and the room the host's
+    /// reading made. Returns whether it prepared again.
+    fn prepare_within(&mut self, now: u32, needed: u32, start: u32, shared: &Shared) -> bool {
+        if reached(now.wrapping_add(needed), start) {
+            return false;
+        }
+        if !self.next_ready {
+            self.prepare_next(shared);
+        }
+        self.prepare_room(shared);
+        true
     }
 
     /// Handles the control PDUs received in the event, in order, and reports
@@ -1991,6 +2064,17 @@ impl Connection {
             shared.acknowledged(core::mem::take(&mut self.completed));
         }
         self.log_trace();
+    }
+
+    /// Tells the host when the radio starts for the event the link layer is
+    /// to listen at, at `start` on its clock, and by when data has to be
+    /// queued to go out then ([`crate::link::Link::next_connection_event`]).
+    /// Only the host's time and a few words are taken here; the host
+    /// converts them when it asks.
+    #[cfg(feature = "event-timing")]
+    fn publish_event(&self, clock: &Clock<'_>, start: u32, shared: &Shared) {
+        let ahead = start.wrapping_sub(clock.now());
+        shared.set_next_event(embassy_time::Instant::now(), ahead, queue_lead(clock.lead()), self.interval);
     }
 
     /// Logs the counters since the last call.
@@ -2146,13 +2230,6 @@ impl Connection {
             if let Some(ended) = self.ended(clock.now()) {
                 break ended;
             }
-            if self.terminate.is_none()
-                && let Some(reason) = shared.take_disconnect()
-            {
-                self.enqueue(Llid::Control, &[OP_TERMINATE_IND, reason]);
-                self.terminate = Some((reason, false));
-                self.terminate_deadline = Some(clock.now().wrapping_add(self.timeout));
-            }
             self.drive_host(clock.now(), shared, entropy);
             if let Some(reason) = self.abort {
                 break Ended::Error(reason);
@@ -2168,7 +2245,7 @@ impl Connection {
                 continue;
             }
             shared.reset_wakeup();
-            if self.skipped < self.latency && self.can_skip(clock.now(), shared) {
+            if self.skips(clock.now(), shared) {
                 // One sleep for the whole run of skipped events, ending where
                 // the event-by-event loop would last have woken: at the start
                 // of the last skipped event, or of the first one at or after
@@ -2178,6 +2255,8 @@ impl Connection {
                 let deadline = self.next_deadline(clock.now(), shared);
                 let stop = self.first_after(self.counter, last, deadline.wrapping_sub(1));
                 let until = self.enable_at(stop);
+                #[cfg(feature = "event-timing")]
+                self.publish_event(clock, self.enable_at(listen), shared);
                 let woken = select(shared.wakeup(), crate::maintenance::requested());
                 let timed_out = clock.idle_until(until, woken).await;
                 crate::health::checkpoint(10);
@@ -2203,12 +2282,21 @@ impl Connection {
             if let Some(reason) = self.abort {
                 break Ended::Error(reason);
             }
+            #[cfg(feature = "event-timing")]
+            self.publish_event(clock, window.0, shared);
             // The host runs while the link layer sleeps: what it queues then
             // wakes the sleep and is prepared again, so that it goes out at
             // this event rather than the next.
+            // A wake too close to the event for that is remembered, as it
+            // took the host's signal.
+            let mut refused = false;
             while !clock.sleep_until(window.0, shared.wakeup()).await {
-                self.prepare_after_wake(clock.now(), window.0, shared);
+                refused |= !self.prepare_after_wake(clock.now(), window.0, shared);
             }
+            // The sleep listens for the host only until the crystal starts;
+            // what the host queued since, or in a wake refused above, is
+            // prepared once TIMER0 runs, where the chip has the time.
+            self.prepare_after_restart(refused, || clock.now(), window.0, shared);
             if let Some(reason) = self.abort {
                 break Ended::Error(reason);
             }
@@ -2217,17 +2305,18 @@ impl Connection {
                 self.counter = self.counter.wrapping_add(1);
                 continue;
             }
-            self.skipped = 0;
             radio.set_channel(channel);
             radio.set_phy(self.phy);
             radio.set_tx_power(tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()));
             self.stats.events = self.stats.events.wrapping_add(1);
             let encrypted = self.encryption.rx_on;
+            let heard_before = self.listening();
             if let Some(address) = self.exchange(radio, clock, rx, window, shared) {
                 self.exchanged(address);
             } else {
                 self.note_miss(channel, window);
             }
+            self.listened(heard_before);
             if self.counter == 0 {
                 log_radio(radio);
             }
@@ -2324,6 +2413,12 @@ impl Connection {
             }
         }
     }
+
+    /// Whether the run loop skips the current event at `now`: while the
+    /// peripheral latency leaves events to skip and nothing needs this one
+    /// ([`Self::can_skip`]).
+    #[inline]
+    fn skips(&self, now: u32, shared: &Shared) -> bool { self.skipped < self.latency && self.can_skip(now, shared) }
 
     /// Answers an encryption request: sends the peripheral's session key
     /// diversifier and IV and asks the host for the long term key.
@@ -2445,6 +2540,24 @@ impl Connection {
             .wrapping_sub(RX_MARGIN_US);
         (enable, latest.wrapping_add(widening).wrapping_add(RX_TAIL_US))
     }
+}
+
+/// How long before the radio's start of an event the host's data has to be
+/// queued to go out at it, with the crystal starting `crystal_lead`
+/// microseconds before TIMER0 restarts for the event. Where the chip
+/// prepares again after the restart ([`chip::PREPARE_AFTER_RESTART`]),
+/// until the restart, which may come an RTC tick early. Elsewhere until the
+/// crystal starts, after which the sleep no longer listens for the host,
+/// and at least as long before as [`Connection::prepare_after_wake`] needs.
+#[cfg(feature = "event-timing")]
+const fn queue_lead(crystal_lead: u32) -> u32 {
+    let restart = SETUP_US.saturating_add(crate::clock::RESTART_EARLY_US);
+    if chip::PREPARE_AFTER_RESTART {
+        return restart;
+    }
+    let crystal = restart.saturating_add(crystal_lead);
+    let wake = SETUP_US.saturating_add(PREPARE_AGAIN_US);
+    if crystal > wake { crystal } else { wake }
 }
 
 /// Parses the parameters of a connection update.

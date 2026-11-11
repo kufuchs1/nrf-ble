@@ -38,6 +38,18 @@ key-missing = []
 # `ConnEvent::PasskeyRequested`, `host::Conn::enter_passkey`), and attributes
 # that need an authenticated link.
 passkey = []
+# `event-timing`: the link layer tells the host when it listens next and until
+# when data queued then still goes out at that event
+# (`link::Link::next_connection_event`, `link::NextEvent`), for a firmware that
+# times its reports to the connection events. About 0.5 KB of flash on the
+# nRF52832, 0.4 KB on the nRF51, and 32 bytes of static RAM.
+event-timing = []
+# `directed-advertising`: a reconnection schedule may start with high duty
+# cycle directed advertising to the bonded central (`host::adv::Phase::directed`),
+# which Linux connects to about 30 to 50 ms sooner than to undirected
+# advertising at 20 ms; a central with host privacy ignores it. About 0.2 KB of
+# flash.
+directed-advertising = []
 
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main): the crate's own dependencies name their git

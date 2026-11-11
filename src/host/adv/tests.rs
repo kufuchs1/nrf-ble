@@ -30,6 +30,8 @@ enum Seen {
     Advertise(u8, u16, bool, Data, Data),
     /// See [`Call::ClearPeers`].
     ClearPeers,
+    /// See [`Call::Advertise`], directed: the target, private.
+    Directed(Peer, bool),
     /// See [`Call::SetAddressResolution`].
     SetAddressResolution(bool),
     /// See [`Call::SetIdentity`].
@@ -75,8 +77,13 @@ impl Control for Recorder {
                 data.len = u8::try_from(adv.len()).unwrap();
                 response.bytes[..scan.len()].copy_from_slice(scan);
                 response.len = u8::try_from(scan.len()).unwrap();
-                assert!(params.kind == Kind::ConnectableUndirected && params.channel_map == 0x07);
-                Seen::Advertise(params.filter_policy, params.interval, params.private, data, response)
+                assert_eq!(params.channel_map, 0x07);
+                if params.kind == Kind::DirectedHighDuty {
+                    Seen::Directed(params.peer, params.private)
+                } else {
+                    assert!(params.kind == Kind::ConnectableUndirected);
+                    Seen::Advertise(params.filter_policy, params.interval, params.private, data, response)
+                }
             },
             Call::ClearPeers => Seen::ClearPeers,
             Call::SetAddressResolution(enable) => Seen::SetAddressResolution(enable),
@@ -357,4 +364,96 @@ fn the_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() 
         assert!(example::NAME.starts_with(&short));
     }
     assert!(adv.as_bytes().len() <= 31 && scan.as_bytes().len() <= 31);
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_directed_phase_lasts_at_most_the_link_layer_s_time() {
+    let phase = Phase::directed(Duration::from_secs(3));
+    assert!(phase.directed && phase.duration == DIRECTED_MAX && phase.interval == DIRECTED_FALLBACK);
+    assert_eq!(Phase::directed(Duration::from_millis(500)).duration, Duration::from_millis(500));
+    assert!(!example::PHASES[0].directed);
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_directed_phase_targets_the_bonded_central_s_identity_only_when_reconnecting() {
+    let phase = Phase::directed(DIRECTED_MAX);
+    let recorder = Recorder::new();
+    // A central without host privacy, which sent no key.
+    let bond = bond(false);
+    let reconnect = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    assert!(reconnect.mode().directs(&phase) && !reconnect.mode().directs(&example::PHASES[0]));
+    let params = reconnect.mode().params(&phase);
+    assert!(params.kind == Kind::DirectedHighDuty && params.peer == CENTRAL && params.private);
+    reconnect.start(&recorder, &phase).unwrap();
+    assert!(recorder.saw(&[Seen::Directed(CENTRAL, true)]));
+    // Never in pairing mode, which has no central to direct it to: it
+    // advertises undirected at 20 ms instead.
+    let pairing = example::advertising(Mode::Pairing, None).unwrap();
+    assert!(!pairing.mode().directs(&phase));
+    let params = pairing.mode().params(&phase);
+    assert!(params.kind == Kind::ConnectableUndirected && params.interval == 32 && params.filter_policy == 0);
+    // A static random identity can be targeted. A central that sent no
+    // identity address keeps the address it paired from in the bond until
+    // the bond is stored (`Bond::from_bytes` refuses it): a private one,
+    // which cannot be targeted, so it gets undirected advertising, from the
+    // accept list only.
+    let mut bond = bond;
+    bond.peer = Peer::new([1, 2, 3, 4, 5, 0xC6], true);
+    assert!(Mode::Reconnect(&bond).directs(&phase));
+    bond.peer = Peer::new([1, 2, 3, 4, 5, 0x46], true);
+    assert!(!Mode::Reconnect(&bond).directs(&phase));
+    let params = Mode::Reconnect(&bond).params(&phase);
+    assert!(params.kind == Kind::ConnectableUndirected && params.interval == 32 && params.filter_policy == 0x03);
+    // An undirected phase stays undirected.
+    assert!(Mode::Reconnect(&bond).params(&example::PHASES[0]).kind == Kind::ConnectableUndirected);
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_central_that_sent_its_key_is_not_directed_to() {
+    // It scans from resolvable private addresses and would drop an
+    // advertisement directed to its identity: the phase advertises
+    // undirected at 20 ms, from the accept list only.
+    let phase = Phase::directed(DIRECTED_MAX);
+    let bond = bond(true);
+    assert!(!Mode::Reconnect(&bond).directs(&phase));
+    let params = Mode::Reconnect(&bond).params(&phase);
+    assert!(params.kind == Kind::ConnectableUndirected && params.interval == 32 && params.filter_policy == 0x03);
+    assert!(params.private);
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn the_link_layer_takes_a_directed_phase() {
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    let identity = identity(1);
+    let bond = bond(false);
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    advertising.configure(&link, &identity).unwrap();
+    let params = advertising.mode().params(&Phase::directed(DIRECTED_MAX));
+    assert!(params.private && params.filter_policy == 0x03);
+    // A private address needs the chip's RNG and AES, and its cache the
+    // time driver, none of which the host tests have, so the link layer is
+    // given the host's parameters as they are but for `private`, with the
+    // identity address, also random, as our own. Our private address would
+    // come from our key of the central's entry, the same as for the
+    // undirected phases.
+    link.advertise(&params.private(false), advertising.data().as_bytes(), advertising.scan().as_bytes()).unwrap();
+    let settings = shared.advertising().unwrap();
+    assert!(settings.kind == Kind::DirectedHighDuty && settings.peer == CENTRAL);
+    assert!(settings.filter_policy == 0x03 && settings.own == identity.peer());
+    assert_eq!(settings.resolving.local_key(Some(CENTRAL)), Some(identity.irk()));
+    let (primary, _) = settings.pdus();
+    let header = primary.as_bytes()[0];
+    assert_eq!(header & 0x0F, crate::pdu::ADV_DIRECT_IND);
+    // TxAdd: our address is random, as a private one is; RxAdd: the
+    // central's identity is public, as BlueZ without host privacy scans
+    // from it.
+    assert!(identity.peer().random && header & 0x40 != 0);
+    assert!(!CENTRAL.random && header & 0x80 == 0);
+    assert_eq!(primary.as_bytes()[2..8], identity.peer().address);
+    assert_eq!(primary.as_bytes()[8..14], CENTRAL.address);
 }

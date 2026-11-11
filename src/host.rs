@@ -45,11 +45,16 @@
 //!   events with [`Conn::next`] and sends its reports with [`Conn::notify`].
 //!
 //! [`Conn::notify`] sends from the application's task, not through the run
-//! task, and paces by acknowledgement: it waits while two fragments of the
-//! link are in flight ([`crate::link::Link::in_flight`]), so one report is
+//! task, and paces by acknowledgement: it waits while
+//! [`engine::Config::notify_depth`] fragments of the link are in flight
+//! ([`crate::link::Link::in_flight`]), two by default, so one report is
 //! always queued when the central acknowledges the previous one, and while
 //! the link layer's queue has fewer than two free places, which keeps one for
-//! the ATT responses, the security manager and signalling.
+//! the ATT responses, the security manager and signalling. A depth of three
+//! queues a button or key report behind the two movement reports before it;
+//! the queue is the same, so it costs no RAM. On the nRF52832 the report can
+//! then ride their connection event if the central keeps it open (MD); the
+//! nRF51 sends one new PDU per event, so there it goes out at a later event.
 //!
 //! # Thread mode
 //!
@@ -650,9 +655,10 @@ where
         }
     }
 
-    /// Notifies `data` for `characteristic`, waiting while two fragments of
-    /// the link are in flight, while the link layer's queue has fewer than
-    /// two free places, or while a PDU of several fragments is being sent.
+    /// Notifies `data` for `characteristic`, waiting while
+    /// [`engine::Config::notify_depth`] fragments of the link are in flight,
+    /// while the link layer's queue has fewer than two free places, or while
+    /// a PDU of several fragments is being sent.
     ///
     /// # Errors
     ///
@@ -1020,7 +1026,7 @@ where
     fn send_notification(&self, epoch: Epoch, characteristic: Char, data: &[u8]) -> Result<(), NotifyError> {
         self.with(|state| {
             let result = state.engine.notification(epoch, characteristic, data).and_then(|fragment| {
-                if self.port.tx_room() < 2 || self.port.in_flight(epoch) >= 2 {
+                if self.port.tx_room() < 2 || self.port.in_flight(epoch) >= state.engine.notify_depth() {
                     return Err(NotifyError::Busy);
                 }
                 self.port.try_send(epoch, fragment.start(), fragment.bytes()).map_err(|error| match error {

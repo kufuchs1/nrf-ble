@@ -6,6 +6,8 @@
 
 extern crate std;
 
+#[cfg(feature = "directed-advertising")]
+use super::adv::{Advertising, DIRECTED_MAX, Phase, Schedule};
 use super::{
     AdvertiseError,
     Aes as _,
@@ -24,6 +26,7 @@ use super::{
     test_aes::Software,
 };
 use crate::{
+    advertiser::legacy::Kind,
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Rx},
     pdu::Peer,
 };
@@ -43,6 +46,8 @@ enum Seen {
     AcceptListAdd(Peer),
     /// [`link::Link::advertise`]: its interval and filter policy.
     Advertise(u16, u8),
+    /// [`link::Link::advertise`], high duty cycle directed: the target.
+    Directed(Peer),
     /// [`link::Link::disconnect`]: the reason.
     Disconnect(u8),
     /// [`link::Link::hold_latency`].
@@ -205,7 +210,11 @@ impl Control for MockLink {
                 if self.connected.get() {
                     return Err(link::Error::Disallowed);
                 }
-                Seen::Advertise(params.interval, params.filter_policy)
+                if params.kind == Kind::DirectedHighDuty {
+                    Seen::Directed(params.peer)
+                } else {
+                    Seen::Advertise(params.interval, params.filter_policy)
+                }
             },
             Call::StopAdvertising => Seen::StopAdvertising,
             _ => Seen::Setup,
@@ -692,6 +701,49 @@ fn notifications_keep_two_in_flight_and_one_place_free() {
     assert_eq!(multiplications.get(), 0);
 }
 
+#[test]
+fn a_depth_of_three_queues_a_third_notification() {
+    let host = Host::new(
+        MockLink::new(),
+        &example::DB,
+        Config::new(Some(example::PARAMS), Unclaimed::Keep).with_notify_depth(3),
+    );
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    // Two movement reports wait for the event; the key report is queued
+    // behind them (on the nRF52832 it can go out in the same event).
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[1; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[2; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[3; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[4; 8]), Err(NotifyError::Busy));
+    // One place of the four stays free for an ATT response.
+    assert_eq!(link.tx_room(), 1);
+    assert_eq!(request_queued(link, &mut tasks, &[0x0A, 0x0D, 0x00]), 4);
+    assert_eq!(link.deliver().len(), 4);
+    // A smaller queue bounds the depth too: one place stays free.
+    link.capacity.set(2);
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[5; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[6; 8]), Err(NotifyError::Busy));
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[test]
+fn a_depth_of_zero_is_one() {
+    assert_eq!(Config::new(None, Unclaimed::Keep).notify_depth, super::engine::NOTIFY_DEPTH);
+    assert_eq!(Config::new(None, Unclaimed::Keep).with_notify_depth(0).notify_depth, 1);
+    // A depth set to zero in the field still lets one notification go out.
+    let mut config = Config::new(Some(example::PARAMS), Unclaimed::Keep);
+    config.notify_depth = 0;
+    let host = Host::new(MockLink::new(), &example::DB, config);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[1; 8]), Ok(()));
+    assert_eq!(conn.try_notify(example::KEYBOARD, &[2; 8]), Err(NotifyError::Busy));
+    assert_eq!(multiplications.get(), 0);
+}
+
 /// Sends an ATT request and returns how many fragments the link layer's
 /// queue then holds.
 fn request_queued<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, pdu: &[u8]) -> usize {
@@ -1148,6 +1200,78 @@ fn advertising_runs_its_phases_and_then_times_out() {
     link.advance(45_000);
     assert!(matches!(ready(advertise.as_mut()), Err(AdvertiseError::Timeout)));
     assert_eq!(link.calls(), [Seen::StopAdvertising]);
+    assert_eq!(multiplications.get(), 1);
+}
+
+/// A directed phase, then the example's first phase.
+#[cfg(feature = "directed-advertising")]
+static DIRECTED_FIRST: [Phase; 2] = [Phase::directed(DIRECTED_MAX), example::PHASES[0]];
+/// A schedule that starts with [`DIRECTED_FIRST`]'s directed phase.
+#[cfg(feature = "directed-advertising")]
+static DIRECTED_SCHEDULE: Schedule = Schedule::new(&DIRECTED_FIRST, embassy_time::Duration::from_secs(20));
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_reconnection_advertises_directed_to_the_bonded_central_first() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    // A central without host privacy, which sent no key.
+    let mut bond = bond(&identity);
+    bond.peer_irk = None;
+    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    link.advance(1_279);
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert!(link.calls().is_empty());
+    // The link layer ends it; the undirected phase follows (1.28 s is a
+    // tick more in the 32 768 Hz ticks of the time).
+    link.event(Event::AdvertisingTimeout);
+    link.advance(2);
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls(), [Seen::Advertise(32, 3)]);
+    link.advance(3_000);
+    assert!(matches!(ready(advertise.as_mut()), Err(AdvertiseError::Timeout)));
+    // The central connects during the directed phase of the next call.
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    link.advance(10);
+    link.connect(bond.peer, None, local_rpa());
+    tasks.step();
+    let _conn = ready(advertise.as_mut()).unwrap();
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn pairing_advertises_a_directed_phase_undirected_at_20_ms() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = Advertising::new(Mode::Pairing, &DIRECTED_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 0)));
+    link.advance(1_279);
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert!(link.calls().is_empty());
+    // The directed phase's time is over: the next phase, also at 20 ms.
+    link.advance(2);
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls(), [Seen::Advertise(32, 0)]);
+    link.advance(2_998);
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.advance(2);
+    assert!(matches!(ready(advertise.as_mut()), Err(AdvertiseError::Timeout)));
     assert_eq!(multiplications.get(), 1);
 }
 
