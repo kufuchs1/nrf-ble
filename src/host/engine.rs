@@ -141,6 +141,10 @@ pub const READY_IDLE: Duration = Duration::from_millis(1000);
 /// The time ATT is to be idle before the connection parameters are asked
 /// for.
 pub const PARAMS_IDLE: Duration = Duration::from_millis(1500);
+/// How many fragments of the link may be in flight for a notification to go
+/// out, by default: one report is always queued when the central
+/// acknowledges the one before ([`Config::with_notify_depth`]).
+pub const NOTIFY_DEPTH: u8 = 2;
 /// The longest wait for the response to our connection parameter request.
 pub const SIGNALLING_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest wait for our Pairing Failed to be acknowledged before the
@@ -227,15 +231,19 @@ struct Commands {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Config {
+    /// How many fragments of the link may be in flight, queued or on the air
+    /// and not acknowledged, for a notification to go out:
+    /// [`NOTIFY_DEPTH`] unless [`Self::with_notify_depth`] changes it.
+    pub notify_depth: u8,
     /// The connection parameters to ask for once ATT is idle, `None` to keep
     /// the central's.
-    pub params:    Option<ParamRange>,
+    pub params:       Option<ParamRange>,
     /// What pairing protects against: Just Works by default, Passkey Entry
     /// as a keyboard with [`Self::with_security`].
     #[cfg(feature = "passkey")]
-    pub security:  smp::Security,
+    pub security:     smp::Security,
     /// What happens to a link that arrives while no advertising call waits.
-    pub unclaimed: Unclaimed,
+    pub unclaimed:    Unclaimed,
 }
 
 /// The protocol state of the host: see the module documentation.
@@ -496,7 +504,8 @@ pub enum RequestError {
 #[non_exhaustive]
 pub enum NotifyError {
     /// No room now: a PDU of several fragments is being sent, the link layer
-    /// lacks two free places, or two fragments are in flight.
+    /// lacks two free places, or [`Config::notify_depth`] fragments are in
+    /// flight.
     Busy,
     /// The link ended.
     Disconnected,
@@ -516,11 +525,28 @@ impl Config {
     #[must_use = "the configuration is only built"]
     pub const fn new(params: Option<ParamRange>, unclaimed: Unclaimed) -> Self {
         Self {
+            notify_depth: NOTIFY_DEPTH,
             params,
             #[cfg(feature = "passkey")]
             security: smp::Security::JUST_WORKS,
             unclaimed,
         }
+    }
+
+    /// This configuration, letting a notification go out while fewer than
+    /// `depth` fragments of the link are in flight, at least one: 3 queues a
+    /// button or key report behind two movement reports, where
+    /// [`NOTIFY_DEPTH`] holds it until the central acknowledged one of them.
+    /// On the nRF52832, which prepares the next PDU while its answer goes out,
+    /// it can then join them in the same connection event if the central
+    /// keeps the event open (MD); the nRF51 sends one new PDU per event, so
+    /// there it only waits in the queue and goes out at a later event. The
+    /// link layer's queue bounds it too, as a notification always leaves one
+    /// place free.
+    #[inline]
+    #[must_use = "the configuration is only built"]
+    pub const fn with_notify_depth(self, depth: u8) -> Self {
+        Self { notify_depth: if depth == 0 { 1 } else { depth }, ..self }
     }
 
     /// This configuration, pairing with `security`: for a keyboard,
@@ -1021,6 +1047,12 @@ impl Engine {
         Segmenter::new(Channel::Att, len).and_then(|segmenter| segmenter.fragment(bytes)).ok_or(NotifyError::TooLong)
     }
 
+    /// How many fragments of the link may be in flight for a notification to
+    /// go out ([`Config::notify_depth`]), at least one.
+    #[inline]
+    #[must_use = "the depth is only read"]
+    pub fn notify_depth(&self) -> usize { usize::from(self.config.notify_depth.max(1)) }
+
     /// Takes a fragment the link layer received, at `now`, with `crypto` for
     /// the security manager and `app` for the dynamic values.
     #[inline]
@@ -1147,8 +1179,12 @@ impl Engine {
         let Some(link) = self.link.as_mut() else { return };
         match outcome {
             Outcome::Bonded(mut bonded) => {
+                // A central without a key of its own that sends its identity
+                // address sends an all-zero key, as the Core specification
+                // allows: that is no key, so that the bond is stored and
+                // directed advertising reaches the central.
                 let (peer, irk) = match bonded.identity {
-                    Some(identity) => (identity.address, Some(identity.irk)),
+                    Some(identity) => (identity.address, (identity.irk != [0; 16]).then_some(identity.irk)),
                     None => (link.info.identity.unwrap_or(link.info.peer), None),
                 };
                 let mut bond = Bond::new(peer, irk, bonded.ltk, self.variant, self.db);

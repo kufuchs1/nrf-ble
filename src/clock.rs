@@ -85,6 +85,10 @@ const CRYSTAL_LEAD_DOWN_US: u32 = 2;
 const CRYSTAL_LEAD_UP_US: u32 = 100;
 /// Time before TIMER0 restarts at which the task wakes to wait for it.
 const RESUME_EARLY_US: u32 = 100;
+/// How much earlier than [`SETUP_US`] before the time slept for TIMER0 may
+/// restart: on an RTC tick, which comes every 30.5 us.
+#[cfg(any(test, feature = "event-timing"))]
+pub(crate) const RESTART_EARLY_US: u32 = 31;
 /// Fixed PPI channel: TIMER0 COMPARE0 to RADIO TXEN.
 const PPI_TXEN: usize = 20;
 /// Fixed PPI channel: TIMER0 COMPARE0 to RADIO RXEN.
@@ -470,9 +474,13 @@ impl<'peripherals> Clock<'peripherals> {
         self.paused = Some((tick, time));
     }
 
+    /// Starts receiving at `at`. Returns how long before `at` the start was
+    /// programmed, or `None` if `at` is not in the future.
+    pub(crate) fn receive_ahead(&mut self, at: u32) -> Option<u32> { self.start_at(at, PPI_RXEN) }
+
     /// Starts receiving at `at`. Returns false if `at` is not in the future.
     #[inline]
-    pub fn receive_at(&mut self, at: u32) -> bool { self.start_at(at, PPI_RXEN) }
+    pub fn receive_at(&mut self, at: u32) -> bool { self.receive_ahead(at).is_some() }
 
     /// Restarts TIMER0 as soon as the crystal can run.
     ///
@@ -571,14 +579,15 @@ impl<'peripherals> Clock<'peripherals> {
         true
     }
 
-    /// Starts the radio through `channel` at `at`. Returns false if `at` is
-    /// not in the future.
-    fn start_at(&mut self, at: u32, channel: usize) -> bool {
+    /// Starts the radio through `channel` at `at`. Returns how long before
+    /// `at` the start was programmed, or `None` if `at` is not in the future.
+    fn start_at(&mut self, at: u32, channel: usize) -> Option<u32> {
         self.cancel_start();
         REGS.cc(CC_START).write_value(at.wrapping_sub(self.base));
         REGS.events_compare(CC_START).write_value(0);
         PPI.chenset().write(|w| w.set_ch(channel, true));
-        is_ahead(at.wrapping_sub(self.now()))
+        let ahead = at.wrapping_sub(self.now());
+        is_ahead(ahead).then_some(ahead)
     }
 
     /// Disarms the deadline of [`Self::expire_at`].
@@ -590,7 +599,7 @@ impl<'peripherals> Clock<'peripherals> {
 
     /// Starts sending at `at`. Returns false if `at` is not in the future.
     #[inline]
-    pub fn transmit_at(&mut self, at: u32) -> bool { self.start_at(at, PPI_TXEN) }
+    pub fn transmit_at(&mut self, at: u32) -> bool { self.start_at(at, PPI_TXEN).is_some() }
 
     /// Sleeps until the crystal runs, starting it again if it does not come
     /// up in time.

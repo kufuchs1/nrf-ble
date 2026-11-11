@@ -48,8 +48,18 @@
 //! room, [`Link::tx_room_changed`] waits until the link layer took a fragment
 //! from the queue or the central acknowledged some, and [`Link::in_flight`]
 //! counts the fragments of the link that the central has not acknowledged
-//! yet, so the host can keep at most two fragments in flight and learn when
-//! the central received what it sent.
+//! yet, so the host can bound the fragments in flight, two by default or
+//! `engine::Config::notify_depth`, and learn when the central received what
+//! it sent.
+//!
+//! # Timing data to the connection events
+//!
+//! With the `event-timing` feature, `Link::next_connection_event` tells when
+//! the link layer listens next on the link (`NextEvent::start`) and until
+//! when a fragment queued with [`Link::try_send`] still goes out at that
+//! event (`NextEvent::queue_by`), so a firmware can take its input just
+//! before and queue its report in time, rather than at a random point of the
+//! interval.
 //!
 //! # Peripheral latency
 //!
@@ -59,7 +69,10 @@
 //! whichever is longer, after a PDU with a payload in either direction, and
 //! never while the host holds it with [`Link::hold_latency`]. A request of
 //! the central is then answered at the next event, not up to the latency
-//! later.
+//! later. After an event in which it heard nothing from the central, it
+//! listens at every event until it hears it again, as Zephyr does, so a lost
+//! anchor costs one interval, not the whole latency, and a supervision
+//! timeout shorter than a few latencies holds.
 
 use crate::{
     advertiser::legacy::{DATA_MAX, FILTER_LIST_SIZE, Kind, Settings as LegacySettings},
@@ -245,6 +258,67 @@ pub struct Info {
     /// `TxAdd` of the connection request). Pairing uses this address and
     /// [`Self::local`], not the identities.
     pub peer:             Peer,
+}
+
+/// When the link layer listens next on a link: see
+/// [`Link::next_connection_event`].
+#[cfg(feature = "event-timing")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub struct NextEvent {
+    /// The connection interval: the events after this one follow it at this
+    /// distance, as far as the peripheral latency does not let the link layer
+    /// skip them while the link is quiet.
+    pub interval: Duration,
+    /// The latest time at which a fragment queued with [`Link::try_send`]
+    /// still goes out at this event, if nothing queued before waits ahead of
+    /// it. Data queued later goes out at the next event the link layer
+    /// listens at. It may have passed already. It is a best-effort bound: a
+    /// crystal that comes up late, about one restart in fifty, or a central
+    /// that does not acknowledge in time can still leave the data for the
+    /// next event.
+    pub queue_by: Instant,
+    /// When the radio starts listening for the central's first packet of the
+    /// event: a little before it, by the receive window's widening, the
+    /// radio's ramp-up and a margin of 30 us.
+    pub start:    Instant,
+}
+
+/// The next event as the link layer plans it, in its own time, kept for
+/// [`Link::next_connection_event`], which turns it into [`NextEvent`] in the
+/// host's time so the link layer's loop does no 64-bit arithmetic.
+#[cfg(feature = "event-timing")]
+#[derive(Clone, Copy)]
+struct Planned {
+    /// Time from [`Self::at`] until the radio's start, signed as a wrapping
+    /// difference of the link layer's clock.
+    ahead:    u32,
+    /// The host's time when the event was planned.
+    at:       Instant,
+    /// The link's generation: a plan of an earlier link is never given for
+    /// a later one.
+    epoch:    u32,
+    /// Connection interval in microseconds.
+    interval: u32,
+    /// How long before the radio's start data has to be queued.
+    lead:     u32,
+}
+
+#[cfg(feature = "event-timing")]
+impl Planned {
+    /// The event in the host's time.
+    fn resolve(self) -> NextEvent {
+        let ahead = self.ahead.cast_signed();
+        let distance = Duration::from_micros(u64::from(ahead.unsigned_abs()));
+        let start = if ahead < 0_i32 { self.at.checked_sub(distance) } else { self.at.checked_add(distance) }
+            .unwrap_or(self.at);
+        NextEvent {
+            interval: Duration::from_micros(u64::from(self.interval)),
+            queue_by: start.checked_sub(Duration::from_micros(u64::from(self.lead))).unwrap_or(start),
+            start,
+        }
+    }
 }
 
 /// An event of the link layer.
@@ -489,6 +563,10 @@ struct HostState {
     /// Connection updates the host asked for while it answered a central's
     /// request, each owed a completion when that ends.
     merged_updates:   u8,
+    /// The next event the link layer listens at, once planned, with the
+    /// link it was planned for.
+    #[cfg(feature = "event-timing")]
+    next_event:       Option<Planned>,
     /// Authenticated payload timeout in units of 10 ms.
     payload_timeout:  u16,
     /// Accepted host PHY request.
@@ -550,6 +628,8 @@ impl HostState {
             legacy_enabled: false,
             ltk_pending: false,
             merged_updates: 0,
+            #[cfg(feature = "event-timing")]
+            next_event: None,
             payload_timeout: DEFAULT_PAYLOAD_TIMEOUT,
             phy_pending: None,
             phys: [1, 1],
@@ -916,6 +996,18 @@ impl Shared {
         })
     }
 
+    /// Records the next event the link layer listens at: its radio starts
+    /// `ahead` microseconds after the host's time `at`, data must be queued
+    /// `lead` microseconds before, and events are `interval` microseconds
+    /// apart. One copy under the lock; the conversion waits for the host.
+    #[cfg(feature = "event-timing")]
+    pub(crate) fn set_next_event(&self, at: Instant, ahead: u32, lead: u32, interval: u32) {
+        self.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            state.next_event = Some(Planned { ahead, at, epoch: state.epoch, interval, lead });
+        });
+    }
+
     /// Publishes the current receive and transmit PHY.
     pub(crate) fn set_phys(&self, rx: u8, tx: u8) { self.state.lock(|cell| cell.borrow_mut().phys = [rx, tx]); }
 
@@ -991,6 +1083,10 @@ impl Shared {
 
     /// Takes a pending host reset at a radio-safe boundary.
     pub(crate) fn take_reset(&self) -> bool { self.reset.try_take().is_some() }
+
+    /// Takes a wakeup from the host that nothing waited for. Returns whether
+    /// there was one.
+    pub(crate) fn take_wakeup(&self) -> bool { self.wakeup.try_take().is_some() }
 
     /// Queues an event for the host. Returns false if there is no room.
     pub(crate) fn try_push_event(&self, event: Event) -> bool { self.events.try_send(event).is_ok() }
@@ -1281,6 +1377,29 @@ impl<'shared> Link<'shared> {
                 Rx::Acl(acl)
             },
         }
+    }
+
+    /// When the link layer listens next on the link `epoch`, and until when
+    /// data queued with [`Self::try_send`] still goes out then, for a firmware
+    /// that times its reports to the connection events: `None` once the link
+    /// ended, or before the link layer planned its first event.
+    ///
+    /// The link layer plans each event before it sleeps towards it, so while
+    /// the host runs this is the coming event, or, with the peripheral
+    /// latency, the event the link layer means to listen at after the ones it
+    /// skips; data queued meanwhile ends the skipping, and goes out at the
+    /// first event still ahead. The time is the host's ([`Instant`]), to a
+    /// tick of its clock.
+    #[cfg(feature = "event-timing")]
+    #[inline]
+    #[must_use = "the time is only read"]
+    pub fn next_connection_event(&self, epoch: Epoch) -> Option<NextEvent> {
+        let planned = self.shared.state.lock(|cell| {
+            let state = cell.borrow();
+            state.current(epoch).ok()?;
+            state.next_event.filter(|planned| planned.epoch == epoch.0)
+        })?;
+        Some(planned.resolve())
     }
 
     /// The authenticated payload timeout of the link in units of 10 ms.

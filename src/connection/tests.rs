@@ -1812,3 +1812,219 @@ fn acknowledged_host_packets_are_counted_for_the_host() {
     assert_eq!(link_api.in_flight(epoch), 0);
     assert_eq!(link_api.acked(), 1);
 }
+
+/// The event the run loop listens at next from the current one: the
+/// current, or the last that the peripheral latency lets it skip to, by the
+/// loop's own condition.
+fn listens_at(link: &Connection, shared: &Shared) -> u16 {
+    if link.skips(link.expected_anchor(), shared) { link.listen_counter() } else { link.counter }
+}
+
+/// What the central's packets do at an event in these tests.
+#[derive(Clone, Copy)]
+enum Air {
+    /// A packet with a CRC error.
+    Corrupt,
+    /// An empty PDU with a valid CRC.
+    Heard,
+    /// Nothing.
+    Silent,
+}
+
+/// Listens at the current event as the run loop does, through
+/// `Connection::listening` and `Connection::listened`, with the radio's part
+/// replaced by `air`, a packet whose access address ends 40 us after the
+/// event's anchor, then moves to the next event. That the run loop calls the
+/// two around its exchange is not covered here: the host tests cannot run
+/// the loop with its clock and radio.
+fn listen_with(link: &mut Connection, shared: &Shared, air: Air) {
+    let address = link.expected_anchor().wrapping_add(40);
+    let heard_before = link.listening();
+    match air {
+        Air::Corrupt => assert!(link.decide(None, address, false, shared).is_some()),
+        Air::Heard => assert!(link.receive(Llid::Continuation.bits(), 0, true, address, shared).is_some()),
+        Air::Silent => {},
+    }
+    link.listened(heard_before);
+    link.counter = link.counter.wrapping_add(1);
+}
+
+#[test]
+fn after_an_event_that_heard_nothing_every_event_is_listened_at_until_the_central_is_heard() {
+    let shared = Shared::new();
+    let mut link = latent(false);
+    // An event that heard the central: the latency applies after it.
+    listen_with(&mut link, &shared, Air::Heard);
+    assert_eq!(listens_at(&link, &shared), 1031);
+    // One that heard nothing, or only a packet with a CRC error: the next
+    // event is listened at, and so is every one after it that hears
+    // nothing.
+    let mut link = latent(false);
+    for (counter, air) in (1000..1006_u16).zip([Air::Silent, Air::Corrupt].into_iter().cycle()) {
+        assert_eq!(link.counter, counter);
+        listen_with(&mut link, &shared, air);
+        assert_eq!(listens_at(&link, &shared), counter + 1);
+    }
+    // The first event that hears it again lets the latency resume.
+    listen_with(&mut link, &shared, Air::Heard);
+    assert_eq!(listens_at(&link, &shared), 1007 + 30);
+}
+
+/// Runs the link's events from the current one as the run loop decides
+/// them, with the central out of reach at the events of `fade`, until the
+/// first event after the fade that hears it. `break_latency` is whether an
+/// event that heard nothing makes the loop listen at the next (as
+/// `Connection::listened` does); without, as before. Returns that event, or
+/// `None` if the supervision timeout ended the link first.
+fn ride_out(
+    link: &mut Connection,
+    shared: &Shared,
+    fade: core::ops::RangeInclusive<u16>,
+    break_latency: bool,
+) -> Option<u16> {
+    loop {
+        if link.ended(link.expected_anchor()).is_some() {
+            return None;
+        }
+        let listen = listens_at(link, shared);
+        if listen != link.counter {
+            link.skip_to(listen, shared);
+            continue;
+        }
+        let counter = link.counter;
+        let heard = !fade.contains(&counter);
+        listen_with(link, shared, if heard { Air::Heard } else { Air::Silent });
+        if !break_latency {
+            // As before: a miss left the latency to skip again.
+            link.skipped = 0;
+        }
+        if heard && counter > *fade.end() {
+            return Some(counter);
+        }
+    }
+}
+
+#[test]
+fn a_supervision_timeout_of_a_few_latencies_survives_a_fade_over_a_listened_event() {
+    // 15 ms, a latency of 30 and a timeout of 1 s, just above the 930 ms the
+    // specification asks for at least. The central is heard at event 1000,
+    // then out of reach for 480 ms from event 1031, the next one listened at.
+    let shared = Shared::new();
+    let fade = 1031..=1062_u16;
+    let mut link = latent(false);
+    link.timeout = 1_000_000;
+    // Event 1000 is listened at, as after a payload.
+    link.skipped = link.latency;
+    // Listening at every event after the miss hears it at 1063, 945 ms after
+    // the last packet.
+    assert_eq!(ride_out(&mut link, &shared, fade.clone(), true), Some(1063));
+    // Skipping the whole latency again after the miss listened at 1062
+    // only, and would at 1093: 1.4 s without a packet.
+    let mut before = latent(false);
+    before.timeout = 1_000_000;
+    before.skipped = before.latency;
+    assert_eq!(ride_out(&mut before, &shared, fade, false), None);
+}
+
+#[test]
+fn host_data_queued_while_the_crystal_starts_goes_out_where_the_chip_has_the_time() {
+    // The nRF52832 prepares it once TIMER0 restarted; the nRF51 leaves it
+    // for the next event until its setup time is measured.
+    assert_eq!(chip::PREPARE_AFTER_RESTART, cfg!(feature = "nrf52832"));
+    // A crystal up to 70 us late still leaves the time.
+    assert!(SETUP_US - PREPARE_LATE_US >= 70);
+    let shared = Shared::new();
+    shared.set_connected(true);
+    let packet = [1_u8, 2, 3];
+    for (restart, start, prepares) in [
+        // TIMER0 restarted on time, or an RTC tick early.
+        (1000_u32, 1000 + SETUP_US, true),
+        (1000, 1000 + SETUP_US + crate::clock::RESTART_EARLY_US, true),
+        // The crystal came up 70 us late.
+        (1070, 1000 + SETUP_US, true),
+        // Too late for it: the data waits for the next event.
+        (1000, 1000 + PREPARE_LATE_US, false),
+    ] {
+        let prepares = prepares && chip::PREPARE_AFTER_RESTART;
+        let mut link = connection();
+        link.start_slots(&shared);
+        link.prepare_next(&shared);
+        link.prepare_room(&shared);
+        assert!(!link.next_ready);
+        // Without anything from the host, nothing is prepared again.
+        assert!(!link.prepare_after_restart(false, || restart, start, &shared));
+        assert!(shared.queue_acl_for_test(&packet));
+        assert_eq!(link.prepare_after_restart(false, || restart, start, &shared), prepares);
+        assert_eq!(link.next_ready, prepares);
+        if prepares {
+            // The central's acknowledgement at the event sends it.
+            let decision =
+                link.decide(Some((Llid::Continuation.bits() | NESN, 0, true)), start, true, &shared).unwrap();
+            assert!(decision.acked.is_some());
+            assert!(link.tx_kind == TxKind::Acl);
+            assert_eq!(&link.current().plain.0[DATA_HEADER_LEN..DATA_HEADER_LEN + packet.len()], &packet[..]);
+        } else {
+            // The next event's preparation takes it; on the nRF51 the
+            // host's signal is left for the sleep before it.
+            assert_eq!(shared.take_wakeup(), !chip::PREPARE_AFTER_RESTART);
+            link.prepare_next(&shared);
+            assert!(link.next_ready);
+        }
+        while shared.next_acl_out().is_some() {}
+    }
+}
+
+#[test]
+fn host_data_that_woke_the_sleep_too_late_to_prepare_still_goes_out_where_the_chip_has_the_time() {
+    // The sleep's last part, with TIMER0 running and the event less than
+    // 3 ms ahead, waits on a timer and on the host's signal until
+    // `SETUP_US` before the start. The run loop passes a wake that
+    // `prepare_after_wake` refused on to `prepare_after_restart`, as the
+    // wait took the signal. These are the two calls of the loop, which the
+    // host tests cannot run with its clock, so the loop's passing of the
+    // refusal from one to the other is not covered here.
+    let shared = Shared::new();
+    shared.set_connected(true);
+    let packet = [4_u8, 5, 6];
+    let start = 10_000_u32;
+    for woken in [SETUP_US + PREPARE_AGAIN_US - 1, 400, SETUP_US + 32] {
+        let mut link = connection();
+        link.start_slots(&shared);
+        link.prepare_next(&shared);
+        link.prepare_room(&shared);
+        assert!(shared.queue_acl_for_test(&packet));
+        // The sleep's wait takes the signal.
+        assert!(shared.take_wakeup());
+        let refused = !link.prepare_after_wake(start - woken, start, &shared);
+        assert!(refused && !link.next_ready);
+        // TIMER0's time for the event, `SETUP_US` before it: the chip that
+        // prepares then takes the data, queued before the time the host was
+        // told; the nRF51, which does not, told the host an earlier time.
+        let prepared = link.prepare_after_restart(refused, || start - SETUP_US, start, &shared);
+        assert_eq!(prepared, chip::PREPARE_AFTER_RESTART);
+        assert_eq!(link.next_ready, chip::PREPARE_AFTER_RESTART);
+        #[cfg(feature = "event-timing")]
+        assert_eq!(woken > queue_lead(0), chip::PREPARE_AFTER_RESTART);
+        while shared.next_acl_out().is_some() {}
+    }
+}
+
+#[cfg(feature = "event-timing")]
+#[test]
+fn the_host_learns_how_long_before_an_event_its_data_is_due() {
+    use crate::clock::RESTART_EARLY_US;
+    for crystal in [300_u32, 800, 1500, 2500] {
+        let lead = queue_lead(crystal);
+        if chip::PREPARE_AFTER_RESTART {
+            // Until TIMER0 restarts, an RTC tick early at most; the
+            // preparation after it then still has its time.
+            assert_eq!(lead, SETUP_US + RESTART_EARLY_US);
+            assert!(lead - RESTART_EARLY_US >= PREPARE_LATE_US);
+        } else {
+            // Until the crystal starts, when the sleep stops listening for
+            // the host; the sleep woken by then prepares again in time.
+            assert_eq!(lead, SETUP_US + RESTART_EARLY_US + crystal);
+            assert!(lead > SETUP_US + PREPARE_AGAIN_US);
+        }
+    }
+}

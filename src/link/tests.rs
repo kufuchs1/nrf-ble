@@ -548,3 +548,51 @@ fn next_returns_events_before_fragments_and_marks_the_fragment_read() {
     assert!(matches!(run(link.next()), Rx::Acl(acl) if acl.payload() == [1] && !acl.encrypted()));
     assert!(drained.as_mut().poll(&mut context).is_ready());
 }
+
+#[cfg(feature = "event-timing")]
+#[test]
+fn the_next_connection_event_is_known_only_for_its_link_once_planned() {
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    let epoch = connect(&shared);
+    assert_eq!(link.next_connection_event(epoch), None);
+    let at = Instant::from_secs(10);
+    // The radio starts 5 ms after `at`; data is due 331 us before it.
+    shared.set_next_event(at, 5000, 331, 15_000);
+    let next = link.next_connection_event(epoch).unwrap();
+    assert_eq!(next.start, at + Duration::from_micros(5000));
+    assert_eq!(next.queue_by, next.start - Duration::from_micros(331));
+    assert_eq!(next.interval, Duration::from_micros(15_000));
+    // Another link's epoch learns nothing.
+    assert_eq!(link.next_connection_event(Epoch(epoch.0.wrapping_add(1))), None);
+    // Nor does anyone once the link ended, or the next link before its first
+    // event is planned.
+    shared.set_connected(false);
+    assert_eq!(link.next_connection_event(epoch), None);
+    let next_link = connect(&shared);
+    assert_eq!(link.next_connection_event(next_link), None);
+}
+
+#[cfg(feature = "event-timing")]
+#[test]
+fn a_planned_event_converts_to_the_host_time_both_ways() {
+    let at = Instant::from_secs(10);
+    let ahead = Planned { ahead: 2000, at, epoch: 0, interval: 7500, lead: 2000 }.resolve();
+    assert_eq!(ahead.start, at + Duration::from_micros(2000));
+    assert_eq!(ahead.queue_by, at);
+    // An event planned late: its start passed already.
+    let behind = Planned { ahead: 0_u32.wrapping_sub(2000), at, epoch: 0, interval: 7500, lead: 300 }.resolve();
+    assert_eq!(behind.start, at - Duration::from_micros(2000));
+    assert!(behind.queue_by < behind.start);
+    // Near the start of the host's time the times stop at it instead of
+    // wrapping.
+    let early = Planned {
+        ahead:    0_u32.wrapping_sub(2000),
+        at:       Instant::from_ticks(0),
+        epoch:    0,
+        interval: 7500,
+        lead:     300,
+    };
+    assert_eq!(early.resolve().start, Instant::from_ticks(0));
+    assert_eq!(early.resolve().queue_by, Instant::from_ticks(0));
+}
