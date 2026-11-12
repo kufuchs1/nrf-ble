@@ -21,7 +21,7 @@ const LTK: [u8; 16] = [0x11; 16];
 /// A central's identity resolving key.
 const IRK: [u8; 16] = [0x22; 16];
 
-/// A bond with BlueZ's public identity and no key of its, on the example
+/// A bond with `BlueZ`'s public identity and no key of its, on the example
 /// table.
 fn example_bond() -> Bond {
     Bond::new(Peer::new([1, 2, 3, 4, 5, 6], false), None, LTK, Variant::new(0, 3), &example::DB)

@@ -1,4 +1,4 @@
-//! Tests of the attribute server: the whole BlueZ first connection as golden
+//! Tests of the attribute server: the whole `BlueZ` first connection as golden
 //! PDUs against the example table, and the error cases.
 
 use super::*;
@@ -88,7 +88,7 @@ fn join(parts: &[&[u8]]) -> Bytes {
     bytes
 }
 
-/// The whole first connection of BlueZ (research-bluez.md, section 1.1),
+/// The whole first connection of `BlueZ` (research-bluez.md, section 1.1),
 /// after pairing: MTU, server features, primary, secondary and include
 /// discovery, characteristics, descriptors, the hash, then the profiles'
 /// reads and configuration writes. Every response is checked octet by octet.

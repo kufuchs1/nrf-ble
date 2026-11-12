@@ -1,4 +1,4 @@
-//! A minimal Bluetooth LE host for Linux and BlueZ.
+//! A minimal Bluetooth LE host for Linux and `BlueZ`.
 //!
 //! The host serves one connection as a peripheral: L2CAP with the fixed
 //! channels for ATT, signalling and the security manager, a GATT server over
@@ -62,8 +62,8 @@
 //! a thread mode mutex ([`StateMutex`]) rather than a critical section, which
 //! would hold off the link layer for the whole of the longer AES computations
 //! of pairing. Each AES block on the ECB still holds a critical section for
-//! that one block, as [`crate::encrypt_block`] shares the ECB with the link
-//! layer: f5, which runs three CMACs, takes 13 AES blocks and so holds
+//! that one block, as [`crate::crypto::encrypt_block`] shares the ECB with the
+//! link layer: f5, which runs three CMACs, takes 13 AES blocks and so holds
 //! interrupts off 13 times, each for about 7 us on the nRF52832.
 //!
 //! # Advertising
@@ -102,7 +102,7 @@
 //! The application reads the link's events and the key presses in one task,
 //! so it stores each bond as it comes and sees the end of the link at once.
 //! It sends reports only after [`ConnEvent::Ready`] and a settle time, which
-//! gives BlueZ the moment it needs to create its input device; the settle
+//! gives `BlueZ` the moment it needs to create its input device; the settle
 //! time is to be measured on the hardware.
 //!
 //! ```no_run
@@ -217,7 +217,7 @@
 //!     Host::new(Link::new(&SHARED), &my_device::DB, my_device::CONFIG);
 //! /// The battery level, which the table reads and the host notifies.
 //! static BATTERY: Battery = Battery::new(my_device::BATTERY_LEVEL, 100);
-//! /// The time BlueZ gets after [`ConnEvent::Ready`] before the first
+//! /// The time `BlueZ` gets after [`ConnEvent::Ready`] before the first
 //! /// report: to be measured.
 //! const SETTLE: Duration = Duration::from_millis(200);
 //!
@@ -331,18 +331,22 @@ pub mod signal;
 pub mod smp;
 
 use crate::{
-    crypto::wipe,
+    crypto::{encrypt_block, wipe},
     host::{
         adv::{Advertising, Call, Control, Mode},
+        att::NotifyError as AttNotifyError,
+        bond::Bond,
         engine::{Command, Engine},
         gatt::{AttError, Char, Db, Handler, Sec},
         identity::LocalIdentity,
-        smp::Random,
+        smp::{Random, Reason},
     },
-    link::{self, Epoch, Event, Info, Link, Rx},
+    link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Link, Rx},
+    rng,
 };
 use core::{
     cell::RefCell,
+    fmt,
     future::{Future, pending},
     sync::atomic::{AtomicU8, Ordering},
 };
@@ -356,11 +360,6 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::{blocking_mutex::Mutex, mutex::Mutex as AsyncMutex, signal::Signal};
 use embassy_time::{Instant, Timer};
-#[cfg(feature = "param-requests")]
-pub use engine::RequestError;
-pub use engine::{ConnEvent, NotifyError};
-#[cfg(feature = "passkey")]
-pub use smp::PasskeyError;
 
 /// The mutex around the host's state: a thread mode mutex on the chip, so no
 /// critical section ever holds off the link layer for the engine's work.
@@ -370,6 +369,123 @@ pub type StateMutex = ThreadModeRawMutex;
 /// has no thread mode, for the host tests.
 #[cfg(not(all(target_arch = "arm", target_os = "none")))]
 pub type StateMutex = CriticalSectionRawMutex;
+
+/// An event of the host for the application, with [`Engine::take_event`]
+/// or [`Conn::next`].
+///
+/// Events of one kind coalesce until they are taken. They come in this
+/// order: `PasskeyRequested` (feature `passkey`), [`Self::PairingFailed`],
+/// `KeyMissing` (feature `key-missing`), [`Self::Encrypted`],
+/// [`Self::Bonded`], [`Self::BondUpdated`], [`Self::ParamsUpdated`],
+/// `ParamsRejected` (feature `param-requests`), [`Self::Ready`], and
+/// [`Self::Disconnected`] last, after every other event of its link.
+#[derive(Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnEvent {
+    /// The bonded central changed its subscriptions: the bond to store in
+    /// place of the stored one.
+    BondUpdated(Bond),
+    /// A pairing made this bond, which the firmware stores: reported once
+    /// the central acknowledged our identity keys.
+    Bonded(Bond),
+    /// The link ended, with the reason; 0 if it is no longer known.
+    Disconnected(u8),
+    /// The link is encrypted: with the bond's key, or with a new pairing's.
+    Encrypted {
+        /// With the key of the bond the advertising was set up with.
+        bonded: bool,
+    },
+    /// The central of a reconnection asked to encrypt with a key the host
+    /// does not have: the bond's central lost its key, or holds one of
+    /// another pairing. The host answered with the negative reply and ends
+    /// the link at once with [`engine::SECURITY_FAILURE`]; the bond stays as it
+    /// is.
+    #[cfg(feature = "key-missing")]
+    KeyMissing,
+    /// A pairing failed, with the reason; the link ends.
+    PairingFailed(Reason),
+    /// The central rejected a connection parameter request.
+    ///
+    /// The request was the engine's own ([`engine::Config::params`]) or one of
+    /// [`Conn::request_params`], and the central answered with
+    /// a Connection Parameter Update Response that refuses it, or a Command
+    /// Reject. An accepted
+    /// request has no event of its own: [`Self::ParamsUpdated`] follows once
+    /// the central updated the link. A request the central never answers
+    /// gives neither; after [`engine::SIGNALLING_TIMEOUT`] the next one may go
+    /// out.
+    #[cfg(feature = "param-requests")]
+    ParamsRejected,
+    /// The connection parameters changed to these.
+    ParamsUpdated(ConnectionParams),
+    /// Passkey Entry asks for the passkey the central displays.
+    ///
+    /// The user types it on the device; give it with
+    /// [`Conn::enter_passkey`], or `None` to refuse. It comes
+    /// first among the link's events; [`Self::PairingFailed`] or the end of
+    /// the link ends the entry.
+    #[cfg(feature = "passkey")]
+    PasskeyRequested,
+    /// Discovery is over: the link is encrypted, the central has our
+    /// response to its last input report configuration write, and ATT has
+    /// been idle for [`engine::INPUTS_IDLE`] since (or, without such a write,
+    /// for [`engine::READY_IDLE`]). `BlueZ` still needs a moment to create its
+    /// input device: the application waits a settle time, measured on the
+    /// hardware, before its first report.
+    Ready,
+}
+
+/// Why [`Engine::request_params`] sent no request.
+#[cfg(feature = "param-requests")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum RequestError {
+    /// A request waits for its response, or for its place in the link
+    /// layer's queue: one at a time.
+    Busy,
+    /// The link ended, or is ending.
+    Gone,
+    /// The range is out of the specification's ranges: an interval of 7.5 ms
+    /// to 4 s, the shortest at most the longest, and a latency and timeout
+    /// that fit the longest.
+    Invalid,
+}
+
+/// Why a notification cannot be sent now, or at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum NotifyError {
+    /// No room now: a PDU of several fragments is being sent, the link layer
+    /// lacks two free places, or [`engine::Config::notify_depth`] fragments are
+    /// in flight.
+    Busy,
+    /// The link ended.
+    Disconnected,
+    /// The link lacks the security the characteristic needs.
+    Insecure,
+    /// The client has not enabled notifications, or the characteristic
+    /// cannot notify.
+    NotSubscribed,
+    /// The value is longer than [`att::NOTIFY_MAX`].
+    TooLong,
+}
+
+/// Why a passkey was not taken.
+#[cfg(feature = "passkey")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum PasskeyError {
+    /// The link ended, or is ending.
+    Gone,
+    /// The passkey has more than six decimal digits.
+    Invalid,
+    /// No pairing waits for a passkey: none asked for one, it was given
+    /// already, or the pairing ended.
+    NotWaiting,
+}
 
 /// AES-128 encryption of one block, the only block cipher the host needs: the
 /// CMAC of pairing, the key derivation of the identity and the resolvable
@@ -384,53 +500,58 @@ pub trait Aes {
 
 /// The link layer and the time as the host's tasks use them:
 /// [`crate::link::Link`] with Embassy's time in the firmware, a stand-in in
-/// the host tests. Each call is the [`crate::link::Link`] call of the same
-/// name.
-pub trait Port: Control {
-    /// [`crate::link::Link::disconnect`].
-    ///
-    /// # Errors
-    ///
-    /// As [`crate::link::Link::disconnect`].
-    fn disconnect(&self, epoch: Epoch, reason: u8) -> Result<(), link::Error>;
-
-    /// [`crate::link::Link::hold_latency`].
-    fn hold_latency(&self, hold: bool);
-
-    /// [`crate::link::Link::in_flight`].
-    fn in_flight(&self, epoch: Epoch) -> usize;
-
-    /// [`crate::link::Link::info`].
-    fn info(&self) -> Option<Info>;
-
+/// the host tests.
+///
+/// Each call is the [`crate::link::Link`] call its documentation names,
+/// under a name of the host's own.
+///
+/// It is [`Sync`], as a [`Host`] in a static needs it to be, so the host's
+/// futures are [`Send`].
+pub trait Port: Control + Sync {
     /// [`crate::link::Link::ltk_reply`].
     ///
     /// # Errors
     ///
     /// As [`crate::link::Link::ltk_reply`].
-    fn ltk_reply(&self, epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), link::Error>;
+    fn answer_ltk(&self, epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), link::Error>;
 
-    /// [`crate::link::Link::next`].
-    fn next(&self) -> impl Future<Output = Rx>;
+    /// [`crate::link::Link::disconnect`].
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::link::Link::disconnect`].
+    fn end_link(&self, epoch: Epoch, reason: u8) -> Result<(), link::Error>;
+
+    /// [`crate::link::Link::in_flight`].
+    fn fragments_in_flight(&self, epoch: Epoch) -> usize;
+
+    /// [`crate::link::Link::info`].
+    fn link_info(&self) -> Option<Info>;
 
     /// The time now.
     fn now(&self) -> Instant;
 
-    /// Waits until `deadline`.
-    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
+    /// [`crate::link::Link::tx_room`].
+    fn queue_room(&self) -> usize;
+
+    /// [`crate::link::Link::tx_room_changed`].
+    fn queue_room_returned(&self) -> impl Future<Output = ()>;
+
+    /// [`crate::link::Link::next`].
+    fn receive(&self, acl: &mut AclIn) -> impl Future<Output = Rx>;
 
     /// [`crate::link::Link::try_send`].
     ///
     /// # Errors
     ///
     /// As [`crate::link::Link::try_send`].
-    fn try_send(&self, epoch: Epoch, start: bool, fragment: &[u8]) -> Result<(), link::Error>;
+    fn send_fragment(&self, epoch: Epoch, start: bool, fragment: &[u8]) -> Result<(), link::Error>;
 
-    /// [`crate::link::Link::tx_room`].
-    fn tx_room(&self) -> usize;
+    /// [`crate::link::Link::hold_latency`].
+    fn set_latency_hold(&self, hold: bool);
 
-    /// [`crate::link::Link::tx_room_changed`].
-    fn tx_room_changed(&self) -> impl Future<Output = ()>;
+    /// Waits until `deadline`.
+    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
 }
 
 /// Why [`Host::advertise`] returned without a link.
@@ -469,7 +590,7 @@ pub struct Conn<'host, P> {
     host:  &'host Host<P>,
 }
 
-/// AES-128 on the hardware ECB, through [`crate::encrypt_block`].
+/// AES-128 on the hardware ECB, through [`crate::crypto::encrypt_block`].
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct Ecb;
@@ -534,14 +655,47 @@ struct Waiting<'host, P: Port> {
     linked: bool,
 }
 
+impl fmt::Debug for ConnEvent {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::BondUpdated(_) => f.debug_tuple("BondUpdated").finish_non_exhaustive(),
+            Self::Bonded(_) => f.debug_tuple("Bonded").finish_non_exhaustive(),
+            Self::Disconnected(reason) => f.debug_tuple("Disconnected").field(&reason).finish(),
+            Self::Encrypted { bonded } => f.debug_struct("Encrypted").field("bonded", &bonded).finish(),
+            #[cfg(feature = "key-missing")]
+            Self::KeyMissing => f.write_str("KeyMissing"),
+            Self::PairingFailed(reason) => f.debug_tuple("PairingFailed").field(&reason).finish(),
+            #[cfg(feature = "param-requests")]
+            Self::ParamsRejected => f.write_str("ParamsRejected"),
+            Self::ParamsUpdated(params) => f.debug_tuple("ParamsUpdated").field(&params).finish(),
+            #[cfg(feature = "passkey")]
+            Self::PasskeyRequested => f.write_str("PasskeyRequested"),
+            Self::Ready => f.write_str("Ready"),
+        }
+    }
+}
+
+impl From<AttNotifyError> for NotifyError {
+    #[inline]
+    fn from(error: AttNotifyError) -> Self {
+        match error {
+            AttNotifyError::Insecure => Self::Insecure,
+            AttNotifyError::NotSubscribed => Self::NotSubscribed,
+            AttNotifyError::Pending => Self::Busy,
+            AttNotifyError::TooLong => Self::TooLong,
+        }
+    }
+}
+
 impl Aes for Ecb {
     #[inline]
-    fn encrypt(&self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] { crate::encrypt_block(key, block) }
+    fn encrypt(&self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] { encrypt_block(key, block) }
 }
 
 impl Aes for Hardware {
     #[inline]
-    fn encrypt(&self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] { crate::encrypt_block(key, block) }
+    fn encrypt(&self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] { encrypt_block(key, block) }
 }
 
 impl Battery {
@@ -600,7 +754,7 @@ where
     ///
     /// [`crate::link::Error::Gone`] if the link already ended.
     #[inline]
-    pub fn disconnect(&self) -> Result<(), link::Error> { self.host.port.disconnect(self.epoch, engine::REMOTE_USER) }
+    pub fn disconnect(&self) -> Result<(), link::Error> { self.host.port.end_link(self.epoch, engine::REMOTE_USER) }
 
     /// Gives the passkey the user typed after [`ConnEvent::PasskeyRequested`].
     ///
@@ -771,7 +925,7 @@ where
                     || {
                         if engine.has_claimed_link() {
                             Before::Returned
-                        } else if engine.has_link() || self.port.info().is_some() {
+                        } else if engine.has_link() || self.port.link_info().is_some() {
                             // A link that is ending, or one the run task has
                             // not given the engine yet: setting the engine up
                             // for this call now would change it under that
@@ -827,12 +981,12 @@ where
     /// Runs the P-256 jobs of pairing, with `crypto`'s random numbers and
     /// AES, calling `before_multiplication` right before each
     /// multiplication, for the watchdog, and yielding between two jobs.
-    /// Spawn it as a task of its own.
+    /// Spawn it as a task of its own; both are [`Send`], so its future is.
     #[inline]
     pub async fn crypto<C, F>(&self, crypto: &mut C, mut before_multiplication: F) -> !
     where
-        C: Aes + Random,
-        F: FnMut(),
+        C: Aes + Random + Send,
+        F: FnMut() + Send,
     {
         loop {
             let Some(job) = self.with(|state| state.engine.take_job()) else {
@@ -856,17 +1010,17 @@ where
         let now = self.port.now();
         let engine = &mut state.engine;
         engine.on_time(now);
-        let in_flight = engine.epoch().map_or(0, |epoch| self.port.in_flight(epoch));
+        let in_flight = engine.epoch().map_or(0, |epoch| self.port.fragments_in_flight(epoch));
         while let Some(command) = engine.take_command(in_flight, now) {
             // A link that ended needs no answer: its event follows.
             let _gone: Result<(), link::Error> = match command {
-                Command::Disconnect { epoch, reason } => self.port.disconnect(epoch, reason),
+                Command::Disconnect { epoch, reason } => self.port.end_link(epoch, reason),
                 Command::HoldLatency(hold) => {
-                    self.port.hold_latency(hold);
+                    self.port.set_latency_hold(hold);
                     Ok(())
                 },
                 Command::LtkReply { epoch, mut key } => {
-                    let result = self.port.ltk_reply(epoch, key);
+                    let result = self.port.answer_ltk(epoch, key);
                     if let Some(bytes) = key.as_mut() {
                         wipe(bytes);
                     }
@@ -875,8 +1029,8 @@ where
             };
         }
         while let Some(epoch) = engine.epoch()
-            && let Some(fragment) = engine.next_fragment(self.port.tx_room())
-            && self.port.try_send(epoch, fragment.start(), fragment.bytes()).is_ok()
+            && let Some(fragment) = engine.next_fragment(self.port.queue_room())
+            && self.port.send_fragment(epoch, fragment.start(), fragment.bytes()).is_ok()
         {
             engine.fragment_sent(now);
         }
@@ -901,7 +1055,7 @@ where
         let mut woken = false;
         loop {
             let (claimed, linkless) =
-                self.with(|state| (state.engine.claim(), !state.engine.has_link() && self.port.info().is_none()));
+                self.with(|state| (state.engine.claim(), !state.engine.has_link() && self.port.link_info().is_none()));
             if let Some(epoch) = claimed {
                 return Ok(epoch);
             }
@@ -949,20 +1103,20 @@ where
     #[must_use = "the port is only read"]
     pub const fn port(&self) -> &P { &self.port }
 
-    /// Takes what the link layer gave, with `crypto` for the security
-    /// manager and `app` for the dynamic values.
-    fn receive<C>(&self, rx: &Rx, app: &dyn Handler, crypto: &mut C)
+    /// Takes what the link layer gave, a fragment in `acl`, with `crypto`
+    /// for the security manager and `app` for the dynamic values.
+    fn receive<C>(&self, rx: Rx, acl: &AclIn, app: &dyn Handler, crypto: &mut C)
     where
         C: Aes + Random,
     {
         let now = self.port.now();
-        let arrived = self.with(|state| match *rx {
-            Rx::Acl(acl) => {
-                state.engine.on_acl(crypto, app, &acl, now);
+        let arrived = self.with(|state| match rx {
+            Rx::Acl => {
+                state.engine.on_acl(crypto, app, acl, now);
                 false
             },
             Rx::Event(Event::Connected(epoch)) => {
-                if let Some(info) = self.port.info().filter(|info| info.epoch == epoch) {
+                if let Some(info) = self.port.link_info().filter(|info| info.epoch == epoch) {
                     state.engine.connected(&info, now);
                 }
                 true
@@ -982,17 +1136,20 @@ where
 
     /// Runs the host: see the module documentation. `app` serves the table's
     /// dynamic values, `crypto` gives the security manager its random
-    /// numbers and AES. Spawn it as a task of its own.
+    /// numbers and AES. Spawn it as a task of its own; `app` is [`Sync`] and
+    /// `crypto` [`Send`], so its future is [`Send`].
     ///
     /// `app` runs inside the host's state, so it must not call into the
     /// host: no [`Conn`] method, no [`Battery::update`] and no other
     /// [`Host`] method, or the second borrow of the state panics. It may read
     /// and write atomics and signal other tasks, as [`Battery::read`] does.
     #[inline]
-    pub async fn run<C>(&self, app: &dyn Handler, crypto: &mut C) -> !
+    pub async fn run<C>(&self, app: &(dyn Handler + Sync), crypto: &mut C) -> !
     where
-        C: Aes + Random,
+        C: Aes + Random + Send,
     {
+        // Where the link layer puts a received fragment.
+        let mut acl = AclIn::EMPTY;
         loop {
             // The passkey the application gave, for the security manager.
             #[cfg(feature = "passkey")]
@@ -1006,13 +1163,14 @@ where
             };
             let room_changed = async {
                 if room {
-                    self.port.tx_room_changed().await;
+                    self.port.queue_room_returned().await;
                 } else {
                     pending::<()>().await;
                 }
             };
-            match select4(self.port.next(), timer, room_changed, self.wake.wait()).await {
-                Either4::First(rx) => self.receive(&rx, app, crypto),
+            let woken = select4(self.port.receive(&mut acl), timer, room_changed, self.wake.wait()).await;
+            match woken {
+                Either4::First(rx) => self.receive(rx, &acl, app, crypto),
                 Either4::Third(()) => {
                     self.with(|state| state.notify_waiting = false);
                     self.room.signal(());
@@ -1026,10 +1184,10 @@ where
     fn send_notification(&self, epoch: Epoch, characteristic: Char, data: &[u8]) -> Result<(), NotifyError> {
         self.with(|state| {
             let result = state.engine.notification(epoch, characteristic, data).and_then(|fragment| {
-                if self.port.tx_room() < 2 || self.port.in_flight(epoch) >= state.engine.notify_depth() {
+                if self.port.queue_room() < 2 || self.port.fragments_in_flight(epoch) >= state.engine.notify_depth() {
                     return Err(NotifyError::Busy);
                 }
-                self.port.try_send(epoch, fragment.start(), fragment.bytes()).map_err(|error| match error {
+                self.port.send_fragment(epoch, fragment.start(), fragment.bytes()).map_err(|error| match error {
                     link::Error::Full => NotifyError::Busy,
                     link::Error::Disallowed
                     | link::Error::Gone
@@ -1053,46 +1211,44 @@ where
 
 impl Port for Link<'_> {
     #[inline]
-    fn disconnect(&self, epoch: Epoch, reason: u8) -> Result<(), link::Error> { Self::disconnect(self, epoch, reason) }
+    fn answer_ltk(&self, epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), link::Error> { self.ltk_reply(epoch, key) }
 
     #[inline]
-    fn hold_latency(&self, hold: bool) { Self::hold_latency(self, hold); }
+    fn end_link(&self, epoch: Epoch, reason: u8) -> Result<(), link::Error> { self.disconnect(epoch, reason) }
 
     #[inline]
-    fn in_flight(&self, epoch: Epoch) -> usize { Self::in_flight(self, epoch) }
+    fn fragments_in_flight(&self, epoch: Epoch) -> usize { self.in_flight(epoch) }
 
     #[inline]
-    fn info(&self) -> Option<Info> { Self::info(self) }
-
-    #[inline]
-    fn ltk_reply(&self, epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), link::Error> {
-        Self::ltk_reply(self, epoch, key)
-    }
-
-    #[inline]
-    fn next(&self) -> impl Future<Output = Rx> { Self::next(self) }
+    fn link_info(&self) -> Option<Info> { self.info() }
 
     #[inline]
     fn now(&self) -> Instant { Instant::now() }
 
     #[inline]
-    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> { Timer::at(deadline) }
+    fn queue_room(&self) -> usize { self.tx_room() }
 
     #[inline]
-    fn try_send(&self, epoch: Epoch, start: bool, fragment: &[u8]) -> Result<(), link::Error> {
-        Self::try_send(self, epoch, start, fragment)
+    fn queue_room_returned(&self) -> impl Future<Output = ()> { self.tx_room_changed() }
+
+    #[inline]
+    fn receive(&self, acl: &mut AclIn) -> impl Future<Output = Rx> { self.next(acl) }
+
+    #[inline]
+    fn send_fragment(&self, epoch: Epoch, start: bool, fragment: &[u8]) -> Result<(), link::Error> {
+        self.try_send(epoch, start, fragment)
     }
 
     #[inline]
-    fn tx_room(&self) -> usize { Self::tx_room(self) }
+    fn set_latency_hold(&self, hold: bool) { self.hold_latency(hold); }
 
     #[inline]
-    fn tx_room_changed(&self) -> impl Future<Output = ()> { Self::tx_room_changed(self) }
+    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> { Timer::at(deadline) }
 }
 
 impl Random for Hardware {
     #[inline]
-    fn fill(&mut self, out: &mut [u8]) { crate::rng::fill(out); }
+    fn fill(&mut self, out: &mut [u8]) { rng::fill(out); }
 }
 
 impl<P> Drop for Waiting<'_, P>

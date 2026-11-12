@@ -192,18 +192,33 @@ all = { level = "deny", priority = 1 }
 pedantic = { level = "deny", priority = 1 }
 restriction = { level = "deny", priority = 1 }
 nursery = { level = "deny", priority = 1 }
+# The only lints allowed. Each comment says why, and what the other way
+# would cost where one exists.
+#
+# It refuses enabling the restriction group as a whole. The other way, a deny
+# list of every restriction lint by name, would no longer take in the lints
+# each new nightly adds, and would turn the allows below into lints silently
+# left out; enabling the group keeps both visible.
 blanket_clippy_restriction_lints = { level = "allow", priority = 2 }
-big_endian_bytes = { level = "allow", priority = 2 }
-future_not_send = { level = "allow", priority = 2 }
+# Pairs that contradict each other by definition, so one of each must be
+# allowed. `needless_return` (style) refuses the `return` that
+# `implicit_return` demands at the end of every function.
 implicit_return = { level = "allow", priority = 2 }
-little_endian_bytes = { level = "allow", priority = 2 }
-separated_literal_suffix = { level = "allow", priority = 2 }
-single_call_fn = { level = "allow", priority = 2 }
+# `mod_module_files` refuses `foo/mod.rs`, `self_named_module_files` refuses
+# `foo.rs` beside `foo/`; the code uses `foo.rs`. Both look only at those two
+# layouts, so children loaded with `#[path]` from folders that have no
+# same-named file would pass both; that layout is not Rust's convention and
+# changes no code, so the allow stays.
 self_named_module_files = { level = "allow", priority = 2 }
+# `pub_without_shorthand` refuses `pub(in crate)`, `pub_with_shorthand`
+# refuses `pub(crate)`, the only two ways to write that visibility; the code
+# writes `pub(crate)`.
 pub_with_shorthand = { level = "allow", priority = 2 }
-pub_use = { level = "allow", priority = 2 }
-# Result/Option propagation is intentional; it keeps driver error paths explicit.
+# `question_mark` (style) demands `?` for every early return of `None` or an
+# error written out (let-else, `if let`, `match`), which `question_mark_used`
+# refuses.
 question_mark_used = { level = "allow", priority = 2 }
-# Raised inside the defmt macro expansion, only for some log formats.
-missing_asserts_for_indexing = { level = "allow", priority = 2 }
-
+# `too_many_lines` (pedantic) and `cognitive_complexity` (nursery) are met by
+# splitting a long function into parts, each called once, which
+# `single_call_fn` refuses.
+single_call_fn = { level = "allow", priority = 2 }

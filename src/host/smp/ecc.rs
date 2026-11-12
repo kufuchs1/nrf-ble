@@ -69,6 +69,8 @@ pub const DEBUG_PUBLIC_KEY: [u8; PUBLIC_KEY_LEN] = [
 /// Signed radix 16 digits of a scalar: two per octet, and one for the carry
 /// out of the most significant one.
 const DIGITS: usize = 2 * KEY_LEN + 1;
+/// Doublings for each signed digit of four bits.
+const DOUBLINGS: u8 = 4;
 
 /// Why a public key is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +225,7 @@ fn encode(point: &ProjectivePoint) -> Option<[u8; PUBLIC_KEY_LEN]> {
         return None;
     }
     let mut out = [0; PUBLIC_KEY_LEN];
+    #[rustc_unroll(never)]
     for (target, &octet) in out.iter_mut().zip(affine.x().iter().chain(affine.y().iter())) {
         *target = octet;
     }
@@ -251,7 +254,7 @@ fn multiply(secret: &[u8; KEY_LEN], base: &ProjectivePoint) -> ProjectivePoint {
     let mut first = true;
     for &digit in digits.iter().rev() {
         if !first {
-            for _ in 0_u8..4 {
+            for _ in 0..DOUBLINGS {
                 double_in_place(&mut product);
             }
         }
@@ -272,11 +275,11 @@ fn multiply(secret: &[u8; KEY_LEN], base: &ProjectivePoint) -> ProjectivePoint {
 /// the last, which is 0 or 1: the nibbles, each brought into range by
 /// carrying 16 into the next.
 fn recode(secret: &[u8; KEY_LEN]) -> [i8; DIGITS] {
-    let mut digits = [0_i8; DIGITS];
+    let mut digits: [i8; DIGITS] = [0; DIGITS];
     for (pair, &octet) in digits.as_chunks_mut::<2>().0.iter_mut().zip(secret.iter().rev()) {
         *pair = [(octet & 0x0F).cast_signed(), octet.wrapping_shr(4).cast_signed()];
     }
-    let mut carry = 0_i8;
+    let mut carry: i8 = 0;
     for digit in &mut digits {
         let value = digit.wrapping_add(carry);
         carry = value.wrapping_add(8).wrapping_shr(4);
@@ -293,7 +296,8 @@ fn select(table: &[ProjectivePoint; 8], digit: i8, out: &mut ProjectivePoint) {
     let sign = digit.wrapping_shr(7);
     let magnitude = (digit ^ sign).wrapping_sub(sign).cast_unsigned();
     *out = ProjectivePoint::IDENTITY;
-    let mut index = 0_u8;
+    let mut index: u8 = 0;
+    #[rustc_unroll(never)]
     for entry in table {
         index = index.wrapping_add(1);
         out.conditional_assign(entry, magnitude.ct_eq(&index));

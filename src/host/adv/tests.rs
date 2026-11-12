@@ -12,7 +12,7 @@ use crate::{
 };
 use core::cell::RefCell;
 
-/// The bonded central: BlueZ's public identity address.
+/// The bonded central: `BlueZ`'s public identity address.
 const CENTRAL: Peer = Peer::new([1, 2, 3, 4, 5, 6], false);
 /// The central's identity resolving key.
 const CENTRAL_IRK: [u8; 16] = [0x33; 16];

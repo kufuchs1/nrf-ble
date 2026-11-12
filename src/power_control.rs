@@ -68,13 +68,15 @@ impl PowerControl {
     /// Received signal strength in dBm, averaged, once a packet arrived.
     #[inline]
     #[must_use = "the signal strength is only read"]
-    pub fn average_dbm(&self) -> Option<i32> { self.average.map(|average| average.checked_div(SCALE).unwrap_or(0_i32)) }
+    pub fn average_dbm(&self) -> Option<i32> {
+        self.average.map(|average| average.checked_div(SCALE).unwrap_or_default())
+    }
 
     /// Steps the power down or up by one level from the average.
     const fn decide(&mut self) {
         let Some(average) = self.average else { return };
         let own = i32::from(LEVELS_DBM.get(self.level).copied().unwrap_or_default());
-        let at_central = own.saturating_add(average.checked_div(SCALE).unwrap_or(0_i32));
+        let at_central = own.saturating_add(average.checked_div(SCALE).unwrap_or_default());
         if at_central > TARGET_HIGH_DBM && self.hold == 0 && self.level > self.floor {
             self.level = self.level.saturating_sub(1);
         } else if at_central < TARGET_LOW_DBM {

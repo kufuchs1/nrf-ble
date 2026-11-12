@@ -25,14 +25,14 @@
 //!   and the link layer resolves its resolvable private addresses through that
 //!   list: scan requests and connection requests from any other device are
 //!   ignored. The entry is in device privacy mode, so the central may also
-//!   connect from its identity address, as BlueZ does without host privacy.
+//!   connect from its identity address, as `BlueZ` does without host privacy.
 //!
 //! With the feature `directed-advertising`, a phase in [`Mode::Reconnect`]
 //! may also be directed (`Phase::directed`): high duty cycle directed
 //! advertising, an `ADV_DIRECT_IND` to the bonded central every 3.75 ms for
 //! at most `DIRECTED_MAX`, connectable by that central only. Linux connects
 //! to it as to an undirected advertisement from a device of its accept list
-//! with auto-connect (and only to it for a device BlueZ merely allows to
+//! with auto-connect (and only to it for a device `BlueZ` merely allows to
 //! connect), so a first directed phase makes a reconnection about 30 to 50 ms
 //! faster than one at 20 ms. The target is the central's identity address,
 //! which a central scanning from its identity address takes: Linux without
@@ -114,6 +114,7 @@
 
 use crate::{
     advertiser::legacy::{self, Kind},
+    bytes::le16_bytes,
     host::{bond::Bond, identity::LocalIdentity},
     link::{self, AdvParams, Link},
     pdu::Peer,
@@ -478,7 +479,7 @@ impl Data {
     /// [`Overflow`] if it does not fit.
     #[inline]
     pub const fn appearance(&mut self, appearance: u16) -> Result<&mut Self, Overflow> {
-        self.push(AD_APPEARANCE, &appearance.to_le_bytes())
+        self.push(AD_APPEARANCE, &le16_bytes(appearance))
     }
 
     /// The structures written so far.
@@ -550,11 +551,11 @@ impl Data {
         let end = start.saturating_add(data.len()).saturating_add(2);
         let target = self.bytes.get_mut(start..end).ok_or(Overflow::TooLong)?;
         // Both fit an octet now: the structure fits the data's 31 octets.
-        let length = u8::try_from(data.len().saturating_add(1)).unwrap_or(u8::MAX);
+        let length: u8 = data.len().saturating_add(1).saturating_cast();
         let (header, body) = target.split_at_mut(2);
         header.copy_from_slice(&[length, kind]);
         body.copy_from_slice(data);
-        self.len = u8::try_from(end).unwrap_or(u8::MAX);
+        self.len = end.saturating_cast();
         Ok(self)
     }
 
@@ -572,7 +573,7 @@ impl Data {
         let octets = uuids.len().saturating_mul(2);
         let target = list.get_mut(..octets).ok_or(Overflow::TooLong)?;
         for (chunk, uuid) in target.as_chunks_mut::<2>().0.iter_mut().zip(uuids) {
-            *chunk = uuid.to_le_bytes();
+            *chunk = le16_bytes(*uuid);
         }
         self.push(AD_SERVICES_16, target)
     }
@@ -592,7 +593,7 @@ impl Data {
     /// [`Overflow`] if it does not fit.
     #[inline]
     pub const fn tx_power(&mut self, dbm: i8) -> Result<&mut Self, Overflow> {
-        self.push(AD_TX_POWER, &dbm.to_le_bytes())
+        self.push(AD_TX_POWER, &[dbm.cast_unsigned()])
     }
 }
 

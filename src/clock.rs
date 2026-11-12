@@ -5,7 +5,7 @@
 //! keeps the time on the low frequency clock and restarts TIMER0 at an exact
 //! tick before the next event.
 
-use crate::{chip, log::info, sleep};
+use crate::{chip, sleep};
 #[cfg(feature = "nrf51")]
 use core::future::pending;
 use core::{
@@ -25,7 +25,7 @@ use embassy_nrf::{
         TIMER0 as REGS,
         timer::vals::{Bitmode, Mode},
     },
-    peripherals::{RTC0, TIMER0},
+    peripherals::{self, RTC0, TIMER0},
 };
 use embassy_sync::{blocking_mutex::CriticalSectionMutex, waitqueue::AtomicWaker};
 use embassy_time::{Duration, Timer, with_timeout};
@@ -668,7 +668,7 @@ fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_o
 /// stops both while the radio idles for long, and [`resume_calibration`]
 /// starts them again with a calibration at once.
 #[inline]
-pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>) -> ! {
+pub async fn calibrate_rc(_temperature: Peri<'_, peripherals::TEMP>) -> ! {
     #[cfg(feature = "nrf51")]
     if !chip::calibrates_rc().await {
         info!("the low frequency clock is a crystal: no RC calibration");
@@ -677,7 +677,7 @@ pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>
         }
     }
     let mut calibrated_at = None;
-    let mut skipped = 0_u8;
+    let mut skipped: u8 = 0;
     loop {
         if CALIBRATION_PAUSED.load(Ordering::Relaxed) {
             info!("RC calibration paused");
@@ -868,18 +868,16 @@ fn request_crystal() -> bool {
 /// Whether the RTC counter is past `tick`.
 fn passed(tick: u32) -> bool {
     let difference = rtc_now().wrapping_sub(tick) & RTC_MASK;
-    difference != 0 && difference < RTC_MASK >> 1_u32
+    difference != 0 && difference < RTC_MASK >> 1
 }
 
 /// The RTC counter.
 fn rtc_now() -> u32 { RTC.counter().read().counter() }
 
 /// Microseconds of `ticks` RTC ticks, 15625/512 us each.
-const fn ticks_to_us(ticks: u32) -> u32 {
-    u32::try_from(u64::from(ticks).saturating_mul(15_625) >> 9_u32).unwrap_or(u32::MAX)
-}
+const fn ticks_to_us(ticks: u32) -> u32 { (u64::from(ticks).saturating_mul(15_625) >> 9).saturating_cast() }
 
 /// Whole RTC ticks in `us` microseconds.
 const fn us_to_ticks(us: u32) -> u32 {
-    u32::try_from(u64::from(us).wrapping_shl(9).checked_div(15_625).unwrap_or(0)).unwrap_or(u32::MAX)
+    u64::from(us).wrapping_shl(9).checked_div(15_625).unwrap_or(0).saturating_cast()
 }

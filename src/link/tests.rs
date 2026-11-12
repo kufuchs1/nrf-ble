@@ -52,7 +52,8 @@ fn reset_waits_for_radio_shutdown_and_clears_old_queues() {
     assert!(shared.take_reset());
     shared.complete_reset();
     assert!(reset.as_mut().poll(&mut context).is_ready());
-    assert!(link.try_next().is_none());
+    let mut acl = AclIn::EMPTY;
+    assert!(link.try_next(&mut acl).is_none());
     assert!(!shared.state.lock(|cell| cell.borrow().connected));
 }
 
@@ -312,11 +313,11 @@ fn a_key_reply_needs_its_link_and_a_pending_request() {
     assert_eq!(link.ltk_reply(Epoch(0), Some([0xAA; 16])), Err(Error::Gone));
     assert!(shared.take_ltk().is_none());
     assert_eq!(link.ltk_reply(epoch, Some([0xAA; 16])), Ok(()));
-    assert_eq!(shared.take_ltk(), Some(Some([0xAA; 16])));
+    assert_eq!(shared.take_ltk(), Some(LtkAnswer::Key([0xAA; 16])));
     assert_eq!(link.ltk_reply(epoch, None), Err(Error::Disallowed));
     assert!(shared.request_ltk([0; 8], [0; 2]));
     assert_eq!(link.ltk_reply(epoch, None), Ok(()));
-    assert_eq!(shared.take_ltk(), Some(None));
+    assert_eq!(shared.take_ltk(), Some(LtkAnswer::Missing));
 }
 
 #[test]
@@ -335,7 +336,7 @@ fn a_key_reply_for_a_link_that_ended_has_no_effect_on_the_next() {
     assert_eq!(link.ltk_reply(old, None), Err(Error::Gone));
     assert!(shared.take_ltk().is_none());
     assert_eq!(link.ltk_reply(next, Some([0xBB; 16])), Ok(()));
-    assert_eq!(shared.take_ltk(), Some(Some([0xBB; 16])));
+    assert_eq!(shared.take_ltk(), Some(LtkAnswer::Key([0xBB; 16])));
 }
 
 #[test]
@@ -409,7 +410,8 @@ fn disconnect_drops_outgoing_data_and_requests_but_keeps_received_data() {
     shared.set_connected(false);
     // Acknowledged data reaches the host before the disconnection, with its
     // encryption.
-    let Some(Rx::Acl(acl)) = link.try_next() else { panic!("the received fragment is kept") };
+    let mut acl = AclIn::EMPTY;
+    let Some(Rx::Acl) = link.try_next(&mut acl) else { panic!("the received fragment is kept") };
     assert!(acl.start() && acl.encrypted() && acl.payload() == [1, 2, 3]);
     assert!(shared.next_acl_out().is_none());
     assert!(shared.take_ltk().is_none());
@@ -419,7 +421,7 @@ fn disconnect_drops_outgoing_data_and_requests_but_keeps_received_data() {
     // A reset drops it.
     assert!(shared.push_acl_in(Llid::Start, &[1], false));
     shared.complete_reset();
-    assert!(link.try_next().is_none());
+    assert!(link.try_next(&mut acl).is_none());
 }
 
 #[test]
@@ -541,11 +543,13 @@ fn next_returns_events_before_fragments_and_marks_the_fragment_read() {
     let epoch = connect(&shared);
     assert!(shared.push_acl_in(Llid::Start, &[1], false));
     assert!(shared.try_push_event(Event::Connected(epoch)));
-    assert!(matches!(run(link.next()), Rx::Event(Event::Connected(e)) if e == epoch));
+    let mut acl = AclIn::EMPTY;
+    assert!(matches!(run(link.next(&mut acl)), Rx::Event(Event::Connected(e)) if e == epoch));
     let mut drained = pin!(shared.acl_in_drained());
     let mut context = Context::from_waker(Waker::noop());
     assert!(drained.as_mut().poll(&mut context).is_pending());
-    assert!(matches!(run(link.next()), Rx::Acl(acl) if acl.payload() == [1] && !acl.encrypted()));
+    assert!(matches!(run(link.next(&mut acl)), Rx::Acl));
+    assert!(acl.payload() == [1] && !acl.encrypted());
     assert!(drained.as_mut().poll(&mut context).is_ready());
 }
 

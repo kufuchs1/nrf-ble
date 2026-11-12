@@ -62,7 +62,6 @@ pub const DECRYPT_WAIT: u32 = 400;
 /// Busy-wait iterations for sealing a PDU ahead of its event, whose key
 /// stream the CCM generates first: about 1 ms on the 16 MHz Cortex-M0, far
 /// above the time it takes.
-#[cfg_attr(test, expect(dead_code, reason = "the host tests seal with a stand-in"))]
 pub const SEAL_WAIT: u32 = 1600;
 /// Whether host data queued while the crystal started for an event, after
 /// the sleep before it stopped listening for the host, is still prepared

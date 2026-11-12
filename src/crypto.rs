@@ -1,15 +1,19 @@
-//! Link encryption: session key derivation with the ECB and AES-CCM packet
-//! encryption and decryption on the fly with the radio, and AES-128 in the
-//! ECB for everything else.
+//! Link encryption on the CCM, and AES-128 on the ECB for everything else.
+//!
+//! The link derives its session key with the ECB and encrypts and decrypts
+//! its packets with AES-CCM on the fly with the radio. [`encrypt_block`]
+//! serves the host ([`crate::host::Ecb`]) and the resolvable private
+//! addresses.
 //!
 //! The ECB shares its AES core with the CCM, which aborts a running ECB
 //! operation. [`encrypt_block`] runs with interrupts off, so the link layer
 //! cannot start one of its own in between, and retries with interrupts on, so
 //! a radio event that aborted it is not delayed.
 
-use crate::{chip, radio::Phy, sleep};
+use crate::{bytes::le64_bytes, chip, radio::Phy, sleep};
 use core::{
     hint::black_box,
+    slice,
     sync::atomic::{Ordering, compiler_fence},
 };
 use embassy_nrf::pac::{
@@ -21,7 +25,7 @@ use embassy_nrf::pac::{
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 
 /// Size of a CCM configuration: key, packet counter, direction and IV.
-pub const CONFIG_LEN: usize = 33;
+pub(crate) const CONFIG_LEN: usize = 33;
 /// Offset of the packet counter in a CCM configuration.
 const COUNTER_OFFSET: usize = 16;
 /// Offset of the direction bit in a CCM configuration.
@@ -31,9 +35,9 @@ const IV_OFFSET: usize = 25;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
 const PPI_CRYPT: usize = 25;
 /// Scratch space for every length the CCM may take from a packet.
-pub const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
+pub(crate) const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
 /// The packet counter is 39 bits; the next bit belongs to the direction.
-pub const COUNTER_LIMIT: u64 = 1 << 39;
+pub(crate) const COUNTER_LIMIT: u64 = 1 << 39;
 
 /// Prepares the CCM to decrypt the next received packet from `input` into
 /// `output` while it is received.
@@ -46,7 +50,7 @@ pub const COUNTER_LIMIT: u64 = 1 << 39;
 /// [`disarm`], [`stop`] or [`disable`]. `input` and `output` must point to
 /// RAM holding [`crate::pdu::BUFFER_LEN`] bytes.
 #[inline]
-pub unsafe fn arm_decrypt(
+pub(crate) unsafe fn arm_decrypt(
     config: &[u8; CONFIG_LEN],
     (input, output): (*mut u8, *mut u8),
     scratch: &mut [u8; SCRATCH_LEN],
@@ -78,10 +82,29 @@ pub unsafe fn arm_decrypt(
 /// DMA until this returns. `input` must point to a PDU in RAM and `output`
 /// to RAM with room for it and its MIC, neither accessed meanwhile. No
 /// decryption may be armed.
-#[cfg(not(test))]
-#[expect(clippy::cfg_not_test, reason = "the host tests seal with a stand-in, without the CCM's registers")]
 #[inline]
-pub unsafe fn seal(
+pub(crate) unsafe fn seal(
+    config: &[u8; CONFIG_LEN],
+    pointers: (*const u8, *mut u8),
+    scratch: &mut [u8; SCRATCH_LEN],
+    phy: Phy,
+) -> bool {
+    if cfg!(test) {
+        // SAFETY: the caller's guarantees cover the stand-in's.
+        unsafe { seal_stand_in(config, pointers) }
+    } else {
+        // SAFETY: the caller's guarantees are the CCM's.
+        unsafe { seal_ccm(config, pointers, scratch, phy) }
+    }
+}
+
+/// [`seal`] on the CCM.
+///
+/// # Safety
+///
+/// As for [`seal`].
+#[inline]
+unsafe fn seal_ccm(
     config: &[u8; CONFIG_LEN],
     (input, output): (*const u8, *mut u8),
     scratch: &mut [u8; SCRATCH_LEN],
@@ -109,42 +132,48 @@ pub unsafe fn seal(
     completed
 }
 
-/// The host tests' stand-in for the CCM: copies the header, adds the MIC to
-/// the length, flips the payload and puts the low four octets of the packet
-/// counter where the MIC goes, so a test sees which counter sealed a PDU.
+/// [`seal`] for the host tests, on the PC, which has no CCM: copies the
+/// header, adds the MIC to the length, flips the payload and puts the low
+/// four octets of the packet counter where the MIC goes, so a test sees
+/// which counter sealed a PDU.
 ///
 /// # Safety
 ///
 /// `input` points to a PDU and `output` to a distinct buffer with room for
 /// it and its MIC.
-#[cfg(test)]
-pub unsafe fn seal(
-    config: &[u8; CONFIG_LEN],
-    (input, output): (*const u8, *mut u8),
-    _scratch: &mut [u8; SCRATCH_LEN],
-    _phy: Phy,
-) -> bool {
-    // SAFETY: the caller passes two distinct buffers, which hold a whole
-    // PDU and room for its MIC.
-    let (plain, sealed) = unsafe {
-        let len = usize::from(*input.add(1));
-        (core::slice::from_raw_parts(input, 3 + len), core::slice::from_raw_parts_mut(output, 3 + len + 4))
+unsafe fn seal_stand_in(config: &[u8; CONFIG_LEN], (input, output): (*const u8, *mut u8)) -> bool {
+    // SAFETY: a PDU starts with its two header octets.
+    let header = unsafe { slice::from_raw_parts(input, 2) };
+    let Some(&length) = header.get(1) else { return false };
+    let plain_len = usize::from(length).saturating_add(3);
+    // SAFETY: the PDU is its header, its length octet's payload and the S1
+    // octet.
+    let plain = unsafe { slice::from_raw_parts(input, plain_len) };
+    // SAFETY: `output` has room for the PDU and its MIC, apart from `input`.
+    let sealed = unsafe { slice::from_raw_parts_mut(output, plain_len.saturating_add(4)) };
+    let (Some((head, payload)), Some((sealed_head, sealed_rest))) =
+        (plain.split_first_chunk::<3>(), sealed.split_first_chunk_mut::<3>())
+    else {
+        return false;
     };
-    let len = plain.len() - 3;
-    sealed[..3].copy_from_slice(&plain[..3]);
-    sealed[1] = plain[1] + 4;
-    for (target, source) in sealed[3..3 + len].iter_mut().zip(&plain[3..]) {
+    *sealed_head = *head;
+    if let Some(sealed_length) = sealed_head.get_mut(1) {
+        *sealed_length = length.wrapping_add(4);
+    }
+    let Some((sealed_payload, mic)) = sealed_rest.split_at_mut_checked(payload.len()) else { return false };
+    for (target, source) in sealed_payload.iter_mut().zip(payload) {
         *target = !*source;
     }
-    sealed[3 + len..].copy_from_slice(&config[COUNTER_OFFSET..COUNTER_OFFSET + 4]);
+    let Some(counter) = config.get(COUNTER_OFFSET..).and_then(<[u8]>::first_chunk::<4>) else { return false };
+    mic.copy_from_slice(counter);
     true
 }
 
 /// A CCM configuration for one direction.
 #[inline]
 #[must_use = "the configuration is only built"]
-pub const fn config(key: [u8; 16], iv: [u8; 8], central_to_peripheral: bool) -> [u8; CONFIG_LEN] {
-    let mut config = [0_u8; CONFIG_LEN];
+pub(crate) const fn config(key: [u8; 16], iv: [u8; 8], central_to_peripheral: bool) -> [u8; CONFIG_LEN] {
+    let mut config: [u8; CONFIG_LEN] = [0; CONFIG_LEN];
     if let Some(target) = config.get_mut(..16) {
         target.copy_from_slice(&key);
     }
@@ -159,17 +188,17 @@ pub const fn config(key: [u8; 16], iv: [u8; 8], central_to_peripheral: bool) -> 
 
 /// Stops starting the CCM from the radio.
 #[inline]
-pub fn disarm() {
+pub(crate) fn disarm() {
     PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
     CCM.shorts().write(|w| w.set_endksgen_crypt(false));
 }
 
 /// Enables the CCM.
 #[inline]
-pub fn enable() { CCM.enable().write(|w| w.set_enable(Enable::Enabled)); }
+pub(crate) fn enable() { CCM.enable().write(|w| w.set_enable(Enable::Enabled)); }
 
 /// Releases the CCM after the link ends, including its fixed PPI channels.
-pub fn disable() {
+pub(crate) fn disable() {
     disarm();
     CCM.enable().write(|w| w.set_enable(Enable::Disabled));
 }
@@ -179,7 +208,7 @@ pub fn disable() {
 /// CCM expects.
 #[inline]
 #[must_use = "the key is only computed"]
-pub fn session_key(ltk: [u8; 16], skd: [u8; 16]) -> Option<[u8; 16]> { derive_session_key(ltk, skd, ecb) }
+pub(crate) fn session_key(ltk: [u8; 16], skd: [u8; 16]) -> Option<[u8; 16]> { derive_session_key(ltk, skd, ecb) }
 
 /// `block` encrypted with `key` by the ECB, both most significant octet
 /// first. Safe to call from any context below the link layer interrupt.
@@ -187,7 +216,7 @@ pub fn session_key(ltk: [u8; 16], skd: [u8; 16]) -> Option<[u8; 16]> { derive_se
 #[must_use = "the block is only computed"]
 pub fn encrypt_block(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
     static ECB_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
-    let mut data = [0_u8; 48];
+    let mut data: [u8; 48] = [0; 48];
     for (target, source) in data.iter_mut().zip(key.iter().chain(block.iter())) {
         *target = *source;
     }
@@ -227,7 +256,7 @@ fn derive_session_key<Encrypt>(ltk: [u8; 16], skd: [u8; 16], encrypt: Encrypt) -
 where
     Encrypt: FnOnce(&mut [u8; 48]) -> bool,
 {
-    let mut data = [0_u8; 48];
+    let mut data: [u8; 48] = [0; 48];
     for (target, source) in data.iter_mut().zip(ltk.iter().rev().chain(skd.iter().rev())) {
         *target = *source;
     }
@@ -240,12 +269,12 @@ where
 /// Sets the packet counter of a configuration.
 #[inline]
 #[must_use = "counter exhaustion must end the connection before a nonce is reused"]
-pub const fn set_counter(config: &mut [u8; CONFIG_LEN], counter: u64) -> bool {
+pub(crate) const fn set_counter(config: &mut [u8; CONFIG_LEN], counter: u64) -> bool {
     if counter >= COUNTER_LIMIT {
         return false;
     }
     if let Some(target) = config.get_mut(COUNTER_OFFSET..COUNTER_OFFSET.saturating_add(5))
-        && let Some(source) = counter.to_le_bytes().first_chunk::<5>()
+        && let Some(source) = le64_bytes(counter).first_chunk::<5>()
     {
         target.copy_from_slice(source);
     }
@@ -263,7 +292,7 @@ fn set_pointers(config: &[u8; CONFIG_LEN], input: *const u8, output: *mut u8, sc
 
 /// Stops a decryption the radio started, for a packet that is not used.
 #[inline]
-pub fn stop() {
+pub(crate) fn stop() {
     CCM.tasks_stop().write_value(1);
     CCM.events_endcrypt().write_value(0);
     CCM.events_error().write_value(0);
@@ -273,7 +302,7 @@ pub fn stop() {
 /// Overwrites key material with zeros once it is no longer needed, so it
 /// does not outlive its use in RAM.
 #[inline]
-pub fn wipe(bytes: &mut [u8]) {
+pub(crate) fn wipe(bytes: &mut [u8]) {
     bytes.fill(0);
     // Keeps the compiler from dropping the stores to memory that is about
     // to be released.
@@ -285,7 +314,7 @@ pub fn wipe(bytes: &mut [u8]) {
 /// MIC is valid. `None` means a hardware error or an incomplete transfer.
 #[inline]
 #[must_use = "the MIC status is only read"]
-pub fn wait_decrypted() -> Option<bool> {
+pub(crate) fn wait_decrypted() -> Option<bool> {
     let mut remaining = chip::DECRYPT_WAIT;
     while CCM.events_endcrypt().read() == 0 && CCM.events_error().read() == 0 && remaining != 0 {
         remaining = remaining.saturating_sub(1);
@@ -302,7 +331,7 @@ pub fn wait_decrypted() -> Option<bool> {
 /// avoided as the specification requires.
 #[must_use = "the address is only computed"]
 #[inline]
-pub fn resolvable_address(irk: [u8; 16], random: [u8; 3]) -> [u8; 6] {
+pub(crate) fn resolvable_address(irk: [u8; 16], random: [u8; 3]) -> [u8; 6] {
     resolvable_address_with(irk, random, encrypt_block)
 }
 
@@ -310,7 +339,7 @@ pub fn resolvable_address(irk: [u8; 16], random: [u8; 3]) -> [u8; 6] {
 /// private address generated with the identity resolving key `irk`.
 #[inline]
 #[must_use = "the check is only computed"]
-pub fn resolves(irk: [u8; 16], address: [u8; 6]) -> bool { resolves_with(irk, address, encrypt_block) }
+pub(crate) fn resolves(irk: [u8; 16], address: [u8; 6]) -> bool { resolves_with(irk, address, encrypt_block) }
 
 /// [`resolves`] using `encrypt` for AES-128.
 fn resolves_with<Encrypt>(
@@ -347,7 +376,7 @@ where
     // AES takes keys and blocks most significant octet first.
     let mut key = irk;
     key.reverse();
-    let mut block = [0_u8; 16];
+    let mut block: [u8; 16] = [0; 16];
     if let Some(tail) = block.last_chunk_mut::<3>() {
         *tail = [prand2, prand1, prand0];
     }

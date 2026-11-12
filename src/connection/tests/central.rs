@@ -1,6 +1,6 @@
 //! The answer within the interframe space against a central that follows
 //! the acknowledgement rules of the Core specification (Vol 6, Part B,
-//! 4.5.9), as BlueZ's controller does at the start of a link: the feature
+//! 4.5.9), as `BlueZ`'s controller does at the start of a link: the feature
 //! exchange, the version exchange, then data both ways.
 //!
 //! The radio is modelled as the nRF51 latches its packet pointer: the
@@ -156,7 +156,7 @@ impl Central {
         self.received.push((header & LLID_MASK, payload));
     }
 
-    /// What BlueZ's controller sends next: the version exchange once our
+    /// What `BlueZ`'s controller sends next: the version exchange once our
     /// features came, then an ATT request.
     fn respond(&mut self, llid: u8, payload: &[u8]) {
         if llid != Llid::Control.bits() {
@@ -261,7 +261,7 @@ impl Sim {
             let crc_ok = !self.random.chance(self.faults.corrupted);
             let packet = crc_ok.then_some((header, self.rx[1], true));
             let decision = self.link.decide(packet, 1000, true, &self.shared).expect("the link goes on");
-            let buffer = self.link.answer_buffer(decision.md);
+            let buffer = self.link.answer_buffer(decision.follow.md);
             let on_air = |link: &mut Connection, slot: bool| *link.slot_mut(slot).on_air();
             // Within the interframe space, only the header of the buffer
             // the radio points at changes.
@@ -280,7 +280,7 @@ impl Sim {
             };
             let rx = self.rx;
             self.link.after_answer(decision, &rx, (None, late, 0), &self.shared);
-            if chip::PREPARE_IN_EVENT && decision.more && !late && !self.link.next_ready {
+            if chip::PREPARE_IN_EVENT && decision.follow.more && !late && !self.link.next_ready {
                 self.link.prepare_next(&self.shared);
             }
             if late {
@@ -296,7 +296,7 @@ impl Sim {
                 break;
             }
             self.central.receive(&sent);
-            if !decision.more {
+            if !decision.follow.more {
                 break;
             }
         }
@@ -491,8 +491,8 @@ fn the_answer_patches_only_the_header_of_the_pdu_on_the_air() {
         link.prepare_next(&shared);
         link.commit_next();
         let before = *link.current_mut().on_air();
-        link.sn = true;
-        link.nesn = true;
+        link.seq.sn = true;
+        link.seq.nesn = true;
         let buffer = link.answer_buffer(true);
         let after = *link.current_mut().on_air();
         assert_eq!(buffer.cast_const(), link.current_mut().on_air().0.as_ptr());
@@ -515,13 +515,13 @@ fn room_is_counted_before_the_event_and_used_up_by_new_packets() {
     let mut header = Llid::Start.bits();
     for _ in 0..room {
         let decision = link.decide(Some((header, 1, true)), 1000, true, &shared).unwrap();
-        assert!(link.received && !decision.duplicate);
-        link.received = false;
+        assert!(link.seq.received && !decision.duplicate);
+        link.seq.received = false;
         header ^= SN;
     }
     // The host's queue is full now: the next one comes again.
     let decision = link.decide(Some((header, 1, true)), 1000, true, &shared).unwrap();
-    assert!(!link.received && !decision.duplicate && !decision.more);
+    assert!(!link.seq.received && !decision.duplicate && !decision.follow.more);
 }
 
 #[test]
@@ -539,7 +539,7 @@ fn a_second_acknowledgement_in_an_event_is_answered_with_an_empty_pdu() {
     let first = link.decide(Some((empty | NESN, 0, true)), 1000, true, &shared).unwrap();
     link.after_answer(first, &[0; BUFFER_LEN], (None, false, 0), &shared);
     assert!(link.tx_kind == TxKind::Control && !first.fallback);
-    assert_eq!(first.md, chip::PREPARE_IN_EVENT);
+    assert_eq!(first.follow.md, chip::PREPARE_IN_EVENT);
     // The second, before anything is prepared again, an empty one.
     let second = link.decide(Some((empty | SN, 0, true)), 1000, true, &shared).unwrap();
     link.after_answer(second, &[0; BUFFER_LEN], (None, false, 0), &shared);

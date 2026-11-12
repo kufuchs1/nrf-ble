@@ -1,6 +1,6 @@
 //! One fresh encryption response prefetched while radio scheduling continues.
 
-use crate::crypto;
+use crate::{crypto, rng};
 use core::{cell::RefCell, ops::AsyncFnMut};
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
@@ -34,7 +34,7 @@ impl Prefetch {
 
     /// Produces at most one spare response, yielding to the radio between
     /// bytes.
-    pub(super) async fn run(&self) -> ! { self.run_with(crate::rng::fill_async).await }
+    pub(super) async fn run(&self) -> ! { self.run_with(rng::fill_async).await }
 
     /// Supplies entropy through an injectable async source for host
     /// regressions.
