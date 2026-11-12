@@ -64,7 +64,6 @@ pub struct Command {
 
 /// The outcome of a Connection Parameter Update Request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Outcome {
     /// The central accepted the parameters; the link layer reports the
@@ -72,6 +71,20 @@ pub enum Outcome {
     Accepted,
     /// The central rejected them, with a response or a Command Reject.
     Rejected,
+}
+
+impl Outcome {
+    /// The name of the outcome, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Accepted => defmt::intern!("Accepted"),
+            Self::Rejected => defmt::intern!("Rejected"),
+        }
+    }
 }
 
 /// The signalling channel of one link.

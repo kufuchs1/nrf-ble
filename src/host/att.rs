@@ -135,7 +135,6 @@ const LOCAL_MAX: usize = DYNAMIC_MAX;
 
 /// Why a notification or an indication cannot be sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum NotifyError {
     /// The link lacks the security the characteristic needs.
@@ -146,6 +145,22 @@ pub enum NotifyError {
     Pending,
     /// The value is longer than [`NOTIFY_MAX`].
     TooLong,
+}
+
+impl NotifyError {
+    /// The name of the error, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Insecure => defmt::intern!("Insecure"),
+            Self::NotSubscribed => defmt::intern!("NotSubscribed"),
+            Self::Pending => defmt::intern!("Pending"),
+            Self::TooLong => defmt::intern!("TooLong"),
+        }
+    }
 }
 
 /// The attribute server of one link: the table, the link's client
@@ -303,14 +318,14 @@ impl Server {
     /// Why it cannot be sent: [`NotifyError::Pending`] while the previous
     /// one waits for its confirmation.
     #[inline]
-    pub fn indicate(
+    pub const fn indicate(
         &mut self,
         characteristic: Char,
         data: &[u8],
         level: Sec,
         out: &mut [u8; MTU],
     ) -> Result<usize, NotifyError> {
-        let subscribed = characteristic.cccd().is_some_and(|index| self.subscriptions.indicating(index));
+        let subscribed = characteristic.cccd().is_some_and(const |index| self.subscriptions.indicating(index));
         check_notify(characteristic, PROP_INDICATE, subscribed, data, level)?;
         if self.indicating {
             return Err(NotifyError::Pending);
@@ -336,14 +351,14 @@ impl Server {
     ///
     /// Why it cannot be sent.
     #[inline]
-    pub fn notify(
+    pub const fn notify(
         &self,
         characteristic: Char,
         data: &[u8],
         level: Sec,
         out: &mut [u8; MTU],
     ) -> Result<usize, NotifyError> {
-        let subscribed = characteristic.cccd().is_some_and(|index| self.subscriptions.notifying(index));
+        let subscribed = characteristic.cccd().is_some_and(const |index| self.subscriptions.notifying(index));
         check_notify(characteristic, PROP_NOTIFY, subscribed, data, level)?;
         Ok(handle_value(out, NOTIFICATION, characteristic.handle(), data))
     }
@@ -482,7 +497,7 @@ impl Server {
     /// for it yet: that ordering is still to be done, with the 30 s timer
     /// of the confirmation.
     #[inline]
-    pub fn service_changed(&mut self, level: Sec, out: &mut [u8; MTU]) -> Option<usize> {
+    pub const fn service_changed(&mut self, level: Sec, out: &mut [u8; MTU]) -> Option<usize> {
         let characteristic = self.db.service_changed()?;
         if !self.subscriptions.is_written(characteristic.cccd()?) {
             return None;

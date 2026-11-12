@@ -39,7 +39,6 @@ pub const CID_SECURITY_MANAGER: u16 = 0x0006;
 
 /// A fixed channel the host serves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Channel {
     /// The attribute protocol, CID 4.
@@ -124,6 +123,19 @@ impl Channel {
             _ => None,
         }
     }
+
+    /// The name of the channel, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Att => defmt::intern!("Att"),
+            Self::SecurityManager => defmt::intern!("SecurityManager"),
+            Self::Signalling => defmt::intern!("Signalling"),
+        }
+    }
 }
 
 impl Fragment {
@@ -155,7 +167,7 @@ impl Reassembly {
     /// a PDU and whether it was received `encrypted`. Returns the PDU it
     /// completes, if any, on a channel the host serves.
     #[inline]
-    pub fn push(&mut self, start: bool, encrypted: bool, data: &[u8]) -> Option<Pdu<'_>> {
+    pub const fn push(&mut self, start: bool, encrypted: bool, data: &[u8]) -> Option<Pdu<'_>> {
         if start {
             // A new start drops a PDU that is still incomplete.
             self.active = true;
@@ -172,7 +184,7 @@ impl Reassembly {
         target.copy_from_slice(data);
         self.len = end;
         self.encrypted &= encrypted;
-        let &[len0, len1, cid0, cid1] = self.buffer.first_chunk::<HEADER_LEN>().filter(|_| end >= HEADER_LEN)?;
+        let &[len0, len1, cid0, cid1] = self.buffer.first_chunk::<HEADER_LEN>().filter(const |_| end >= HEADER_LEN)?;
         let expected = HEADER_LEN.saturating_add(usize::from(le16([len0, len1])));
         if expected > RX_MAX || end > expected {
             // Longer than the buffer, or than the header announces.
@@ -190,7 +202,7 @@ impl Reassembly {
 
     /// Takes a fragment the link layer received, as [`Self::push`].
     #[inline]
-    pub fn push_acl(&mut self, acl: &AclIn) -> Option<Pdu<'_>> {
+    pub const fn push_acl(&mut self, acl: &AclIn) -> Option<Pdu<'_>> {
         self.push(acl.start(), acl.encrypted(), acl.payload())
     }
 }

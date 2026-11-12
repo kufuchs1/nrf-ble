@@ -20,7 +20,7 @@ use super::{
     engine::{Config, Unclaimed},
     example,
     gatt::{AttError, Handler, ValueId},
-    identity::{DeviceSecret, LocalIdentity, Variant},
+    identity::{self, DeviceSecret, Variant},
     l2cap::{CID_ATT, CID_SECURITY_MANAGER, CID_SIGNALLING, Channel, Reassembly},
     smp::tests::{CENTRAL_ADDRESS, CENTRAL_IDENTITY, CENTRAL_IRK, Central, Device, linux_request, local_rpa, pdu},
     test_aes::Software,
@@ -369,13 +369,13 @@ fn host(unclaimed: Unclaimed) -> Host<MockLink> {
 }
 
 /// Our identity in generation `generation`.
-fn identity(generation: u8) -> LocalIdentity {
-    LocalIdentity::derive(&Software, &DeviceSecret::new([0x11; 16], [0x22; 16]), Variant::new(0, generation))
+fn identity(generation: u8) -> identity::Local {
+    identity::Local::derive(&Software, &DeviceSecret::new([0x11; 16], [0x22; 16]), Variant::new(0, generation))
 }
 
 /// A bond with the central of the SMP tests, made under `identity`, with
 /// the battery's and the keyboard's notifications on.
-fn bond(identity: &LocalIdentity) -> Bond {
+fn bond(identity: &identity::Local) -> Bond {
     let mut bond =
         Bond::new(Peer::new(CENTRAL_IDENTITY, false), Some(CENTRAL_IRK), [0x5C; 16], identity.variant(), &example::DB);
     bond.cccd = 0b0101;
@@ -1839,4 +1839,36 @@ fn a_just_works_key_stays_unauthenticated_when_a_passkey_pairing_starts_on_its_l
 #[should_panic(expected = "authenticated attributes")]
 fn a_table_with_authenticated_attributes_needs_passkey_entry() {
     let _host = Host::new(MockLink::new(), &keyboard::DB, Config::new(None, Unclaimed::Keep));
+}
+
+/// The host's futures over the link layer are [`Send`], so a firmware's
+/// tasks that await them pass Clippy's `future_not_send`: the port is
+/// [`Sync`], the application [`Sync`], the AES and random source [`Send`].
+/// The futures are only built, never polled.
+#[test]
+fn the_host_s_futures_over_the_link_layer_are_send() {
+    /// Takes a future that is [`Send`].
+    fn send<F: Future + Send>(_future: F) {}
+    /// Takes an async function whose future is [`Send`].
+    fn send_fn<A, F: Future + Send>(_function: fn(A) -> F) {}
+    /// Takes an async method with two arguments whose future is [`Send`].
+    fn send_fn3<A, B, C, F: Future + Send>(_function: fn(A, B, C) -> F) {}
+    static SHARED: link::Shared = link::Shared::new();
+    static HOST: Host<link::Link<'static>> =
+        Host::new(link::Link::new(&SHARED), &example::DB, Config::new(Some(example::PARAMS), Unclaimed::Keep));
+    let mut run_device = Device(1);
+    let mut crypto_device = Device(2);
+    send(HOST.run(&App, &mut run_device));
+    send(HOST.crypto(&mut crypto_device, || {}));
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    send(HOST.advertise(&advertising, &identity));
+    let next: fn(&'static super::Conn<'static, link::Link<'static>>) -> _ = super::Conn::next;
+    send_fn(next);
+    let notify: fn(&'static super::Conn<'static, link::Link<'static>>, super::gatt::Char, &'static [u8]) -> _ =
+        super::Conn::notify;
+    send_fn3(notify);
+    let update: fn(&'static super::Battery, &'static super::Conn<'static, link::Link<'static>>, u8) -> _ =
+        super::Battery::update;
+    send_fn3(update);
 }

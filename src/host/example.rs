@@ -206,7 +206,7 @@ pub const CONFIG: Config = Config::new(Some(PARAMS), Unclaimed::Keep);
 
 /// The advertising in `mode`: [`CONTENT`] with `tx_power`, on [`PAIRING`] or
 /// [`RECONNECT`].
-pub fn advertising(mode: Mode<'_>, tx_power: Option<i8>) -> Result<Advertising<'_>, Overflow> {
+pub const fn advertising(mode: Mode<'_>, tx_power: Option<i8>) -> Result<Advertising<'_>, Overflow> {
     let schedule = match mode {
         Mode::Pairing => &PAIRING,
         Mode::Reconnect(_) => &RECONNECT,

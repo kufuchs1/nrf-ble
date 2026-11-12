@@ -256,6 +256,8 @@ pub const DYNAMIC_MAX: usize = 22;
 /// The Bluetooth base UUID with a zero 16-bit part, least significant octet
 /// first.
 const BASE_UUID: [u8; 16] = [0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0, 0, 0, 0];
+/// The characteristic UUID of a HID report.
+const REPORT: u16 = 0x2A4D;
 
 /// Who may read and write an attribute: `None` for nobody, otherwise the
 /// security the request needs.
@@ -285,7 +287,6 @@ pub struct Attr {
 /// A characteristic of the table, as the application names it to notify or
 /// indicate its value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct Char {
     /// Index of its client characteristic configuration bits.
@@ -308,6 +309,9 @@ pub struct Db {
     cccds:           u8,
     /// The layout hash, the value of the Database Hash characteristic.
     hash:            [u8; 16],
+    /// The client characteristic configuration descriptors of the input
+    /// reports that notify, one bit for each index ([`input_reports`]).
+    input_reports:   u16,
     /// The Service Changed characteristic, if the table has one.
     service_changed: Option<Char>,
 }
@@ -329,8 +333,8 @@ pub enum Kind {
 }
 
 /// The security of a link, or the security an attribute needs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy, Debug, Eq)]
+#[derive_const(PartialEq)]
 #[non_exhaustive]
 pub enum Sec {
     /// Encrypted with a key from authenticated pairing (with protection
@@ -346,7 +350,6 @@ pub enum Sec {
 /// descriptor (notify and indicate), and which of them the client wrote on
 /// this link.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct Subscriptions {
     /// Two bits for each descriptor, descriptor 0 in the lowest.
@@ -388,13 +391,11 @@ pub enum Value {
 
 /// Names a dynamic value for [`Handler`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct ValueId(u8);
 
 /// An ATT error code, as an Error Response carries it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct AttError(u8);
 
@@ -628,10 +629,10 @@ impl Db {
     /// table.
     #[inline]
     #[must_use = "the handle is only computed"]
-    pub fn group_end(&self, handle: u16) -> u16 {
+    pub const fn group_end(&self, handle: u16) -> u16 {
         let mut end = handle;
         while let Some(attr) = self.attr(end.saturating_add(1)) {
-            if attr.kind == Kind::Service || end == u16::MAX {
+            if matches!(attr.kind, Kind::Service) || end == u16::MAX {
                 break;
             }
             end = end.saturating_add(1);
@@ -643,6 +644,14 @@ impl Db {
     #[inline]
     #[must_use = "the hash is only read"]
     pub const fn hash(&self) -> [u8; 16] { self.hash }
+
+    /// The client characteristic configuration descriptors of the input
+    /// reports that notify, one bit for each index: the HID reports
+    /// (0x2A4D) with the notify property, as `BlueZ` subscribes to each of
+    /// them. [`Self::new`] finds them at compile time.
+    #[inline]
+    #[must_use = "the bits are only read"]
+    pub(crate) const fn input_reports(&self) -> u16 { self.input_reports }
 
     /// The handle of the last attribute: the number of attributes, which
     /// [`Self::new`] checked to fit a handle.
@@ -688,7 +697,13 @@ impl Db {
     pub const fn new(attrs: &'static [Attr]) -> Self {
         assert!(attrs.len() < 0xFFFF, "the table has more attributes than handles");
         let cccds = check(attrs);
-        Self { attrs, cccds, hash: hash::layout(attrs), service_changed: find_service_changed(attrs) }
+        Self {
+            attrs,
+            cccds,
+            hash: hash::layout(attrs),
+            input_reports: input_reports(attrs),
+            service_changed: find_service_changed(attrs),
+        }
     }
 
     /// The Service Changed characteristic, if the table has one.
@@ -702,6 +717,19 @@ impl Sec {
     #[inline]
     #[must_use = "the comparison is only computed"]
     pub const fn met_by(self, level: Self) -> bool { level.rank() >= self.rank() }
+
+    /// The name of the level, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Authenticated => defmt::intern!("Authenticated"),
+            Self::Encrypted => defmt::intern!("Encrypted"),
+            Self::Open => defmt::intern!("Open"),
+        }
+    }
 
     /// Rank of the level: open below encrypted below authenticated.
     const fn rank(self) -> u8 {
@@ -820,7 +848,7 @@ impl Uuid {
     /// Writes the UUID as ATT carries it into the start of `out` and
     /// returns its length, or 0 if `out` is too short.
     #[inline]
-    pub fn write(&self, out: &mut [u8]) -> usize {
+    pub const fn write(&self, out: &mut [u8]) -> usize {
         match *self {
             Self::U16(short) => copy(out, &le16_bytes(short)),
             Self::U128(long) => copy(out, long),
@@ -923,8 +951,8 @@ const fn needs_authentication(kind: Kind) -> bool {
 
 /// Copies `source` into the start of `out` and returns its length, or 0 if
 /// `out` is too short.
-fn copy(out: &mut [u8], source: &[u8]) -> usize {
-    out.get_mut(..source.len()).map_or(0, |target| {
+const fn copy(out: &mut [u8], source: &[u8]) -> usize {
+    out.get_mut(..source.len()).map_or(0, const |target| {
         target.copy_from_slice(source);
         source.len()
     })
@@ -952,6 +980,29 @@ const fn find_service_changed(attrs: &'static [Attr]) -> Option<Char> {
         handle = handle.saturating_add(1);
     }
     None
+}
+
+/// The client characteristic configuration descriptors of the input reports
+/// of `attrs` that notify, one bit for each index: the HID reports (0x2A4D)
+/// with the notify property, as `BlueZ` subscribes to each of them.
+const fn input_reports(attrs: &[Attr]) -> u16 {
+    let mut inputs: u16 = 0;
+    let mut report = false;
+    let mut rest = attrs;
+    while let Some((attr, tail)) = rest.split_first() {
+        match (attr.kind, attr.value) {
+            (Kind::Characteristic(props), _) => {
+                report = matches!(attr.uuid, Uuid::U16(REPORT)) && props & PROP_NOTIFY != 0;
+            },
+            (Kind::Service, _) => report = false,
+            (Kind::Descriptor(_), Value::Cccd(index)) if report => {
+                inputs |= u16::checked_shl(1, u32::from(index)).unwrap_or(0);
+            },
+            _ => {},
+        }
+        rest = tail;
+    }
+    inputs
 }
 
 /// The attribute at `index` of `attrs`.

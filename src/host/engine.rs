@@ -119,8 +119,8 @@ use crate::{
         NotifyError,
         att::{MTU, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
         bond::Bond,
-        gatt::{CCCD_MAX, Char, Db, Handler, Kind, PROP_NOTIFY, Sec, Uuid, Value},
-        identity::{LocalIdentity, Variant},
+        gatt::{CCCD_MAX, Char, Db, Handler, Sec},
+        identity::{self, Variant},
         l2cap::{Channel, Fragment, RX_MAX, Reassembly, Segmenter},
         signal::{self, Action, Signalling},
         smp::{self, Job, JobResult, Outcome, Random, Reason, Responder},
@@ -183,8 +183,6 @@ const EV_KEY_MISSING: Flags = 0x100;
 /// Event flag: Passkey Entry asks for the passkey.
 #[cfg(feature = "passkey")]
 const EV_PASSKEY: Flags = 0x200;
-/// The characteristic UUID of a HID report.
-const REPORT: u16 = 0x2A4D;
 /// What the user typed for Passkey Entry when they gave up: out of the
 /// range of passkeys, as [`smp::NO_PASSKEY`] is.
 #[cfg(feature = "passkey")]
@@ -350,7 +348,8 @@ enum Inputs {
 }
 
 /// Which key the host gave the link layer for the link.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq)]
+#[derive_const(PartialEq)]
 enum Key {
     /// The bond's.
     Bond,
@@ -425,13 +424,26 @@ enum Source {
 /// What happens to a link that arrives while no advertising call waits for
 /// one, because the call's future was dropped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Unclaimed {
     /// It ends at once with [`REMOTE_USER`].
     Disconnect,
     /// The next advertising call returns it without advertising.
     Keep,
+}
+
+impl Unclaimed {
+    /// The name of the choice, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Disconnect => defmt::intern!("Disconnect"),
+            Self::Keep => defmt::intern!("Keep"),
+        }
+    }
 }
 
 impl Config {
@@ -482,7 +494,7 @@ impl Engine {
     /// never waits for one; the call waits for it before it advertises
     /// ([`Self::has_key_pair`]).
     #[inline]
-    pub fn advertise(&mut self, pairable: bool, identity: &LocalIdentity, bond: Option<Bond>, security: Duration) {
+    pub fn advertise(&mut self, pairable: bool, identity: &identity::Local, bond: Option<Bond>, security: Duration) {
         self.smp.set_pairable(pairable);
         self.smp.set_identity(identity.irk(), identity.address());
         self.variant = identity.variant();
@@ -535,9 +547,9 @@ impl Engine {
     /// that of a Passkey Entry pairing, as it was when the key went to the
     /// link layer, or the bond's, if its pairing was.
     #[cfg(feature = "passkey")]
-    fn authenticated(&self) -> bool {
-        match self.link.as_ref().and_then(|link| link.key) {
-            Some(Key::Bond) => self.bond.as_ref().is_some_and(|bond| bond.authenticated),
+    const fn authenticated(&self) -> bool {
+        match self.link.as_ref().and_then(const |link| link.key) {
+            Some(Key::Bond) => self.bond.as_ref().is_some_and(const |bond| bond.authenticated),
             Some(Key::Passkey) => true,
             Some(Key::Pairing) | None => false,
         }
@@ -550,7 +562,7 @@ impl Engine {
 
     /// The key the bond gives the link layer's request with `ediv` and
     /// `rand`: only EDIV 0 and Rand 0, and only for the bonded central.
-    fn bond_key(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
+    const fn bond_key(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
         let bond = self.bond.as_ref()?;
         let info = &self.link.as_ref()?.info;
         let bonded = info.identity == Some(bond.peer) || info.peer == bond.peer;
@@ -560,9 +572,11 @@ impl Engine {
     /// Returns the link that arrived for the advertising call that waits, or
     /// for a call that was dropped, once; never one that is ending.
     #[inline]
-    pub fn claim(&mut self) -> Option<Epoch> {
-        let link =
-            self.link.as_mut().filter(|link| !link.fate.claimed && !link.fate.closing && link.ending.is_none())?;
+    pub const fn claim(&mut self) -> Option<Epoch> {
+        let link = self
+            .link
+            .as_mut()
+            .filter(const |link| !link.fate.claimed && !link.fate.closing && link.ending.is_none())?;
         link.fate.claimed = true;
         Some(link.info.epoch)
     }
@@ -704,7 +718,7 @@ impl Engine {
     /// The link, if one exists.
     #[inline]
     #[must_use = "the link is only read"]
-    pub fn epoch(&self) -> Option<Epoch> { self.link.as_ref().map(|link| link.info.epoch) }
+    pub const fn epoch(&self) -> Option<Epoch> { self.link.as_ref().map(const |link| link.info.epoch) }
 
     /// Notes that the fragment [`Self::next_fragment`] gave was queued by the
     /// link layer, at `now`.
@@ -801,7 +815,7 @@ impl Engine {
     /// input report of the table that notifies; false for a table without
     /// one.
     fn inputs_written(&self) -> bool {
-        let inputs = input_reports(self.db);
+        let inputs = self.db.input_reports();
         let subscriptions = self.att.subscriptions();
         inputs != 0 && (0..CCCD_MAX).all(|index| (inputs >> index) & 1 == 0 || subscriptions.is_written(index))
     }
@@ -1151,7 +1165,7 @@ impl Engine {
     /// `level`, raised to authenticated if the key of the link is one of
     /// authenticated pairing.
     #[cfg(feature = "passkey")]
-    fn raised(&self, level: Sec) -> Sec {
+    const fn raised(&self, level: Sec) -> Sec {
         if level == Sec::Encrypted && self.authenticated() { Sec::Authenticated } else { level }
     }
 
@@ -1187,7 +1201,7 @@ impl Engine {
 
     /// Restores the bond's subscriptions, once the link is encrypted with
     /// the bond's key.
-    fn restore(&mut self) {
+    const fn restore(&mut self) {
         let Some(link) = self.link.as_mut() else { return };
         if link.discovery.restored || link.key != Some(Key::Bond) {
             return;
@@ -1355,8 +1369,8 @@ impl Engine {
     /// Puts the live subscriptions into the bond, if the link is encrypted
     /// with its key and they changed. A bond not yet reported carries them
     /// in [`ConnEvent::Bonded`].
-    fn update_bond(&mut self) {
-        let Some(link) = self.link.as_ref().filter(|link| link.key == Some(Key::Bond)) else { return };
+    const fn update_bond(&mut self) {
+        let Some(link) = self.link.as_ref().filter(const |link| link.key == Some(Key::Bond)) else { return };
         let bits = self.att.subscriptions().bits();
         if let Some(bond) = self.bond.as_mut()
             && bond.cccd != bits
@@ -1389,25 +1403,6 @@ impl Source {
             Self::Smp => Channel::SecurityManager,
         }
     }
-}
-
-/// The client characteristic configuration descriptors of the input reports
-/// of `db` that notify, one bit for each index: the HID reports (0x2A4D) with
-/// the notify property, as `BlueZ` subscribes to each of them.
-fn input_reports(db: &Db) -> u16 {
-    let mut inputs: u16 = 0;
-    let mut report = false;
-    for attr in db.attrs() {
-        match (attr.kind(), attr.value_source()) {
-            (Kind::Characteristic(props), _) => report = attr.uuid() == Uuid::U16(REPORT) && props & PROP_NOTIFY != 0,
-            (Kind::Service, _) => report = false,
-            (Kind::Descriptor(_), Value::Cccd(index)) if report => {
-                inputs |= u16::checked_shl(1, u32::from(index)).unwrap_or(0);
-            },
-            _ => {},
-        }
-    }
-    inputs
 }
 
 /// Whether the connection parameters `params` are those of `range`.

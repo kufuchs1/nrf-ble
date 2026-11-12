@@ -24,7 +24,7 @@ impl UsedChannels {
     /// Builds the map from the 5-byte bit field of the link layer.
     #[inline]
     #[must_use = "the map is only built"]
-    pub fn new(bits: [u8; 5]) -> Self {
+    pub const fn new(bits: [u8; 5]) -> Self {
         let mut map = Self { count: 0, used: [0; 37] };
         for channel in 0..DATA_CHANNELS {
             if is_set(bits, channel) {
@@ -105,7 +105,7 @@ impl Hopping {
 
 /// The pseudo-random number of algorithm 2 for event `counter` (Core, Vol 6,
 /// Part B, 4.5.8.3.3).
-fn csa2_random(counter: u16, identifier: u16) -> u16 {
+const fn csa2_random(counter: u16, identifier: u16) -> u16 {
     let mut value = counter ^ identifier;
     for _ in 0..PERMUTATIONS {
         // The bits of each octet reversed, the octets in place.
@@ -115,9 +115,20 @@ fn csa2_random(counter: u16, identifier: u16) -> u16 {
     value ^ identifier
 }
 
+// Core, Vol 6, Part C, 3.1: with every channel used, events 1, 2 and 3 of
+// the access address 0x8E89BED6 (channel identifier 0x305F) are on channels
+// 20, 6 and 21.
+const _: () = assert!(
+    matches!(csa2_random(1, 0x305F).checked_rem(37), Some(20))
+        && matches!(csa2_random(2, 0x305F).checked_rem(37), Some(6))
+        && matches!(csa2_random(3, 0x305F).checked_rem(37), Some(21)),
+    "algorithm 2 departs from the specification's samples"
+);
+
 /// Whether a channel bit is set in a link layer channel map.
-fn is_set(bits: [u8; 5], channel: u8) -> bool {
-    bits.get(usize::from(channel >> 3)).is_some_and(|byte| byte & u8::wrapping_shl(1, u32::from(channel & 7)) != 0)
+const fn is_set(bits: [u8; 5], channel: u8) -> bool {
+    bits.get(usize::from(channel >> 3))
+        .is_some_and(const |&byte| byte & u8::wrapping_shl(1, u32::from(channel & 7)) != 0)
 }
 
 #[cfg(test)]

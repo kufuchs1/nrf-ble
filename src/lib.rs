@@ -4,8 +4,10 @@
 
 #![no_std]
 // Const trait implementations of the standard library, so that const
-// functions use the methods of Option, Result, Ord, From and TryFrom, `?`
-// and slice ranges like the rest of the code, instead of matches and casts.
+// functions use the methods of Option, Result, Ord, From and TryFrom, `?`,
+// slice ranges, `RangeInclusive::contains` for the range checks
+// (`const_range`) and `for` loops over ranges (`const_iter`) like the rest
+// of the code, instead of matches, casts and while loops.
 // Beside them: default values on struct fields (`default_field_values`), so
 // a starting value stands at its field and the constructor writes `..`;
 // `saturating_cast` and `truncate` (`integer_casts`,
@@ -20,7 +22,9 @@
     const_cmp,
     const_convert,
     const_index,
+    const_iter,
     const_option_ops,
+    const_range,
     const_result_trait_fn,
     const_trait_impl,
     const_try,
@@ -32,17 +36,6 @@
 )]
 // Rustdoc marks each item behind a Cargo feature with the feature it needs.
 #![cfg_attr(doc, feature(doc_cfg))]
-#![cfg_attr(
-    feature = "defmt",
-    expect(
-        clippy::missing_asserts_for_indexing,
-        reason = "raised inside the expansion of defmt's `derive(Format)`, on every type that derives it, by the \
-                  `DEFMT_LOG` filter of the `unreachable!` it puts into `format`; a hand-written `Format` with \
-                  `write!` instead leaves out the trait's hidden `_format_tag` and `_format_data`, which \
-                  `missing_trait_methods` refuses, and only defmt's hidden internals could write those; the lint \
-                  stays on in every build without defmt"
-    )
-)]
 
 #[cfg(all(feature = "nrf52832", feature = "nrf51"))]
 compile_error!(

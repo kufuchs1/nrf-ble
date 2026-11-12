@@ -209,6 +209,9 @@ const PREPARE_AGAIN_US: u32 = 200;
 /// start, so a crystal that comes up more than about 100 us after the
 /// restart leaves the data for the next event.
 const PREPARE_LATE_US: u32 = 200;
+// A crystal up to 70 us late still leaves the time.
+const _: () =
+    assert!(SETUP_US >= PREPARE_LATE_US.saturating_add(70), "a crystal up to 70 us late no longer leaves the time");
 /// Highest transmit power in dBm.
 const MAX_POWER_DBM: i8 = LEVELS_DBM.last().copied().unwrap_or(0);
 /// Acceptable power reduction when no packet has been measured yet.
@@ -620,7 +623,8 @@ struct Queued {
 }
 
 /// Kind of the PDU being sent.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq)]
+#[derive_const(PartialEq)]
 enum TxKind {
     /// The last fragment of ACL data from the host.
     Acl,
@@ -896,7 +900,7 @@ impl Connection {
     /// What an acknowledgement of our PDU completes, after the answer: the
     /// host's packet, a termination or a length response, and the hold of
     /// the latency after a payload.
-    fn after_ack(&mut self, acked: Acked) {
+    const fn after_ack(&mut self, acked: Acked) {
         self.stats.acked = self.stats.acked.wrapping_add(1);
         if acked.kind != TxKind::Empty {
             self.stats.acked_data = self.stats.acked_data.wrapping_add(1);
@@ -989,9 +993,9 @@ impl Connection {
 
     /// Tells a central that supports power control about a change of the
     /// own transmit power.
-    fn announce_power(&mut self) {
+    const fn announce_power(&mut self) {
         let level = for_phy_mut(&mut self.power, self.tx_phy).level();
-        let supports = self.central_features.is_some_and(|[_, _, _, _, power, ..]| power & 0x02 != 0);
+        let supports = self.central_features.is_some_and(const |[_, _, _, _, power, ..]| power & 0x02 != 0);
         let free = self.encryption.phase == Phase::Idle && self.queue.is_empty();
         if level == *for_phy_mut(&mut self.announced_power, self.tx_phy)
             || !supports
@@ -1509,22 +1513,22 @@ impl Connection {
 
     /// Determines timeouts without allowing received traffic to postpone a
     /// pending local disconnect or the initial connection establishment.
-    fn ended(&self, now: u32) -> Option<Ended> {
+    const fn ended(&self, now: u32) -> Option<Ended> {
         if let Some(reason) = self.abort {
             return Some(Ended::Error(reason));
         }
-        if self.procedure_deadline.is_some_and(|deadline| reached(now, deadline)) {
+        if self.procedure_deadline.is_some_and(const |deadline| reached(now, deadline)) {
             return Some(Ended::Error(ERROR_RESPONSE_TIMEOUT));
         }
         if let Some((reason, acknowledged)) = self.terminate
-            && (acknowledged || self.terminate_deadline.is_some_and(|deadline| reached(now, deadline)))
+            && (acknowledged || self.terminate_deadline.is_some_and(const |deadline| reached(now, deadline)))
         {
             return Some(Ended::Local(reason));
         }
         if let Some(reason) = self.terminated {
             return Some(Ended::Terminated(reason));
         }
-        if self.establishment_deadline.is_some_and(|deadline| reached(now, deadline)) {
+        if self.establishment_deadline.is_some_and(const |deadline| reached(now, deadline)) {
             return Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH));
         }
         if reached(now, self.last_valid.wrapping_add(self.timeout)) {
@@ -1673,7 +1677,7 @@ impl Connection {
 
     /// Updates the encryption phases and the anchor after an exchange whose
     /// access address arrived at `address`.
-    fn exchanged(&mut self, address: u32) {
+    const fn exchanged(&mut self, address: u32) {
         if self.encryption.phase == Phase::Starting
             && self.tx_kind == TxKind::Control
             && self.current().plain.0.get(DATA_HEADER_LEN) == Some(&OP_START_ENC_REQ)
@@ -2174,10 +2178,10 @@ impl Connection {
     /// Holds the peripheral latency off until [`LATENCY_HOLD_US`] or
     /// [`LATENCY_HOLD_EVENTS`] intervals after `time`, whichever is later,
     /// unless it is held longer already.
-    fn hold_latency_from(&mut self, time: u32) {
+    const fn hold_latency_from(&mut self, time: u32) {
         let span = LATENCY_HOLD_US.max(self.interval.saturating_mul(LATENCY_HOLD_EVENTS));
         let until = time.wrapping_add(span);
-        if self.hold_until.is_none_or(|current| reached(until, current)) {
+        if self.hold_until.is_none_or(const |current| reached(until, current)) {
             self.hold_until = Some(until);
         }
     }
@@ -3193,7 +3197,7 @@ const fn queue_lead(crystal_lead: u32) -> u32 {
 }
 
 /// Parses the parameters of a connection update.
-fn parse_update(bytes: &[u8]) -> Option<Update> {
+const fn parse_update(bytes: &[u8]) -> Option<Update> {
     let [win_size, offset0, offset1, interval0, interval1, latency0, latency1, timeout0, timeout1, instant0, instant1] =
         field::<11>(bytes, 0)?;
     let params =
@@ -3279,7 +3283,7 @@ const fn limit_flags(level: usize) -> u8 {
 
 /// Whether a connection parameter request or response has parameters within
 /// the specification: an interval range, latency and supervision timeout.
-fn valid_request(params: &[u8]) -> bool {
+const fn valid_request(params: &[u8]) -> bool {
     let Some([min0, min1, max0, max1, latency0, latency1, timeout0, timeout1]) = field::<8>(params, 0) else {
         return false;
     };

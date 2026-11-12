@@ -60,13 +60,7 @@ pub struct DeviceSecret {
 /// Our identity for one [`Variant`]: the static random address and the
 /// identity resolving key. The key is overwritten when it is dropped.
 #[derive(Clone, Eq, PartialEq)]
-#[expect(
-    clippy::module_name_repetitions,
-    reason = "until the firmwares switch: the three import it by this name from this module, and a re-export \
-              or alias under the old name raises `pub_use` or this lint again; the way out is a rename to \
-              `identity::Local` (or a move to `host`) together with their imports"
-)]
-pub struct LocalIdentity {
+pub struct Local {
     /// The static random address, least significant octet first.
     address: [u8; 6],
     /// The identity resolving key, least significant octet first.
@@ -78,7 +72,6 @@ pub struct LocalIdentity {
 /// Which identity the device takes: a slot in the low octet and a generation
 /// in the high one.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Variant(u16);
 
 impl DeviceSecret {
@@ -122,7 +115,7 @@ impl Drop for DeviceSecret {
     }
 }
 
-impl LocalIdentity {
+impl Local {
     /// The static random address, least significant octet first, for
     /// [`crate::link::Link::set_identity`] and the Identity Address
     /// Information PDU.
@@ -169,7 +162,7 @@ impl LocalIdentity {
     pub const fn variant(&self) -> Variant { self.variant }
 }
 
-impl Drop for LocalIdentity {
+impl Drop for Local {
     #[inline]
     fn drop(&mut self) { wipe(&mut self.irk); }
 }

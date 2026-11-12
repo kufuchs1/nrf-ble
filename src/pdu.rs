@@ -18,6 +18,16 @@ pub const ADV_PAYLOAD_MAX: usize = 255;
 pub const BUFFER_LEN: usize = HEADER_LEN + 1 + chip::PAYLOAD_MAX;
 /// Length of a PDU header.
 pub const HEADER_LEN: usize = 2;
+
+// A packet buffer takes, as the radio's DMA writes it, the longest payload
+// the untrusted length field can announce, 31 octets with the nRF51's five
+// bits and 255 with the nRF52832's eight, and a legacy advertising PDU of up
+// to 37 octets.
+const _: () = {
+    let length_field_max: usize = if cfg!(feature = "nrf51") { 31 } else { 255 };
+    assert!(BUFFER_LEN >= length_field_max.saturating_add(3), "the largest length field overruns a packet buffer");
+    assert!(BUFFER_LEN >= HEADER_LEN.saturating_add(37), "a legacy advertising PDU overruns a packet buffer");
+};
 /// Header bit marking the receiver address as random.
 const RX_ADD_RANDOM: u8 = 0x80;
 /// Header bit marking the sender address as random.
@@ -97,7 +107,8 @@ impl Llid {
 }
 
 /// A device address with its type.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq)]
+#[derive_const(PartialEq)]
 #[non_exhaustive]
 pub struct Peer {
     /// The address, least significant octet first.
@@ -282,7 +293,7 @@ pub(crate) fn valid_channel_map(map: [u8; 5]) -> bool {
 }
 
 /// Validates timing both when connecting and when updating an existing link.
-pub(crate) fn valid_connection_parameters(
+pub(crate) const fn valid_connection_parameters(
     interval: u16,
     latency: u16,
     timeout: u16,
@@ -323,7 +334,7 @@ fn valid_access_address(address: u32) -> bool {
 /// The scanner of a received scan request to `advertiser`, if it is one.
 #[inline]
 #[must_use = "the request is only checked"]
-pub fn scan_request(pdu: &[u8], advertiser: Peer) -> Option<Peer> {
+pub const fn scan_request(pdu: &[u8], advertiser: Peer) -> Option<Peer> {
     let (Some([header, len]), Some(scanner), Some(target)) =
         (field::<2>(pdu, 0), field::<ADDRESS_LEN>(pdu, 2), field::<ADDRESS_LEN>(pdu, 8))
     else {
@@ -332,7 +343,7 @@ pub fn scan_request(pdu: &[u8], advertiser: Peer) -> Option<Peer> {
     (header & PDU_TYPE_MASK == SCAN_REQ
         && len == SCAN_REQ_LEN
         && Peer::new(target, header & RX_ADD_RANDOM != 0) == advertiser)
-        .then(|| Peer::new(scanner, header & TX_ADD_RANDOM != 0))
+        .then(const || Peer::new(scanner, header & TX_ADD_RANDOM != 0))
 }
 
 /// Whether an advertising channel PDU header is that of a scan request,
@@ -344,7 +355,7 @@ pub const fn is_scan_request(header: u8) -> bool { header & PDU_TYPE_MASK == SCA
 /// `N` bytes of `bytes` from `offset`, if present.
 #[inline]
 #[must_use = "the bytes are only copied"]
-pub fn field<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+pub const fn field<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     bytes.get(offset..).and_then(<[u8]>::first_chunk::<N>).copied()
 }
 
