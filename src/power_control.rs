@@ -26,6 +26,18 @@ use crate::chip;
 pub const LEVELS_DBM: [i8; chip::LEVELS_DBM.len()] = chip::LEVELS_DBM;
 /// Level at the start of a connection and for advertising: 0 dBm.
 pub const DEFAULT_LEVEL: usize = 5;
+
+// Every level is a setting of the radio's TXPOWER register, the levels
+// ascend, and the default is 0 dBm.
+const _: () = {
+    let mut rest = LEVELS_DBM.as_slice();
+    while let Some((&level, tail)) = rest.split_first() {
+        assert!(chip::txpower(level).to_bits().cast_signed() == level, "a level is not a radio setting");
+        assert!(tail.first().is_none_or(const |&next| next > level), "the levels do not ascend");
+        rest = tail;
+    }
+    assert!(matches!(LEVELS_DBM.get(DEFAULT_LEVEL), Some(&0)), "the default level is not 0 dBm");
+};
 /// Estimated signal at the central above which the power steps down.
 ///
 /// TODO(nRF51): the nRF51's RSSI is coarser than the nRF52832's, about
@@ -68,8 +80,8 @@ impl PowerControl {
     /// Received signal strength in dBm, averaged, once a packet arrived.
     #[inline]
     #[must_use = "the signal strength is only read"]
-    pub fn average_dbm(&self) -> Option<i32> {
-        self.average.map(|average| average.checked_div(SCALE).unwrap_or_default())
+    pub const fn average_dbm(&self) -> Option<i32> {
+        self.average.map(const |average| average.checked_div(SCALE).unwrap_or_default())
     }
 
     /// Steps the power down or up by one level from the average.
@@ -121,12 +133,12 @@ impl PowerControl {
     /// Takes the signal strength of a packet received with a valid CRC, in
     /// -dBm as the radio reports it.
     #[inline]
-    pub fn on_packet(&mut self, rssi: u8) {
+    pub const fn on_packet(&mut self, rssi: u8) {
         let sample = i32::from(rssi).saturating_mul(-SCALE);
-        self.average = Some(
-            self.average
-                .map_or(sample, |average| average.saturating_add(sample.saturating_sub(average) >> SMOOTHING_SHIFT)),
-        );
+        self.average =
+            Some(self.average.map_or(sample, const |average| {
+                average.saturating_add(sample.saturating_sub(average) >> SMOOTHING_SHIFT)
+            }));
         self.samples = self.samples.saturating_add(1);
         self.hold = self.hold.saturating_sub(1);
         if self.floor_left != 0 {
@@ -158,12 +170,8 @@ mod tests {
     }
 
     #[test]
-    fn every_level_is_a_radio_setting_and_the_default_is_0_dbm() {
-        assert_eq!(LEVELS_DBM[DEFAULT_LEVEL], 0);
-        assert!(LEVELS_DBM.is_sorted());
-        for level in LEVELS_DBM {
-            assert_eq!(chip::txpower(level).to_bits().cast_signed(), level);
-        }
+    fn only_the_nrf52832_has_3_dbm() {
+        // The rest of the table is checked at compile time, beside it.
         assert_eq!(LEVELS_DBM.contains(&3), cfg!(feature = "nrf52832"));
     }
 

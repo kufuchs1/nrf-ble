@@ -36,6 +36,14 @@ const IV_OFFSET: usize = 25;
 const PPI_CRYPT: usize = 25;
 /// Scratch space for every length the CCM may take from a packet.
 pub(crate) const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
+
+// The scratch space takes the longest key stream the CCM may generate, 27
+// octets on the nRF51 and as many as the untrusted eight-bit length field
+// announces on the nRF52832, after the 16 octets of the MIC and header.
+const _: () = {
+    let key_stream_max: usize = if cfg!(feature = "nrf51") { 27 } else { 255 };
+    assert!(SCRATCH_LEN >= key_stream_max.saturating_add(16), "the CCM's key stream overruns its scratch space");
+};
 /// The packet counter is 39 bits; the next bit belongs to the direction.
 pub(crate) const COUNTER_LIMIT: u64 = 1 << 39;
 
@@ -410,18 +418,6 @@ mod tests {
         assert_eq!(bytes, previous);
         assert!(!set_counter(&mut bytes, u64::MAX));
         assert_eq!(bytes, previous);
-    }
-
-    #[test]
-    fn ccm_dma_buffers_cover_the_untrusted_length_field() {
-        // An eight-bit length field on the nRF52832; on the nRF51 a five-bit
-        // one, and a CCM that encrypts at most 27 octets.
-        let (length_max, key_stream_max) =
-            if cfg!(feature = "nrf51") { (31, 27) } else { (usize::from(u8::MAX), usize::from(u8::MAX)) };
-        assert!(SCRATCH_LEN >= 16 + key_stream_max);
-        assert!(crate::pdu::BUFFER_LEN >= 3 + length_max);
-        // Legacy advertising PDUs carry up to 37 octets.
-        assert!(crate::pdu::BUFFER_LEN >= crate::pdu::HEADER_LEN + 37);
     }
 
     #[test]

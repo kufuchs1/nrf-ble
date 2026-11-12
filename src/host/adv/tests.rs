@@ -104,8 +104,8 @@ impl Control for Recorder {
 }
 
 /// Our identity in generation `generation`.
-fn identity(generation: u8) -> LocalIdentity {
-    LocalIdentity::derive(&Software, &DeviceSecret::new([1; 16], [2; 16]), Variant::new(0, generation))
+fn identity(generation: u8) -> identity::Local {
+    identity::Local::derive(&Software, &DeviceSecret::new([1; 16], [2; 16]), Variant::new(0, generation))
 }
 
 /// A bond with [`CENTRAL`] under our identity of generation 1, with the

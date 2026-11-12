@@ -286,7 +286,6 @@ pub struct Identity {
 /// Our IO capability, as the Pairing Response gives it.
 #[cfg(feature = "passkey")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum IoCapability {
     /// A keyboard without a display (0x02): Passkey Entry with any central
@@ -376,7 +375,6 @@ pub struct Output {
 
 /// A reason of a Pairing Failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct Reason(u8);
 
@@ -472,7 +470,6 @@ pub struct Responder {
 /// What our side of pairing can protect against, and what it requires.
 #[cfg(feature = "passkey")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct Security {
     /// Our IO capability.
@@ -484,7 +481,8 @@ pub struct Security {
 }
 
 /// Where a pairing stands.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq)]
+#[derive_const(PartialEq)]
 enum State {
     /// Nb is queued: waiting for the central's `DHKey` check and the
     /// Diffie-Hellman key, whichever is still missing; with whether the
@@ -838,11 +836,11 @@ impl Responder {
     }
 
     /// Takes the central's identity resolving key.
-    fn identity_information(&mut self, params: &[u8], encrypted: bool) -> Result<Option<Outcome>, Reason> {
+    const fn identity_information(&mut self, params: &[u8], encrypted: bool) -> Result<Option<Outcome>, Reason> {
         if !self.takes_keys(encrypted) || self.received != 0 {
             return Err(Reason::UNSPECIFIED);
         }
-        self.peer_irk = params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?;
+        self.peer_irk = params.try_into().map_err(const |_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?;
         self.received = ID_INFO;
         Ok(None)
     }
@@ -1213,11 +1211,11 @@ impl Responder {
     }
 
     /// Takes the central's nonce.
-    fn random(&mut self, params: &[u8]) -> Result<Option<Outcome>, Reason> {
+    const fn random(&mut self, params: &[u8]) -> Result<Option<Outcome>, Reason> {
         if self.state != State::Random || self.queued(OUT_PUBLIC_KEY | OUT_CONFIRM) {
             return Err(Reason::UNSPECIFIED);
         }
-        self.na = reversed(params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+        self.na = reversed(params.try_into().map_err(const |_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?);
         self.pending |= OUT_RANDOM;
         self.state = State::Check(false);
         Ok(None)
@@ -1385,6 +1383,19 @@ impl IoCapability {
             Self::NoInputNoOutput => NO_INPUT_NO_OUTPUT,
         }
     }
+
+    /// The name of the IO capability, for a defmt log line (`{=istr}`):
+    /// interned, so the string stays in the `.defmt` section, which takes no
+    /// flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::KeyboardOnly => defmt::intern!("KeyboardOnly"),
+            Self::NoInputNoOutput => defmt::intern!("NoInputNoOutput"),
+        }
+    }
 }
 
 #[cfg(feature = "passkey")]
@@ -1439,7 +1450,7 @@ pub(crate) fn forget(passkey: &mut u32, blank: u32) {
 }
 
 /// `value` in the other byte order.
-fn reversed<const N: usize>(value: &[u8; N]) -> [u8; N] {
+const fn reversed<const N: usize>(value: &[u8; N]) -> [u8; N] {
     let mut out = *value;
     out.reverse();
     out

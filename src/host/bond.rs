@@ -95,7 +95,7 @@ impl Bond {
     /// identity address that is not static.
     #[inline]
     #[must_use = "the bond is only decoded"]
-    pub fn from_bytes(bytes: &[u8; BOND_LEN]) -> Option<Self> {
+    pub const fn from_bytes(bytes: &[u8; BOND_LEN]) -> Option<Self> {
         let (&[version, flags], after_flags) = bytes.split_first_chunk::<2>()?;
         let (&address, after_address) = after_flags.split_first_chunk::<6>()?;
         let (&irk_octets, after_irk) = after_address.split_first_chunk::<16>()?;
@@ -155,9 +155,9 @@ impl Bond {
     /// descriptors, which a bond of an older table may hold, are left out.
     #[inline]
     #[must_use = "the subscriptions are only built"]
-    pub fn subscriptions(&self, db: &Db) -> Subscriptions {
+    pub const fn subscriptions(&self, db: &Db) -> Subscriptions {
         let bits = u32::from(db.cccds()).saturating_mul(2);
-        let mask = u32::checked_shl(1, bits).map_or(u32::MAX, |bit| bit.wrapping_sub(1));
+        let mask = u32::checked_shl(1, bits).map_or(u32::MAX, const |bit| bit.wrapping_sub(1));
         Subscriptions::from_bits(self.cccd & mask)
     }
 
@@ -208,8 +208,8 @@ impl Drop for Bond {
 
 /// Whether `peer` can be an identity address: a public address, or a static
 /// random one (two most significant bits set), and not zero.
-fn is_identity(peer: Peer) -> bool {
-    peer.address != [0; 6] && (!peer.random || peer.address.last().is_some_and(|&top| top & 0xC0 == 0xC0))
+const fn is_identity(peer: Peer) -> bool {
+    peer.address != [0; 6] && (!peer.random || peer.address.last().is_some_and(const |&top| top & 0xC0 == 0xC0))
 }
 
 /// The layout a bond with `db` keeps: the first four octets of its hash,

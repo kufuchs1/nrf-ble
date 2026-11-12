@@ -37,8 +37,8 @@ impl Handler for App {
 fn at(millis: u64) -> Instant { Instant::from_millis(millis) }
 
 /// Our identity.
-fn identity() -> LocalIdentity {
-    LocalIdentity::derive(&Software, &DeviceSecret::new([0x11; 16], [0x22; 16]), Variant::new(0, 1))
+fn identity() -> identity::Local {
+    identity::Local::derive(&Software, &DeviceSecret::new([0x11; 16], [0x22; 16]), Variant::new(0, 1))
 }
 
 /// The information of a link from `peer`, resolved to `identity`.
@@ -166,7 +166,7 @@ fn the_parameter_request_leaves_the_last_place_to_responses() {
 fn pair(
     engine: &mut Engine,
     device: &mut Device,
-    identity: &LocalIdentity,
+    identity: &identity::Local,
     peer: Peer,
     central_id: bool,
 ) -> (Epoch, [u8; 16]) {
@@ -267,5 +267,5 @@ fn an_all_zero_key_from_the_central_is_no_key() {
 fn the_input_reports_are_the_notifying_hid_reports() {
     // The keyboard's, the consumer control's and the mouse's
     // configuration, not the battery's.
-    assert_eq!(input_reports(&example::DB), 0b1110);
+    assert_eq!(example::DB.input_reports(), 0b1110);
 }

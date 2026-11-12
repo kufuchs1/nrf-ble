@@ -1931,8 +1931,8 @@ fn host_data_queued_while_the_crystal_starts_goes_out_where_the_chip_has_the_tim
     // The nRF52832 prepares it once TIMER0 restarted; the nRF51 leaves it
     // for the next event until its setup time is measured.
     assert_eq!(chip::PREPARE_AFTER_RESTART, cfg!(feature = "nrf52832"));
-    // A crystal up to 70 us late still leaves the time.
-    assert!(SETUP_US - PREPARE_LATE_US >= 70);
+    // That a crystal up to 70 us late still leaves the time is checked at
+    // compile time, beside PREPARE_LATE_US.
     let shared = Shared::new();
     shared.set_connected(true);
     let packet = [1_u8, 2, 3];

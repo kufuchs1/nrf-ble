@@ -74,7 +74,6 @@ const DOUBLINGS: u8 = 4;
 
 /// Why a public key is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum KeyError {
     /// The key is the debug public key or its negation, whose private key
@@ -87,6 +86,21 @@ pub enum KeyError {
     /// The key is our own public key or its negation, which a central only
     /// sends to reflect our own values back to us.
     Own,
+}
+
+impl KeyError {
+    /// The name of the error, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Debug => defmt::intern!("Debug"),
+            Self::Invalid => defmt::intern!("Invalid"),
+            Self::Own => defmt::intern!("Own"),
+        }
+    }
 }
 
 /// Our key pair for one pairing: the private key and the public key it

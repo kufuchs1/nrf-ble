@@ -118,7 +118,7 @@
 //!         adv::Mode,
 //!         bond::{BOND_LEN, Bond},
 //!         gatt::{AttError, Handler, ValueId},
-//!         identity::{DeviceSecret, LocalIdentity, Variant},
+//!         identity::{self, DeviceSecret, Variant},
 //!     },
 //!     link::{Link, Shared},
 //! };
@@ -261,7 +261,7 @@
 //!             },
 //!         };
 //!         let mode = bond.as_ref().map_or(Mode::Pairing, Mode::Reconnect);
-//!         let identity = LocalIdentity::derive(&Hardware::default(), &secret, variant);
+//!         let identity = identity::Local::derive(&Hardware::default(), &secret, variant);
 //!         let Ok(advertising) = my_device::advertising(mode) else { return };
 //!         let Ok(conn) = HOST.advertise(&advertising, &identity).await else {
 //!             wait_for_key_press().await;
@@ -338,7 +338,6 @@ use crate::{
         bond::Bond,
         engine::{Command, Engine},
         gatt::{AttError, Char, Db, Handler, Sec},
-        identity::LocalIdentity,
         smp::{Random, Reason},
     },
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Link, Rx},
@@ -438,7 +437,6 @@ pub enum ConnEvent {
 /// Why [`Engine::request_params`] sent no request.
 #[cfg(feature = "param-requests")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum RequestError {
     /// A request waits for its response, or for its place in the link
@@ -452,9 +450,24 @@ pub enum RequestError {
     Invalid,
 }
 
+#[cfg(feature = "param-requests")]
+impl RequestError {
+    /// The name of the error, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Busy => defmt::intern!("Busy"),
+            Self::Gone => defmt::intern!("Gone"),
+            Self::Invalid => defmt::intern!("Invalid"),
+        }
+    }
+}
+
 /// Why a notification cannot be sent now, or at all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum NotifyError {
     /// No room now: a PDU of several fragments is being sent, the link layer
@@ -472,10 +485,26 @@ pub enum NotifyError {
     TooLong,
 }
 
+impl NotifyError {
+    /// The name of the error, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Busy => defmt::intern!("Busy"),
+            Self::Disconnected => defmt::intern!("Disconnected"),
+            Self::Insecure => defmt::intern!("Insecure"),
+            Self::NotSubscribed => defmt::intern!("NotSubscribed"),
+            Self::TooLong => defmt::intern!("TooLong"),
+        }
+    }
+}
+
 /// Why a passkey was not taken.
 #[cfg(feature = "passkey")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum PasskeyError {
     /// The link ended, or is ending.
@@ -485,6 +514,22 @@ pub enum PasskeyError {
     /// No pairing waits for a passkey: none asked for one, it was given
     /// already, or the pairing ended.
     NotWaiting,
+}
+
+#[cfg(feature = "passkey")]
+impl PasskeyError {
+    /// The name of the error, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Gone => defmt::intern!("Gone"),
+            Self::Invalid => defmt::intern!("Invalid"),
+            Self::NotWaiting => defmt::intern!("NotWaiting"),
+        }
+    }
 }
 
 /// AES-128 encryption of one block, the only block cipher the host needs: the
@@ -556,7 +601,6 @@ pub trait Port: Control + Sync {
 
 /// Why [`Host::advertise`] returned without a link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum AdvertiseError {
     /// A link exists, which an earlier call returned.
@@ -565,6 +609,30 @@ pub enum AdvertiseError {
     Setup(adv::Error),
     /// Every phase of the schedule ran without a connection.
     Timeout,
+}
+
+impl AdvertiseError {
+    /// The name of the error, with the setup error it carries, for a defmt log
+    /// line (`{=istr}`): interned, so the string stays in the `.defmt` section,
+    /// which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Connected => defmt::intern!("Connected"),
+            Self::Setup(adv::Error::Link(link::Error::Disallowed)) => defmt::intern!("Setup(Link(Disallowed))"),
+            Self::Setup(adv::Error::Link(link::Error::Full)) => defmt::intern!("Setup(Link(Full))"),
+            Self::Setup(adv::Error::Link(link::Error::Gone)) => defmt::intern!("Setup(Link(Gone))"),
+            Self::Setup(adv::Error::Link(link::Error::Invalid)) => defmt::intern!("Setup(Link(Invalid))"),
+            Self::Setup(adv::Error::Link(link::Error::Unsupported)) => defmt::intern!("Setup(Link(Unsupported))"),
+            Self::Setup(adv::Error::Link(link::Error::UnsupportedRemote)) => {
+                defmt::intern!("Setup(Link(UnsupportedRemote))")
+            },
+            Self::Setup(adv::Error::WrongIdentity) => defmt::intern!("Setup(WrongIdentity)"),
+            Self::Timeout => defmt::intern!("Timeout"),
+        }
+    }
 }
 
 /// A value the table reads through the [`Handler`] and the host notifies,
@@ -676,7 +744,7 @@ impl fmt::Debug for ConnEvent {
     }
 }
 
-impl From<AttNotifyError> for NotifyError {
+const impl From<AttNotifyError> for NotifyError {
     #[inline]
     fn from(error: AttNotifyError) -> Self {
         match error {
@@ -916,7 +984,7 @@ where
     pub async fn advertise(
         &self,
         advertising: &Advertising<'_>,
-        identity: &LocalIdentity,
+        identity: &identity::Local,
     ) -> Result<Conn<'_, P>, AdvertiseError> {
         loop {
             let before = self.with(|state| {

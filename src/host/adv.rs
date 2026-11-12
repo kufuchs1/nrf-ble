@@ -63,7 +63,10 @@
 //! with its [`Content`]. A remote for instance advertises at 20 ms for 3 s,
 //! so a central that waits connects at once, then at 50 ms for 12 s and at
 //! 400 ms for 45 s, one minute in all, and gives 60 s to pair and 20 s for
-//! the bonded central to encrypt, which it does at once:
+//! the bonded central to encrypt, which it does at once. [`Content::data`]
+//! and [`Advertising::new`] are const, so the data can also be built in a
+//! const item, where a name or service list that does not fit fails the
+//! build instead of returning [`Overflow`]:
 //!
 //! ```
 //! use embassy_time::Duration;
@@ -71,6 +74,7 @@
 //!     Advertising,
 //!     BATTERY_SERVICE,
 //!     Content,
+//!     Data,
 //!     HID_SERVICE,
 //!     Mode,
 //!     Overflow,
@@ -91,6 +95,12 @@
 //! /// The name, a keyboard's appearance, the HID and Battery services.
 //! const CONTENT: Content<'static> =
 //!     Content::new(b"My Remote", 0x03C1, &[HID_SERVICE, BATTERY_SERVICE]);
+//! /// The pairing mode's advertising and scan response data, built at
+//! /// compile time.
+//! const PAIRING_DATA: (Data, Data) = match CONTENT.data(true) {
+//!     Ok(data) => data,
+//!     Err(_) => panic!("the content does not fit"),
+//! };
 //!
 //! /// The advertising of `mode`.
 //! fn advertising(mode: Mode<'_>) -> Result<Advertising<'_>, Overflow> {
@@ -101,6 +111,7 @@
 //! let pairing = advertising(Mode::Pairing).unwrap();
 //! assert_eq!(pairing.scan().as_bytes(), b"");
 //! assert_eq!(&pairing.data().as_bytes()[13..], b"\x0A\x09My Remote");
+//! assert_eq!(pairing.data().as_bytes(), PAIRING_DATA.0.as_bytes());
 //! ```
 //!
 //! # The advertising call
@@ -115,7 +126,7 @@
 use crate::{
     advertiser::legacy::{self, Kind},
     bytes::le16_bytes,
-    host::{bond::Bond, identity::LocalIdentity},
+    host::{bond::Bond, identity},
     link::{self, AdvParams, Link},
     pdu::Peer,
 };
@@ -207,7 +218,6 @@ pub struct Data {
 
 /// Why advertising could not be set up or started.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
     /// The link layer refused a call.
@@ -215,6 +225,26 @@ pub enum Error {
     /// The bond of [`Mode::Reconnect`] was made under another identity than
     /// the one given: the central would not know our address.
     WrongIdentity,
+}
+
+impl Error {
+    /// The name of the error, with the link layer's error it carries, for a
+    /// defmt log line (`{=istr}`): interned, so the string stays in the
+    /// `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::Link(link::Error::Disallowed) => defmt::intern!("Link(Disallowed)"),
+            Self::Link(link::Error::Full) => defmt::intern!("Link(Full)"),
+            Self::Link(link::Error::Gone) => defmt::intern!("Link(Gone)"),
+            Self::Link(link::Error::Invalid) => defmt::intern!("Link(Invalid)"),
+            Self::Link(link::Error::Unsupported) => defmt::intern!("Link(Unsupported)"),
+            Self::Link(link::Error::UnsupportedRemote) => defmt::intern!("Link(UnsupportedRemote)"),
+            Self::WrongIdentity => defmt::intern!("WrongIdentity"),
+        }
+    }
 }
 
 /// How the device advertises.
@@ -229,11 +259,23 @@ pub enum Mode<'bond> {
 
 /// Why an AD structure was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Overflow {
     /// It does not fit in the [`DATA_MAX`] octets.
     TooLong,
+}
+
+impl Overflow {
+    /// The name of the error, for a defmt log line (`{=istr}`): interned,
+    /// so the string stays in the `.defmt` section, which takes no flash.
+    #[cfg(feature = "defmt")]
+    #[inline]
+    #[must_use = "the name is only read"]
+    pub fn name(self) -> defmt::Str {
+        match self {
+            Self::TooLong => defmt::intern!("TooLong"),
+        }
+    }
 }
 
 /// One phase of advertising: its interval and how long it lasts, and with
@@ -337,7 +379,7 @@ impl<'bond> Advertising<'bond> {
     /// [`Error::WrongIdentity`] if the bond was made under another variant
     /// than `identity`'s, [`Error::Link`] if the link layer refused a call.
     #[inline]
-    pub fn configure<C>(&self, control: &C, identity: &LocalIdentity) -> Result<(), Error>
+    pub fn configure<C>(&self, control: &C, identity: &identity::Local) -> Result<(), Error>
     where
         C: Control,
     {
@@ -390,7 +432,7 @@ impl<'bond> Advertising<'bond> {
     ///
     /// [`Overflow`] if the content does not fit.
     #[inline]
-    pub fn new(mode: Mode<'bond>, schedule: &'static Schedule, content: &Content<'_>) -> Result<Self, Overflow> {
+    pub const fn new(mode: Mode<'bond>, schedule: &'static Schedule, content: &Content<'_>) -> Result<Self, Overflow> {
         let (data, scan) = content.data(mode.discoverable())?;
         Ok(Self { data, mode, scan, schedule })
     }
@@ -440,7 +482,7 @@ impl<'name> Content<'name> {
     /// [`Overflow`] if a structure does not fit, or not even one character
     /// of the name.
     #[inline]
-    pub fn data(&self, discoverable: bool) -> Result<(Data, Data), Overflow> {
+    pub const fn data(&self, discoverable: bool) -> Result<(Data, Data), Overflow> {
         let flags = if discoverable { LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED } else { BR_EDR_NOT_SUPPORTED };
         let mut adv = Data::new();
         adv.flags(flags)?.services(self.services)?.appearance(self.appearance)?;
@@ -521,16 +563,16 @@ impl Data {
     ///
     /// [`Overflow`] if not even one character fits.
     #[inline]
-    pub fn name_fitting(&mut self, name: &[u8]) -> Result<bool, Overflow> {
+    pub const fn name_fitting(&mut self, name: &[u8]) -> Result<bool, Overflow> {
         if self.name(name).is_ok() {
             return Ok(false);
         }
         let mut room = self.room().saturating_sub(2).min(name.len());
-        while name.get(room).is_some_and(|&octet| octet & 0xC0 == 0x80) {
+        while name.get(room).is_some_and(const |&octet| octet & 0xC0 == 0x80) {
             room = room.saturating_sub(1);
         }
         match name.get(..room) {
-            Some(short) if !short.is_empty() => self.short_name(short).map(|_| true),
+            Some(short) if !short.is_empty() => self.short_name(short).map(const |_| true),
             _ => Err(Overflow::TooLong),
         }
     }
@@ -568,12 +610,15 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn services(&mut self, uuids: &[u16]) -> Result<&mut Self, Overflow> {
+    pub const fn services(&mut self, uuids: &[u16]) -> Result<&mut Self, Overflow> {
         let mut list = [0; DATA_MAX];
         let octets = uuids.len().saturating_mul(2);
         let target = list.get_mut(..octets).ok_or(Overflow::TooLong)?;
-        for (chunk, uuid) in target.as_chunks_mut::<2>().0.iter_mut().zip(uuids) {
-            *chunk = le16_bytes(*uuid);
+        let (chunks, _) = target.as_chunks_mut::<2>();
+        let mut index = 0;
+        while let (Some(chunk), Some(&uuid)) = (chunks.get_mut(index), uuids.get(index)) {
+            *chunk = le16_bytes(uuid);
+            index = index.saturating_add(1);
         }
         self.push(AD_SERVICES_16, target)
     }
@@ -602,7 +647,7 @@ impl Default for Data {
     fn default() -> Self { Self::new() }
 }
 
-impl From<link::Error> for Error {
+const impl From<link::Error> for Error {
     #[inline]
     fn from(error: link::Error) -> Self { Self::Link(error) }
 }

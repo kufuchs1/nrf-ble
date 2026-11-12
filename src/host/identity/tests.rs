@@ -38,7 +38,7 @@ fn ficr_words_are_taken_least_significant_octet_first() {
 #[test]
 fn the_identity_is_the_roots_encrypting_the_variant() {
     let variant = Variant::new(0, 1);
-    let identity = LocalIdentity::derive(&Software, &secret(), variant);
+    let identity = Local::derive(&Software, &secret(), variant);
     let block = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut address = *Software.encrypt(secret().er, block).first_chunk::<6>().unwrap();
     address[5] |= 0xC0;
@@ -60,7 +60,7 @@ const PINNED_IRK: [u8; 16] =
 fn the_derivation_is_pinned() {
     // The values of the scheme for these roots: a change here changes every
     // device's address and orphans its bonds.
-    let identity = LocalIdentity::derive(&Software, &secret(), Variant::new(0, 1));
+    let identity = Local::derive(&Software, &secret(), Variant::new(0, 1));
     assert_eq!(identity.address(), PINNED_ADDRESS);
     assert_eq!(identity.irk(), PINNED_IRK);
 }
@@ -71,7 +71,7 @@ fn every_variant_gives_a_static_random_identity_of_its_own() {
     let mut seen = [([0; 6], [0; 16]); 64];
     for (index, entry) in seen.iter_mut().enumerate() {
         let index = u8::try_from(index).unwrap();
-        let identity = LocalIdentity::derive(&Software, &secret, Variant::new(index % 4, index / 4));
+        let identity = Local::derive(&Software, &secret, Variant::new(index % 4, index / 4));
         assert_eq!(identity.address()[5] & 0xC0, 0xC0);
         assert_ne!(identity.irk(), [0; 16]);
         *entry = (identity.address(), identity.irk());
@@ -84,12 +84,12 @@ fn every_variant_gives_a_static_random_identity_of_its_own() {
 #[test]
 fn a_new_pairing_gives_a_new_identity() {
     let secret = secret();
-    let first = LocalIdentity::derive(&Software, &secret, Variant::new(0, 0));
-    let second = LocalIdentity::derive(&Software, &secret, Variant::new(0, 0).next_generation());
+    let first = Local::derive(&Software, &secret, Variant::new(0, 0));
+    let second = Local::derive(&Software, &secret, Variant::new(0, 0).next_generation());
     assert_ne!(first.address(), second.address());
     assert_ne!(first.irk(), second.irk());
     // The same variant gives the same identity again.
-    assert!(first == LocalIdentity::derive(&Software, &secret, Variant::new(0, 0)));
+    assert!(first == Local::derive(&Software, &secret, Variant::new(0, 0)));
 }
 
 #[test]

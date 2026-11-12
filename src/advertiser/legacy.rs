@@ -34,7 +34,8 @@ pub const RESOLVING_LIST_SIZE: usize = 2;
 static LATE_SCAN_DECISIONS: AtomicU32 = AtomicU32::new(0);
 
 /// Advertising type.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq)]
+#[derive_const(PartialEq)]
 #[non_exhaustive]
 pub enum Kind {
     /// Connectable and scannable undirected.
