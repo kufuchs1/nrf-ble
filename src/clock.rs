@@ -875,11 +875,11 @@ fn passed(tick: u32) -> bool {
 fn rtc_now() -> u32 { RTC.counter().read().counter() }
 
 /// Microseconds of `ticks` RTC ticks, 15625/512 us each.
-fn ticks_to_us(ticks: u32) -> u32 {
+const fn ticks_to_us(ticks: u32) -> u32 {
     u32::try_from(u64::from(ticks).saturating_mul(15_625) >> 9_u32).unwrap_or(u32::MAX)
 }
 
 /// Whole RTC ticks in `us` microseconds.
-fn us_to_ticks(us: u32) -> u32 {
+const fn us_to_ticks(us: u32) -> u32 {
     u32::try_from(u64::from(us).wrapping_shl(9).checked_div(15_625).unwrap_or(0)).unwrap_or(u32::MAX)
 }

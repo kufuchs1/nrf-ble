@@ -127,7 +127,7 @@ impl Fragment {
     /// The payload for the link layer.
     #[inline]
     #[must_use = "the payload is only read"]
-    pub fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// Whether it starts the PDU, for [`crate::link::Link::try_send`].
     #[inline]
@@ -201,7 +201,7 @@ impl Segmenter {
     /// Marks the fragment [`Self::fragment`] gave as queued, so the next
     /// call gives the one after it.
     #[inline]
-    pub fn advance(&mut self) {
+    pub const fn advance(&mut self) {
         let total = self.total();
         self.offset = self.offset.saturating_add(fragment_len(total, self.offset)).min(total);
     }
@@ -250,7 +250,7 @@ impl Segmenter {
     /// does not fit the 16-bit length field.
     #[inline]
     #[must_use = "the segmenter is only built"]
-    pub fn new(channel: Channel, payload_len: usize) -> Option<Self> {
+    pub const fn new(channel: Channel, payload_len: usize) -> Option<Self> {
         let len = u16::try_from(payload_len.saturating_add(HEADER_LEN)).ok()?.checked_sub(4)?;
         Some(Self { channel, len, offset: 0 })
     }
@@ -263,9 +263,6 @@ impl Segmenter {
 /// Length of the fragment of a PDU of `total` octets that starts at
 /// `offset`.
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "27 fits a u16")]
-const fn fragment_len(total: u16, offset: u16) -> u16 {
-    let left = total.saturating_sub(offset);
-    if left > FRAGMENT_MAX as u16 { FRAGMENT_MAX as u16 } else { left }
-}
+const fn fragment_len(total: u16, offset: u16) -> u16 { total.saturating_sub(offset).min(FRAGMENT_MAX as u16) }
 
 #[cfg(test)] mod tests;

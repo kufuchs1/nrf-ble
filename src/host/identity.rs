@@ -216,7 +216,7 @@ impl Variant {
 /// A static random address from six random octets, least significant first
 /// (Core, Vol 6, Part B, 1.3.2.1): the two most significant bits set, and the
 /// rest neither all zeros nor all ones, which flips the lowest bit.
-fn static_random(mut octets: [u8; 6]) -> [u8; 6] {
+const fn static_random(mut octets: [u8; 6]) -> [u8; 6] {
     let mut random = octets;
     if let Some(top) = random.last_mut() {
         *top &= 0x3F;

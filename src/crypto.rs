@@ -143,7 +143,7 @@ pub unsafe fn seal(
 /// A CCM configuration for one direction.
 #[inline]
 #[must_use = "the configuration is only built"]
-pub fn config(key: [u8; 16], iv: [u8; 8], central_to_peripheral: bool) -> [u8; CONFIG_LEN] {
+pub const fn config(key: [u8; 16], iv: [u8; 8], central_to_peripheral: bool) -> [u8; CONFIG_LEN] {
     let mut config = [0_u8; CONFIG_LEN];
     if let Some(target) = config.get_mut(..16) {
         target.copy_from_slice(&key);
@@ -240,7 +240,7 @@ where
 /// Sets the packet counter of a configuration.
 #[inline]
 #[must_use = "counter exhaustion must end the connection before a nonce is reused"]
-pub fn set_counter(config: &mut [u8; CONFIG_LEN], counter: u64) -> bool {
+pub const fn set_counter(config: &mut [u8; CONFIG_LEN], counter: u64) -> bool {
     if counter >= COUNTER_LIMIT {
         return false;
     }

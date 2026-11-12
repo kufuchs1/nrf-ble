@@ -392,6 +392,12 @@ costs about 1.5 KB more static RAM, which on the nRF52832 comes out of the stack
 central's data length request with the 27-octet default. The host's `param-requests`, `key-missing` and `passkey` are
 described in [Optional features](#optional-features); they work on both chips.
 
+The crate needs a nightly toolchain, which its [`rust-toolchain.toml`](rust-toolchain.toml) names, and so does a
+firmware that uses it: [`src/lib.rs`](src/lib.rs) enables the unstable const trait implementations of the standard
+library (`const_trait_impl`, `const_cmp`, `const_option_ops`, `const_try` and their kin), so that its `const fn`s use
+the methods of `Option`, `Result`, `Ord` and `TryFrom` and `?` instead of matches and casts. A nightly that renames or
+changes one of those features breaks the build until the list there follows it.
+
 The crate follows the main branch of every dependency (the default branch, master, where a repository has none), and
 commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
 `Cargo.lock` keeps them until `cargo update`. Its own dependencies name their git source and branch, not a version: with

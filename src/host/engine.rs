@@ -836,12 +836,7 @@ impl Engine {
     /// Whether a link exists that an advertising call returned.
     #[inline]
     #[must_use = "the state is only read"]
-    pub const fn has_claimed_link(&self) -> bool {
-        match self.link.as_ref() {
-            Some(link) => link.claimed,
-            None => false,
-        }
-    }
+    pub const fn has_claimed_link(&self) -> bool { self.link.as_ref().is_some_and(const |link| link.claimed) }
 
     /// Whether a job waits for the crypto task.
     #[inline]
@@ -1051,7 +1046,7 @@ impl Engine {
     /// go out ([`Config::notify_depth`]), at least one.
     #[inline]
     #[must_use = "the depth is only read"]
-    pub fn notify_depth(&self) -> usize { usize::from(self.config.notify_depth.max(1)) }
+    pub const fn notify_depth(&self) -> usize { usize::from(self.config.notify_depth.max(1)) }
 
     /// Takes a fragment the link layer received, at `now`, with `crypto` for
     /// the security manager and `app` for the dynamic values.

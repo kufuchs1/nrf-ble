@@ -71,7 +71,7 @@ impl PowerControl {
     pub fn average_dbm(&self) -> Option<i32> { self.average.map(|average| average.checked_div(SCALE).unwrap_or(0_i32)) }
 
     /// Steps the power down or up by one level from the average.
-    fn decide(&mut self) {
+    const fn decide(&mut self) {
         let Some(average) = self.average else { return };
         let own = i32::from(LEVELS_DBM.get(self.level).copied().unwrap_or_default());
         let at_central = own.saturating_add(average.checked_div(SCALE).unwrap_or(0_i32));
@@ -110,7 +110,7 @@ impl PowerControl {
 
     /// Takes a packet of ours that the central did not acknowledge.
     #[inline]
-    pub fn on_loss(&mut self) {
+    pub const fn on_loss(&mut self) {
         self.level = self.level.saturating_add(1).min(LEVELS_DBM.len().saturating_sub(1));
         self.samples = 0;
         self.hold = HOLD_AFTER_LOSS;

@@ -609,7 +609,7 @@ impl Output {
     /// The PDU for the security manager channel.
     #[inline]
     #[must_use = "the PDU is only read"]
-    pub fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// A PDU with `code` and the parameters `parts` in order.
     fn new(code: u8, parts: &[&[u8]]) -> Self {
@@ -944,7 +944,7 @@ impl Responder {
     /// `None`, and the bond's key is the engine's to give.
     #[inline]
     #[must_use = "the key is only read"]
-    pub fn ltk_request(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
+    pub const fn ltk_request(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
         (ediv == 0 && rand == [0; 8] && matches!(self.state, State::Encryption | State::Keys)).then_some(self.ltk)
     }
 
@@ -1174,7 +1174,7 @@ impl Responder {
     /// The Z of f4 in `round` of Passkey Entry: 0x80 with the passkey's bit
     /// of the round, the least significant in round 0.
     #[cfg(feature = "passkey")]
-    fn passkey_bit(&self, round: u8) -> u8 {
+    const fn passkey_bit(&self, round: u8) -> u8 {
         let passkey = if self.passkey == NO_PASSKEY { 0 } else { self.passkey };
         let bit = passkey.checked_shr(u32::from(round)).unwrap_or_default() & 1;
         0x80 | u8::from(bit != 0)

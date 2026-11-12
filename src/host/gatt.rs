@@ -433,8 +433,8 @@ impl Access {
     #[must_use = "the access is only built"]
     pub const fn from_props(props: u8, sec: Sec) -> Self {
         Self {
-            read:  if props & PROP_READ == 0 { None } else { Some(sec) },
-            write: if props & (PROP_WRITE | PROP_WRITE_WITHOUT_RESPONSE) == 0 { None } else { Some(sec) },
+            read:  (props & PROP_READ != 0).then_some(sec),
+            write: (props & (PROP_WRITE | PROP_WRITE_WITHOUT_RESPONSE) != 0).then_some(sec),
         }
     }
 }
@@ -615,12 +615,9 @@ impl Db {
     /// If no characteristic is declared at `handle`.
     #[inline]
     #[must_use = "the characteristic is only looked up"]
-    #[expect(clippy::panic, reason = "only evaluated while compiling the table")]
+    #[expect(clippy::expect_used, reason = "only evaluated while compiling the table")]
     pub const fn characteristic(&self, handle: u16) -> Char {
-        match char_at(self.attrs, handle) {
-            Some(characteristic) => characteristic,
-            None => panic!("no characteristic is declared at this handle"),
-        }
+        char_at(self.attrs, handle).expect("no characteristic is declared at this handle")
     }
 
     /// The end handle of the service declared at `handle`: the handle
@@ -728,12 +725,14 @@ impl Subscriptions {
     /// Whether the client asked for indications on the descriptor `index`.
     #[inline]
     #[must_use = "the bit is only read"]
-    pub fn indicating(self, index: u8) -> bool { self.value(index) & CCC_INDICATE != 0 }
+    pub const fn indicating(self, index: u8) -> bool { self.value(index) & CCC_INDICATE != 0 }
 
     /// Whether the client wrote the descriptor `index` on this link.
     #[inline]
     #[must_use = "the bit is only read"]
-    pub fn is_written(self, index: u8) -> bool { self.written.checked_shr(u32::from(index)).unwrap_or(0) & 1 != 0 }
+    pub const fn is_written(self, index: u8) -> bool {
+        self.written.checked_shr(u32::from(index)).unwrap_or(0) & 1 != 0
+    }
 
     /// No subscriptions.
     #[inline]
@@ -744,12 +743,12 @@ impl Subscriptions {
     /// `index`.
     #[inline]
     #[must_use = "the bit is only read"]
-    pub fn notifying(self, index: u8) -> bool { self.value(index) & CCC_NOTIFY != 0 }
+    pub const fn notifying(self, index: u8) -> bool { self.value(index) & CCC_NOTIFY != 0 }
 
     /// Stores the bits of `value` that `props` allow for the descriptor
     /// `index`, as written on this link.
     #[inline]
-    pub fn set(&mut self, index: u8, value: u16, props: u8) {
+    pub const fn set(&mut self, index: u8, value: u16, props: u8) {
         if index >= CCCD_MAX {
             return;
         }
@@ -770,7 +769,7 @@ impl Subscriptions {
     /// The value of the descriptor `index`, as a Read gives it.
     #[inline]
     #[must_use = "the value is only read"]
-    pub fn value(self, index: u8) -> u16 {
+    pub const fn value(self, index: u8) -> u16 {
         let bits = self.values.checked_shr(u32::from(index).saturating_mul(2)).unwrap_or(0) & 3;
         u16::try_from(bits).unwrap_or_default()
     }
@@ -782,7 +781,7 @@ impl Uuid {
     /// UUID matches too.
     #[inline]
     #[must_use = "the comparison is only computed"]
-    pub fn matches(&self, raw: &[u8]) -> bool {
+    pub const fn matches(&self, raw: &[u8]) -> bool {
         match (*self, raw.len()) {
             (Self::U16(short), 2) => raw == short.to_le_bytes(),
             (_, 16) => raw == self.to_u128(),
@@ -931,9 +930,8 @@ fn copy(out: &mut [u8], source: &[u8]) -> usize {
 
 /// The characteristic declared at `handle` of `attrs`, `None` if none is.
 const fn char_at(attrs: &'static [Attr], handle: u16) -> Option<Char> {
-    let (Some(declaration), Some(value)) = (nth(attrs, handle.wrapping_sub(1)), nth(attrs, handle)) else {
-        return None;
-    };
+    let declaration = nth(attrs, handle.wrapping_sub(1))?;
+    let value = nth(attrs, handle)?;
     let (Kind::Characteristic(props), Kind::Value(_, sec)) = (declaration.kind, value.kind) else { return None };
     let value_handle = handle.saturating_add(1);
     Some(Char { cccd: cccd_after(attrs, value_handle), handle: value_handle, props, sec })
@@ -955,12 +953,9 @@ const fn find_service_changed(attrs: &'static [Attr]) -> Option<Char> {
 }
 
 /// The attribute at `index` of `attrs`.
-#[expect(clippy::as_conversions, reason = "a u16 always fits a usize, and From is not const")]
 const fn nth(attrs: &'static [Attr], index: u16) -> Option<&'static Attr> {
-    match attrs.split_at_checked(index as usize) {
-        Some((_, rest)) => rest.first(),
-        None => None,
-    }
+    let (_, rest) = attrs.split_at_checked(usize::from(index))?;
+    rest.first()
 }
 
 /// The Peripheral Preferred Connection Parameters value of `range`:

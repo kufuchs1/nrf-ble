@@ -302,7 +302,8 @@ impl Stats {
 }
 
 /// State of the encryption start procedure.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq)]
+#[derive_const(PartialEq)]
 enum Phase {
     /// A validated request waits for its prefetched, single-use random block.
     AwaitingEntropy {
@@ -434,7 +435,7 @@ struct DataLength {
 
 impl DataLength {
     /// Effective transmit octets and time and receive octets and time.
-    fn effective(&self) -> [u16; 4] {
+    const fn effective(&self) -> [u16; 4] {
         let [default_octets, default_time] = LENGTH_DEFAULT;
         let [max_octets, max_time] = LENGTH_MAX;
         // A host that lowers its length takes effect at once: shorter packets
@@ -850,7 +851,7 @@ impl Connection {
     /// retransmission of the central acknowledges too (Core, Vol 6, Part B,
     /// 4.5.9). Returns what was acknowledged and whether the empty PDU stands
     /// in for more that waits.
-    fn ack_fast(&mut self, header: u8) -> (Option<Acked>, bool) {
+    const fn ack_fast(&mut self, header: u8) -> (Option<Acked>, bool) {
         if (header & NESN != 0) == self.sn {
             return (None, false);
         }
@@ -1071,7 +1072,7 @@ impl Connection {
     /// the previous CCM counter and must not be delivered or consume another
     /// nonce, as in the Core receive sequence and Zephyr. Returns whether it
     /// is a duplicate, or `None` if it ends the link.
-    fn classify(&mut self, header: u8, len: u8, mic_ok: bool, address: u32) -> Option<bool> {
+    const fn classify(&mut self, header: u8, len: u8, mic_ok: bool, address: u32) -> Option<bool> {
         let llid = header & LLID_MASK;
         let maximum = ACL_MAX.saturating_add(if self.encryption.rx_on { MIC_LEN } else { 0 });
         if llid == 0 || usize::from(len) > maximum || (len == 0 && llid != Llid::Continuation.bits()) {
@@ -1121,7 +1122,7 @@ impl Connection {
     /// Latest time an event that began at `anchor` may still exchange
     /// packets: the next event's receive window opens no earlier than one
     /// interval later, less its widening and setup.
-    fn close_by(&self, anchor: u32) -> u32 {
+    const fn close_by(&self, anchor: u32) -> u32 {
         anchor
             .wrapping_add(self.interval)
             .wrapping_sub(self.widening(self.interval))
@@ -1273,7 +1274,7 @@ impl Connection {
 
     /// Radio start of event `counter` on the current anchor: the start
     /// [`Self::window`] gives once the counter got there without a packet.
-    fn enable_at(&self, counter: u16) -> u32 {
+    const fn enable_at(&self, counter: u16) -> u32 {
         let expected =
             self.anchor.wrapping_add(self.interval.wrapping_mul(u32::from(counter.wrapping_sub(self.anchor_counter))));
         expected
@@ -1310,7 +1311,7 @@ impl Connection {
     }
 
     /// Queues a control PDU.
-    fn enqueue(&mut self, llid: Llid, payload: &[u8]) {
+    const fn enqueue(&mut self, llid: Llid, payload: &[u8]) {
         let mut data = [0_u8; CONTROL_PAYLOAD_MAX];
         let len = payload.len().min(CONTROL_PAYLOAD_MAX);
         if let (Some(target), Some(source)) = (data.get_mut(..len), payload.get(..len)) {
@@ -1480,7 +1481,7 @@ impl Connection {
 
     /// Access address time expected at the current event from the last
     /// anchor.
-    fn expected_anchor(&self) -> u32 {
+    const fn expected_anchor(&self) -> u32 {
         let events = u32::from(self.counter.wrapping_sub(self.anchor_counter));
         self.anchor.wrapping_add(self.interval.wrapping_mul(events))
     }
@@ -1503,7 +1504,7 @@ impl Connection {
     }
 
     /// Consumes one complete prefetched block; no hardware RNG work runs here.
-    fn finish_encryption_request(&mut self, rand: [u8; 8], ediv: [u8; 2], material: &entropy::Material) {
+    const fn finish_encryption_request(&mut self, rand: [u8; 8], ediv: [u8; 2], material: &entropy::Material) {
         let mut response = [0_u8; 13];
         if let Some(code) = response.first_mut() {
             *code = OP_ENC_RSP;
@@ -1525,7 +1526,7 @@ impl Connection {
     /// First event from `from` up to `last` whose radio start is after
     /// `time`, or `last`. Starts move by at most one interval per event, so
     /// the whole intervals in between are passed at once.
-    fn first_after(&self, from: u16, last: u16, time: u32) -> u16 {
+    const fn first_after(&self, from: u16, last: u16, time: u32) -> u16 {
         let span = last.wrapping_sub(from);
         let passed = time.wrapping_sub(self.enable_at(from));
         if !reached(time, self.enable_at(from)) {
@@ -2486,7 +2487,7 @@ impl Connection {
 
     /// Longest payload this side may send now: the effective octets, and as
     /// many as fit the effective time on the transmit PHY with the MIC.
-    fn tx_payload_max(&self) -> usize {
+    const fn tx_payload_max(&self) -> usize {
         let [octets, time, ..] = self.length.effective();
         let per_byte = 8_u32.checked_div(u32::from(self.tx_phy.hci())).unwrap_or(8);
         let mic = if self.encryption.tx_on { MIC_LEN } else { 0 };
@@ -2509,17 +2510,17 @@ impl Connection {
     /// at most half the interval less the interframe space (Core, Vol 6,
     /// Part B, 4.5.7), as Zephyr limits it: wider windows would overlap the
     /// neighbouring events.
-    fn widening(&self, elapsed: u32) -> u32 {
+    const fn widening(&self, elapsed: u32) -> u32 {
         let drift = u64::from(elapsed).saturating_mul(u64::from(self.sca_ppm)).div_ceil(1_000_000);
         let limit = (self.interval >> 1_u32).saturating_sub(T_IFS_US);
         u32::try_from(drift).unwrap_or(u32::MAX).saturating_add(WIDENING_FIXED_US).min(limit)
     }
 
     /// Radio start and access address deadline of the current event.
-    fn window(&self) -> (u32, u32) { self.window_at(self.counter) }
+    const fn window(&self) -> (u32, u32) { self.window_at(self.counter) }
 
     /// Radio start and access address deadline of event `counter`.
-    fn window_at(&self, counter: u16) -> (u32, u32) {
+    const fn window_at(&self, counter: u16) -> (u32, u32) {
         let (earliest, latest) = match self.expect {
             Expect::Anchor => {
                 let expected = self
@@ -2557,7 +2558,7 @@ const fn queue_lead(crystal_lead: u32) -> u32 {
     }
     let crystal = restart.saturating_add(crystal_lead);
     let wake = SETUP_US.saturating_add(PREPARE_AGAIN_US);
-    if crystal > wake { crystal } else { wake }
+    crystal.max(wake)
 }
 
 /// Parses the parameters of a connection update.
@@ -2616,7 +2617,7 @@ const fn for_phy_mut<Value>(values: &mut [Value; 2], phy: Phy) -> &mut Value {
 }
 
 /// Transmit power in dBm of power control level `level`.
-fn tx_power(level: usize) -> i8 { LEVELS_DBM.get(level).copied().unwrap_or_default() }
+const fn tx_power(level: usize) -> i8 { LEVELS_DBM.get(level).copied().unwrap_or_default() }
 
 /// Whether an instant is still ahead of the current event: the event at it
 /// is running already, and the specification counts a distance of 32767 or

@@ -124,7 +124,7 @@ impl<const N: usize> Advertisement<N> {
     /// The PDU bytes up to the end of the payload.
     #[inline]
     #[must_use = "the bytes are only borrowed"]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         let len = usize::from(self.bytes.get(1).copied().unwrap_or_default());
         self.bytes.get(..HEADER_LEN.saturating_add(len)).unwrap_or_default()
     }

@@ -435,7 +435,7 @@ impl AclIn {
     /// The payload.
     #[inline]
     #[must_use = "the payload is only read"]
-    pub fn payload(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn payload(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// Whether it starts an L2CAP message rather than continuing one.
     #[inline]
@@ -592,9 +592,9 @@ struct HostState {
 
 impl HostState {
     /// A private address is reusable only with the same key, before expiry.
-    fn cached_address(&self, key: [u8; 16], now: Instant) -> Option<Peer> {
+    const fn cached_address(&self, key: [u8; 16], now: Instant) -> Option<Peer> {
         let (address, made_with, expires) = self.private_address?;
-        (made_with == key && now < expires).then_some(address)
+        (made_with == key && now.as_ticks() < expires.as_ticks()).then_some(address)
     }
 
     /// The epoch if it names the current link.

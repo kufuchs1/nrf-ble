@@ -45,7 +45,7 @@ impl<Item: Copy, const N: usize> Ring<Item, N> {
     }
 
     /// Takes the first item off, if any.
-    pub(super) fn drop_front(&mut self) {
+    pub(super) const fn drop_front(&mut self) {
         if self.len != 0 {
             self.head = u8::try_from(self.index(1)).unwrap_or(0);
             self.len = self.len.saturating_sub(1);
@@ -53,10 +53,10 @@ impl<Item: Copy, const N: usize> Ring<Item, N> {
     }
 
     /// The first item.
-    pub(super) fn front(&self) -> Option<&Item> { self.get(0) }
+    pub(super) const fn front(&self) -> Option<&Item> { self.get(0) }
 
     /// The first item, to change in place.
-    pub(super) fn front_mut(&mut self) -> Option<&mut Item> {
+    pub(super) const fn front_mut(&mut self) -> Option<&mut Item> {
         if self.len == 0 {
             return None;
         }
@@ -64,7 +64,7 @@ impl<Item: Copy, const N: usize> Ring<Item, N> {
     }
 
     /// The item `offset` places after the first.
-    pub(super) fn get(&self, offset: usize) -> Option<&Item> {
+    pub(super) const fn get(&self, offset: usize) -> Option<&Item> {
         if offset >= usize::from(self.len) {
             return None;
         }
@@ -72,10 +72,12 @@ impl<Item: Copy, const N: usize> Ring<Item, N> {
     }
 
     /// Whether another item fits.
-    pub(super) fn has_room(&self) -> bool { usize::from(self.len) < N }
+    pub(super) const fn has_room(&self) -> bool { usize::from(self.len) < N }
 
     /// Storage index of the item `offset` places after the first.
-    fn index(&self, offset: usize) -> usize { usize::from(self.head).wrapping_add(offset).checked_rem(N).unwrap_or(0) }
+    const fn index(&self, offset: usize) -> usize {
+        usize::from(self.head).wrapping_add(offset).checked_rem(N).unwrap_or(0)
+    }
 
     /// Whether it holds no item.
     pub(super) const fn is_empty(&self) -> bool { self.len == 0 }
@@ -84,20 +86,20 @@ impl<Item: Copy, const N: usize> Ring<Item, N> {
     pub(super) const fn items_mut(&mut self) -> &mut [Item; N] { &mut self.items }
 
     /// Number of items.
-    pub(super) fn len(&self) -> usize { usize::from(self.len) }
+    pub(super) const fn len(&self) -> usize { usize::from(self.len) }
 
     /// An empty ring whose places hold `fill`.
     pub(super) const fn new(fill: Item) -> Self { Self { head: 0, items: [fill; N], len: 0 } }
 
     /// Adds `item` at the end. Returns false if it is full.
-    pub(super) fn push(&mut self, item: Item) -> bool {
+    pub(super) const fn push(&mut self, item: Item) -> bool {
         let Some(slot) = self.push_mut() else { return false };
         *slot = item;
         true
     }
 
     /// Adds an item at the end and gives its place, to fill in place.
-    pub(super) fn push_mut(&mut self) -> Option<&mut Item> {
+    pub(super) const fn push_mut(&mut self) -> Option<&mut Item> {
         if !self.has_room() {
             return None;
         }
@@ -137,7 +139,7 @@ impl TxSlot {
 
 impl Trace {
     /// Notes a control PDU, as long as there is room.
-    pub(super) fn control(&mut self, sent: bool, opcode: u8) {
+    pub(super) const fn control(&mut self, sent: bool, opcode: u8) {
         if let Some(entry) = self.controls.get_mut(usize::from(self.count)) {
             *entry = (sent, opcode);
             self.count = self.count.saturating_add(1);
@@ -168,7 +170,7 @@ impl Connection {
     /// Sends the prepared PDU: takes it off the queue or the host's packet
     /// and uses up its packet counter. Within the interframe space, in a
     /// constant time.
-    pub(super) fn commit_next(&mut self) {
+    pub(super) const fn commit_next(&mut self) {
         let next = !self.cur;
         let slot = self.slot(next);
         let (source, encrypted, kind) = (slot.source, slot.encrypted, slot.kind);

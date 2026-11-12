@@ -477,14 +477,14 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn appearance(&mut self, appearance: u16) -> Result<&mut Self, Overflow> {
+    pub const fn appearance(&mut self, appearance: u16) -> Result<&mut Self, Overflow> {
         self.push(AD_APPEARANCE, &appearance.to_le_bytes())
     }
 
     /// The structures written so far.
     #[inline]
     #[must_use = "the data is only read"]
-    pub fn as_bytes(&self) -> &[u8] { self.bytes.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn as_bytes(&self) -> &[u8] { self.bytes.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// Adds the flags.
     ///
@@ -492,7 +492,7 @@ impl Data {
     ///
     /// [`Overflow`] if they do not fit.
     #[inline]
-    pub fn flags(&mut self, flags: u8) -> Result<&mut Self, Overflow> { self.push(AD_FLAGS, &[flags]) }
+    pub const fn flags(&mut self, flags: u8) -> Result<&mut Self, Overflow> { self.push(AD_FLAGS, &[flags]) }
 
     /// Whether no structure was written.
     #[inline]
@@ -502,7 +502,7 @@ impl Data {
     /// The octets written so far.
     #[inline]
     #[must_use = "the length is only read"]
-    pub fn len(&self) -> usize { usize::from(self.len) }
+    pub const fn len(&self) -> usize { usize::from(self.len) }
 
     /// Adds the complete local name, UTF-8.
     ///
@@ -510,7 +510,7 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn name(&mut self, name: &[u8]) -> Result<&mut Self, Overflow> { self.push(AD_NAME, name) }
+    pub const fn name(&mut self, name: &[u8]) -> Result<&mut Self, Overflow> { self.push(AD_NAME, name) }
 
     /// Adds the complete local name if it fits, otherwise the shortened
     /// name: as much of it as fits, cut before a UTF-8 continuation octet.
@@ -545,7 +545,7 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit; the data is then unchanged.
     #[inline]
-    pub fn push(&mut self, kind: u8, data: &[u8]) -> Result<&mut Self, Overflow> {
+    pub const fn push(&mut self, kind: u8, data: &[u8]) -> Result<&mut Self, Overflow> {
         let start = self.len();
         let end = start.saturating_add(data.len()).saturating_add(2);
         let target = self.bytes.get_mut(start..end).ok_or(Overflow::TooLong)?;
@@ -559,7 +559,7 @@ impl Data {
     }
 
     /// The octets left.
-    fn room(&self) -> usize { DATA_MAX.saturating_sub(self.len()) }
+    const fn room(&self) -> usize { DATA_MAX.saturating_sub(self.len()) }
 
     /// Adds the complete list of 16-bit service UUIDs.
     ///
@@ -583,7 +583,7 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn short_name(&mut self, name: &[u8]) -> Result<&mut Self, Overflow> { self.push(AD_SHORT_NAME, name) }
+    pub const fn short_name(&mut self, name: &[u8]) -> Result<&mut Self, Overflow> { self.push(AD_SHORT_NAME, name) }
 
     /// Adds the TX power level in dBm.
     ///
@@ -591,7 +591,9 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn tx_power(&mut self, dbm: i8) -> Result<&mut Self, Overflow> { self.push(AD_TX_POWER, &dbm.to_le_bytes()) }
+    pub const fn tx_power(&mut self, dbm: i8) -> Result<&mut Self, Overflow> {
+        self.push(AD_TX_POWER, &dbm.to_le_bytes())
+    }
 }
 
 impl Default for Data {
@@ -689,7 +691,7 @@ impl Phase {
     #[inline]
     #[must_use = "the phase is only built"]
     pub const fn directed(duration: Duration) -> Self {
-        let longest = if duration.as_ticks() > DIRECTED_MAX.as_ticks() { DIRECTED_MAX } else { duration };
+        let longest = Duration::from_ticks(duration.as_ticks().min(DIRECTED_MAX.as_ticks()));
         Self { directed: true, duration: longest, interval: DIRECTED_FALLBACK }
     }
 
@@ -742,10 +744,7 @@ impl Schedule {
 /// target: public, or static random.
 #[cfg(feature = "directed-advertising")]
 const fn is_identity(peer: Peer) -> bool {
-    match peer.address.last() {
-        Some(&top) => !peer.random || top & STATIC_RANDOM == STATIC_RANDOM,
-        None => false,
-    }
+    peer.address.last().is_some_and(const |&top| !peer.random || top & STATIC_RANDOM == STATIC_RANDOM)
 }
 
 #[cfg(test)] mod tests;

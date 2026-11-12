@@ -197,7 +197,7 @@ impl Server {
     pub const fn cancel_indication(&mut self) { self.indicating = false; }
 
     /// Answers an Exchange MTU Request: always the default MTU.
-    fn exchange_mtu(params: &[u8], out: &mut [u8; MTU]) -> Answer {
+    const fn exchange_mtu(params: &[u8], out: &mut [u8; MTU]) -> Answer {
         if params.len() != 2 {
             return Err((0, AttError::INVALID_PDU));
         }
@@ -347,7 +347,7 @@ impl Server {
 
     /// The characteristic properties of the characteristic that owns the
     /// descriptor at `handle`.
-    fn owner_props(&self, handle: u16) -> u8 {
+    const fn owner_props(&self, handle: u16) -> u8 {
         let mut previous = handle;
         while previous > 1 {
             previous = previous.saturating_sub(1);
@@ -594,7 +594,7 @@ impl<'out> Writer<'out> {
     }
 
     /// Appends `bytes` if they fit; returns whether they did.
-    fn push(&mut self, bytes: &[u8]) -> bool {
+    const fn push(&mut self, bytes: &[u8]) -> bool {
         let end = self.len.saturating_add(bytes.len());
         let Some(target) = self.buf.get_mut(self.len..end) else { return false };
         target.copy_from_slice(bytes);
@@ -603,7 +603,7 @@ impl<'out> Writer<'out> {
     }
 
     /// The room left.
-    fn rest(&mut self) -> &mut [u8] { self.buf.get_mut(self.len..).unwrap_or_default() }
+    const fn rest(&mut self) -> &mut [u8] { self.buf.get_mut(self.len..).unwrap_or_default() }
 }
 
 /// Checks a notification or indication (`prop`) of `data` for
@@ -629,7 +629,7 @@ const fn check_notify(
 
 /// Writes an Error Response to the request `opcode` for `handle` with
 /// `error` into `out` and returns its length.
-fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: AttError) -> usize {
+const fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: AttError) -> usize {
     let [handle0, handle1] = handle.to_le_bytes();
     let mut writer = Writer::new(out, ERROR_RESPONSE);
     writer.push(&[opcode, handle0, handle1, error.code()]);
@@ -638,7 +638,7 @@ fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: AttError)
 
 /// Writes a notification or indication (`opcode`) of `data` for `handle`
 /// into `out` and returns its length.
-fn handle_value(out: &mut [u8; MTU], opcode: u8, handle: u16, data: &[u8]) -> usize {
+const fn handle_value(out: &mut [u8; MTU], opcode: u8, handle: u16, data: &[u8]) -> usize {
     let mut writer = Writer::new(out, opcode);
     writer.push(&handle.to_le_bytes());
     writer.push(data);
@@ -668,7 +668,7 @@ const fn range(start_bytes: [u8; 2], end_bytes: [u8; 2]) -> Result<(u16, u16), F
 
 /// The handle range and the attribute type of a Read By Type or Read By
 /// Group Type Request, whose type is a 16-bit or a 128-bit UUID.
-fn typed_range(params: &[u8]) -> Result<(u16, u16, &[u8]), Failure> {
+const fn typed_range(params: &[u8]) -> Result<(u16, u16, &[u8]), Failure> {
     let Some((&[start0, start1, end0, end1], uuid)) = params.split_first_chunk::<4>() else {
         return Err((0, AttError::INVALID_PDU));
     };

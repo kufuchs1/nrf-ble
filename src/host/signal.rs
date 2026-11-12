@@ -85,7 +85,7 @@ impl Command {
     /// The command for the PDU's payload.
     #[inline]
     #[must_use = "the command is only read"]
-    pub fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// A command with `code`, `identifier` and the data `parts` in order.
     fn new(code: u8, identifier: u8, parts: &[&[u8]]) -> Self {

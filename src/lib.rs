@@ -3,6 +3,21 @@
 //! of [`link`] instead of HCI.
 
 #![no_std]
+// Const trait implementations of the standard library, so that const
+// functions use the methods of Option, Result, Ord, From and TryFrom, `?`
+// and slice ranges like the rest of the code, instead of matches and casts.
+#![feature(
+    const_bool,
+    const_closures,
+    const_cmp,
+    const_convert,
+    const_index,
+    const_option_ops,
+    const_result_trait_fn,
+    const_trait_impl,
+    const_try,
+    derive_const
+)]
 
 #[cfg(all(feature = "nrf52832", feature = "nrf51"))]
 compile_error!(

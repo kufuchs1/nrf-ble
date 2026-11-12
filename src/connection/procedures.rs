@@ -51,10 +51,7 @@ use crate::{
 };
 
 /// Highest transmit power in dBm.
-const MAX_POWER_DBM: i8 = match LEVELS_DBM.last() {
-    Some(&dbm) => dbm,
-    None => 0,
-};
+const MAX_POWER_DBM: i8 = LEVELS_DBM.last().copied().unwrap_or(0);
 /// Acceptable power reduction when no packet has been measured yet.
 const UNKNOWN_REDUCTION: u8 = 0xFF;
 /// Error code: different transaction collision, another procedure with an
@@ -120,7 +117,7 @@ impl Connection {
     }
 
     /// Current connection parameters in link layer units.
-    pub(super) fn current_params(&self) -> ConnectionParams {
+    pub(super) const fn current_params(&self) -> ConnectionParams {
         ConnectionParams::new(
             u16::try_from(self.interval.checked_div(UNIT_1250_US).unwrap_or(0)).unwrap_or(u16::MAX),
             self.latency,
@@ -562,7 +559,7 @@ impl Connection {
 
 /// Power control flags of `level`: bit 0 at the lowest power, bit 1 at the
 /// highest.
-fn limit_flags(level: usize) -> u8 {
+const fn limit_flags(level: usize) -> u8 {
     u8::from(level == 0) | (u8::from(level.saturating_add(1) >= LEVELS_DBM.len()) << 1_u8)
 }
 

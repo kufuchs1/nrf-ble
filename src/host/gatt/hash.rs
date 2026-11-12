@@ -44,14 +44,16 @@ impl Lanes {
     /// Takes `byte`.
     const fn byte(self, byte: u8) -> Self {
         Self {
-            first:  (self.first ^ u64_from(byte)).wrapping_mul(PRIME),
-            second: (self.second ^ u64_from(!byte)).wrapping_mul(PRIME),
+            first:  (self.first ^ u64::from(byte)).wrapping_mul(PRIME),
+            second: (self.second ^ u64::from(!byte)).wrapping_mul(PRIME),
         }
     }
 
     /// Takes each octet of `bytes`, after their number.
     const fn bytes(self, bytes: &[u8]) -> Self {
-        let mut lanes = self.u16(u16_from(bytes.len()));
+        // Saturated: only a value's length, which the table keeps far
+        // shorter.
+        let mut lanes = self.u16(u16::try_from(bytes.len()).unwrap_or(u16::MAX));
         let mut rest = bytes;
         while let Some((&byte, tail)) = rest.split_first() {
             lanes = lanes.byte(byte);
@@ -127,12 +129,3 @@ pub(super) const fn layout(attrs: &[Attr]) -> [u8; 16] {
     }
     lanes.finish()
 }
-
-/// `byte` widened, as `From` is not const.
-#[expect(clippy::as_conversions, reason = "widening, and From is not const")]
-const fn u64_from(byte: u8) -> u64 { byte as u64 }
-
-/// `len` as a u16, saturated: only a value's length, which the table keeps
-/// far shorter.
-#[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "saturated first, and From is not const")]
-const fn u16_from(len: usize) -> u16 { if len > 0xFFFF { 0xFFFF } else { len as u16 } }
