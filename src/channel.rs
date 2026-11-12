@@ -2,6 +2,9 @@
 
 /// Number of data channels.
 const DATA_CHANNELS: u8 = 37;
+/// Rounds of permutation, multiplication and addition in algorithm 2's
+/// pseudo-random number.
+const PERMUTATIONS: u8 = 3;
 
 /// Used data channels.
 #[derive(Clone, Copy)]
@@ -75,12 +78,12 @@ impl Hopping {
             },
             Self::Csa2 { identifier } => {
                 let random = csa2_random(counter, identifier);
-                let unmapped = u8::try_from(random.checked_rem(u16::from(DATA_CHANNELS)).unwrap_or(0)).unwrap_or(0);
+                let unmapped = random.checked_rem(u16::from(DATA_CHANNELS)).unwrap_or(0).truncate::<u8>();
                 if map.contains(unmapped) {
                     return unmapped;
                 }
-                let index = u32::from(map.count).saturating_mul(u32::from(random)) >> 16_u32;
-                map.used.get(usize::try_from(index).unwrap_or(0)).copied().unwrap_or(0)
+                let index = u32::from(map.count).saturating_mul(u32::from(random)) >> 16;
+                map.used.get(index.saturating_cast::<usize>()).copied().unwrap_or(0)
             },
         }
     }
@@ -89,9 +92,8 @@ impl Hopping {
     #[inline]
     #[must_use = "the selection is only created"]
     pub const fn csa2(access_address: u32) -> Self {
-        let [byte0, byte1, byte2, byte3] = access_address.to_le_bytes();
-        let low = u16::from_le_bytes([byte0, byte1]);
-        let high = u16::from_le_bytes([byte2, byte3]);
+        let low: u16 = access_address.truncate();
+        let high: u16 = access_address.wrapping_shr(16).truncate();
         Self::Csa2 { identifier: high ^ low }
     }
 
@@ -105,9 +107,9 @@ impl Hopping {
 /// Part B, 4.5.8.3.3).
 fn csa2_random(counter: u16, identifier: u16) -> u16 {
     let mut value = counter ^ identifier;
-    for _ in 0_u8..3 {
-        let [high, low] = value.to_be_bytes();
-        let permuted = u16::from_be_bytes([high.reverse_bits(), low.reverse_bits()]);
+    for _ in 0..PERMUTATIONS {
+        // The bits of each octet reversed, the octets in place.
+        let permuted = value.reverse_bits().swap_bytes();
         value = permuted.wrapping_mul(17).wrapping_add(identifier);
     }
     value ^ identifier
@@ -115,7 +117,7 @@ fn csa2_random(counter: u16, identifier: u16) -> u16 {
 
 /// Whether a channel bit is set in a link layer channel map.
 fn is_set(bits: [u8; 5], channel: u8) -> bool {
-    bits.get(usize::from(channel >> 3)).is_some_and(|byte| byte & 1_u8.wrapping_shl(u32::from(channel & 7)) != 0)
+    bits.get(usize::from(channel >> 3)).is_some_and(|byte| byte & u8::wrapping_shl(1, u32::from(channel & 7)) != 0)
 }
 
 #[cfg(test)]

@@ -18,8 +18,8 @@
 //!
 //! 1. Pairing Request, answered with the Pairing Response: no input and no
 //!    output (0x03), no out of band data, `AuthReq` 0x09 (bonding and Secure
-//!    Connections, never protection against a man in the middle, on which BlueZ
-//!    would fail Just Works), a key size of 16 octets, and of each key
+//!    Connections, never protection against a man in the middle, on which
+//!    `BlueZ` would fail Just Works), a key size of 16 octets, and of each key
 //!    distribution only the identity keys (0x02) the central offered.
 //! 2. The central's public key, checked with [`ecc::check_public_key`],
 //!    answered with ours and the confirm value Cb = f4(PKbx, PKax, Nb, 0).
@@ -35,7 +35,7 @@
 //!    [`crate::link::Link::ltk_reply`] takes it, for EDIV 0 and Rand 0 only.
 //! 6. Once the link is encrypted, our identity resolving key and static random
 //!    identity address (Identity Information and Identity Address Information),
-//!    then the central's, if it offered them, which BlueZ sends only after it
+//!    then the central's, if it offered them, which `BlueZ` sends only after it
 //!    received ours.
 //! 7. [`Outcome::Bonded`] with the long term key and the central's identity.
 //!
@@ -143,8 +143,10 @@ pub mod ecc;
 /// The cryptographic functions of pairing: AES-CMAC, f4, f5, f6, g2 and ah.
 pub mod toolbox;
 
+#[cfg(feature = "passkey")]
+use crate::{bytes::be32_bytes, host::PasskeyError};
 use crate::{crypto::wipe, host::Aes, link::Info, pdu::Peer};
-use core::fmt;
+use core::{array::TryFromSliceError, fmt, iter};
 #[cfg(feature = "passkey")]
 use core::{
     hint::black_box,
@@ -372,21 +374,6 @@ pub struct Output {
     len:  u8,
 }
 
-/// Why a passkey was not taken.
-#[cfg(feature = "passkey")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[non_exhaustive]
-pub enum PasskeyError {
-    /// The link ended, or is ending.
-    Gone,
-    /// The passkey has more than six decimal digits.
-    Invalid,
-    /// No pairing waits for a passkey: none asked for one, it was given
-    /// already, or the pairing ended.
-    NotWaiting,
-}
-
 /// A reason of a Pairing Failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -395,92 +382,91 @@ pub struct Reason(u8);
 
 /// The security manager of the peripheral: LE Secure Connections pairing
 /// as responder, one link at a time, and the key pair between pairings.
-#[non_exhaustive]
 pub struct Responder {
     /// Our own static random identity address, least significant octet
     /// first.
-    address:        [u8; 6],
+    address:        [u8; 6] = [0; 6],
     /// Whether the pairing under way is Passkey Entry.
     #[cfg(feature = "passkey")]
-    authenticating: bool,
+    authenticating: bool = false,
     /// The central's address on the air: A of f5 and f6.
-    central:        Peer,
+    central:        Peer = Peer::new([0; 6], false),
     /// The central's `DHKey` check Ea, most significant octet first, until
     /// it is verified; then ours, Eb.
-    check:          [u8; 16],
+    check:          [u8; 16] = [0; 16],
     /// Our confirm value Cb, most significant octet first.
-    confirm:        [u8; 16],
+    confirm:        [u8; 16] = [0; 16],
     /// When the pairing times out.
-    deadline:       Option<Instant>,
+    deadline:       Option<Instant> = None,
     /// Whether the Diffie-Hellman key was asked for.
-    dh:             Dh,
+    dh:             Dh = Dh::Unasked,
     /// The Diffie-Hellman key, most significant octet first, once
     /// [`Self::dh`] is ready, until f5 used it.
-    dh_key:         [u8; KEY_LEN],
+    dh_key:         [u8; KEY_LEN] = [0; KEY_LEN],
     /// The central's identity keys the pairing distributes: 0 or
     /// [`KEY_DIST_ID`].
-    init_dist:      u8,
+    init_dist:      u8 = 0,
     /// The central's `IOcap` for f6: `AuthReq`, OOB data flag, IO
     /// capability.
-    io_cap:         [u8; 3],
+    io_cap:         [u8; 3] = [0; 3],
     /// Our own identity resolving key, least significant octet first.
-    irk:            [u8; 16],
+    irk:            [u8; 16] = [0; 16],
     /// The job waiting to be taken.
-    job:            Option<Task>,
+    job:            Option<Task> = None,
     /// The output whose PDU is being sent, 0 or one bit: it stays the next
     /// PDU until [`Self::pdu_sent`], so its fragments never change.
-    latched:        u8,
+    latched:        u8 = 0,
     /// Our own address on the air: B of f5 and f6.
-    local:          Peer,
+    local:          Peer = Peer::new([0; 6], false),
     /// The long term key, least significant octet first, from the `DHKey`
     /// check until the pairing ends.
-    ltk:            [u8; 16],
+    ltk:            [u8; 16] = [0; 16],
     /// The central's nonce Na, most significant octet first.
-    na:             [u8; 16],
+    na:             [u8; 16] = [0; 16],
     /// Our nonce Nb, most significant octet first.
-    nb:             [u8; 16],
+    nb:             [u8; 16] = [0; 16],
     /// The X coordinate of our public key, most significant octet first, for
     /// the confirm values of Passkey Entry, once the key pair went to the
     /// Diffie-Hellman job.
     #[cfg(feature = "passkey")]
-    own_x:          [u8; KEY_LEN],
+    own_x:          [u8; KEY_LEN] = [0; KEY_LEN],
     /// Our key pair, between its job and the Diffie-Hellman job.
-    pair:           Option<KeyPair>,
+    pair:           Option<KeyPair> = None,
     /// Whether a Pairing Request is taken.
-    pairable:       bool,
+    pairable:       bool = false,
     /// The passkey of Passkey Entry, once the user gave it; otherwise
     /// [`NO_PASSKEY`], which overwrites all of its digits.
     #[cfg(feature = "passkey")]
-    passkey:        u32,
+    passkey:        u32 = NO_PASSKEY,
     /// The central's confirm value of the round of Passkey Entry, most
     /// significant octet first.
     #[cfg(feature = "passkey")]
-    peer_confirm:   [u8; 16],
+    peer_confirm:   [u8; 16] = [0; 16],
     /// The central's identity address, once it arrived.
-    peer_identity:  Option<Peer>,
+    peer_identity:  Option<Peer> = None,
     /// The central's identity resolving key, least significant octet
     /// first, once it arrived.
-    peer_irk:       [u8; 16],
+    peer_irk:       [u8; 16] = [0; 16],
     /// The central's public key, X then Y, most significant octet first.
-    peer_key:       [u8; PUBLIC_KEY_LEN],
+    peer_key:       [u8; PUBLIC_KEY_LEN] = [0; PUBLIC_KEY_LEN],
     /// The PDUs to send, one bit each, sent from the lowest bit up.
-    pending:        u8,
+    pending:        u8 = 0,
     /// The reason of our Pairing Failed.
-    reason:         Reason,
+    reason:         Reason = Reason::UNSPECIFIED,
     /// The central's identity keys received: [`ID_INFO`] and
     /// [`ID_ADDRESS`].
-    received:       u8,
+    received:       u8 = 0,
     /// Our identity keys the pairing distributes: 0 or [`KEY_DIST_ID`].
-    resp_dist:      u8,
+    resp_dist:      u8 = 0,
     /// The job being run, with its number.
-    running:        Option<(Task, u8)>,
+    running:        Option<(Task, u8)> = None,
     /// What our side of pairing protects against.
     #[cfg(feature = "passkey")]
-    security:       Security,
+    security:       Security = Security::JUST_WORKS,
     /// The number of the last Diffie-Hellman job.
-    serial:         u8,
+    serial:         u8 = 0,
     /// Where the pairing stands.
-    state:          State,
+    state:          State = State::Idle,
 }
 
 /// What our side of pairing can protect against, and what it requires.
@@ -553,18 +539,15 @@ pub trait Random {
 
 impl fmt::Debug for Bonded {
     #[inline]
-    #[expect(clippy::renamed_function_params, reason = "a name of one character is refused")]
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Bonded").field("identity", &self.identity).finish_non_exhaustive()
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Bonded").field("identity", &self.identity).finish_non_exhaustive()
     }
 }
 
 impl fmt::Debug for Identity {
     #[inline]
-    #[expect(clippy::renamed_function_params, reason = "a name of one character is refused")]
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Identity")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Identity")
             .field("address", &self.address.address)
             .field("random", &self.address.random)
             .finish_non_exhaustive()
@@ -609,13 +592,13 @@ impl Output {
     /// The PDU for the security manager channel.
     #[inline]
     #[must_use = "the PDU is only read"]
-    pub fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// A PDU with `code` and the parameters `parts` in order.
     fn new(code: u8, parts: &[&[u8]]) -> Self {
-        let mut data = [0_u8; PDU_MAX];
-        let mut len = 0_usize;
-        for &byte in core::iter::once(&code).chain(parts.iter().flat_map(|part| part.iter())) {
+        let mut data: [u8; PDU_MAX] = [0; PDU_MAX];
+        let mut len: usize = 0;
+        for &byte in iter::once(&code).chain(parts.iter().flat_map(|part| part.iter())) {
             if let Some(slot) = data.get_mut(len) {
                 *slot = byte;
                 len = len.saturating_add(1);
@@ -723,8 +706,7 @@ impl Responder {
         if self.state != (State::Check(false)) || self.queued(OUT_RANDOM) {
             return Err(Reason::UNSPECIFIED);
         }
-        self.check =
-            reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+        self.check = reversed(params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?);
         self.state = State::Check(true);
         if self.dh == Dh::Ready { self.verify(aes) } else { Ok(None) }
     }
@@ -860,8 +842,7 @@ impl Responder {
         if !self.takes_keys(encrypted) || self.received != 0 {
             return Err(Reason::UNSPECIFIED);
         }
-        self.peer_irk =
-            params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?;
+        self.peer_irk = params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?;
         self.received = ID_INFO;
         Ok(None)
     }
@@ -944,7 +925,7 @@ impl Responder {
     /// `None`, and the bond's key is the engine's to give.
     #[inline]
     #[must_use = "the key is only read"]
-    pub fn ltk_request(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
+    pub const fn ltk_request(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
         (ediv == 0 && rand == [0; 8] && matches!(self.state, State::Encryption | State::Keys)).then_some(self.ltk)
     }
 
@@ -952,48 +933,7 @@ impl Responder {
     /// one with [`Self::set_identity`] before pairing is allowed.
     #[inline]
     #[must_use = "the security manager is only built"]
-    pub const fn new() -> Self {
-        Self {
-            address: [0; 6],
-            #[cfg(feature = "passkey")]
-            authenticating: false,
-            central: Peer::new([0; 6], false),
-            check: [0; 16],
-            confirm: [0; 16],
-            deadline: None,
-            dh: Dh::Unasked,
-            dh_key: [0; KEY_LEN],
-            init_dist: 0,
-            io_cap: [0; 3],
-            irk: [0; 16],
-            job: None,
-            latched: 0,
-            local: Peer::new([0; 6], false),
-            ltk: [0; 16],
-            na: [0; 16],
-            nb: [0; 16],
-            #[cfg(feature = "passkey")]
-            own_x: [0; KEY_LEN],
-            pair: None,
-            pairable: false,
-            #[cfg(feature = "passkey")]
-            passkey: NO_PASSKEY,
-            #[cfg(feature = "passkey")]
-            peer_confirm: [0; 16],
-            peer_identity: None,
-            peer_irk: [0; 16],
-            peer_key: [0; PUBLIC_KEY_LEN],
-            pending: 0,
-            reason: Reason::UNSPECIFIED,
-            received: 0,
-            resp_dist: 0,
-            running: None,
-            #[cfg(feature = "passkey")]
-            security: Security::JUST_WORKS,
-            serial: 0,
-            state: State::Idle,
-        }
-    }
+    pub const fn new() -> Self { Self { .. } }
 
     /// The next PDU to send: the same one, rendered again, until
     /// [`Self::pdu_sent`] says it was queued, so the fragments of a public
@@ -1058,7 +998,7 @@ impl Responder {
             return Err(Reason::UNSPECIFIED);
         }
         self.peer_confirm =
-            reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+            reversed(params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?);
         if self.passkey == NO_PASSKEY {
             // The user has the time of the timer from now.
             self.state = State::Input;
@@ -1116,10 +1056,7 @@ impl Responder {
         }
         self.end();
         #[cfg(feature = "passkey")]
-        #[expect(clippy::semicolon_outside_block, reason = "a statement of the feature alone")]
-        {
-            self.authenticating = authenticating;
-        }
+        self.set_authenticating(authenticating);
         // Only the PDU being sent stays from an earlier pairing.
         self.pending &= self.latched;
         self.io_cap = [auth, oob, io];
@@ -1127,7 +1064,7 @@ impl Responder {
         self.resp_dist = resp_dist & KEY_DIST_ID;
         if self.resp_dist == 0 {
             // BlueZ keeps no bond without our identity address.
-            crate::log::info!("smp: the central asks for no identity keys");
+            info!("smp: the central asks for no identity keys");
         }
         self.pending |= OUT_RESPONSE;
         self.state = State::PublicKey;
@@ -1174,7 +1111,7 @@ impl Responder {
     /// The Z of f4 in `round` of Passkey Entry: 0x80 with the passkey's bit
     /// of the round, the least significant in round 0.
     #[cfg(feature = "passkey")]
-    fn passkey_bit(&self, round: u8) -> u8 {
+    const fn passkey_bit(&self, round: u8) -> u8 {
         let passkey = if self.passkey == NO_PASSKEY { 0 } else { self.passkey };
         let bit = passkey.checked_shr(u32::from(round)).unwrap_or_default() & 1;
         0x80 | u8::from(bit != 0)
@@ -1191,8 +1128,7 @@ impl Responder {
         if self.queued(OUT_CONFIRM) {
             return Err(Reason::UNSPECIFIED);
         }
-        let na =
-            reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+        let na = reversed(params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?);
         let peer_x = self.peer_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
         let expected = f4(aes, peer_x, &self.own_x, &na, self.passkey_bit(round));
         if !same(&expected, &self.peer_confirm) {
@@ -1249,7 +1185,7 @@ impl Responder {
             return Err(Reason::UNSPECIFIED);
         }
         let key: &[u8; PUBLIC_KEY_LEN] =
-            params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?;
+            params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?;
         self.peer_key = flip_coordinates(key);
         if self.pair.is_some() {
             return self.answer_public_key(crypto);
@@ -1271,7 +1207,7 @@ impl Responder {
             && self.passkey != NO_PASSKEY
             && let Some(low) = value.last_chunk_mut::<4>()
         {
-            *low = self.passkey.to_be_bytes();
+            *low = be32_bytes(self.passkey);
         }
         value
     }
@@ -1281,8 +1217,7 @@ impl Responder {
         if self.state != State::Random || self.queued(OUT_PUBLIC_KEY | OUT_CONFIRM) {
             return Err(Reason::UNSPECIFIED);
         }
-        self.na =
-            reversed(params.try_into().map_err(|_error: core::array::TryFromSliceError| Reason::INVALID_PARAMETERS)?);
+        self.na = reversed(params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?);
         self.pending |= OUT_RANDOM;
         self.state = State::Check(false);
         Ok(None)
@@ -1342,6 +1277,10 @@ impl Responder {
         self.pending |= OUT_CONFIRM;
         self.state = State::Nonce(round);
     }
+
+    /// Records whether the pairing under way is Passkey Entry.
+    #[cfg(feature = "passkey")]
+    const fn set_authenticating(&mut self, authenticating: bool) { self.authenticating = authenticating; }
 
     /// Sets our own identity, which pairing distributes: the identity
     /// resolving key, least significant octet first as
@@ -1481,6 +1420,7 @@ impl Default for Responder {
 /// the PDU's order from the toolbox's, and back.
 fn flip_coordinates(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] {
     let mut out = *key;
+    #[rustc_unroll(never)]
     for coordinate in out.as_chunks_mut::<KEY_LEN>().0 {
         coordinate.reverse();
     }
@@ -1508,7 +1448,7 @@ fn reversed<const N: usize>(value: &[u8; N]) -> [u8; N] {
 /// Whether two check values are the same, in a time that does not depend
 /// on where they differ.
 fn same(left: &[u8; 16], right: &[u8; 16]) -> bool {
-    left.iter().zip(right.iter()).fold(0_u8, |difference, (&one, &other)| difference | (one ^ other)) == 0
+    left.iter().zip(right.iter()).fold(0, |difference: u8, (&one, &other)| difference | (one ^ other)) == 0
 }
 
 #[cfg(test)] pub(crate) mod tests;

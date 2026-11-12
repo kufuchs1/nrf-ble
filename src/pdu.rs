@@ -1,6 +1,9 @@
 //! Link layer packet formats.
 
-use crate::chip;
+use crate::{
+    bytes::{le16, le32, le32_bytes},
+    chip,
+};
 
 /// Length of a device address.
 pub const ADDRESS_LEN: usize = 6;
@@ -124,7 +127,7 @@ impl<const N: usize> Advertisement<N> {
     /// The PDU bytes up to the end of the payload.
     #[inline]
     #[must_use = "the bytes are only borrowed"]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8] {
         let len = usize::from(self.bytes.get(1).copied().unwrap_or_default());
         self.bytes.get(..HEADER_LEN.saturating_add(len)).unwrap_or_default()
     }
@@ -132,8 +135,8 @@ impl<const N: usize> Advertisement<N> {
     /// A PDU with `header` and the payload `parts` in order. Payload beyond
     /// the buffer is cut off.
     fn build(header: u8, parts: &[&[u8]]) -> Self {
-        let mut bytes = [0_u8; N];
-        let mut len = 0_usize;
+        let mut bytes: [u8; N] = [0; N];
+        let mut len: usize = 0;
         for part in parts {
             for &byte in *part {
                 if let Some(slot) = bytes.get_mut(HEADER_LEN.saturating_add(len))
@@ -254,19 +257,19 @@ impl ConnectInd {
             return None;
         }
         let request = Self {
-            access_address: u32::from_le_bytes(access_address),
+            access_address: le32(access_address),
             channel_map,
-            crc_init: u32::from_le_bytes([crc0, crc1, crc2, 0]),
+            crc_init: le32([crc0, crc1, crc2, 0]),
             csa2: kind & CH_SEL != 0,
             hop: hop_sca & 0x1F,
             initiator,
             initiator_random: kind & TX_ADD_RANDOM != 0,
-            interval: u16::from_le_bytes([interval0, interval1]),
-            latency: u16::from_le_bytes([latency0, latency1]),
+            interval: le16([interval0, interval1]),
+            latency: le16([latency0, latency1]),
             sca: hop_sca >> 5,
             sca_ppm: sca_ppm(hop_sca >> 5),
-            timeout: u16::from_le_bytes([timeout0, timeout1]),
-            win_offset: u16::from_le_bytes([offset0, offset1]),
+            timeout: le16([timeout0, timeout1]),
+            win_offset: le16([offset0, offset1]),
             win_size,
         };
         request.is_valid().then_some(request)
@@ -298,10 +301,10 @@ pub(crate) fn valid_connection_parameters(
 
 /// LE 1M data access address constraints (Core, Vol 6, Part B, 2.1.2).
 fn valid_access_address(address: u32) -> bool {
-    let bytes = address.to_le_bytes();
-    let transitions = address ^ (address >> 1_u32);
-    let mut run = 1_u8;
-    for bit in 1_u32..32_u32 {
+    let bytes = le32_bytes(address);
+    let transitions = address ^ address.wrapping_shr(1);
+    let mut run: u8 = 1;
+    for bit in 1..u32::BITS {
         if ((address >> bit) ^ (address >> bit.saturating_sub(1))) & 1 == 0 {
             run = run.saturating_add(1);
             if run > 6 {

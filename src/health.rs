@@ -25,7 +25,7 @@ pub fn healthy() -> bool { !ACTIVE.load(Ordering::Relaxed) || before(seconds_now
 pub fn suspend() { ACTIVE.store(false, Ordering::Relaxed); }
 
 /// Uptime modulo 2^32 seconds.
-fn seconds_now() -> u32 { u32::try_from(Instant::now().as_secs() & u64::from(u32::MAX)).unwrap_or_default() }
+fn seconds_now() -> u32 { Instant::now().as_secs().truncate() }
 
 /// Compares deadlines within half the wrapping time space.
 const fn before(now: u32, deadline: u32) -> bool {

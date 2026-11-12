@@ -25,14 +25,14 @@
 //!   and the link layer resolves its resolvable private addresses through that
 //!   list: scan requests and connection requests from any other device are
 //!   ignored. The entry is in device privacy mode, so the central may also
-//!   connect from its identity address, as BlueZ does without host privacy.
+//!   connect from its identity address, as `BlueZ` does without host privacy.
 //!
 //! With the feature `directed-advertising`, a phase in [`Mode::Reconnect`]
 //! may also be directed (`Phase::directed`): high duty cycle directed
 //! advertising, an `ADV_DIRECT_IND` to the bonded central every 3.75 ms for
 //! at most `DIRECTED_MAX`, connectable by that central only. Linux connects
 //! to it as to an undirected advertisement from a device of its accept list
-//! with auto-connect (and only to it for a device BlueZ merely allows to
+//! with auto-connect (and only to it for a device `BlueZ` merely allows to
 //! connect), so a first directed phase makes a reconnection about 30 to 50 ms
 //! faster than one at 20 ms. The target is the central's identity address,
 //! which a central scanning from its identity address takes: Linux without
@@ -114,6 +114,7 @@
 
 use crate::{
     advertiser::legacy::{self, Kind},
+    bytes::le16_bytes,
     host::{bond::Bond, identity::LocalIdentity},
     link::{self, AdvParams, Link},
     pdu::Peer,
@@ -477,14 +478,14 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn appearance(&mut self, appearance: u16) -> Result<&mut Self, Overflow> {
-        self.push(AD_APPEARANCE, &appearance.to_le_bytes())
+    pub const fn appearance(&mut self, appearance: u16) -> Result<&mut Self, Overflow> {
+        self.push(AD_APPEARANCE, &le16_bytes(appearance))
     }
 
     /// The structures written so far.
     #[inline]
     #[must_use = "the data is only read"]
-    pub fn as_bytes(&self) -> &[u8] { self.bytes.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn as_bytes(&self) -> &[u8] { self.bytes.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// Adds the flags.
     ///
@@ -492,7 +493,7 @@ impl Data {
     ///
     /// [`Overflow`] if they do not fit.
     #[inline]
-    pub fn flags(&mut self, flags: u8) -> Result<&mut Self, Overflow> { self.push(AD_FLAGS, &[flags]) }
+    pub const fn flags(&mut self, flags: u8) -> Result<&mut Self, Overflow> { self.push(AD_FLAGS, &[flags]) }
 
     /// Whether no structure was written.
     #[inline]
@@ -502,7 +503,7 @@ impl Data {
     /// The octets written so far.
     #[inline]
     #[must_use = "the length is only read"]
-    pub fn len(&self) -> usize { usize::from(self.len) }
+    pub const fn len(&self) -> usize { usize::from(self.len) }
 
     /// Adds the complete local name, UTF-8.
     ///
@@ -510,7 +511,7 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn name(&mut self, name: &[u8]) -> Result<&mut Self, Overflow> { self.push(AD_NAME, name) }
+    pub const fn name(&mut self, name: &[u8]) -> Result<&mut Self, Overflow> { self.push(AD_NAME, name) }
 
     /// Adds the complete local name if it fits, otherwise the shortened
     /// name: as much of it as fits, cut before a UTF-8 continuation octet.
@@ -545,21 +546,21 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit; the data is then unchanged.
     #[inline]
-    pub fn push(&mut self, kind: u8, data: &[u8]) -> Result<&mut Self, Overflow> {
+    pub const fn push(&mut self, kind: u8, data: &[u8]) -> Result<&mut Self, Overflow> {
         let start = self.len();
         let end = start.saturating_add(data.len()).saturating_add(2);
         let target = self.bytes.get_mut(start..end).ok_or(Overflow::TooLong)?;
         // Both fit an octet now: the structure fits the data's 31 octets.
-        let length = u8::try_from(data.len().saturating_add(1)).unwrap_or(u8::MAX);
+        let length: u8 = data.len().saturating_add(1).saturating_cast();
         let (header, body) = target.split_at_mut(2);
         header.copy_from_slice(&[length, kind]);
         body.copy_from_slice(data);
-        self.len = u8::try_from(end).unwrap_or(u8::MAX);
+        self.len = end.saturating_cast();
         Ok(self)
     }
 
     /// The octets left.
-    fn room(&self) -> usize { DATA_MAX.saturating_sub(self.len()) }
+    const fn room(&self) -> usize { DATA_MAX.saturating_sub(self.len()) }
 
     /// Adds the complete list of 16-bit service UUIDs.
     ///
@@ -572,7 +573,7 @@ impl Data {
         let octets = uuids.len().saturating_mul(2);
         let target = list.get_mut(..octets).ok_or(Overflow::TooLong)?;
         for (chunk, uuid) in target.as_chunks_mut::<2>().0.iter_mut().zip(uuids) {
-            *chunk = uuid.to_le_bytes();
+            *chunk = le16_bytes(*uuid);
         }
         self.push(AD_SERVICES_16, target)
     }
@@ -583,7 +584,7 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn short_name(&mut self, name: &[u8]) -> Result<&mut Self, Overflow> { self.push(AD_SHORT_NAME, name) }
+    pub const fn short_name(&mut self, name: &[u8]) -> Result<&mut Self, Overflow> { self.push(AD_SHORT_NAME, name) }
 
     /// Adds the TX power level in dBm.
     ///
@@ -591,7 +592,9 @@ impl Data {
     ///
     /// [`Overflow`] if it does not fit.
     #[inline]
-    pub fn tx_power(&mut self, dbm: i8) -> Result<&mut Self, Overflow> { self.push(AD_TX_POWER, &dbm.to_le_bytes()) }
+    pub const fn tx_power(&mut self, dbm: i8) -> Result<&mut Self, Overflow> {
+        self.push(AD_TX_POWER, &[dbm.cast_unsigned()])
+    }
 }
 
 impl Default for Data {
@@ -689,7 +692,7 @@ impl Phase {
     #[inline]
     #[must_use = "the phase is only built"]
     pub const fn directed(duration: Duration) -> Self {
-        let longest = if duration.as_ticks() > DIRECTED_MAX.as_ticks() { DIRECTED_MAX } else { duration };
+        let longest = Duration::from_ticks(duration.as_ticks().min(DIRECTED_MAX.as_ticks()));
         Self { directed: true, duration: longest, interval: DIRECTED_FALLBACK }
     }
 
@@ -742,10 +745,7 @@ impl Schedule {
 /// target: public, or static random.
 #[cfg(feature = "directed-advertising")]
 const fn is_identity(peer: Peer) -> bool {
-    match peer.address.last() {
-        Some(&top) => !peer.random || top & STATIC_RANDOM == STATIC_RANDOM,
-        None => false,
-    }
+    peer.address.last().is_some_and(const |&top| !peer.random || top & STATIC_RANDOM == STATIC_RANDOM)
 }
 
 #[cfg(test)] mod tests;

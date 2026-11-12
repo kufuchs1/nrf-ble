@@ -346,7 +346,7 @@ fn pair(variant: Variant) -> (Responder, Device, Central, Bonded) {
     (responder, device, central, bond)
 }
 
-/// The variant BlueZ pairs with when host privacy is on.
+/// The variant `BlueZ` pairs with when host privacy is on.
 const BOTH_WAYS: Variant =
     Variant { central_id: true, check_before_dh: false, key_pair_first: true, our_id: true };
 

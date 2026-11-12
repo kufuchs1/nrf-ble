@@ -15,7 +15,7 @@
 //! compare a few ticks ahead use [`until_tick`], whose RTC0 TICK backstop
 //! ends a wait whose compare was written too late.
 
-use cortex_m::peripheral::SCB;
+use cortex_m::{asm, peripheral::SCB};
 use embassy_nrf::{
     interrupt::{self, InterruptExt as _},
     pac::RTC0 as RTC,
@@ -68,7 +68,7 @@ where
         if ready() {
             break;
         }
-        cortex_m::asm::wfe();
+        asm::wfe();
     }
     clear();
 }

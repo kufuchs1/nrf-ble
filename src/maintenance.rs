@@ -11,7 +11,7 @@
 //! at once by the next one, can neither leave the link layer parked nor let
 //! flash run while it is not.
 
-use crate::{clock::Clock, radio::Radio};
+use crate::{clock::Clock, health, radio::Radio};
 use core::cell::Cell;
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
@@ -106,7 +106,7 @@ pub async fn service(clock: &mut Clock<'_>, radio: &mut Radio<'_>) {
     }
     radio.disable();
     clock.pause();
-    crate::health::suspend();
+    health::suspend();
     park().await;
 }
 

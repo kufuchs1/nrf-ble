@@ -20,7 +20,7 @@
 //! one; a device that bonds with one central uses slot 0. Each time the
 //! device enters pairing mode it takes the next generation
 //! ([`Variant::next_generation`]), so it pairs again under a new identity
-//! and BlueZ, which keeps the old bond under the old address, needs no
+//! and `BlueZ`, which keeps the old bond under the old address, needs no
 //! `remove` first: it refuses a second Just Works pairing with a device it
 //! has a bond with, and it would resolve the resolvable private address of
 //! an old identity, connect and encrypt with the old key, which the device
@@ -30,7 +30,7 @@
 //! erased with it, and bumps and stores it before it advertises in pairing
 //! mode, not when the pairing bonds. A bond that was cleared or lost, by a
 //! torn write or a power failure before it was stored, then never brings back
-//! a generation BlueZ may hold a bond with; nor does a pairing BlueZ
+//! a generation `BlueZ` may hold a bond with; nor does a pairing `BlueZ`
 //! completed whose bond the device never stored. The bond itself keeps the
 //! variant it was made under ([`crate::host::bond::Bond::local`]), which
 //! reconnection advertises with. The generation wraps after 256 pairing
@@ -41,7 +41,12 @@
 //! [`crate::link::Link::add_peer`] takes it in. It is the AES output as it
 //! comes, as the MX firmwares hand it to the controller.
 
-use crate::{crypto::wipe, host::Aes, pdu::Peer};
+use crate::{
+    bytes::{le16, le16_bytes, le32_bytes},
+    crypto::wipe,
+    host::Aes,
+    pdu::Peer,
+};
 
 /// The device secret the identities derive from: the encryption root and the
 /// identity root, 16 octets each. Both are overwritten when it is dropped.
@@ -55,7 +60,12 @@ pub struct DeviceSecret {
 /// Our identity for one [`Variant`]: the static random address and the
 /// identity resolving key. The key is overwritten when it is dropped.
 #[derive(Clone, Eq, PartialEq)]
-#[expect(clippy::module_name_repetitions, reason = "a local identity, apart from the central's")]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "until the firmwares switch: the three import it by this name from this module, and a re-export \
+              or alias under the old name raises `pub_use` or this lint again; the way out is a rename to \
+              `identity::Local` (or a move to `host`) together with their imports"
+)]
 pub struct LocalIdentity {
     /// The static random address, least significant octet first.
     address: [u8; 6],
@@ -77,11 +87,9 @@ impl DeviceSecret {
     #[inline]
     #[must_use = "the secret is only read"]
     pub fn from_ficr() -> Self {
+        use core::array;
         use embassy_nrf::pac::FICR;
-        Self::from_words(
-            core::array::from_fn(|word| FICR.er(word).read()),
-            core::array::from_fn(|word| FICR.ir(word).read()),
-        )
+        Self::from_words(array::from_fn(|word| FICR.er(word).read()), array::from_fn(|word| FICR.ir(word).read()))
     }
 
     /// The roots from their four words each, every word least significant
@@ -92,7 +100,7 @@ impl DeviceSecret {
         let octets = |words: [u32; 4]| {
             let mut root = [0; 16];
             for (chunk, word) in root.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-                *chunk = word.to_le_bytes();
+                *chunk = le32_bytes(word);
             }
             root
         };
@@ -176,7 +184,7 @@ impl Variant {
     /// The AES block the roots encrypt: the variant least significant octet
     /// first, then zeros.
     const fn block(self) -> [u8; 16] {
-        let [low, high] = self.0.to_le_bytes();
+        let [low, high] = le16_bytes(self.0);
         [low, high, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     }
 
@@ -189,14 +197,14 @@ impl Variant {
     #[inline]
     #[must_use = "the generation is only read"]
     pub const fn generation(self) -> u8 {
-        let [_, high] = self.0.to_le_bytes();
+        let [_, high] = le16_bytes(self.0);
         high
     }
 
     /// The variant of `slot` in `generation`.
     #[inline]
     #[must_use = "the variant is only built"]
-    pub const fn new(slot: u8, generation: u8) -> Self { Self(u16::from_le_bytes([slot, generation])) }
+    pub const fn new(slot: u8, generation: u8) -> Self { Self(le16([slot, generation])) }
 
     /// The same slot in the next generation, for a new pairing mode; after
     /// 255 comes 0.
@@ -208,7 +216,7 @@ impl Variant {
     #[inline]
     #[must_use = "the slot is only read"]
     pub const fn slot(self) -> u8 {
-        let [low, _] = self.0.to_le_bytes();
+        let [low, _] = le16_bytes(self.0);
         low
     }
 }
@@ -216,7 +224,7 @@ impl Variant {
 /// A static random address from six random octets, least significant first
 /// (Core, Vol 6, Part B, 1.3.2.1): the two most significant bits set, and the
 /// rest neither all zeros nor all ones, which flips the lowest bit.
-fn static_random(mut octets: [u8; 6]) -> [u8; 6] {
+const fn static_random(mut octets: [u8; 6]) -> [u8; 6] {
     let mut random = octets;
     if let Some(top) = random.last_mut() {
         *top &= 0x3F;

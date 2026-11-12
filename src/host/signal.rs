@@ -3,7 +3,7 @@
 //! [`Signalling`] sends the Connection Parameter Update Request and takes its
 //! response. The request asks for a [`crate::link::ParamRange`], which is to
 //! be the same constant as the Peripheral Preferred Connection Parameters
-//! characteristic ([`crate::host::gatt::ppcp`]), so BlueZ never finds the two
+//! characteristic ([`crate::host::gatt::ppcp`]), so `BlueZ` never finds the two
 //! disagreeing.
 //!
 //! A request it does not serve is answered with a Command Reject (Core, Vol
@@ -15,7 +15,10 @@
 //! length field that does not match the PDU, is dropped, as Linux drops them.
 //! The LE signalling channel carries one command per PDU.
 
-use crate::link::ParamRange;
+use crate::{
+    bytes::{le16, le16_bytes},
+    link::ParamRange,
+};
 
 /// Code of a Command Reject.
 pub const COMMAND_REJECT: u8 = 0x01;
@@ -85,11 +88,11 @@ impl Command {
     /// The command for the PDU's payload.
     #[inline]
     #[must_use = "the command is only read"]
-    pub fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn bytes(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// A command with `code`, `identifier` and the data `parts` in order.
     fn new(code: u8, identifier: u8, parts: &[&[u8]]) -> Self {
-        let mut data = [0_u8; COMMAND_MAX];
+        let mut data: [u8; COMMAND_MAX] = [0; COMMAND_MAX];
         let mut len = HEADER_LEN;
         for &byte in parts.iter().flat_map(|part| part.iter()) {
             if let Some(slot) = data.get_mut(len) {
@@ -97,7 +100,7 @@ impl Command {
                 len = len.saturating_add(1);
             }
         }
-        let [len0, len1] = u16::try_from(len.saturating_sub(HEADER_LEN)).unwrap_or_default().to_le_bytes();
+        let [len0, len1] = le16_bytes(u16::try_from(len.saturating_sub(HEADER_LEN)).unwrap_or_default());
         if let Some(header) = data.first_chunk_mut::<HEADER_LEN>() {
             *header = [code, identifier, len0, len1];
         }
@@ -107,7 +110,7 @@ impl Command {
     /// A Command Reject of the request with `identifier` for `reason`, with
     /// `data`.
     fn reject(identifier: u8, reason: u16, data: &[u8]) -> Self {
-        Self::new(COMMAND_REJECT, identifier, &[&reason.to_le_bytes(), data])
+        Self::new(COMMAND_REJECT, identifier, &[&le16_bytes(reason), data])
     }
 }
 
@@ -133,7 +136,7 @@ impl Signalling {
     #[must_use = "the answer is only computed"]
     pub fn receive(&mut self, pdu: &[u8]) -> Option<Action> {
         let (&[code, identifier, len0, len1], data) = pdu.split_first_chunk::<HEADER_LEN>()?;
-        if identifier == 0 || usize::from(u16::from_le_bytes([len0, len1])) != data.len() {
+        if identifier == 0 || usize::from(le16([len0, len1])) != data.len() {
             return None;
         }
         if RESPONSES.contains(&code) {
@@ -160,10 +163,10 @@ impl Signalling {
         self.identifier = self.identifier.checked_add(1).unwrap_or(1);
         self.pending = true;
         Some(Command::new(CONNECTION_PARAMETER_UPDATE_REQUEST, self.identifier, &[
-            &range.interval_min.to_le_bytes(),
-            &range.interval_max.to_le_bytes(),
-            &range.latency.to_le_bytes(),
-            &range.timeout.to_le_bytes(),
+            &le16_bytes(range.interval_min),
+            &le16_bytes(range.interval_max),
+            &le16_bytes(range.latency),
+            &le16_bytes(range.timeout),
         ]))
     }
 

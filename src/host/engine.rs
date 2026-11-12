@@ -40,14 +40,14 @@
 //!   otherwise wait for it. Discovery is over on an encrypted link once the
 //!   central acknowledged our Write Response to the write that left every input
 //!   report's client characteristic configuration written on this link, and ATT
-//!   has been idle for [`INPUTS_IDLE`] since: BlueZ creates its input device
+//!   has been idle for [`INPUTS_IDLE`] since: `BlueZ` creates its input device
 //!   only once it received that response, and drops the reports before it.
 //!   Without such a write, as with a table without input reports, ATT is to be
 //!   idle for [`READY_IDLE`] on the encrypted link.
 //! - Once ATT has been idle for [`PARAMS_IDLE`], it asks for the connection
 //!   parameters of its [`Config`] with the L2CAP request, once per link and
 //!   only if the link has others: the same constant as the Peripheral Preferred
-//!   Connection Parameters, so BlueZ never finds the two disagreeing. Asked
+//!   Connection Parameters, so `BlueZ` never finds the two disagreeing. Asked
 //!   earlier, the update would stretch discovery. With the feature
 //!   `param-requests` the application may ask itself
 //!   (`host::Conn::request_params`), for a fallback or a second try, and learns
@@ -107,11 +107,17 @@
 //! with Service Changed); the LE credit based channels; and an MTU
 //! above 23.
 
+#[cfg(feature = "passkey")]
+use crate::host::PasskeyError;
+#[cfg(feature = "param-requests")]
+use crate::host::RequestError;
 use crate::{
     crypto::wipe,
     host::{
         Aes,
-        att::{MTU, NotifyError as AttNotifyError, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
+        ConnEvent,
+        NotifyError,
+        att::{MTU, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
         bond::Bond,
         gatt::{CCCD_MAX, Char, Db, Handler, Kind, PROP_NOTIFY, Sec, Uuid, Value},
         identity::{LocalIdentity, Variant},
@@ -120,9 +126,8 @@ use crate::{
         smp::{self, Job, JobResult, Outcome, Random, Reason, Responder},
     },
     link::{AclIn, ConnectionParams, Epoch, Event, Info, ParamRange},
-    log::info,
 };
-use core::fmt;
+use core::mem;
 use embassy_time::{Duration, Instant};
 
 /// The time ATT is to be idle before discovery counts as over.
@@ -135,7 +140,7 @@ pub const INPUTS_IDLE: Duration = Duration::from_millis(100);
 /// write.
 ///
 /// It is the fallback of [`INPUTS_IDLE`] on an encrypted link, longer than
-/// the gaps of BlueZ's discovery, so a reconnection whose writes come late
+/// the gaps of `BlueZ`'s discovery, so a reconnection whose writes come late
 /// still waits for them.
 pub const READY_IDLE: Duration = Duration::from_millis(1000);
 /// The time ATT is to be idle before the connection parameters are asked
@@ -247,15 +252,14 @@ pub struct Config {
 }
 
 /// The protocol state of the host: see the module documentation.
-#[non_exhaustive]
 pub struct Engine {
     /// The attribute server of the link.
     att:           Server,
     /// The bond: the one the advertising was set up with, or the one the
     /// pairing on the link made.
-    bond:          Option<Bond>,
+    bond:          Option<Bond> = None,
     /// The calls of the link layer that wait.
-    commands:      Commands,
+    commands:      Commands = Commands { disconnect: None, hold: None, ltk: None },
     /// What the engine does.
     config:        Config,
     /// The table.
@@ -263,32 +267,32 @@ pub struct Engine {
     /// The events for the application.
     events:        Events,
     /// The link, while one exists.
-    link:          Option<LinkState>,
+    link:          Option<LinkState> = None,
     /// The passkey the application gave, or [`REFUSED`], until the run task
     /// hands it to the security manager; otherwise [`smp::NO_PASSKEY`],
     /// which overwrites all of its digits.
     #[cfg(feature = "passkey")]
-    passkey_input: u32,
+    passkey_input: u32 = smp::NO_PASSKEY,
     /// The ATT response waiting to be sent.
-    response:      Option<Slot>,
+    response:      Option<Slot> = None,
     /// The reassembly of received fragments.
-    rx:            Reassembly,
+    rx:            Reassembly = Reassembly::new(),
     /// Time from a connection until it has to be encrypted.
-    security:      Duration,
+    security:      Duration = Duration::MAX,
     /// The PDU being sent, with its fragments so far.
-    sending:       Option<(Source, Segmenter)>,
+    sending:       Option<(Source, Segmenter)> = None,
     /// Our signalling reply waiting to be sent.
-    sig_reply:     Option<signal::Command>,
+    sig_reply:     Option<signal::Command> = None,
     /// Our connection parameter request waiting to be sent.
-    sig_req:       Option<signal::Command>,
+    sig_req:       Option<signal::Command> = None,
     /// The signalling channel.
-    signal:        Signalling,
+    signal:        Signalling = Signalling::new(),
     /// The security manager.
     smp:           Responder,
     /// The variant of our identity the advertising was set up with.
-    variant:       Variant,
+    variant:       Variant = Variant::new(0, 0),
     /// Whether an advertising call waits for a link.
-    waiting:       bool,
+    waiting:       bool = false,
 }
 
 /// The events for the application, of the link that last connected.
@@ -307,67 +311,28 @@ struct Events {
     reason:  Reason,
 }
 
-/// An event of the host for the application, with [`Engine::take_event`]
-/// or [`crate::host::Conn::next`].
-///
-/// Events of one kind coalesce until they are taken. They come in this
-/// order: `PasskeyRequested` (feature `passkey`), [`Self::PairingFailed`],
-/// `KeyMissing` (feature `key-missing`), [`Self::Encrypted`],
-/// [`Self::Bonded`], [`Self::BondUpdated`], [`Self::ParamsUpdated`],
-/// `ParamsRejected` (feature `param-requests`), [`Self::Ready`], and
-/// [`Self::Disconnected`] last, after every other event of its link.
-#[derive(Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ConnEvent {
-    /// The bonded central changed its subscriptions: the bond to store in
-    /// place of the stored one.
-    BondUpdated(Bond),
-    /// A pairing made this bond, which the firmware stores: reported once
-    /// the central acknowledged our identity keys.
-    Bonded(Bond),
-    /// The link ended, with the reason; 0 if it is no longer known.
-    Disconnected(u8),
-    /// The link is encrypted: with the bond's key, or with a new pairing's.
-    Encrypted {
-        /// With the key of the bond the advertising was set up with.
-        bonded: bool,
-    },
-    /// The central of a reconnection asked to encrypt with a key the host
-    /// does not have: the bond's central lost its key, or holds one of
-    /// another pairing. The host answered with the negative reply and ends
-    /// the link at once with [`SECURITY_FAILURE`]; the bond stays as it is.
-    #[cfg(feature = "key-missing")]
-    KeyMissing,
-    /// A pairing failed, with the reason; the link ends.
-    PairingFailed(Reason),
-    /// The central rejected a connection parameter request.
-    ///
-    /// The request was the engine's own ([`Config::params`]) or one of
-    /// [`crate::host::Conn::request_params`], and the central answered with
-    /// a Connection Parameter Update Response that refuses it, or a Command
-    /// Reject. An accepted
-    /// request has no event of its own: [`Self::ParamsUpdated`] follows once
-    /// the central updated the link. A request the central never answers
-    /// gives neither; after [`SIGNALLING_TIMEOUT`] the next one may go out.
-    #[cfg(feature = "param-requests")]
-    ParamsRejected,
-    /// The connection parameters changed to these.
-    ParamsUpdated(ConnectionParams),
-    /// Passkey Entry asks for the passkey the central displays.
-    ///
-    /// The user types it on the device; give it with
-    /// [`crate::host::Conn::enter_passkey`], or `None` to refuse. It comes
-    /// first among the link's events; [`Self::PairingFailed`] or the end of
-    /// the link ends the entry.
-    #[cfg(feature = "passkey")]
-    PasskeyRequested,
-    /// Discovery is over: the link is encrypted, the central has our
-    /// response to its last input report configuration write, and ATT has
-    /// been idle for [`INPUTS_IDLE`] since (or, without such a write, for
-    /// [`READY_IDLE`]). BlueZ still needs a moment to create its input
-    /// device: the application waits a settle time, measured on the hardware,
-    /// before its first report.
-    Ready,
+/// Where a link is after the encryption.
+struct Discovery {
+    /// Whether a pairing bonded and [`ConnEvent::Bonded`] waits until
+    /// nothing is in flight.
+    bonding:  bool = false,
+    /// Whether discovery is over.
+    ready:    bool = false,
+    /// Whether the bond's subscriptions were restored, or need not be.
+    restored: bool = false,
+}
+
+/// Who holds a link, and whether it is to end: a link that no advertising
+/// call took may be ended for nobody ([`Unclaimed::Disconnect`]).
+struct Fate {
+    /// Whether an advertising call returned the link.
+    claimed: bool = false,
+    /// Whether the disconnection was asked for; the link layer's event
+    /// follows.
+    closing: bool = false,
+    /// Whether the link is to end once the security manager sent its last
+    /// PDU, our Pairing Failed.
+    failing: bool = false,
 }
 
 /// Where the link is with the configuration of its input reports.
@@ -399,7 +364,6 @@ enum Key {
 }
 
 /// The state of the link.
-#[expect(clippy::struct_excessive_bools, reason = "independent facts about the link")]
 struct LinkState {
     /// When ATT last received or sent a PDU, or the link became encrypted.
     activity:  Instant,
@@ -407,22 +371,15 @@ struct LinkState {
     asked:     bool,
     /// When our connection parameter request times out.
     asking:    Option<Instant>,
-    /// Whether a pairing bonded and [`ConnEvent::Bonded`] waits until
-    /// nothing is in flight.
-    bonding:   bool,
-    /// Whether an advertising call returned the link.
-    claimed:   bool,
-    /// Whether the disconnection was asked for; the link layer's event
-    /// follows.
-    closing:   bool,
+    /// Where the link is after the encryption.
+    discovery: Discovery,
     /// Whether the link is encrypted with a key the host gave.
     encrypted: bool,
     /// Ending once the link layer has no fragment in flight, or at the
     /// instant: the reason.
     ending:    Option<(u8, Instant)>,
-    /// Whether the link is to end once the security manager sent its last
-    /// PDU, our Pairing Failed.
-    failing:   bool,
+    /// Who holds the link, and whether it is to end.
+    fate:      Fate,
     /// What the link layer said about the link.
     info:      Info,
     /// The configuration of the input reports on this link.
@@ -431,10 +388,6 @@ struct LinkState {
     key:       Option<Key>,
     /// The connection parameters.
     params:    ConnectionParams,
-    /// Whether discovery is over.
-    ready:     bool,
-    /// Whether the bond's subscriptions were restored, or need not be.
-    restored:  bool,
     /// When the link has to be encrypted.
     security:  Option<Instant>,
 }
@@ -479,43 +432,6 @@ pub enum Unclaimed {
     Disconnect,
     /// The next advertising call returns it without advertising.
     Keep,
-}
-
-/// Why [`Engine::request_params`] sent no request.
-#[cfg(feature = "param-requests")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[non_exhaustive]
-pub enum RequestError {
-    /// A request waits for its response, or for its place in the link
-    /// layer's queue: one at a time.
-    Busy,
-    /// The link ended, or is ending.
-    Gone,
-    /// The range is out of the specification's ranges: an interval of 7.5 ms
-    /// to 4 s, the shortest at most the longest, and a latency and timeout
-    /// that fit the longest.
-    Invalid,
-}
-
-/// Why a notification cannot be sent now, or at all.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[non_exhaustive]
-pub enum NotifyError {
-    /// No room now: a PDU of several fragments is being sent, the link layer
-    /// lacks two free places, or [`Config::notify_depth`] fragments are in
-    /// flight.
-    Busy,
-    /// The link ended.
-    Disconnected,
-    /// The link lacks the security the characteristic needs.
-    Insecure,
-    /// The client has not enabled notifications, or the characteristic
-    /// cannot notify.
-    NotSubscribed,
-    /// The value is longer than [`crate::host::att::NOTIFY_MAX`].
-    TooLong,
 }
 
 impl Config {
@@ -582,17 +498,18 @@ impl Engine {
     fn att_pdu(&mut self, app: &dyn Handler, pdu: &[u8], encrypted: bool, now: Instant) {
         let Some(link) = self.link.as_mut() else { return };
         link.activity = now;
-        let level = if encrypted && link.key.is_some() { Sec::Encrypted } else { Sec::Open };
-        if level == Sec::Encrypted {
+        let received = if encrypted && link.key.is_some() { Sec::Encrypted } else { Sec::Open };
+        if received == Sec::Encrypted {
             // Proof of the encryption, which its event may follow later.
             link.encrypted = true;
             link.security = None;
             self.restore();
         }
         #[cfg(feature = "passkey")]
-        #[expect(clippy::shadow_reuse, reason = "the same level, raised for a key of authenticated pairing")]
-        let level = self.raised(level);
-        let mut out = [0_u8; MTU];
+        let level = self.raised(received);
+        #[cfg(not(feature = "passkey"))]
+        let level = received;
+        let mut out: [u8; MTU] = [0; MTU];
         if let Some(len) = self.att.handle(pdu, level, app, &mut out) {
             if self.response.is_none() {
                 self.response = Some(Slot { bytes: out, len: u8::try_from(len).unwrap_or_default() });
@@ -644,8 +561,9 @@ impl Engine {
     /// for a call that was dropped, once; never one that is ending.
     #[inline]
     pub fn claim(&mut self) -> Option<Epoch> {
-        let link = self.link.as_mut().filter(|link| !link.claimed && !link.closing && link.ending.is_none())?;
-        link.claimed = true;
+        let link =
+            self.link.as_mut().filter(|link| !link.fate.claimed && !link.fate.closing && link.ending.is_none())?;
+        link.fate.claimed = true;
         Some(link.info.epoch)
     }
 
@@ -663,18 +581,14 @@ impl Engine {
             activity:  now,
             asked:     false,
             asking:    None,
-            bonding:   false,
-            claimed:   false,
-            closing:   false,
+            discovery: Discovery { .. },
             encrypted: false,
             ending:    None,
-            failing:   false,
+            fate:      Fate { .. },
             info:      *info,
             inputs:    Inputs::Open,
             key:       None,
             params:    info.params,
-            ready:     false,
-            restored:  false,
             security:  Some(security),
         });
         self.events.epoch = Some(info.epoch);
@@ -684,7 +598,7 @@ impl Engine {
             info!("a link nobody waits for ends");
             self.commands.disconnect = Some((info.epoch, REMOTE_USER));
             if let Some(link) = self.link.as_mut() {
-                link.closing = true;
+                link.fate.closing = true;
             }
         }
     }
@@ -743,13 +657,13 @@ impl Engine {
             && self.bond.is_some()
             && let Some(link) = self.link.as_mut()
             && link.key.is_none()
-            && !link.closing
+            && !link.fate.closing
         {
             // A reconnection: only the bonded central connects, and it has
             // no key the host knows. Waiting for the security deadline
             // would only keep it connected without encryption.
             info!("the central has no key of the bond: the link ends");
-            link.closing = true;
+            link.fate.closing = true;
             link.security = None;
             self.commands.disconnect = Some((link.info.epoch, SECURITY_FAILURE));
             self.events.flags |= EV_KEY_MISSING;
@@ -766,22 +680,22 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// [`smp::PasskeyError::Gone`] without the link,
-    /// [`smp::PasskeyError::NotWaiting`] unless the pairing waits for the
-    /// passkey and has none yet, [`smp::PasskeyError::Invalid`] above
+    /// [`PasskeyError::Gone`] without the link,
+    /// [`PasskeyError::NotWaiting`] unless the pairing waits for the
+    /// passkey and has none yet, [`PasskeyError::Invalid`] above
     /// [`smp::PASSKEY_MAX`].
     #[cfg(feature = "passkey")]
     #[inline]
-    pub fn enter_passkey(&mut self, epoch: Epoch, passkey: Option<u32>) -> Result<(), smp::PasskeyError> {
+    pub fn enter_passkey(&mut self, epoch: Epoch, passkey: Option<u32>) -> Result<(), PasskeyError> {
         self.link
             .as_ref()
-            .filter(|link| link.info.epoch == epoch && !link.closing && link.ending.is_none())
-            .ok_or(smp::PasskeyError::Gone)?;
+            .filter(|link| link.info.epoch == epoch && !link.fate.closing && link.ending.is_none())
+            .ok_or(PasskeyError::Gone)?;
         if self.passkey_input != smp::NO_PASSKEY || !self.smp.awaits_passkey() {
-            return Err(smp::PasskeyError::NotWaiting);
+            return Err(PasskeyError::NotWaiting);
         }
         if passkey.is_some_and(|value| value > smp::PASSKEY_MAX) {
-            return Err(smp::PasskeyError::Invalid);
+            return Err(PasskeyError::Invalid);
         }
         self.passkey_input = passkey.unwrap_or(REFUSED);
         Ok(())
@@ -823,10 +737,10 @@ impl Engine {
                 let outcome = self.smp.pdu_sent(now);
                 self.outcome(outcome, now);
                 if let Some(link) = self.link.as_mut()
-                    && link.failing
+                    && link.fate.failing
                     && !self.smp.has_output()
                 {
-                    link.failing = false;
+                    link.fate.failing = false;
                     link.ending = Some((SECURITY_FAILURE, now.checked_add(FLUSH_TIMEOUT).unwrap_or(Instant::MAX)));
                 }
             },
@@ -836,12 +750,7 @@ impl Engine {
     /// Whether a link exists that an advertising call returned.
     #[inline]
     #[must_use = "the state is only read"]
-    pub const fn has_claimed_link(&self) -> bool {
-        match self.link.as_ref() {
-            Some(link) => link.claimed,
-            None => false,
-        }
-    }
+    pub const fn has_claimed_link(&self) -> bool { self.link.as_ref().is_some_and(const |link| link.fate.claimed) }
 
     /// Whether a job waits for the crypto task.
     #[inline]
@@ -868,7 +777,7 @@ impl Engine {
     pub fn has_output(&self) -> bool {
         self.link.as_ref().is_some_and(|link| {
             link.ending.is_some()
-                || link.bonding
+                || link.discovery.bonding
                 || link.inputs == Inputs::Sent
                 || self.sending.is_some()
                 || self.smp.has_output()
@@ -942,8 +851,6 @@ impl Engine {
     pub const fn new(db: &'static Db, config: Config) -> Self {
         Self {
             att: Server::new(db),
-            bond: None,
-            commands: Commands { disconnect: None, hold: None, ltk: None },
             config,
             db,
             events: Events {
@@ -954,22 +861,11 @@ impl Engine {
                 params:  ConnectionParams::new(0, 0, 0),
                 reason:  Reason::UNSPECIFIED,
             },
-            link: None,
-            #[cfg(feature = "passkey")]
-            passkey_input: smp::NO_PASSKEY,
-            response: None,
-            rx: Reassembly::new(),
-            security: Duration::MAX,
-            sending: None,
-            signal: Signalling::new(),
-            sig_reply: None,
-            sig_req: None,
             #[cfg(not(feature = "passkey"))]
             smp: Responder::new(),
             #[cfg(feature = "passkey")]
             smp: Responder::with_security(config.security),
-            variant: Variant::new(0, 0),
-            waiting: false,
+            ..
         }
     }
 
@@ -978,9 +874,9 @@ impl Engine {
     #[must_use = "the deadline is only read"]
     pub fn next_deadline(&self) -> Option<Instant> {
         let link = self.link.as_ref()?;
-        let ready = (link.encrypted && !link.ready).then(|| link.activity.checked_add(link.ready_idle()));
-        let params =
-            (link.ready && !link.asked && self.config.params.is_some()).then(|| link.activity.checked_add(PARAMS_IDLE));
+        let ready = (link.encrypted && !link.discovery.ready).then(|| link.activity.checked_add(link.ready_idle()));
+        let params = (link.discovery.ready && !link.asked && self.config.params.is_some())
+            .then(|| link.activity.checked_add(PARAMS_IDLE));
         [
             self.smp.deadline(),
             link.security,
@@ -1032,13 +928,14 @@ impl Engine {
         let link = self
             .link
             .as_ref()
-            .filter(|link| link.info.epoch == epoch && !link.closing && link.ending.is_none())
+            .filter(|link| link.info.epoch == epoch && !link.fate.closing && link.ending.is_none())
             .ok_or(NotifyError::Disconnected)?;
-        let level = if link.encrypted { Sec::Encrypted } else { Sec::Open };
+        let encryption = if link.encrypted { Sec::Encrypted } else { Sec::Open };
         #[cfg(feature = "passkey")]
-        #[expect(clippy::shadow_reuse, reason = "the same level, raised for a key of authenticated pairing")]
-        let level = self.raised(level);
-        let mut out = [0_u8; MTU];
+        let level = self.raised(encryption);
+        #[cfg(not(feature = "passkey"))]
+        let level = encryption;
+        let mut out: [u8; MTU] = [0; MTU];
         let len = self.att.notify(characteristic, data, level, &mut out).map_err(NotifyError::from)?;
         if self.sending.is_some_and(|(_, segmenter)| segmenter.is_mid_pdu()) {
             return Err(NotifyError::Busy);
@@ -1051,7 +948,7 @@ impl Engine {
     /// go out ([`Config::notify_depth`]), at least one.
     #[inline]
     #[must_use = "the depth is only read"]
-    pub fn notify_depth(&self) -> usize { usize::from(self.config.notify_depth.max(1)) }
+    pub const fn notify_depth(&self) -> usize { usize::from(self.config.notify_depth.max(1)) }
 
     /// Takes a fragment the link layer received, at `now`, with `crypto` for
     /// the security manager and `app` for the dynamic values.
@@ -1063,7 +960,7 @@ impl Engine {
         if self.link.is_none() {
             return;
         }
-        let mut buffer = [0_u8; RX_MAX];
+        let mut buffer: [u8; RX_MAX] = [0; RX_MAX];
         let Some((channel, encrypted, len)) = self.rx.push_acl(acl).map(|pdu| {
             let len = pdu.payload.len().min(RX_MAX);
             if let (Some(target), Some(source)) = (buffer.get_mut(..len), pdu.payload.get(..len)) {
@@ -1109,7 +1006,6 @@ impl Engine {
     /// [`Event::Connected`], which comes with the link's information to
     /// [`Self::connected`].
     #[inline]
-    #[expect(clippy::rest_pattern_accessible_field, reason = "the events the engine ignores are matched by variant")]
     pub fn on_event(&mut self, event: &Event, now: Instant) {
         match *event {
             Event::Disconnected(reason) => {
@@ -1117,7 +1013,7 @@ impl Engine {
                     self.disconnected(epoch, reason);
                 }
             },
-            Event::Encryption { on, refresh, .. } => self.encryption(on, refresh, now),
+            Event::Encryption { on, refresh, status: _status } => self.encryption(on, refresh, now),
             Event::LtkRequest { ediv, rand } => self.ltk_request(ediv, rand),
             Event::ParamsUpdated { params, status } => {
                 if let Some(link) = self.link.as_mut()
@@ -1134,9 +1030,9 @@ impl Engine {
             | Event::DataLength(_)
             | Event::ParamsRequested(_)
             | Event::PayloadTimeout
-            | Event::PhyUpdated { .. }
-            | Event::RemoteFeatures { .. }
             | Event::RemoteVersion(_) => {},
+            Event::PhyUpdated { rx: _rx, status: _status, tx: _tx } => {},
+            Event::RemoteFeatures { features: _features, status: _status } => {},
         }
     }
 
@@ -1149,7 +1045,7 @@ impl Engine {
         if link.security.is_some_and(|deadline| now >= deadline) {
             info!("the link was not encrypted in time");
             link.security = None;
-            link.closing = true;
+            link.fate.closing = true;
             self.commands.disconnect = Some((link.info.epoch, SECURITY_FAILURE));
         }
         if link.asking.is_some_and(|deadline| now >= deadline) {
@@ -1157,13 +1053,13 @@ impl Engine {
             self.signal.cancel();
         }
         let idle = now.checked_duration_since(link.activity).unwrap_or(Duration::MIN);
-        if link.encrypted && !link.ready && idle >= link.ready_idle() {
-            link.ready = true;
+        if link.encrypted && !link.discovery.ready && idle >= link.ready_idle() {
+            link.discovery.ready = true;
             self.events.flags |= EV_READY;
             self.events.changed = true;
             self.commands.hold = Some(false);
         }
-        if link.ready && !link.asked && idle >= PARAMS_IDLE {
+        if link.discovery.ready && !link.asked && idle >= PARAMS_IDLE {
             link.asked = true;
             if let Some(range) = self.config.params
                 && !fits(range, link.params)
@@ -1190,20 +1086,17 @@ impl Engine {
                 let mut bond = Bond::new(peer, irk, bonded.ltk, self.variant, self.db);
                 bond.cccd = self.att.subscriptions().bits();
                 #[cfg(feature = "passkey")]
-                #[expect(clippy::semicolon_outside_block, reason = "a statement of the feature alone")]
-                {
-                    bond.authenticated = bonded.authenticated;
-                }
+                bond.set_authenticated(bonded.authenticated);
                 wipe(&mut bonded.ltk);
                 if let Some(identity) = bonded.identity.as_mut() {
                     wipe(&mut identity.irk);
                 }
                 self.bond = Some(bond);
                 link.key = Some(Key::Bond);
-                link.restored = true;
+                link.discovery.restored = true;
                 // Reported once the central has our identity: see
                 // `take_command`.
-                link.bonding = true;
+                link.discovery.bonding = true;
             },
             Outcome::Failed { by_central, reason } => {
                 self.events.flags |= EV_PAIRING_FAILED;
@@ -1211,7 +1104,7 @@ impl Engine {
                 if by_central {
                     link.ending = Some((SECURITY_FAILURE, now));
                 } else {
-                    link.failing = true;
+                    link.fate.failing = true;
                 }
             },
             #[cfg(feature = "passkey")]
@@ -1222,7 +1115,7 @@ impl Engine {
             Outcome::Started => info!("pairing"),
             Outcome::TimedOut => {
                 info!("pairing timed out");
-                link.closing = true;
+                link.fate.closing = true;
                 self.commands.disconnect = Some((link.info.epoch, REMOTE_USER));
             },
         }
@@ -1236,7 +1129,7 @@ impl Engine {
             Source::Att => self.response.map(|slot| (slot.bytes, usize::from(slot.len))),
             Source::Reply | Source::Request => {
                 let command = if source == Source::Reply { self.sig_reply } else { self.sig_req }?;
-                let mut bytes = [0_u8; MTU];
+                let mut bytes: [u8; MTU] = [0; MTU];
                 let len = command.bytes().len().min(MTU);
                 bytes.get_mut(..len)?.copy_from_slice(command.bytes().get(..len)?);
                 Some((bytes, len))
@@ -1281,7 +1174,7 @@ impl Engine {
         let link = self
             .link
             .as_mut()
-            .filter(|link| link.info.epoch == epoch && !link.closing && link.ending.is_none())
+            .filter(|link| link.info.epoch == epoch && !link.fate.closing && link.ending.is_none())
             .ok_or(RequestError::Gone)?;
         if !range.is_valid() {
             return Err(RequestError::Invalid);
@@ -1296,10 +1189,10 @@ impl Engine {
     /// the bond's key.
     fn restore(&mut self) {
         let Some(link) = self.link.as_mut() else { return };
-        if link.restored || link.key != Some(Key::Bond) {
+        if link.discovery.restored || link.key != Some(Key::Bond) {
             return;
         }
-        link.restored = true;
+        link.discovery.restored = true;
         if let Some(bond) = self.bond.as_ref() {
             self.att.restore(bond.subscriptions(self.db));
         }
@@ -1314,10 +1207,11 @@ impl Engine {
     #[must_use = "the security is only read"]
     pub fn security(&self, epoch: Epoch) -> Option<Sec> {
         let link = self.link.as_ref().filter(|link| link.info.epoch == epoch)?;
-        let level = if link.encrypted { Sec::Encrypted } else { Sec::Open };
+        let encryption = if link.encrypted { Sec::Encrypted } else { Sec::Open };
         #[cfg(feature = "passkey")]
-        #[expect(clippy::shadow_reuse, reason = "the same level, raised for a key of authenticated pairing")]
-        let level = self.raised(level);
+        let level = self.raised(encryption);
+        #[cfg(not(feature = "passkey"))]
+        let level = encryption;
         Some(level)
     }
 
@@ -1329,11 +1223,11 @@ impl Engine {
         self.waiting = false;
         if self.config.unclaimed == Unclaimed::Disconnect
             && let Some(link) = self.link.as_mut()
-            && !link.claimed
-            && !link.closing
+            && !link.fate.claimed
+            && !link.fate.closing
         {
             info!("a link nobody waits for ends");
-            link.closing = true;
+            link.fate.closing = true;
             self.commands.disconnect = Some((link.info.epoch, REMOTE_USER));
         }
     }
@@ -1350,8 +1244,8 @@ impl Engine {
             if link.inputs == Inputs::Sent {
                 link.inputs = Inputs::Acked;
             }
-            if link.bonding {
-                link.bonding = false;
+            if link.discovery.bonding {
+                link.discovery.bonding = false;
                 self.events.flags |= EV_BONDED;
                 self.events.changed = true;
             }
@@ -1371,7 +1265,7 @@ impl Engine {
             return None;
         }
         link.ending = None;
-        link.closing = true;
+        link.fate.closing = true;
         Some(Command::Disconnect { epoch: link.info.epoch, reason })
     }
 
@@ -1433,7 +1327,7 @@ impl Engine {
 
     /// Whether an event arrived since the last call.
     #[inline]
-    pub const fn take_events_changed(&mut self) -> bool { core::mem::replace(&mut self.events.changed, false) }
+    pub const fn take_events_changed(&mut self) -> bool { mem::replace(&mut self.events.changed, false) }
 
     /// The next job for the crypto task, if one waits.
     #[inline]
@@ -1468,44 +1362,10 @@ impl Engine {
             && bond.cccd != bits
         {
             bond.cccd = bits;
-            if !link.bonding {
+            if !link.discovery.bonding {
                 self.events.flags |= EV_BOND_UPDATED;
                 self.events.changed = true;
             }
-        }
-    }
-}
-
-impl fmt::Debug for ConnEvent {
-    #[inline]
-    #[expect(clippy::renamed_function_params, reason = "a name of one character is refused")]
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::BondUpdated(_) => formatter.debug_tuple("BondUpdated").finish_non_exhaustive(),
-            Self::Bonded(_) => formatter.debug_tuple("Bonded").finish_non_exhaustive(),
-            Self::Disconnected(reason) => formatter.debug_tuple("Disconnected").field(&reason).finish(),
-            Self::Encrypted { bonded } => formatter.debug_struct("Encrypted").field("bonded", &bonded).finish(),
-            #[cfg(feature = "key-missing")]
-            Self::KeyMissing => formatter.write_str("KeyMissing"),
-            Self::PairingFailed(reason) => formatter.debug_tuple("PairingFailed").field(&reason).finish(),
-            #[cfg(feature = "param-requests")]
-            Self::ParamsRejected => formatter.write_str("ParamsRejected"),
-            Self::ParamsUpdated(params) => formatter.debug_tuple("ParamsUpdated").field(&params).finish(),
-            #[cfg(feature = "passkey")]
-            Self::PasskeyRequested => formatter.write_str("PasskeyRequested"),
-            Self::Ready => formatter.write_str("Ready"),
-        }
-    }
-}
-
-impl From<AttNotifyError> for NotifyError {
-    #[inline]
-    fn from(error: AttNotifyError) -> Self {
-        match error {
-            AttNotifyError::Insecure => Self::Insecure,
-            AttNotifyError::NotSubscribed => Self::NotSubscribed,
-            AttNotifyError::Pending => Self::Busy,
-            AttNotifyError::TooLong => Self::TooLong,
         }
     }
 }
@@ -1533,16 +1393,16 @@ impl Source {
 
 /// The client characteristic configuration descriptors of the input reports
 /// of `db` that notify, one bit for each index: the HID reports (0x2A4D) with
-/// the notify property, as BlueZ subscribes to each of them.
+/// the notify property, as `BlueZ` subscribes to each of them.
 fn input_reports(db: &Db) -> u16 {
-    let mut inputs = 0_u16;
+    let mut inputs: u16 = 0;
     let mut report = false;
     for attr in db.attrs() {
         match (attr.kind(), attr.value_source()) {
             (Kind::Characteristic(props), _) => report = attr.uuid() == Uuid::U16(REPORT) && props & PROP_NOTIFY != 0,
             (Kind::Service, _) => report = false,
             (Kind::Descriptor(_), Value::Cccd(index)) if report => {
-                inputs |= 1_u16.checked_shl(u32::from(index)).unwrap_or(0);
+                inputs |= u16::checked_shl(1, u32::from(index)).unwrap_or(0);
             },
             _ => {},
         }

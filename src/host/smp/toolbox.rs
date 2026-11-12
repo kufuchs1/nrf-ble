@@ -23,7 +23,12 @@
 //! derived. The keys these functions return, and those the caller passes
 //! in, are the caller's to wipe.
 
-use crate::{crypto::wipe, host::Aes, pdu::Peer};
+use crate::{
+    bytes::{be16_bytes, be32, be128, be128_bytes},
+    crypto::wipe,
+    host::Aes,
+    pdu::Peer,
+};
 
 /// The SALT of f5 (Core specification, volume 3, part H, section 2.2.7).
 const F5_SALT: [u8; 16] =
@@ -33,7 +38,7 @@ const F5_SALT: [u8; 16] =
 const F5_KEY_ID: [u8; 4] = *b"btle";
 
 /// The Length of f5: the 256 bits of the `MacKey` and the LTK together.
-const F5_LENGTH: [u8; 2] = 256_u16.to_be_bytes();
+const F5_LENGTH: [u8; 2] = be16_bytes(256);
 
 /// The feedback polynomial of the subkey doubling, x^7 + x^2 + x + 1.
 const CMAC_RB: u128 = 0x87;
@@ -169,9 +174,9 @@ where
 /// bit, and the feedback polynomial added if the bit shifted out was set,
 /// without a branch on it.
 const fn double(block: [u8; 16]) -> [u8; 16] {
-    let value = u128::from_be_bytes(block);
+    let value = be128(block);
     let carry = value.wrapping_shr(127);
-    (value.wrapping_shl(1) ^ (0_u128.wrapping_sub(carry) & CMAC_RB)).to_be_bytes()
+    be128_bytes(value.wrapping_shl(1) ^ (carry.wrapping_neg() & CMAC_RB))
 }
 
 /// The confirm value generation function f4 (section 2.2.6): AES-CMAC
@@ -250,12 +255,10 @@ pub fn g2<A>(aes: &A, u_x: &[u8; 32], v_x: &[u8; 32], key: &[u8; 16], y: &[u8; 1
 where
     A: Aes,
 {
-    u32::from_be_bytes(cmac(aes, *key, &[u_x, v_x, y]).last_chunk::<4>().copied().unwrap_or_default())
+    be32(cmac(aes, *key, &[u_x, v_x, y]).last_chunk::<4>().copied().unwrap_or_default())
 }
 
 /// The exclusive or of two blocks.
-const fn xor(left: [u8; 16], right: [u8; 16]) -> [u8; 16] {
-    (u128::from_be_bytes(left) ^ u128::from_be_bytes(right)).to_be_bytes()
-}
+const fn xor(left: [u8; 16], right: [u8; 16]) -> [u8; 16] { be128_bytes(be128(left) ^ be128(right)) }
 
 #[cfg(test)] pub(crate) mod tests;

@@ -140,8 +140,9 @@ A firmware enables the features it needs: a mouse, for example, `param-requests`
 
 - **Epochs:** each link has an `Epoch`, which `Event::Connected` and `Link::info` carry. A call for a link that ended
   returns `Error::Gone` and has no effect on the next link.
-- **Events:** `Link::next` returns `Rx::Event` and `Rx::Acl`. The event queue holds 6 events of 12 bytes, as the
-  thread executor stalls for about 3 s during a P-256 multiplication; the connection keeps 3 more until there is room.
+- **Events:** `Link::next(&mut acl)` returns `Rx::Event` and `Rx::Acl`, which leaves the fragment in `acl`. The event
+  queue holds 6 events of 12 bytes, as the thread executor stalls for about 3 s during a P-256 multiplication; the
+  connection keeps 3 more until there is room.
   `Event::Connected` comes before the first received fragment of its link and `Event::Disconnected` after its last;
   events and fragments are not otherwise in one order.
 - **Received data:** each `AclIn` carries an `encrypted` flag, set when the link layer received the PDU, so a security
@@ -222,14 +223,15 @@ A firmware enables the features it needs: a mouse, for example, `param-requests`
   close the event after the answer.
 - **The answer within the interframe space:** two transmit slots hold the PDU on the air until the central
   acknowledges it and the next one, which is copied, and on an encrypted link sealed by the CCM, before the event
-  (`src/connection/transmit.rs`); preparing only peeks at the control queue and the host's packet, and a PDU uses up
-  its packet counter only once it is sent. Right after the access address of the central's packet the radio points at
-  the PDU on the air, so the answer only decides, switches to the prepared slot or writes an empty PDU there, and
-  patches the header flags, which the MIC does not cover: no copy, no seal, no queue and no host call. An answer that
-  comes too late resends our previous PDU with its previous flags, which the central takes as a retransmission, and
-  never sends the received packet back; within the interframe space nothing writes to the buffer the radio points at
-  but that header byte. The nRF52832 prepares the next PDU while its answer goes out, so an event carries several PDUs
-  of ours; the nRF51 prepares between events only and sends one new PDU per event until its timing is measured.
+  (`src/connection/transmit.rs`, `src/connection.rs`); preparing only peeks at the control queue and the host's
+  packet, and a PDU uses up its packet counter only once it is sent. Right after the access address of the central's
+  packet the radio points at the PDU on the air, so the answer only decides, switches to the prepared slot or writes
+  an empty PDU there, and patches the header flags, which the MIC does not cover: no copy, no seal, no queue and no
+  host call. An answer that comes too late resends our previous PDU with its previous flags, which the central takes
+  as a retransmission, and never sends the received packet back; within the interframe space nothing writes to the
+  buffer the radio points at but that header byte. The nRF52832 prepares the next PDU while its answer goes out, so an
+  event carries several PDUs of ours; the nRF51 prepares between events only and sends one new PDU per event until its
+  timing is measured.
 - **Host data before an event:** the next PDU is prepared before the link layer sleeps towards an event, and the sleep
   wakes on the host's signal, so data the host queues meanwhile is prepared again and goes out at that event while at
   least 500 µs remain. The sleep listens for the host only until the crystal starts, 300 µs plus the crystal's lead
@@ -257,10 +259,10 @@ A firmware enables the features it needs: a mouse, for example, `param-requests`
 ## Crypto for the host
 
 The host can take its random numbers from the hardware generator ([`rng::fill`](src/rng.rs)) and AES-128 from the
-hardware AES ([`encrypt_block`](src/crypto.rs), the ECB). The resolvable private addresses and the identity resolving
-keys use the ECB as well. It shares its AES core with the link encryption, which aborts it during a radio event: each
-block runs with interrupts off and is retried after an abort, once the link layer has handled the event. The CPU
-sleeps until the ECB ends, woken by its pending interrupt; keep the `ECB` interrupt disabled in the NVIC.
+hardware AES ([`crypto::encrypt_block`](src/crypto.rs), the ECB). The resolvable private addresses and the identity
+resolving keys use the ECB as well. It shares its AES core with the link encryption, which aborts it during a radio
+event: each block runs with interrupts off and is retried after an abort, once the link layer has handled the event.
+The CPU sleeps until the ECB ends, woken by its pending interrupt; keep the `ECB` interrupt disabled in the NVIC.
 
 ## Power
 
@@ -391,6 +393,22 @@ Enable the `defmt` feature for logs, and on the nRF52832 `data-length` for paylo
 costs about 1.5 KB more static RAM, which on the nRF52832 comes out of the stack; without it the link layer answers a
 central's data length request with the 27-octet default. The host's `param-requests`, `key-missing` and `passkey` are
 described in [Optional features](#optional-features); they work on both chips.
+
+The crate needs a nightly toolchain, which its [`rust-toolchain.toml`](rust-toolchain.toml) names, and so does a
+firmware that uses it: [`src/lib.rs`](src/lib.rs) enables the unstable const trait implementations of the standard
+library (`const_trait_impl`, `const_cmp`, `const_option_ops`, `const_try` and their kin), so that its `const fn`s use
+the methods of `Option`, `Result`, `Ord` and `TryFrom` and `?` instead of matches and casts. Beside them it enables
+default values on struct fields (`default_field_values`: each starting value stands at its field, the constructors of
+`Engine`, `Responder` and `Shared` name only what varies, and `Connection` takes its scalar starting values from its
+fields), `saturating_cast` and `truncate` (`integer_casts`, `integer_widen_truncate`) for the conversions that saturate
+or cannot lose bits, and `#[rustc_unroll(never)]` (`loop_hints`) on four loops of the host, which keeps them rolled:
+three of pairing (public key encoding, the constant-time table walk of the scalar multiplication and the coordinate
+flip) and the copy of the value of each ATT Read, Read Blob and Read By Type request. That is 3.2 KB less code in the
+library on the nRF52832 (2.8 KB on the nRF51) and 2.3 to 8 KB less flash in a firmware built with fat LTO, none of it in
+the radio or connection event code. By the instruction timings of its disassembly, the rolled ATT copy takes about 1 µs
+longer for a full 22-octet read on the nRF52832 and is faster on the nRF51. Its documentation, built with rustdoc,
+marks each item behind a Cargo feature with that feature (`doc_cfg`). A nightly that renames or changes one of those
+features breaks the build until the list there follows it.
 
 The crate follows the main branch of every dependency (the default branch, master, where a repository has none), and
 commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
@@ -533,6 +551,11 @@ cargo doc --no-deps                                # rustdoc lints are errors to
 
 Clippy runs on the library for the chip targets, as in nrf-ll. The tests are not linted (`cargo clippy --all-targets`
 fails on the test code under the `restriction` group, as in nrf-ll).
+
+Every Clippy group, `restriction` included, is an error. [`Cargo.toml`](Cargo.toml) allows only lints that another lint
+or the strict setup itself contradicts, each with the reason, and the few `#[expect]` attributes in the code each say
+why no other way exists: a hand-written `Debug`, a lint inside the expansion of defmt's derive, a name the firmwares
+import, and a received fragment handed over by value without a heap.
 
 ## License
 

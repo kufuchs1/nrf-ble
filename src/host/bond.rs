@@ -36,6 +36,7 @@
 //! the caller's to wipe.
 
 use crate::{
+    bytes::{le16, le16_bytes, le32, le32_bytes},
     crypto::wipe,
     host::{
         gatt::{Db, Subscriptions},
@@ -82,7 +83,7 @@ pub struct Bond {
     /// The central's identity address and its type.
     pub peer:          Peer,
     /// The central's identity resolving key, least significant octet first,
-    /// if it sent one. BlueZ sends one only with host privacy on.
+    /// if it sent one. `BlueZ` sends one only with host privacy on.
     pub peer_irk:      Option<[u8; 16]>,
 }
 
@@ -113,7 +114,7 @@ impl Bond {
         };
         // A layout may be zero; without one the octets must be.
         let layout = match (flags & FLAG_LAYOUT != 0, layout_octets == [0; 4]) {
-            (true, _) => Some(u32::from_le_bytes(layout_octets)),
+            (true, _) => Some(le32(layout_octets)),
             (false, true) => None,
             (false, false) => return None,
         };
@@ -122,9 +123,9 @@ impl Bond {
         }
         Some(Self {
             authenticated: flags & FLAG_AUTHENTICATED != 0,
-            cccd: u32::from_le_bytes(cccd),
+            cccd: le32(cccd),
             layout,
-            local: Variant::from_bits(u16::from_le_bytes(local)),
+            local: Variant::from_bits(le16(local)),
             ltk,
             peer,
             peer_irk,
@@ -146,13 +147,17 @@ impl Bond {
         Self { authenticated: false, cccd: 0, layout: layout(db), local, ltk, peer, peer_irk }
     }
 
+    /// Records whether the pairing was authenticated.
+    #[cfg(feature = "passkey")]
+    pub(crate) const fn set_authenticated(&mut self, authenticated: bool) { self.authenticated = authenticated; }
+
     /// The bond's subscriptions to restore on `db`: bits past `db`'s
     /// descriptors, which a bond of an older table may hold, are left out.
     #[inline]
     #[must_use = "the subscriptions are only built"]
     pub fn subscriptions(&self, db: &Db) -> Subscriptions {
         let bits = u32::from(db.cccds()).saturating_mul(2);
-        let mask = 1_u32.checked_shl(bits).map_or(u32::MAX, |bit| bit.wrapping_sub(1));
+        let mask = u32::checked_shl(1, bits).map_or(u32::MAX, |bit| bit.wrapping_sub(1));
         Subscriptions::from_bits(self.cccd & mask)
     }
 
@@ -179,9 +184,9 @@ impl Bond {
             &self.peer.address,
             &self.peer_irk.unwrap_or_default(),
             &self.ltk,
-            &self.local.bits().to_le_bytes(),
-            &self.cccd.to_le_bytes(),
-            &self.layout.unwrap_or_default().to_le_bytes(),
+            &le16_bytes(self.local.bits()),
+            &le32_bytes(self.cccd),
+            &le32_bytes(self.layout.unwrap_or_default()),
         ] {
             let (target, tail) = rest.split_at_mut(field.len().min(rest.len()));
             target.copy_from_slice(field.get(..target.len()).unwrap_or_default());
@@ -211,7 +216,7 @@ fn is_identity(peer: Peer) -> bool {
 /// least significant octet first, for a table with the Service Changed
 /// characteristic.
 fn layout(db: &Db) -> Option<u32> {
-    db.service_changed().map(|_| u32::from_le_bytes(db.hash().first_chunk::<4>().copied().unwrap_or_default()))
+    db.service_changed().map(|_| le32(db.hash().first_chunk::<4>().copied().unwrap_or_default()))
 }
 
 #[cfg(test)] mod tests;

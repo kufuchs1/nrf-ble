@@ -1,5 +1,5 @@
 //! Tests of the host's async glue and its engine over a stand-in link layer
-//! ([`MockLink`]): a first connection with BlueZ's pairing and discovery, a
+//! ([`MockLink`]): a first connection with `BlueZ`'s pairing and discovery, a
 //! reconnection with the bond's key, the pacing of notifications, the
 //! deadlines, the wake-up on room, an advertising call dropped while a
 //! central connects, and the order of the events.
@@ -31,13 +31,44 @@ use crate::{
     pdu::Peer,
 };
 use core::{
-    cell::{Cell, RefCell},
     future::{Future, poll_fn},
     pin::{Pin, pin},
     task::{Context, Poll, Waker},
 };
 use embassy_time::Instant;
-use std::{collections::VecDeque, vec, vec::Vec};
+use std::{
+    collections::VecDeque,
+    sync::{Mutex, MutexGuard},
+    vec,
+    vec::Vec,
+};
+
+/// A cell the host's tasks may share, as [`Port`] and the hook of
+/// [`Host::crypto`] require: [`core::cell::Cell`] and
+/// [`core::cell::RefCell`] behind a mutex.
+struct SyncCell<T>(Mutex<T>);
+
+impl<T> SyncCell<T> {
+    /// A cell holding `value`.
+    const fn new(value: T) -> Self { Self(Mutex::new(value)) }
+
+    /// The value, borrowed.
+    fn borrow(&self) -> MutexGuard<'_, T> { self.0.lock().unwrap() }
+
+    /// The value, borrowed mutably.
+    fn borrow_mut(&self) -> MutexGuard<'_, T> { self.0.lock().unwrap() }
+
+    /// Replaces the value and returns the old one.
+    fn replace(&self, value: T) -> T { core::mem::replace(&mut *self.borrow_mut(), value) }
+
+    /// Sets the value.
+    fn set(&self, value: T) { *self.borrow_mut() = value; }
+}
+
+impl<T: Copy> SyncCell<T> {
+    /// A copy of the value.
+    fn get(&self) -> T { *self.borrow() }
+}
 
 /// A call of the link layer as the stand-in records it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,8 +92,8 @@ enum Seen {
 }
 
 impl core::fmt::Debug for Peer {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(formatter, "{:02X?}/{}", self.address, self.random)
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:02X?}/{}", self.address, self.random)
     }
 }
 
@@ -71,25 +102,33 @@ impl core::fmt::Debug for Peer {
 /// test takes it for the air.
 struct MockLink {
     /// The calls of the link layer so far.
-    calls:     RefCell<Vec<Seen>>,
+    calls:     SyncCell<Vec<Seen>>,
     /// Places in the link layer's queue.
-    capacity:  Cell<usize>,
+    capacity:  SyncCell<usize>,
     /// Whether a link exists.
-    connected: Cell<bool>,
+    connected: SyncCell<bool>,
     /// The current link.
-    epoch:     Cell<u32>,
+    epoch:     SyncCell<u32>,
     /// The link's information.
-    info:      Cell<Option<Info>>,
+    info:      SyncCell<Option<Info>>,
     /// The time in milliseconds.
-    now:       Cell<u64>,
+    now:       SyncCell<u64>,
     /// The fragments queued and not yet taken for the air.
-    queue:     RefCell<VecDeque<(bool, Vec<u8>)>>,
-    /// Room returned since [`Port::tx_room_changed`] last returned.
-    room:      Cell<bool>,
+    queue:     SyncCell<VecDeque<(bool, Vec<u8>)>>,
+    /// Room returned since [`Port::queue_room_returned`] last returned.
+    room:      SyncCell<bool>,
     /// The events and fragments for the host.
-    rx:        RefCell<VecDeque<Rx>>,
+    rx:        SyncCell<VecDeque<Queued>>,
     /// The fragments taken for the air and not yet acknowledged.
-    unacked:   Cell<usize>,
+    unacked:   SyncCell<usize>,
+}
+
+/// What the link layer holds for the host, as [`Link::next`] hands it out.
+enum Queued {
+    /// A received fragment.
+    Acl(AclIn),
+    /// An event.
+    Event(Event),
 }
 
 impl MockLink {
@@ -145,7 +184,7 @@ impl MockLink {
     }
 
     /// The link layer reports `event`.
-    fn event(&self, event: Event) { self.rx.borrow_mut().push_back(Rx::Event(event)); }
+    fn event(&self, event: Event) { self.rx.borrow_mut().push_back(Queued::Event(event)); }
 
     /// The time passes by `millis`.
     fn advance(&self, millis: u64) { self.now.set(self.now.get() + millis); }
@@ -153,16 +192,16 @@ impl MockLink {
     /// A link layer with four places and no link.
     fn new() -> Self {
         Self {
-            calls:     RefCell::new(Vec::new()),
-            capacity:  Cell::new(4),
-            connected: Cell::new(false),
-            epoch:     Cell::new(0),
-            info:      Cell::new(None),
-            now:       Cell::new(1_000),
-            queue:     RefCell::new(VecDeque::new()),
-            room:      Cell::new(false),
-            rx:        RefCell::new(VecDeque::new()),
-            unacked:   Cell::new(0),
+            calls:     SyncCell::new(Vec::new()),
+            capacity:  SyncCell::new(4),
+            connected: SyncCell::new(false),
+            epoch:     SyncCell::new(0),
+            info:      SyncCell::new(None),
+            now:       SyncCell::new(1_000),
+            queue:     SyncCell::new(VecDeque::new()),
+            room:      SyncCell::new(false),
+            rx:        SyncCell::new(VecDeque::new()),
+            unacked:   SyncCell::new(0),
         }
     }
 
@@ -174,7 +213,7 @@ impl MockLink {
         pdu.extend_from_slice(&cid.to_le_bytes());
         pdu.extend_from_slice(payload);
         for (index, chunk) in pdu.chunks(27).enumerate() {
-            self.rx.borrow_mut().push_back(Rx::Acl(AclIn::for_test(index == 0, encrypted, chunk)));
+            self.rx.borrow_mut().push_back(Queued::Acl(AclIn::for_test(index == 0, encrypted, chunk)));
         }
     }
 
@@ -225,7 +264,7 @@ impl Control for MockLink {
 }
 
 impl Port for MockLink {
-    fn disconnect(&self, epoch: Epoch, reason: u8) -> Result<(), link::Error> {
+    fn end_link(&self, epoch: Epoch, reason: u8) -> Result<(), link::Error> {
         if !self.connected.get() || self.info.get().unwrap().epoch != epoch {
             return Err(link::Error::Gone);
         }
@@ -233,19 +272,26 @@ impl Port for MockLink {
         Ok(())
     }
 
-    fn hold_latency(&self, hold: bool) { self.calls.borrow_mut().push(Seen::Hold(hold)); }
+    fn set_latency_hold(&self, hold: bool) { self.calls.borrow_mut().push(Seen::Hold(hold)); }
 
-    fn in_flight(&self, _epoch: Epoch) -> usize { self.queue.borrow().len() + self.unacked.get() }
+    fn fragments_in_flight(&self, _epoch: Epoch) -> usize { self.queue.borrow().len() + self.unacked.get() }
 
-    fn info(&self) -> Option<Info> { self.info.get() }
+    fn link_info(&self) -> Option<Info> { self.info.get() }
 
-    fn ltk_reply(&self, _epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), link::Error> {
+    fn answer_ltk(&self, _epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), link::Error> {
         self.calls.borrow_mut().push(Seen::Ltk(key));
         Ok(())
     }
 
-    fn next(&self) -> impl Future<Output = Rx> {
-        poll_fn(|_| self.rx.borrow_mut().pop_front().map_or(Poll::Pending, Poll::Ready))
+    fn receive(&self, acl: &mut AclIn) -> impl Future<Output = Rx> {
+        poll_fn(move |_| match self.rx.borrow_mut().pop_front() {
+            Some(Queued::Acl(fragment)) => {
+                *acl = fragment;
+                Poll::Ready(Rx::Acl)
+            },
+            Some(Queued::Event(event)) => Poll::Ready(Rx::Event(event)),
+            None => Poll::Pending,
+        })
     }
 
     fn now(&self) -> Instant { Instant::from_millis(self.now.get()) }
@@ -254,7 +300,7 @@ impl Port for MockLink {
         poll_fn(move |_| if self.now() >= deadline { Poll::Ready(()) } else { Poll::Pending })
     }
 
-    fn try_send(&self, epoch: Epoch, start: bool, fragment: &[u8]) -> Result<(), link::Error> {
+    fn send_fragment(&self, epoch: Epoch, start: bool, fragment: &[u8]) -> Result<(), link::Error> {
         if !self.connected.get() || self.info.get().unwrap().epoch != epoch {
             return Err(link::Error::Gone);
         }
@@ -266,9 +312,9 @@ impl Port for MockLink {
         Ok(())
     }
 
-    fn tx_room(&self) -> usize { self.capacity.get() - self.queue.borrow().len() }
+    fn queue_room(&self) -> usize { self.capacity.get() - self.queue.borrow().len() }
 
-    fn tx_room_changed(&self) -> impl Future<Output = ()> {
+    fn queue_room_returned(&self) -> impl Future<Output = ()> {
         poll_fn(|_| if self.room.replace(false) { Poll::Ready(()) } else { Poll::Pending })
     }
 }
@@ -340,7 +386,7 @@ fn bond(identity: &LocalIdentity) -> Bond {
 /// calls in `$count`.
 macro_rules! tasks {
     ($host:expr, $tasks:ident, $count:ident) => {
-        let $count = Cell::new(0_u32);
+        let $count = SyncCell::new(0_u32);
         let mut run_device = Device(0x0123_4567_89AB_CDEF);
         let mut crypto_device = Device(0x0F1E_2D3C_4B5A_6978);
         let run = pin!($host.run(&App, &mut run_device));
@@ -692,7 +738,7 @@ fn notifications_keep_two_in_flight_and_one_place_free() {
     link.capacity.set(2);
     link.queue.borrow_mut().push_back((true, vec![0; 4]));
     link.unacked.set(0);
-    assert_eq!(link.in_flight(conn.epoch()), 1);
+    assert_eq!(link.fragments_in_flight(conn.epoch()), 1);
     assert_eq!(conn.try_notify(example::KEYBOARD, &[4; 8]), Err(NotifyError::Busy));
     // An ATT response still takes that place.
     assert_eq!(request_queued(link, &mut tasks, &[0x0A, 0x0D, 0x00]), 2);
@@ -718,7 +764,7 @@ fn a_depth_of_three_queues_a_third_notification() {
     assert_eq!(conn.try_notify(example::KEYBOARD, &[3; 8]), Ok(()));
     assert_eq!(conn.try_notify(example::KEYBOARD, &[4; 8]), Err(NotifyError::Busy));
     // One place of the four stays free for an ATT response.
-    assert_eq!(link.tx_room(), 1);
+    assert_eq!(link.queue_room(), 1);
     assert_eq!(request_queued(link, &mut tasks, &[0x0A, 0x0D, 0x00]), 4);
     assert_eq!(link.deliver().len(), 4);
     // A smaller queue bounds the depth too: one place stays free.

@@ -103,11 +103,11 @@ impl Phy {
     #[inline]
     pub const fn listen_offset_us(self) -> u32 {
         let rx_ready_ns = RX_READY_US.saturating_mul(1000);
-        let tx_chain_ns = 600_u32;
+        let tx_chain_ns: u32 = 600;
         let Some(delay) = rx_ready_ns.saturating_add(tx_chain_ns).saturating_add(999).checked_div(1000) else {
             return 0;
         };
-        150_u32.saturating_sub(delay).saturating_sub(RX_EARLY_US)
+        u32::saturating_sub(150, delay).saturating_sub(RX_EARLY_US)
     }
 
     /// TIMER TXEN offset from RX END for a 150-us interframe space.
@@ -116,18 +116,18 @@ impl Phy {
     #[must_use = "the delay is only computed"]
     #[inline]
     pub const fn response_offset_us(self, receive: Self) -> u32 {
-        let tx_ready_ns = match self {
-            Self::M1 => 41_050_u32,
-            Self::M2 => 40_000_u32,
+        let tx_ready_ns: u32 = match self {
+            Self::M1 => 41_050,
+            Self::M2 => 40_000,
         };
-        let rx_chain_ns = match receive {
-            Self::M1 => 9400_u32,
-            Self::M2 => 5450_u32,
+        let rx_chain_ns: u32 = match receive {
+            Self::M1 => 9400,
+            Self::M2 => 5450,
         };
         let Some(delay) = tx_ready_ns.saturating_add(rx_chain_ns).saturating_add(500).checked_div(1000) else {
             return 0;
         };
-        150_u32.saturating_sub(delay)
+        u32::saturating_sub(150, delay)
     }
 }
 
@@ -316,7 +316,7 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub fn set_access_address(&mut self, address: u32) {
         REGS.base0().write_value(address.wrapping_shl(8));
-        REGS.prefix0().write(|w| w.set_ap0(address.to_le_bytes().last().copied().unwrap_or_default()));
+        REGS.prefix0().write(|w| w.set_ap0(address.wrapping_shr(24).truncate()));
     }
 
     /// Sets the packet buffer the radio sends from or receives into by DMA.
@@ -449,8 +449,8 @@ impl<'peripherals> Radio<'peripherals> {
 /// Radio frequency offset from 2400 MHz of a BLE channel index.
 const fn frequency(channel: u8) -> u8 {
     match channel {
-        0..=10 => 4_u8.saturating_add(channel.saturating_mul(2)),
-        11..=36 => 6_u8.saturating_add(channel.saturating_mul(2)),
+        0..=10 => u8::saturating_add(4, channel.saturating_mul(2)),
+        11..=36 => u8::saturating_add(6, channel.saturating_mul(2)),
         38 => 26,
         39 => 80,
         _ => 2,

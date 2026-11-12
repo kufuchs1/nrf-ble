@@ -221,7 +221,7 @@ fn bad_mic_cannot_acknowledge_acl_or_move_sequence_numbers() {
     let shared = Shared::new();
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &shared), None);
     assert_eq!(link.abort, Some(ERROR_MIC_FAILURE));
-    assert!(!link.sn && !link.nesn && !link.received);
+    assert!(!link.seq.sn && !link.seq.nesn && !link.seq.received);
     assert_eq!(link.completed, 0);
     assert_eq!(link.last_valid, 100);
 }
@@ -236,9 +236,9 @@ fn unverified_new_payloads_never_change_receive_sequence_state() {
             link.tx_kind = TxKind::Acl;
             let result = link.receive(header, len, false, 999, &shared);
             assert_ne!(result, Some(true), "header={header:#x}, len={len}");
-            assert!(!link.nesn && !link.received);
+            assert!(!link.seq.nesn && !link.seq.received);
             let acknowledged = result == Some(false) && header & NESN != 0;
-            assert_eq!(link.sn, acknowledged);
+            assert_eq!(link.seq.sn, acknowledged);
             assert_eq!(link.completed, u16::from(acknowledged));
             // Only a retransmission keeps the link alive.
             assert_eq!(link.last_valid, if result == Some(false) { 999 } else { 100 });
@@ -251,11 +251,11 @@ fn unverified_new_payloads_never_change_receive_sequence_state() {
 fn encrypted_retransmission_acknowledges_tx_without_consuming_rx_nonce() {
     let mut link = connection();
     link.encryption.rx_on = true;
-    link.nesn = true;
+    link.seq.nesn = true;
     link.tx_kind = TxKind::Acl;
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &Shared::new()), Some(false));
     assert_eq!(link.abort, None);
-    assert!(link.sn && link.nesn && !link.received);
+    assert!(link.seq.sn && link.seq.nesn && !link.seq.received);
     assert_eq!(link.completed, 1);
     // It shows the central is there, which keeps the link alive.
     assert_eq!(link.last_valid, 999);
@@ -269,7 +269,7 @@ fn new_authenticated_packet_acknowledges_acl() {
     link.encryption.rx_on = true;
     link.tx_kind = TxKind::Acl;
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, true, 999, &Shared::new()), Some(true));
-    assert!(link.sn && link.nesn && link.received);
+    assert!(link.seq.sn && link.seq.nesn && link.seq.received);
     assert_eq!(link.completed, 1);
     assert_eq!(link.last_valid, 999);
 }
@@ -283,7 +283,7 @@ fn malformed_data_packets_fail_closed() {
         link.encryption.rx_on = encrypted;
         assert_eq!(link.receive(header, len, true, 999, &Shared::new()), None);
         assert_eq!(link.abort, Some(ERROR_INVALID_PARAMETERS));
-        assert!(!link.received && !link.sn && !link.nesn);
+        assert!(!link.seq.received && !link.seq.sn && !link.seq.nesn);
     }
 }
 
@@ -805,8 +805,8 @@ fn an_expired_payload_timeout_waits_for_room_in_the_event_queue() {
 #[test]
 fn data_while_encryption_starts_or_pauses_ends_the_link_unacknowledged() {
     let phases = [
-        Phase::AwaitingEntropy { rand: [0; 8], ediv: [0; 2] },
-        Phase::AwaitingKey { requested: true, rand: [0; 8], ediv: [0; 2] },
+        Phase::AwaitingEntropy(KeyLookup { ediv: [0; 2], rand: [0; 8] }),
+        Phase::AwaitingKey(KeyLookup { ediv: [0; 2], rand: [0; 8] }, true),
         Phase::Starting,
         Phase::AwaitingStartResponse,
         Phase::Pausing,
@@ -819,7 +819,7 @@ fn data_while_encryption_starts_or_pauses_ends_the_link_unacknowledged() {
             link.encryption.phase = phase;
             assert_eq!(link.receive(llid.bits(), 5, true, 999, &Shared::new()), None);
             assert_eq!(link.abort, Some(ERROR_MIC_FAILURE));
-            assert!(!link.nesn && !link.received);
+            assert!(!link.seq.nesn && !link.seq.received);
         }
         // Empty PDUs and control PDUs keep the procedure going.
         let mut link = connection();
@@ -919,10 +919,10 @@ fn a_finished_link_leaves_no_key_material_behind() {
 #[test]
 fn plain_duplicate_can_acknowledge_tx_without_delivering_rx_twice() {
     let mut link = connection();
-    link.nesn = true;
+    link.seq.nesn = true;
     link.tx_kind = TxKind::Acl;
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 1, true, 999, &Shared::new()), Some(false));
-    assert!(link.sn && link.nesn && !link.received);
+    assert!(link.seq.sn && link.seq.nesn && !link.seq.received);
     assert_eq!(link.completed, 1);
 }
 
@@ -1056,7 +1056,7 @@ fn encryption_waits_without_rng_work_and_builds_the_prefetched_response() {
     let mut request = [0x11; 23];
     request[0] = OP_ENC_REQ;
     link.handle_control(&request, false);
-    assert!(matches!(link.encryption.phase, Phase::AwaitingEntropy { .. }));
+    assert!(matches!(link.encryption.phase, Phase::AwaitingEntropy(_)));
     for _ in 0..5 {
         link.drive_encryption(&shared, &prefetch);
         assert!(link.queue.is_empty());
@@ -1068,7 +1068,7 @@ fn encryption_waits_without_rng_work_and_builds_the_prefetched_response() {
     assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
     link.drive_encryption(&shared, &prefetch);
     assert!(
-        matches!(link.encryption.phase, Phase::AwaitingKey { rand, ediv, .. } if rand == [0x11; 8] && ediv == [0x11; 2])
+        matches!(link.encryption.phase, Phase::AwaitingKey(lookup, _) if lookup == KeyLookup { ediv: [0x11; 2], rand: [0x11; 8] })
     );
     let response = *link.queue.front().unwrap();
     assert_eq!(response.data[0], OP_ENC_RSP);
@@ -1145,7 +1145,7 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
         rx[1] = u8::try_from(payload.len()).unwrap();
         rx[DATA_HEADER_LEN..DATA_HEADER_LEN + payload.len()].copy_from_slice(payload);
         assert_eq!(link.receive(header, rx[1], true, 999, &shared), Some(true));
-        assert!(link.received);
+        assert!(link.seq.received);
         link.stash(&rx, false, &shared);
     }
     // Data reached the host in order; the control PDU waits.
@@ -1153,14 +1153,14 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
     assert!(link.pending.front().is_some());
     // The host has room for two packets, both taken: the next data packet is
     // not acknowledged and comes again.
-    let nesn = link.nesn;
+    let nesn = link.seq.nesn;
     assert_eq!(link.receive(Llid::Start.bits() | SN, 1, true, 999, &shared), Some(true));
-    assert!(!link.received);
-    assert_eq!(link.nesn, nesn);
+    assert!(!link.seq.received);
+    assert_eq!(link.seq.nesn, nesn);
     // Empty packets need no room.
-    link.nesn = !link.nesn;
+    link.seq.nesn = !link.seq.nesn;
     assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 999, &shared), Some(true));
-    assert!(link.received);
+    assert!(link.seq.received);
     rx[0] = Llid::Continuation.bits();
     rx[1] = 0;
     link.stash(&rx, false, &shared);
@@ -1788,12 +1788,12 @@ fn data_waits_while_the_host_has_not_got_the_start_of_the_link() {
     let mut link = connection();
     link.notify(Event::Connected(Epoch::for_test(1)), &full);
     assert_eq!(link.receive(Llid::Start.bits(), 1, true, 999, &full), Some(true));
-    assert!(!link.received);
+    assert!(!link.seq.received);
     // Once the event is through, the central's next attempt is taken.
     _ = queued(&full);
     link.flush_notifications(&full);
     assert_eq!(link.receive(Llid::Start.bits(), 1, true, 999, &full), Some(true));
-    assert!(link.received);
+    assert!(link.seq.received);
 }
 
 #[test]

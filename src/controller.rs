@@ -3,14 +3,17 @@
 
 use crate::{
     advertiser::legacy::{self, Kind, Settings},
+    bytes::le16,
     clock::{Clock, SETUP_US},
     connection::{Connection, Ended},
+    health,
     link::{ConnectionParams, Event, Shared},
-    log::info,
+    maintenance,
     pdu::BUFFER_LEN,
     radio::Radio,
+    rng,
 };
-use embassy_futures::select::select;
+use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant};
 
 /// Upper bound of the random delay added to each advertising interval.
@@ -35,7 +38,7 @@ async fn check_limits(settings: &Settings, since: &mut Option<Instant>, shared: 
     shared.stop_advertising();
     if matches!(
         select(shared.push_event(Event::AdvertisingTimeout), shared.reset_requested()).await,
-        embassy_futures::select::Either::Second(())
+        Either::Second(())
     ) {
         shared.signal_reset();
     }
@@ -48,9 +51,9 @@ async fn interval(settings: &Settings) -> u32 {
     if settings.kind == Kind::DirectedHighDuty {
         return HIGH_DUTY_INTERVAL_US;
     }
-    let mut jitter = [0_u8; 2];
-    crate::rng::fill_async(&mut jitter).await;
-    settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).checked_rem(ADV_DELAY_MAX_US).unwrap_or(0))
+    let mut jitter: [u8; 2] = [0; 2];
+    rng::fill_async(&mut jitter).await;
+    settings.interval.saturating_add(u32::from(le16(jitter)).checked_rem(ADV_DELAY_MAX_US).unwrap_or(0))
 }
 
 /// Logs the scan requests the advertiser decided only after the radio had
@@ -66,13 +69,13 @@ fn log_late_scans(seen: &mut u32) {
 /// Runs the link layer forever.
 #[inline]
 pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) -> ! {
-    let mut rx = [0_u8; BUFFER_LEN];
+    let mut rx: [u8; BUFFER_LEN] = [0; BUFFER_LEN];
     let mut since = None;
     let mut late_scans = 0;
     loop {
-        crate::health::checkpoint(15);
-        crate::maintenance::service(clock, radio).await;
-        crate::health::checkpoint(15);
+        health::checkpoint(15);
+        maintenance::service(clock, radio).await;
+        health::checkpoint(15);
         if shared.take_reset() {
             radio.disable();
             clock.pause();
@@ -82,8 +85,8 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         let Some(settings) = shared.advertising() else {
             since = None;
             clock.pause();
-            crate::health::suspend();
-            select(shared.changed(), crate::maintenance::requested()).await;
+            health::suspend();
+            select(shared.changed(), maintenance::requested()).await;
             continue;
         };
         if check_limits(&settings, &mut since, shared).await {
@@ -127,6 +130,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             "connection ended: {} events, {} missed, {} crc errors, {} packets",
             stats.events, stats.missed, stats.crc_errors, stats.received
         );
+        #[cfg(feature = "defmt")]
         stats.log_answers("connection ended");
         if matches!(ended, Ended::Reset) {
             radio.disable();
@@ -137,10 +141,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         // The host gets the retained events and every packet the link
         // acknowledged before it learns that the link ended.
         if !connection.flush_after_disconnect(shared).await
-            || matches!(
-                select(shared.acl_in_drained(), shared.reset_requested()).await,
-                embassy_futures::select::Either::Second(())
-            )
+            || matches!(select(shared.acl_in_drained(), shared.reset_requested()).await, Either::Second(()))
         {
             radio.disable();
             clock.pause();
@@ -156,7 +157,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         shared.set_connected(false);
         if matches!(
             select(shared.push_event(Event::Disconnected(reason)), shared.reset_requested()).await,
-            embassy_futures::select::Either::Second(())
+            Either::Second(())
         ) {
             radio.disable();
             clock.pause();

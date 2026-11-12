@@ -1,6 +1,6 @@
 //! The attribute protocol, as a server with the default MTU of 23 octets.
 //!
-//! [`Server`] decodes the requests BlueZ sends, answers them from the GATT
+//! [`Server`] decodes the requests `BlueZ` sends, answers them from the GATT
 //! table ([`crate::host::gatt::Db`]) with the error codes of the Core
 //! specification, and encodes notifications and indications. One request is
 //! outstanding at a time, so the engine keeps one response slot of
@@ -20,7 +20,7 @@
 //!   Database Hash (0x2B2A) gives the table's hash.
 //! - Read, and Read Blob: an offset equal to the value's length gives an empty
 //!   response, a larger one Invalid Offset (0x07), never Attribute Not Long
-//!   (0x0B), which would fail BlueZ's whole read.
+//!   (0x0B), which would fail `BlueZ`'s whole read.
 //! - Read By Group Type for primary services, with the real end handle of the
 //!   last service; secondary services (0x2801) give 0x0A, any other type
 //!   Unsupported Group Type (0x10).
@@ -28,11 +28,11 @@
 //!
 //! Any other request gets Request Not Supported (0x06); a command (opcode bit
 //! 6) is never answered, not even when it fails, and an unexpected response
-//! is ignored, as BlueZ shuts the bearer down on an unsolicited one. A request
-//! with the wrong length gets Invalid PDU (0x04), and a client characteristic
-//! configuration write of a length other than 2 Invalid Attribute Value
-//! Length (0x0D). Other configuration writes are taken leniently: only the
-//! bits the characteristic's properties allow are kept.
+//! is ignored, as `BlueZ` shuts the bearer down on an unsolicited one. A
+//! request with the wrong length gets Invalid PDU (0x04), and a client
+//! characteristic configuration write of a length other than 2 Invalid
+//! Attribute Value Length (0x0D). Other configuration writes are taken
+//! leniently: only the bits the characteristic's properties allow are kept.
 //!
 //! An attribute that needs encryption is served only for a request that was
 //! itself received encrypted ([`crate::link::AclIn::encrypted`]) on a link
@@ -41,7 +41,7 @@
 //! of each request, so the check never depends on the order in which the
 //! host learns of the encryption. A request that lacks it gets Insufficient
 //! Encryption (0x0F), never Insufficient Authentication (0x05), on which
-//! BlueZ would ask for pairing with protection against a man in the middle,
+//! `BlueZ` would ask for pairing with protection against a man in the middle,
 //! and Just Works pairing would fail. The table refuses attributes that
 //! need authenticated pairing while it is compiled
 //! ([`crate::host::gatt::Db::new`]), so the server never sends 0x05.
@@ -50,22 +50,25 @@
 //! was declared with, also for a characteristic that can be neither read
 //! nor written.
 
-use crate::host::gatt::{
-    AttError,
-    Attr,
-    Char,
-    DYNAMIC_MAX,
-    Db,
-    Handler,
-    Kind,
-    PRIMARY_SERVICE,
-    PROP_INDICATE,
-    PROP_NOTIFY,
-    SECONDARY_SERVICE,
-    Sec,
-    Subscriptions,
-    Uuid,
-    Value,
+use crate::{
+    bytes::{le16, le16_bytes},
+    host::gatt::{
+        AttError,
+        Attr,
+        Char,
+        DYNAMIC_MAX,
+        Db,
+        Handler,
+        Kind,
+        PRIMARY_SERVICE,
+        PROP_INDICATE,
+        PROP_NOTIFY,
+        SECONDARY_SERVICE,
+        Sec,
+        Subscriptions,
+        Uuid,
+        Value,
+    },
 };
 
 /// The ATT MTU: the default, which the server never raises.
@@ -197,11 +200,11 @@ impl Server {
     pub const fn cancel_indication(&mut self) { self.indicating = false; }
 
     /// Answers an Exchange MTU Request: always the default MTU.
-    fn exchange_mtu(params: &[u8], out: &mut [u8; MTU]) -> Answer {
+    const fn exchange_mtu(params: &[u8], out: &mut [u8; MTU]) -> Answer {
         if params.len() != 2 {
             return Err((0, AttError::INVALID_PDU));
         }
-        let [low, high] = u16::try_from(MTU).unwrap_or_default().to_le_bytes();
+        let [low, high] = le16_bytes(u16::try_from(MTU).unwrap_or_default());
         let mut writer = Writer::new(out, EXCHANGE_MTU_RESPONSE);
         writer.push(&[low, high]);
         Ok(writer.finish())
@@ -214,14 +217,14 @@ impl Server {
             return Err((0, AttError::INVALID_PDU));
         };
         let (start, end) = range([start0, start1], [end0, end1])?;
-        if u16::from_le_bytes([type0, type1]) != PRIMARY_SERVICE {
+        if le16([type0, type1]) != PRIMARY_SERVICE {
             return Err((start, AttError::ATTRIBUTE_NOT_FOUND));
         }
         let mut writer = Writer::new(out, FIND_BY_TYPE_VALUE_RESPONSE);
         for (handle, attr) in self.within(start, end) {
             if attr.kind() == Kind::Service && attr.uuid().matches(value) {
-                let [handle0, handle1] = handle.to_le_bytes();
-                let [group0, group1] = self.db.group_end(handle).to_le_bytes();
+                let [handle0, handle1] = le16_bytes(handle);
+                let [group0, group1] = le16_bytes(self.db.group_end(handle));
                 if !writer.push(&[handle0, handle1, group0, group1]) {
                     break;
                 }
@@ -245,8 +248,8 @@ impl Server {
             if writer.len == 1 {
                 writer.push(&[if uuid.wire_len() == 2 { FORMAT_16 } else { FORMAT_128 }]);
             }
-            let mut entry = [0_u8; 18];
-            let [handle0, handle1] = handle.to_le_bytes();
+            let mut entry: [u8; 18] = [0; 18];
+            let [handle0, handle1] = le16_bytes(handle);
             entry[0] = handle0;
             entry[1] = handle1;
             let len = entry.get_mut(2..).map_or(0, |rest| uuid.write(rest)).saturating_add(2);
@@ -347,7 +350,7 @@ impl Server {
 
     /// The characteristic properties of the characteristic that owns the
     /// descriptor at `handle`.
-    fn owner_props(&self, handle: u16) -> u8 {
+    const fn owner_props(&self, handle: u16) -> u8 {
         let mut previous = handle;
         while previous > 1 {
             previous = previous.saturating_sub(1);
@@ -361,7 +364,7 @@ impl Server {
     /// Answers a Read Request.
     fn read(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Answer {
         let &[handle0, handle1] = params else { return Err((0, AttError::INVALID_PDU)) };
-        self.read_at(u16::from_le_bytes([handle0, handle1]), 0, level, app, Writer::new(out, READ_RESPONSE))
+        self.read_at(le16([handle0, handle1]), 0, level, app, Writer::new(out, READ_RESPONSE))
     }
 
     /// Answers a read of the attribute at `handle` from `offset` with the
@@ -378,8 +381,8 @@ impl Server {
     /// Answers a Read Blob Request.
     fn read_blob(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Answer {
         let &[handle0, handle1, offset0, offset1] = params else { return Err((0, AttError::INVALID_PDU)) };
-        let handle = u16::from_le_bytes([handle0, handle1]);
-        let offset = usize::from(u16::from_le_bytes([offset0, offset1]));
+        let handle = le16([handle0, handle1]);
+        let offset = usize::from(le16([offset0, offset1]));
         self.read_at(handle, offset, level, app, Writer::new(out, READ_BLOB_RESPONSE))
     }
 
@@ -408,9 +411,9 @@ impl Server {
             if writer.len == 1 {
                 writer.push(&[u8::try_from(entry_len).unwrap_or_default()]);
             }
-            let mut entry = [0_u8; 20];
-            let [handle0, handle1] = handle.to_le_bytes();
-            let [group0, group1] = self.db.group_end(handle).to_le_bytes();
+            let mut entry: [u8; 20] = [0; 20];
+            let [handle0, handle1] = le16_bytes(handle);
+            let [group0, group1] = le16_bytes(self.db.group_end(handle));
             if let Some(header) = entry.first_chunk_mut::<4>() {
                 *header = [handle0, handle1, group0, group1];
             }
@@ -441,7 +444,7 @@ impl Server {
                 Err(error) if pair_len.is_none() => return Err((handle, error)),
                 Err(_) => break,
             };
-            let mut value = [0_u8; MTU - 4];
+            let mut value: [u8; MTU - 4] = [0; MTU - 4];
             let len = source.copy(0, &mut value).unwrap_or_default();
             let entry_len = len.saturating_add(2);
             if *pair_len.get_or_insert(entry_len) != entry_len {
@@ -453,7 +456,7 @@ impl Server {
             if writer.rest().len() < entry_len {
                 break;
             }
-            writer.push(&handle.to_le_bytes());
+            writer.push(&le16_bytes(handle));
             writer.push(value.get(..len).unwrap_or_default());
         }
         writer.found(start)
@@ -465,7 +468,7 @@ impl Server {
     /// The engine calls it only once the link is encrypted with the bond's
     /// key, never at the connection: a value whose characteristic is open,
     /// such as the battery level, would otherwise be notified before the
-    /// encryption, which BlueZ does not expect, and would take a link layer
+    /// encryption, which `BlueZ` does not expect, and would take a link layer
     /// buffer that pairing needs.
     #[inline]
     pub const fn restore(&mut self, subscriptions: Subscriptions) { self.subscriptions = subscriptions; }
@@ -474,7 +477,7 @@ impl Server {
     /// if the table has the characteristic and the client wrote its
     /// configuration on this link with indications on, and no indication
     /// waits. It is to be asked for only after the Write Response to that
-    /// write went out, as BlueZ registers its handler only then; an earlier
+    /// write went out, as `BlueZ` registers its handler only then; an earlier
     /// indication would be confirmed and dropped. The engine does not ask
     /// for it yet: that ordering is still to be done, with the 30 s timer
     /// of the confirmation.
@@ -494,11 +497,11 @@ impl Server {
 
     /// The value of the attribute `attr` at `handle`, as a read gives it.
     fn value(&self, handle: u16, attr: &Attr, app: &dyn Handler) -> Result<Source, AttError> {
-        let mut bytes = [0_u8; LOCAL_MAX];
+        let mut bytes: [u8; LOCAL_MAX] = [0; LOCAL_MAX];
         let len = match (attr.kind(), attr.value_source()) {
             (Kind::Service, _) => attr.uuid().write(&mut bytes),
             (Kind::Characteristic(props), _) => {
-                let [value0, value1] = handle.saturating_add(1).to_le_bytes();
+                let [value0, value1] = le16_bytes(handle.saturating_add(1));
                 if let Some(header) = bytes.first_chunk_mut::<3>() {
                     *header = [props, value0, value1];
                 }
@@ -506,7 +509,7 @@ impl Server {
             },
             (_, Value::Cccd(index)) => {
                 if let Some(target) = bytes.first_chunk_mut::<2>() {
-                    *target = self.subscriptions.value(index).to_le_bytes();
+                    *target = le16_bytes(self.subscriptions.value(index));
                 }
                 2
             },
@@ -536,14 +539,14 @@ impl Server {
         let Some((&[handle0, handle1], data)) = params.split_first_chunk::<2>() else {
             return Err((0, AttError::INVALID_PDU));
         };
-        let handle = u16::from_le_bytes([handle0, handle1]);
+        let handle = le16([handle0, handle1]);
         let attr = self.db.attr(handle).ok_or((handle, AttError::INVALID_HANDLE))?;
         permit(attr.access().write, level, AttError::WRITE_NOT_PERMITTED).map_err(|error| (handle, error))?;
         match attr.value_source() {
             Value::Cccd(index) => {
                 let &[value0, value1] = data else { return Err((handle, AttError::INVALID_ATTRIBUTE_VALUE_LENGTH)) };
                 let props = self.owner_props(handle);
-                self.subscriptions.set(index, u16::from_le_bytes([value0, value1]), props);
+                self.subscriptions.set(index, le16([value0, value1]), props);
                 Ok(())
             },
             Value::Dynamic(id) => app.write(id, data, with_response).map_err(|error| (handle, error)),
@@ -570,6 +573,7 @@ impl Source {
         };
         let left = len.checked_sub(offset).ok_or(AttError::INVALID_OFFSET)?;
         let count = left.min(out.len());
+        #[rustc_unroll(never)]
         for (index, slot) in out.iter_mut().take(count).enumerate() {
             *slot = bytes.get(offset.saturating_add(index)).copied().unwrap_or_default();
         }
@@ -594,7 +598,7 @@ impl<'out> Writer<'out> {
     }
 
     /// Appends `bytes` if they fit; returns whether they did.
-    fn push(&mut self, bytes: &[u8]) -> bool {
+    const fn push(&mut self, bytes: &[u8]) -> bool {
         let end = self.len.saturating_add(bytes.len());
         let Some(target) = self.buf.get_mut(self.len..end) else { return false };
         target.copy_from_slice(bytes);
@@ -603,7 +607,7 @@ impl<'out> Writer<'out> {
     }
 
     /// The room left.
-    fn rest(&mut self) -> &mut [u8] { self.buf.get_mut(self.len..).unwrap_or_default() }
+    const fn rest(&mut self) -> &mut [u8] { self.buf.get_mut(self.len..).unwrap_or_default() }
 }
 
 /// Checks a notification or indication (`prop`) of `data` for
@@ -629,8 +633,8 @@ const fn check_notify(
 
 /// Writes an Error Response to the request `opcode` for `handle` with
 /// `error` into `out` and returns its length.
-fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: AttError) -> usize {
-    let [handle0, handle1] = handle.to_le_bytes();
+const fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: AttError) -> usize {
+    let [handle0, handle1] = le16_bytes(handle);
     let mut writer = Writer::new(out, ERROR_RESPONSE);
     writer.push(&[opcode, handle0, handle1, error.code()]);
     writer.finish()
@@ -638,9 +642,9 @@ fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: AttError)
 
 /// Writes a notification or indication (`opcode`) of `data` for `handle`
 /// into `out` and returns its length.
-fn handle_value(out: &mut [u8; MTU], opcode: u8, handle: u16, data: &[u8]) -> usize {
+const fn handle_value(out: &mut [u8; MTU], opcode: u8, handle: u16, data: &[u8]) -> usize {
     let mut writer = Writer::new(out, opcode);
-    writer.push(&handle.to_le_bytes());
+    writer.push(&le16_bytes(handle));
     writer.push(data);
     writer.finish()
 }
@@ -659,7 +663,7 @@ const fn permit(required: Option<Sec>, level: Sec, denied: AttError) -> Result<(
 /// The handle range of a request: Invalid Handle for a start of 0 or after
 /// the end.
 const fn range(start_bytes: [u8; 2], end_bytes: [u8; 2]) -> Result<(u16, u16), Failure> {
-    let (start, end) = (u16::from_le_bytes(start_bytes), u16::from_le_bytes(end_bytes));
+    let (start, end) = (le16(start_bytes), le16(end_bytes));
     if start == 0 || start > end {
         return Err((start, AttError::INVALID_HANDLE));
     }
@@ -668,7 +672,7 @@ const fn range(start_bytes: [u8; 2], end_bytes: [u8; 2]) -> Result<(u16, u16), F
 
 /// The handle range and the attribute type of a Read By Type or Read By
 /// Group Type Request, whose type is a 16-bit or a 128-bit UUID.
-fn typed_range(params: &[u8]) -> Result<(u16, u16, &[u8]), Failure> {
+const fn typed_range(params: &[u8]) -> Result<(u16, u16, &[u8]), Failure> {
     let Some((&[start0, start1, end0, end1], uuid)) = params.split_first_chunk::<4>() else {
         return Err((0, AttError::INVALID_PDU));
     };

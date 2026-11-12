@@ -13,7 +13,7 @@ use embassy_sync::{
 static RNG: Generator<Hardware> = Generator::new(Hardware);
 
 /// Register operations, replaceable by a host backend for cancellation tests.
-trait Backend {
+trait Backend: Sync {
     /// Enables the next data-ready interrupt.
     fn arm(&self);
     /// Disables the data-ready interrupt without consuming a byte.

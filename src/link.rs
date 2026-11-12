@@ -23,8 +23,8 @@
 //! # Order of what the host receives
 //!
 //! [`Link::next`] returns events ([`Rx::Event`]) and received ACL fragments
-//! ([`Rx::Acl`]) from two queues. They are not one FIFO, and the host may
-//! rely on these guarantees only:
+//! ([`Rx::Acl`], the fragment in the caller's [`AclIn`]) from two queues. They
+//! are not one FIFO, and the host may rely on these guarantees only:
 //!
 //! - [`Event::Connected`] comes before the first fragment of its link: the link
 //!   layer receives no data while that event waits for room.
@@ -76,12 +76,15 @@
 
 use crate::{
     advertiser::legacy::{DATA_MAX, FILTER_LIST_SIZE, Kind, Settings as LegacySettings},
+    bytes::le16,
+    chip,
     crypto,
-    log::info,
     pdu::{Llid, Peer, valid_connection_parameters},
+    rng,
 };
 use core::{
     cell::RefCell,
+    mem,
     sync::atomic::{AtomicBool, AtomicI8, Ordering},
 };
 use embassy_futures::select::{Either, select};
@@ -119,6 +122,10 @@ pub const LATENCY_HOLD_START_US: u32 = 1_000_000;
 
 /// Read RSSI value while no packet was received.
 const RSSI_UNKNOWN: i8 = 127;
+/// The lowest RSSI reported, in dBm.
+const RSSI_MIN_DBM: i32 = -127;
+/// The highest RSSI reported, in dBm.
+const RSSI_MAX_DBM: i32 = 20;
 /// Default authenticated payload timeout in units of 10 ms.
 const DEFAULT_PAYLOAD_TIMEOUT: u16 = 3000;
 /// Lifetime of a resolvable private address, as the Core suggests.
@@ -311,7 +318,7 @@ impl Planned {
     fn resolve(self) -> NextEvent {
         let ahead = self.ahead.cast_signed();
         let distance = Duration::from_micros(u64::from(ahead.unsigned_abs()));
-        let start = if ahead < 0_i32 { self.at.checked_sub(distance) } else { self.at.checked_add(distance) }
+        let start = if ahead.is_negative() { self.at.checked_sub(distance) } else { self.at.checked_add(distance) }
             .unwrap_or(self.at);
         NextEvent {
             interval: Duration::from_micros(u64::from(self.interval)),
@@ -389,16 +396,19 @@ pub enum Event {
     RemoteVersion([u8; 5]),
 }
 
-#[expect(clippy::rest_pattern_accessible_field, reason = "the events are matched by variant only")]
 impl Event {
     /// Whether this starts a link.
     pub(crate) const fn is_connected(&self) -> bool { matches!(self, Self::Connected(_)) }
 
     /// Whether this reports connection parameters.
-    pub(crate) const fn is_params_update(&self) -> bool { matches!(self, Self::ParamsUpdated { .. }) }
+    pub(crate) const fn is_params_update(&self) -> bool {
+        matches!(self, Self::ParamsUpdated { params: _params, status: _status })
+    }
 
     /// Whether this reports a PHY.
-    pub(crate) const fn is_phy_update(&self) -> bool { matches!(self, Self::PhyUpdated { .. }) }
+    pub(crate) const fn is_phy_update(&self) -> bool {
+        matches!(self, Self::PhyUpdated { rx: _rx, status: _status, tx: _tx })
+    }
 }
 
 /// A received ACL fragment.
@@ -416,6 +426,9 @@ pub struct AclIn {
 }
 
 impl AclIn {
+    /// No fragment: the buffer that [`Link::next`] fills.
+    pub const EMPTY: Self = Self { data: [0; ACL_MAX], encrypted: false, len: 0, start: false };
+
     /// A fragment of `payload`, which `start`s an L2CAP message or not and
     /// was received `encrypted` or not, for tests.
     #[cfg(test)]
@@ -435,7 +448,7 @@ impl AclIn {
     /// The payload.
     #[inline]
     #[must_use = "the payload is only read"]
-    pub fn payload(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
+    pub const fn payload(&self) -> &[u8] { self.data.get(..usize::from(self.len)).unwrap_or_default() }
 
     /// Whether it starts an L2CAP message rather than continuing one.
     #[inline]
@@ -446,13 +459,9 @@ impl AclIn {
 /// What [`Link::next`] returns.
 #[derive(Clone, Copy)]
 #[non_exhaustive]
-#[cfg_attr(
-    feature = "data-length",
-    expect(clippy::large_enum_variant, reason = "returned by value from the queue, without a heap to box it")
-)]
 pub enum Rx {
-    /// A received ACL fragment.
-    Acl(AclIn),
+    /// A received ACL fragment, now in the caller's [`AclIn`].
+    Acl,
     /// An event.
     Event(Event),
 }
@@ -542,6 +551,17 @@ impl AdvParams {
     pub const fn private(self, private: bool) -> Self { Self { private, ..self } }
 }
 
+/// The host's answer to a long term key request. Without [`Debug`] beyond
+/// the tests, so no log prints the key.
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+pub(crate) enum LtkAnswer {
+    /// The key, least significant octet first.
+    Key([u8; 16]),
+    /// The host has no key: the encryption is rejected.
+    Missing,
+}
+
 /// Host state kept by the link layer.
 struct HostState {
     /// Fragments of the link the central acknowledged.
@@ -592,9 +612,9 @@ struct HostState {
 
 impl HostState {
     /// A private address is reusable only with the same key, before expiry.
-    fn cached_address(&self, key: [u8; 16], now: Instant) -> Option<Peer> {
+    const fn cached_address(&self, key: [u8; 16], now: Instant) -> Option<Peer> {
         let (address, made_with, expires) = self.private_address?;
-        (made_with == key && now < expires).then_some(address)
+        (made_with == key && now.as_ticks() < expires.as_ticks()).then_some(address)
     }
 
     /// The epoch if it names the current link.
@@ -647,44 +667,44 @@ impl HostState {
 /// State shared between the host and the link layer.
 pub struct Shared {
     /// ACL data received from the air.
-    acl_in:          Channel<CriticalSectionRawMutex, AclIn, ACL_IN_BUFFERS>,
+    acl_in:          Channel<CriticalSectionRawMutex, AclIn, ACL_IN_BUFFERS> = Channel::new(),
     /// ACL data from the host for the air.
-    acl_out:         Channel<CriticalSectionRawMutex, AclOut, ACL_OUT_BUFFERS>,
+    acl_out:         Channel<CriticalSectionRawMutex, AclOut, ACL_OUT_BUFFERS> = Channel::new(),
     /// The host read ACL data from the air.
-    acl_taken:       Signal<CriticalSectionRawMutex, ()>,
+    acl_taken:       Signal<CriticalSectionRawMutex, ()> = Signal::new(),
     /// Advertising settings changed.
-    changed:         Signal<CriticalSectionRawMutex, ()>,
+    changed:         Signal<CriticalSectionRawMutex, ()> = Signal::new(),
     /// Data length the host set for the link: payload octets and time.
-    data_length:     Signal<CriticalSectionRawMutex, [u16; 2]>,
+    data_length:     Signal<CriticalSectionRawMutex, [u16; 2]> = Signal::new(),
     /// Disconnection requested by the host, with the reason.
-    disconnect:      Signal<CriticalSectionRawMutex, u8>,
+    disconnect:      Signal<CriticalSectionRawMutex, u8> = Signal::new(),
     /// Events for the host.
-    events:          Channel<CriticalSectionRawMutex, Event, EVENT_QUEUE>,
+    events:          Channel<CriticalSectionRawMutex, Event, EVENT_QUEUE> = Channel::new(),
     /// The host holds the peripheral latency off.
-    hold_latency:    AtomicBool,
+    hold_latency:    AtomicBool = AtomicBool::new(false),
     /// The host decides on a central's connection parameter requests.
-    host_decides:    AtomicBool,
+    host_decides:    AtomicBool = AtomicBool::new(false),
     /// Long term key from the host, `None` if it has none.
-    ltk:             Signal<CriticalSectionRawMutex, Option<[u8; 16]>>,
+    ltk:             Signal<CriticalSectionRawMutex, Option<[u8; 16]>> = Signal::new(),
     /// Connection parameters the host asks the central for.
-    param_request:   Signal<CriticalSectionRawMutex, [u16; 4]>,
+    param_request:   Signal<CriticalSectionRawMutex, [u16; 4]> = Signal::new(),
     /// The host's answer to a central's connection parameter request: the
     /// parameters to offer, or the reason to reject it.
-    parameter_reply: Signal<CriticalSectionRawMutex, Result<[u16; 4], u8>>,
+    parameter_reply: Signal<CriticalSectionRawMutex, Result<[u16; 4], u8>> = Signal::new(),
     /// Reset handshake with the radio executor.
-    reset:           Signal<CriticalSectionRawMutex, ()>,
+    reset:           Signal<CriticalSectionRawMutex, ()> = Signal::new(),
     /// Radio reset completion.
-    reset_done:      Signal<CriticalSectionRawMutex, ()>,
+    reset_done:      Signal<CriticalSectionRawMutex, ()> = Signal::new(),
     /// Received signal strength of the link in dBm, averaged; 127 while
     /// unknown.
-    rssi:            AtomicI8,
+    rssi:            AtomicI8 = AtomicI8::new(RSSI_UNKNOWN),
     /// Host state.
-    state:           Mutex<CriticalSectionRawMutex, RefCell<HostState>>,
+    state:           Mutex<CriticalSectionRawMutex, RefCell<HostState>> = Mutex::new(RefCell::new(HostState::new(0))),
     /// The link layer took a fragment from the host's queue, or the central
     /// acknowledged fragments.
-    tx_room:         Signal<CriticalSectionRawMutex, ()>,
+    tx_room:         Signal<CriticalSectionRawMutex, ()> = Signal::new(),
     /// Something for the connection arrived from the host.
-    wakeup:          Signal<CriticalSectionRawMutex, ()>,
+    wakeup:          Signal<CriticalSectionRawMutex, ()> = Signal::new(),
 }
 
 impl Default for Shared {
@@ -777,28 +797,7 @@ impl Shared {
     /// Creates the shared state.
     #[inline]
     #[must_use = "the state is only created"]
-    pub const fn new() -> Self {
-        Self {
-            acl_in:          Channel::new(),
-            acl_out:         Channel::new(),
-            acl_taken:       Signal::new(),
-            changed:         Signal::new(),
-            data_length:     Signal::new(),
-            disconnect:      Signal::new(),
-            events:          Channel::new(),
-            hold_latency:    AtomicBool::new(false),
-            host_decides:    AtomicBool::new(false),
-            ltk:             Signal::new(),
-            param_request:   Signal::new(),
-            parameter_reply: Signal::new(),
-            reset:           Signal::new(),
-            reset_done:      Signal::new(),
-            rssi:            AtomicI8::new(RSSI_UNKNOWN),
-            state:           Mutex::new(RefCell::new(HostState::new(0))),
-            tx_room:         Signal::new(),
-            wakeup:          Signal::new(),
-        }
-    }
+    pub const fn new() -> Self { Self { .. } }
 
     /// Takes the next ACL fragment of the current link for the air, if one
     /// is waiting; fragments of a link that ended are dropped.
@@ -835,7 +834,7 @@ impl Shared {
             return address;
         }
         let mut prand = [0; 3];
-        crate::rng::fill(&mut prand);
+        rng::fill(&mut prand);
         let address = Peer::new(crypto::resolvable_address(key, prand), true);
         self.state.lock(|cell| {
             cell.borrow_mut().private_address = Some((address, key, now.saturating_add(lifetime)));
@@ -864,13 +863,13 @@ impl Shared {
     /// Passes received ACL data to the host, with whether it was received
     /// encrypted. Returns false if there is no room.
     pub(crate) fn push_acl_in(&self, llid: Llid, payload: &[u8], encrypted: bool) -> bool {
-        let mut data = [0_u8; ACL_MAX];
+        let mut data: [u8; ACL_MAX] = [0; ACL_MAX];
         let len = payload.len().min(ACL_MAX);
         if let (Some(target), Some(source)) = (data.get_mut(..len), payload.get(..len)) {
             target.copy_from_slice(source);
         }
         let start = llid != Llid::Continuation;
-        self.acl_in.try_send(AclIn { data, encrypted, len: u8::try_from(len).unwrap_or(u8::MAX), start }).is_ok()
+        self.acl_in.try_send(AclIn { data, encrypted, len: len.saturating_cast(), start }).is_ok()
     }
 
     /// Queues an event for the host, waiting for room.
@@ -909,7 +908,7 @@ impl Shared {
             if !state.connected || state.ltk_pending {
                 return false;
             }
-            if self.events.try_send(Event::LtkRequest { ediv: u16::from_le_bytes(ediv), rand }).is_err() {
+            if self.events.try_send(Event::LtkRequest { ediv: le16(ediv), rand }).is_err() {
                 return false;
             }
             state.ltk_pending = true;
@@ -1019,8 +1018,7 @@ impl Shared {
 
     /// Publishes the averaged signal strength of the link.
     pub(crate) fn set_rssi(&self, dbm: Option<i32>) {
-        let value =
-            dbm.map_or(RSSI_UNKNOWN, |level| i8::try_from(level.clamp(-127_i32, 20_i32)).unwrap_or(RSSI_UNKNOWN));
+        let value = dbm.map_or(RSSI_UNKNOWN, |level| level.clamp(RSSI_MIN_DBM, RSSI_MAX_DBM).truncate::<i8>());
         self.rssi.store(value, Ordering::Relaxed);
     }
 
@@ -1055,16 +1053,17 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn take_event(&self) -> Option<Event> { self.events.try_receive().ok() }
 
-    /// Takes the host's answer to a long term key request: `None` while
-    /// none came, `Some(None)` for a host without a key.
-    #[expect(clippy::option_option, reason = "no answer differs from the answer that there is no key")]
-    pub(crate) fn take_ltk(&self) -> Option<Option<[u8; 16]>> { self.ltk.try_take() }
+    /// Takes the host's answer to a long term key request, `None` while
+    /// none came.
+    pub(crate) fn take_ltk(&self) -> Option<LtkAnswer> {
+        self.ltk.try_take().map(|key| key.map_or(LtkAnswer::Missing, LtkAnswer::Key))
+    }
 
     /// Takes the number of connection updates that were part of the host's
     /// answer to a central's request, each owed a completion now that the
     /// central's procedure ended.
     pub(crate) fn take_merged_updates(&self) -> u8 {
-        self.state.lock(|cell| core::mem::take(&mut cell.borrow_mut().merged_updates))
+        self.state.lock(|cell| mem::take(&mut cell.borrow_mut().merged_updates))
     }
 
     /// Takes connection parameters the host asks the central for.
@@ -1079,7 +1078,7 @@ impl Shared {
     }
 
     /// Takes the host's queries for the central's features and version.
-    pub(crate) fn take_queries(&self) -> u8 { self.state.lock(|cell| core::mem::take(&mut cell.borrow_mut().queries)) }
+    pub(crate) fn take_queries(&self) -> u8 { self.state.lock(|cell| mem::take(&mut cell.borrow_mut().queries)) }
 
     /// Takes a pending host reset at a radio-safe boundary.
     pub(crate) fn take_reset(&self) -> bool { self.reset.try_take().is_some() }
@@ -1112,7 +1111,6 @@ pub struct Link<'shared> {
     shared: &'shared Shared,
 }
 
-#[expect(clippy::same_name_method, reason = "the host's port trait mirrors these calls")]
 impl<'shared> Link<'shared> {
     /// Adds a device to the filter accept list. Refused while advertising
     /// uses the list.
@@ -1326,7 +1324,7 @@ impl<'shared> Link<'shared> {
             if state.current(epoch).is_err() {
                 return 0;
             }
-            usize::try_from(state.sent.wrapping_sub(state.acked)).unwrap_or(usize::MAX)
+            state.sent.wrapping_sub(state.acked).saturating_cast()
         })
     }
 
@@ -1366,15 +1364,20 @@ impl<'shared> Link<'shared> {
     #[must_use = "the handle is only created"]
     pub const fn new(shared: &'shared Shared) -> Self { Self { shared } }
 
-    /// Waits for the next event or received fragment. See the module
-    /// documentation for the order. One task reads them.
+    /// Waits for the next event or received fragment, which it puts into
+    /// `acl`. See the module documentation for the order. One task reads
+    /// them.
+    ///
+    /// The caller's buffer keeps a fragment of up to 251 octets (with
+    /// `data-length`) out of the returned value, which is moved on.
     #[inline]
-    pub async fn next(&self) -> Rx {
+    pub async fn next(&self, acl: &mut AclIn) -> Rx {
         match select(self.shared.events.receive(), self.shared.acl_in.receive()).await {
             Either::First(event) => Rx::Event(event),
-            Either::Second(acl) => {
+            Either::Second(received) => {
+                *acl = received;
                 self.shared.acl_taken.signal(());
-                Rx::Acl(acl)
+                Rx::Acl
             },
         }
     }
@@ -1749,23 +1752,24 @@ impl<'shared> Link<'shared> {
     /// Ends advertising.
     #[inline]
     pub fn stop_advertising(&self) {
-        let was = self.shared.state.lock(|cell| core::mem::take(&mut cell.borrow_mut().legacy_enabled));
+        let was = self.shared.state.lock(|cell| mem::take(&mut cell.borrow_mut().legacy_enabled));
         if was {
             self.shared.changed.signal(());
             info!("advertising stopped");
         }
     }
 
-    /// The next event or received fragment, if one waits.
+    /// The next event or received fragment, if one waits; a fragment goes
+    /// into `acl`.
     #[inline]
     #[must_use = "a taken event or fragment is gone from the queue"]
-    pub fn try_next(&self) -> Option<Rx> {
+    pub fn try_next(&self, acl: &mut AclIn) -> Option<Rx> {
         if let Ok(event) = self.shared.events.try_receive() {
             return Some(Rx::Event(event));
         }
-        let acl = self.shared.acl_in.try_receive().ok()?;
+        *acl = self.shared.acl_in.try_receive().ok()?;
         self.shared.acl_taken.signal(());
-        Some(Rx::Acl(acl))
+        Some(Rx::Acl)
     }
 
     /// Queues one fragment of an L2CAP message for the link without waiting,
@@ -1777,7 +1781,7 @@ impl<'shared> Link<'shared> {
     /// longer than [`ACL_MAX`], [`Error::Full`] without room.
     #[inline]
     pub fn try_send(&self, epoch: Epoch, start: bool, fragment: &[u8]) -> Result<(), Error> {
-        let mut data = [0_u8; ACL_MAX];
+        let mut data: [u8; ACL_MAX] = [0; ACL_MAX];
         let Some(target) = data.get_mut(..fragment.len()) else { return Err(Error::Invalid) };
         target.copy_from_slice(fragment);
         let llid = if start && !fragment.is_empty() { Llid::Start } else { Llid::Continuation };
@@ -1848,7 +1852,7 @@ fn phy_preferences(tx: Option<u8>, rx: Option<u8>) -> Result<[u8; 2], Error> {
         None => Ok(3),
         Some(bits) if bits & !0b111 != 0 || bits == 0 => Err(Error::Invalid),
         // LE 2M and LE Coded are missing on the nRF51.
-        Some(bits) if !crate::chip::PHY_2M && bits & 0b110 != 0 => Err(Error::Unsupported),
+        Some(bits) if !chip::PHY_2M && bits & 0b110 != 0 => Err(Error::Unsupported),
         Some(bits) if bits & 0b100 != 0 => Err(Error::Invalid),
         Some(bits) => Ok(bits),
     };
