@@ -1,11 +1,15 @@
 //! Tests of P-256: the debug key pair, the data sets of the Core
-//! specification, seeded random scalars against the `ecdh` of `p256`, and
-//! the keys and scalars that are refused.
+//! specification, seeded random scalars against the `p256` crate used
+//! directly, and the keys and scalars that are refused.
+//!
+//! The arithmetic is that of `p256`, so these check our use of it: the byte
+//! order, the X coordinate as the Diffie-Hellman key, the protocol checks of
+//! the central's key, the hook and the wiping of the caller's octets.
 
 use super::*;
 use crate::host::smp::toolbox::tests::hex;
 use core::cell::Cell;
-use p256::{PublicKey, ecdh};
+use p256::{NonZeroScalar, ProjectivePoint, ecdh};
 
 /// The private key of the debug key pair (Core specification, volume 3,
 /// part H, section 2.3.5.6.1).
@@ -26,20 +30,30 @@ const ZERO: &str = "00000000 00000000 00000000 00000000 00000000 00000000 000000
 /// The Y coordinate of the curve point whose X is zero.
 const Y_OF_ZERO: &str = "66485c78 0e2f83d7 2433bd5d 84a06bb6 541c2af3 1dae8717 28bf856a 174f93f4";
 
+/// The X coordinate of a curve point whose Y is one.
+const X_OF_Y_ONE: &str = "6916fac4 5e568b6b 9e2e2ecd 611b282e 5fcc40a3 067d6010 57f879ce 5a8a73cc";
+
+/// One plus the field prime, below 2^256: one again, reduced.
+const ONE_PLUS_PRIME: &str = "ffffffff 00000001 00000000 00000000 00000001 00000000 00000000 00000000";
+
+/// One, as a coordinate.
+const ONE: &str = "00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000001";
+
 /// A key pair from `secret`, which must be valid.
 fn key_pair(mut secret: [u8; KEY_LEN]) -> KeyPair {
     KeyPair::generate(&mut secret, || ()).expect("a valid private key")
 }
 
 /// The negation of the public key `key`: the same X and the other Y.
-fn negated(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] { encode(&point(key).neg()).expect("not the identity") }
+fn negated(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] { encode(&(-point(key).to_projective()).to_affine()) }
 
-/// The point of the public key `key`, which must be on the curve, without
-/// the checks for the debug key and our own.
-fn point(key: &[u8; PUBLIC_KEY_LEN]) -> ProjectivePoint {
+/// The public key `key`, which must be a point of the curve, without the
+/// checks for the debug key and our own.
+fn point(key: &[u8; PUBLIC_KEY_LEN]) -> PublicKey {
     let x = FieldBytes::from(*key.first_chunk::<KEY_LEN>().expect("X"));
     let y = FieldBytes::from(*key.last_chunk::<KEY_LEN>().expect("Y"));
-    ProjectivePoint::from(AffinePoint::from_coordinates(&x, &y).expect("a point of the curve"))
+    let on_curve = <AffinePoint as point::AffineCoordinates>::from_coordinates(&x, &y).expect("a point of the curve");
+    PublicKey::from_affine(on_curve).expect("not the identity")
 }
 
 /// A public key from its two coordinates.
@@ -75,11 +89,13 @@ fn the_debug_private_key_gives_the_debug_public_key() {
 }
 
 /// The debug key pair is refused as the central's key, so its own
-/// Diffie-Hellman key is computed without the check.
+/// Diffie-Hellman key is computed without the check, with the same call
+/// `dh_key` makes.
 #[test]
 fn the_debug_key_pair_gives_its_dh_key() {
-    let product = multiply(&hex(DEBUG_PRIVATE_KEY), &point(&DEBUG_PUBLIC_KEY));
-    assert_eq!(x_coordinate(&product), Some(hex(DEBUG_DH_KEY)));
+    let pair = key_pair(hex(DEBUG_PRIVATE_KEY));
+    let shared = pair.secret.diffie_hellman(&point(&DEBUG_PUBLIC_KEY));
+    assert_eq!(<[u8; KEY_LEN]>::from(*shared.raw_secret_bytes()), hex(DEBUG_DH_KEY));
 }
 
 /// P-256 data set 1 (Core specification, volume 2, part G, section
@@ -155,15 +171,15 @@ fn edge_scalars_match_p256() {
     two[KEY_LEN - 1] = 2;
     for secret in [one, two, order_less_1, order_less_2, [0x88; KEY_LEN], [0x77; KEY_LEN], [0x80; KEY_LEN]] {
         let expected = PublicKey::from_secret_scalar(&NonZeroScalar::from_repr(secret.into()).expect("valid"));
-        let expected = encode(&expected.to_projective()).expect("not the identity");
-        assert_eq!(key_pair(secret).public_key(), &expected, "{secret:02x?}");
+        assert_eq!(key_pair(secret).public_key(), &encode(expected.as_affine()), "{secret:02x?}");
     }
-    let generator = encode(&ProjectivePoint::GENERATOR).expect("not the identity");
+    let generator = encode(&ProjectivePoint::GENERATOR.to_affine());
+    assert_eq!(key_pair(one).public_key(), &generator);
     assert_eq!(key_pair(order_less_1).public_key(), &negated(&generator));
 }
 
-/// 64 seeded random key pairs and Diffie-Hellman keys against the `ecdh`
-/// of the `p256` crate.
+/// 64 seeded random key pairs and Diffie-Hellman keys against the `p256`
+/// crate used directly: its public key of the scalar, and its `ecdh`.
 #[test]
 fn random_scalars_match_p256_ecdh() {
     let mut secrets = scalars(0x5EED_0FB1_EC0D_E000);
@@ -179,8 +195,8 @@ fn random_scalars_match_p256_ecdh() {
         let scalar_b = NonZeroScalar::from_repr(secret_b.into()).expect("valid");
         let public_a = PublicKey::from_secret_scalar(&scalar_a);
         let public_b = PublicKey::from_secret_scalar(&scalar_b);
-        assert_eq!(Some(*pair_a.public_key()), encode(&public_a.to_projective()));
-        assert_eq!(Some(*pair_b.public_key()), encode(&public_b.to_projective()));
+        assert_eq!(pair_a.public_key(), &encode(public_a.as_affine()));
+        assert_eq!(pair_b.public_key(), &encode(public_b.as_affine()));
         let expected: [u8; KEY_LEN] = (*ecdh::diffie_hellman(scalar_a, public_b.as_affine()).raw_secret_bytes()).into();
         assert_eq!(pair_a.dh_key(pair_b.public_key(), || ()), Ok(expected));
         assert_eq!(pair_b.dh_key(pair_a.public_key(), || ()), Ok(expected));
@@ -212,7 +228,11 @@ fn central_keys_are_refused_without_a_multiplication() {
     // X is zero on the curve, but the field prime is not a coordinate.
     let zero_x = public_key(ZERO, Y_OF_ZERO);
     let prime_x = public_key(PRIME, Y_OF_ZERO);
-    let prime_y = public_key(ZERO, PRIME);
+    // Y is one on the curve, but one plus the field prime is not a
+    // coordinate: reduced it would be a point of the curve, so only the
+    // check against the field prime refuses it.
+    let y_one = public_key(X_OF_Y_ONE, ONE);
+    let prime_y = public_key(X_OF_Y_ONE, ONE_PLUS_PRIME);
     let cases = [
         (DEBUG_PUBLIC_KEY, KeyError::Debug),
         (negated(&DEBUG_PUBLIC_KEY), KeyError::Debug),
@@ -230,6 +250,8 @@ fn central_keys_are_refused_without_a_multiplication() {
         assert_eq!(pair.dh_key(&peer, || called.set(true)), Err(error), "{peer:02x?}");
         assert!(!called.get());
     }
-    assert_eq!(check_public_key(&zero_x, &own), Ok(()));
-    assert!(pair.dh_key(&zero_x, || ()).is_ok());
+    for valid in [zero_x, y_one] {
+        assert_eq!(check_public_key(&valid, &own), Ok(()), "{valid:02x?}");
+        assert!(pair.dh_key(&valid, || ()).is_ok(), "{valid:02x?}");
+    }
 }

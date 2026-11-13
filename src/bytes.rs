@@ -64,16 +64,6 @@ pub const fn le64_bytes(value: u64) -> [u8; 8] { to_memory!(value.to_le() => 8) 
 #[must_use = "the octets are only computed"]
 pub const fn be16_bytes(value: u16) -> [u8; 2] { to_memory!(value.to_be() => 2) }
 
-/// A `u128` from sixteen octets, most significant first.
-#[inline]
-#[must_use = "the value is only computed"]
-pub const fn be128(bytes: [u8; 16]) -> u128 { u128::from_be(from_memory!(bytes as u128)) }
-
-/// The sixteen octets of `value`, most significant first.
-#[inline]
-#[must_use = "the octets are only computed"]
-pub const fn be128_bytes(value: u128) -> [u8; 16] { to_memory!(value.to_be() => 16) }
-
 /// A `u32` from four octets, most significant first.
 #[inline]
 #[must_use = "the value is only computed"]
@@ -104,10 +94,6 @@ mod tests {
         }
         for value in [0, 1, 0x0123_4567_89AB_CDEF, u64::MAX] {
             assert_eq!(le64_bytes(value), value.to_le_bytes());
-        }
-        for value in [0, 1, 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF, u128::MAX] {
-            assert_eq!(be128_bytes(value), value.to_be_bytes());
-            assert_eq!(be128(value.to_be_bytes()), value);
         }
     }
 }

@@ -29,8 +29,9 @@ What is done so far:
   accept list, resolving list and privacy, advertising, long term key replies, disconnection, connection parameter
   requests and replies, data length, PHY, authenticated payload timeout, RSSI and the central's features and version.
 - The host's AES seam (`host::Aes`, the hardware ECB behind `host::Ecb`, software AES in the tests).
-- The cryptography of pairing: AES-CMAC and f4, f5, f6, g2 and ah in `host::smp::toolbox`, and P-256 key generation,
-  Diffie-Hellman and public key checks in `host::smp::ecc`, with a constant time scalar multiplication of our own.
+- The cryptography of pairing: f4, f5, f6, g2 and ah in `host::smp::toolbox`, over the AES-CMAC of the RustCrypto
+  `cmac` crate, and P-256 key generation, Diffie-Hellman and public key checks in `host::smp::ecc`, from the RustCrypto
+  `p256` crate (see [Cryptography of pairing](#cryptography-of-pairing)).
 - The security manager (`host::smp::Responder`): LE Secure Connections Just Works pairing as responder, with bonding and
   the identity keys both ways, as a state machine without input or output of its own. The P-256 multiplications are
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
@@ -263,6 +264,112 @@ hardware AES ([`crypto::encrypt_block`](src/crypto.rs), the ECB). The resolvable
 resolving keys use the ECB as well. It shares its AES core with the link encryption, which aborts it during a radio
 event: each block runs with interrupts off and is retried after an abort, once the link layer has handled the event.
 The CPU sleeps until the ECB ends, woken by its pending interrupt; keep the `ECB` interrupt disabled in the NVIC.
+
+### Cryptography of pairing
+
+No cryptographic algorithm of pairing is our own: P-256 is the RustCrypto `p256` crate, AES-CMAC the RustCrypto `cmac`
+crate, AES the hardware ECB (the `aes` crate in the host tests). What stays ours is what the Core specification
+writes on top of them, and the drivers: the formulas of f4, f5, f6, g2 and ah (which key, which message, which octets
+of the result; volume 3, part H, section 2.2), the byte order of the PDUs, the protocol checks of the central's key,
+and the ECB, CCM and RNG drivers ([`crypto`](src/crypto.rs), [`rng`](src/rng.rs)).
+
+P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomputed-tables`):
+
+- The private key is `SecretKey::from_bytes` of 32 octets from the RNG, which refuses zero and anything not below the
+  order of the curve (the caller then draws again); the public key is `SecretKey::public_key`, the Diffie-Hellman key
+  `SecretKey::diffie_hellman`, whose X coordinate is the key f5 takes.
+- The central's public key is decoded with `AffinePoint::from_coordinates`, which refuses a coordinate not below the
+  field prime and a point off the curve, and `PublicKey::from_affine`, which refuses the identity. P-256 has a cofactor
+  of 1, so any other point has the prime order and needs no subgroup check: an invalid curve attack has no point to
+  start from. On top of that, as the specification asks, the key is refused when it is the debug public key or our own
+  public key, or the negation of either (by X; volume 3, part H, section 2.3.5.6.1). A refused key costs
+  no multiplication.
+- Both multiplications are `ProjectivePoint::mul` of the `primeorder` crate: a fixed window of signed radix 16
+  digits, a table of 1 to 8 times the point read in full for every digit and selected with the constant time
+  operations of `subtle`, and the complete addition formulas of Renes, Costello and Batina, which have no exceptional
+  case to branch on.
+- What the crates claim of themselves, from their README files at the revisions in use (`p256` and `primeorder` 0.14.0
+  at 9c61da6, `crypto-bigint` 0.7.11 at 145de32): the arithmetic of `p256` and `primeorder` "has never been
+  independently audited"; it is designed so that the operations that depend on a secret run in constant time, but
+  whether the generated machine code is constant time "has not been thoroughly assessed". `crypto-bigint`, the integer
+  arithmetic below them, was audited by NCC Group without significant findings, but has changed much since that audit.
+- Machine code checks: the CI of `crypto-bigint` runs `cargo checkct` (BINSEC) on thumbv6m and thumbv7em, among other
+  targets, over the functions its `checkct/driver` names: limb carries and borrows, leading and trailing zeros,
+  modular subtraction, the carries of wide multiplication and squaring, Montgomery multiplication and squaring,
+  modular inversion, division and remainder, `mul_mod_special` and exponentiation. These are the building blocks the
+  P-256 field of `p256` uses, compiled in the driver. Not checked that way: the field and scalar functions of `p256`
+  built from them (`p256/src/arithmetic/field/field32.rs` on both chips), the table selection
+  (`LookupTable::select`) and the point formulas of `primeorder`, and the code a firmware's build makes of all of it.
+  Nobody has checked the machine code of this path on our builds.
+- Multipliers: the field multiplication is `MULS` on the nRF51 and `UMULL`, `UMLAL` and `UMAAL` on the nRF52832. The
+  Cortex-M0 Technical Reference Manual (ARM DDI 0432C, section 3.3, instruction set summary) gives `MULS` 1 or 32
+  cycles, by the multiplier the chip maker built in; either way the count does not depend on the operands. The
+  Cortex-M4 Technical Reference Manual (ARM DDI 0439B, section 3.3, table 3-1) gives the long multiplies one cycle,
+  without the early termination of the Cortex-M3. Which multiplier the nRF51 has is not stated in the Nordic
+  documents at hand; the times below assume the single cycle one.
+- Wiping: `SecretKey` and the `SharedSecret` of the Diffie-Hellman key overwrite themselves when dropped, and the
+  caller's random octets are overwritten at once. Nothing else is overwritten. These stay on the stack of the thread
+  that ran the job, until something else writes over them: the copy of the private key as a scalar that
+  `SecretKey::public_key` and `SecretKey::diffie_hellman` make (`NonZeroScalar`, which is `Copy` and does not overwrite
+  itself), the recoded digits and the table of multiples of each multiplication, and in the Diffie-Hellman the shared
+  point, projective and affine, whose X is the Diffie-Hellman key. A firmware that wants them gone can overwrite the
+  part of its crypto task's stack the job used, after each job.
+- Time: per multiplication on the nRF51 at 16 MHz, emulated (a Cortex-M0 with the single cycle multiplier and no flash
+  wait states; `p256` 0.14.0 from crates.io in a test harness, through `mul_by_generator` and `diffie_hellman`, as
+  here): 2.28 s at opt-level 3, 2.74 s at opt-level 3 with the crypto crates at "z" (the overrides below), 2.93 s with
+  everything at "z". With the 32 cycle multiplier, about 3.7 s more. Not measured on the chip yet, which has to be done
+  before release (TIMER or RTC around a job). The firmware's watchdog hook runs right before each multiplication.
+
+AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 at e905def with `zeroize`): the CMAC of RFC 4493 from the crate, over an
+adapter that implements the block cipher traits of the `cipher` crate for one key and hands each block to
+`host::Aes::encrypt`, the hardware ECB in the firmware. The crate overwrites its chaining value and pending block when
+dropped, the adapter its copy of the key. The host tests check the adapter against FIPS 197, the CMAC against the four
+examples of RFC 4493 with every split of the message, and f4, f5 (with its key T), f6, g2 and ah against the sample
+data of volume 3, part H, appendix D; P-256 against the debug key pair, data sets 1 and 2 of volume 2, part G, section
+7.1.2, edge scalars and 64 seeded random scalar pairs against `p256` used directly, and the refusal of a coordinate not
+below the field prime on either axis whose reduced value would be a point of the curve.
+
+What the crates cost, measured on the firmwares' release builds (fat LTO) with nrf-ble patched to this tree, against
+the loop and CMAC of our own before them (95ff5bf). "3" is the firmwares' opt-level 3 as they are; "z" adds the
+overrides below. Stack is the deepest static call path of the crypto task:
+
+| Firmware (flash region) | Flash before | Flash, 3 | Flash, z | Crypto task stack: before, 3, z |
+|---|---|---|---|---|
+| Presentation remote, nRF51 (258,048 B) | 183,744 B | 192,588 B (+8,844) | 189,112 B (+5,368) | 3,140, 4,932, 4,844 B |
+| MX Master 3S, nRF52832 (253,952 B) | 223,644 B | 267,112 B, 13,160 over | 249,464 B (+25,820) | 2,848, 4,536, 4,316 B |
+| MX Keys S, nRF52832 (253,952 B) | 213,304 B | 256,848 B, 2,896 over | 239,180 B (+25,876) | 2,848, 4,536, 4,324 B |
+
+Static RAM grows by 8 B on the nRF52832 and not at all on the nRF51; the host task's stack by at most 56 B. At
+opt-level 3 the compiler inlines the field multiplication and the point formulas into `ProjectivePoint::mul` (36 KB on
+the nRF52832), so the two nRF52832 firmwares do not fit their flash. A firmware that uses this nrf-ble needs, in its
+own Cargo.toml (profile settings and patches apply only in the workspace being built, so nrf-ble cannot set them):
+
+```toml
+# The P-256 crates for size: the generic point code is still built at the
+# firmware's opt-level, the field arithmetic below it is not inlined.
+[profile.release.package.p256]
+opt-level = "z"
+[profile.release.package.primeorder]
+opt-level = "z"
+[profile.release.package.primefield]
+opt-level = "z"
+[profile.release.package.crypto-bigint]
+opt-level = "z"
+[profile.release.package.elliptic-curve]
+opt-level = "z"
+
+[patch.crates-io]
+# cmac's `cipher`, the same copy as nrf-ble's; without it the build fails
+# with two versions of `cipher`.
+cipher = { git = "https://github.com/RustCrypto/traits", branch = "master" }
+```
+
+To keep every crate on its branch, a firmware also patches the rest of what `cmac` and `ecdh` bring in, as nrf-ble's
+own list does: `inout`, `dbl` and `block-buffer` from RustCrypto utils, `digest`, `hmac` and `hkdf`. The presentation
+remote's stack budget (`STACK_MIN` in its Makefile.toml, from a measured pairing peak of 4,844 B) has to grow with the
+crypto task, by about 1.7 KB with the overrides (1.8 KB without), to about 7.2 KB, and its `RAM_LIMIT` shrink to
+match (static RAM of 7,148 B still fits); the pairing peak is then measured again on the remote with its stack report
+build.
 
 ## Power
 
