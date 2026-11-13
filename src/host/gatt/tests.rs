@@ -103,7 +103,7 @@ fn input_reports(map: &[u8]) -> [(u8, u32); 3] {
             other => usize::from(other),
         };
         let data = &tail[..len];
-        let value = data.iter().rev().fold(0_u32, |value, &byte| value << 8 | u32::from(byte));
+        let value = data.iter().rev().fold(0_u32, |value, &byte| value.wrapping_shl(8) | u32::from(byte));
         match prefix & 0xFC {
             0x84 => {
                 let slot = reports.iter().position(|&(id, _)| id == 0).unwrap();

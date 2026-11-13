@@ -16,7 +16,7 @@ pub(crate) fn hex<const N: usize>(text: &str) -> [u8; N] {
     for octet in &mut out {
         let high = digits.next().expect("too few digits");
         let low = digits.next().expect("too few digits");
-        *octet = high << 4 | low;
+        *octet = high.wrapping_shl(4) | low;
     }
     assert!(digits.next().is_none(), "too many digits");
     out

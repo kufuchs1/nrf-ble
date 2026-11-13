@@ -66,9 +66,9 @@ impl Random {
         if rate == 0 {
             return false;
         }
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
+        self.0 ^= self.0.wrapping_shl(13);
+        self.0 ^= self.0.wrapping_shr(7);
+        self.0 ^= self.0.wrapping_shl(17);
         u32::try_from(self.0 % 1000).unwrap() < rate
     }
 }

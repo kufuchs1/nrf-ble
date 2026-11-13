@@ -82,7 +82,7 @@ impl Hopping {
                 if map.contains(unmapped) {
                     return unmapped;
                 }
-                let index = u32::from(map.count).saturating_mul(u32::from(random)) >> 16;
+                let index = u32::from(map.count).saturating_mul(u32::from(random)).wrapping_shr(16);
                 map.used.get(index.saturating_cast::<usize>()).copied().unwrap_or(0)
             },
         }
@@ -127,7 +127,7 @@ const _: () = assert!(
 
 /// Whether a channel bit is set in a link layer channel map.
 const fn is_set(bits: [u8; 5], channel: u8) -> bool {
-    bits.get(usize::from(channel >> 3))
+    bits.get(usize::from(channel.wrapping_shr(3)))
         .is_some_and(const |&byte| byte & u8::wrapping_shl(1, u32::from(channel & 7)) != 0)
 }
 

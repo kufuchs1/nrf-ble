@@ -832,12 +832,12 @@ async fn temperature() -> i32 {
 fn crystal_running() -> bool { CLOCK.events_hfclkstarted().read() != 0 }
 
 /// Whether a wrapping difference is a positive time.
-const fn is_ahead(difference: u32) -> bool { difference > 0 && difference < u32::MAX >> 1 }
+const fn is_ahead(difference: u32) -> bool { difference > 0 && difference < u32::MAX.wrapping_shr(1) }
 
 /// Whether `now` is at or past `at`.
 #[inline]
 #[must_use = "the comparison is only computed"]
-pub const fn reached(now: u32, at: u32) -> bool { now.wrapping_sub(at) < u32::MAX >> 1 }
+pub const fn reached(now: u32, at: u32) -> bool { now.wrapping_sub(at) < u32::MAX.wrapping_shr(1) }
 
 /// Drops one user of the high frequency crystal and stops it after the last.
 fn release_crystal() {
@@ -868,14 +868,14 @@ fn request_crystal() -> bool {
 /// Whether the RTC counter is past `tick`.
 fn passed(tick: u32) -> bool {
     let difference = rtc_now().wrapping_sub(tick) & RTC_MASK;
-    difference != 0 && difference < RTC_MASK >> 1
+    difference != 0 && difference < RTC_MASK.wrapping_shr(1)
 }
 
 /// The RTC counter.
 fn rtc_now() -> u32 { RTC.counter().read().counter() }
 
 /// Microseconds of `ticks` RTC ticks, 15625/512 us each.
-const fn ticks_to_us(ticks: u32) -> u32 { (u64::from(ticks).saturating_mul(15_625) >> 9).saturating_cast() }
+const fn ticks_to_us(ticks: u32) -> u32 { u64::from(ticks).saturating_mul(15_625).wrapping_shr(9).saturating_cast() }
 
 /// Whole RTC ticks in `us` microseconds.
 const fn us_to_ticks(us: u32) -> u32 {

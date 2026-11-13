@@ -45,7 +45,7 @@ const _: () = {
     assert!(SCRATCH_LEN >= key_stream_max.saturating_add(16), "the CCM's key stream overruns its scratch space");
 };
 /// The packet counter is 39 bits; the next bit belongs to the direction.
-pub(crate) const COUNTER_LIMIT: u64 = 1 << 39;
+pub(crate) const COUNTER_LIMIT: u64 = u64::strict_shl(1, 39);
 
 /// Prepares the CCM to decrypt the next received packet from `input` into
 /// `output` while it is received.

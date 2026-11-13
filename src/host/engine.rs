@@ -817,7 +817,9 @@ impl Engine {
     fn inputs_written(&self) -> bool {
         let inputs = self.db.input_reports();
         let subscriptions = self.att.subscriptions();
-        inputs != 0 && (0..CCCD_MAX).all(|index| (inputs >> index) & 1 == 0 || subscriptions.is_written(index))
+        inputs != 0
+            && (0..CCCD_MAX)
+                .all(|index| inputs.wrapping_shr(u32::from(index)) & 1 == 0 || subscriptions.is_written(index))
     }
 
     /// Whether the client of the link `epoch` enabled notifications of

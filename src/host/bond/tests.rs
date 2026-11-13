@@ -133,7 +133,7 @@ fn subscriptions_past_the_tables_descriptors_are_left_out() {
     let mut bond = example_bond();
     bond.cccd = u32::MAX;
     let cccds = u32::from(example::DB.cccds());
-    assert_eq!(bond.subscriptions(&example::DB).bits(), (1 << (2 * cccds)) - 1);
+    assert_eq!(bond.subscriptions(&example::DB).bits(), u32::unbounded_shl(1, 2 * cccds).wrapping_sub(1));
     bond.cccd = 0b01_00_01;
     assert_eq!(bond.subscriptions(&example::DB).bits(), 0b01_00_01);
     assert!(bond.subscriptions(&example::DB).notifying(2));

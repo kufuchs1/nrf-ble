@@ -277,8 +277,8 @@ impl ConnectInd {
             initiator_random: kind & TX_ADD_RANDOM != 0,
             interval: le16([interval0, interval1]),
             latency: le16([latency0, latency1]),
-            sca: hop_sca >> 5,
-            sca_ppm: sca_ppm(hop_sca >> 5),
+            sca: hop_sca.wrapping_shr(5),
+            sca_ppm: sca_ppm(hop_sca.wrapping_shr(5)),
             timeout: le16([timeout0, timeout1]),
             win_offset: le16([offset0, offset1]),
             win_size,
@@ -316,7 +316,7 @@ fn valid_access_address(address: u32) -> bool {
     let transitions = address ^ address.wrapping_shr(1);
     let mut run: u8 = 1;
     for bit in 1..u32::BITS {
-        if ((address >> bit) ^ (address >> bit.saturating_sub(1))) & 1 == 0 {
+        if (address.unbounded_shr(bit) ^ address.unbounded_shr(bit.saturating_sub(1))) & 1 == 0 {
             run = run.saturating_add(1);
             if run > 6 {
                 return false;
@@ -328,7 +328,7 @@ fn valid_access_address(address: u32) -> bool {
     (address ^ ADV_ACCESS_ADDRESS).count_ones() > 1
         && !bytes.iter().all(|byte| Some(byte) == bytes.first())
         && (transitions & 0x7FFF_FFFF).count_ones() <= 24
-        && ((transitions >> 26) & 0x1F).count_ones() >= 2
+        && (transitions.wrapping_shr(26) & 0x1F).count_ones() >= 2
 }
 
 /// The scanner of a received scan request to `advertiser`, if it is one.
@@ -401,7 +401,7 @@ mod tests {
     fn advertising_and_weak_access_addresses_are_rejected() {
         assert!(!valid_access_address(ADV_ACCESS_ADDRESS));
         for bit in 0..32 {
-            assert!(!valid_access_address(ADV_ACCESS_ADDRESS ^ (1 << bit)));
+            assert!(!valid_access_address(ADV_ACCESS_ADDRESS ^ u32::unbounded_shl(1, bit)));
         }
         for address in [0, u32::MAX, 0xAAAA_AAAA, 0x0000_5678, 0xFF00_7F00] {
             assert!(!valid_access_address(address));

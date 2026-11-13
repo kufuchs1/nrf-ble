@@ -22,7 +22,7 @@ use embassy_nrf::{
 };
 
 /// Bit of SCB SCR that turns a newly pending interrupt into a wake event.
-const SEVONPEND: u32 = 1 << 4;
+const SEVONPEND: u32 = u32::strict_shl(1, 4);
 
 /// Clears the TICK event and every wake source the link layer uses.
 fn clear() {
