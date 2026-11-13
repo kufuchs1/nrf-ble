@@ -55,9 +55,9 @@ fn scalars(mut seed: u64) -> impl Iterator<Item = [u8; KEY_LEN]> {
     core::iter::repeat_with(move || {
         let mut out = [0; KEY_LEN];
         for chunk in out.chunks_exact_mut(8) {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
+            seed ^= seed.wrapping_shl(13);
+            seed ^= seed.wrapping_shr(7);
+            seed ^= seed.wrapping_shl(17);
             chunk.copy_from_slice(&seed.to_be_bytes());
         }
         out

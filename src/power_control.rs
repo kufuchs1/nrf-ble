@@ -135,10 +135,9 @@ impl PowerControl {
     #[inline]
     pub const fn on_packet(&mut self, rssi: u8) {
         let sample = i32::from(rssi).saturating_mul(-SCALE);
-        self.average =
-            Some(self.average.map_or(sample, const |average| {
-                average.saturating_add(sample.saturating_sub(average) >> SMOOTHING_SHIFT)
-            }));
+        self.average = Some(self.average.map_or(sample, const |average| {
+            average.saturating_add(sample.saturating_sub(average).wrapping_shr(SMOOTHING_SHIFT))
+        }));
         self.samples = self.samples.saturating_add(1);
         self.hold = self.hold.saturating_sub(1);
         if self.floor_left != 0 {

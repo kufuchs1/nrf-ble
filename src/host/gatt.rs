@@ -250,6 +250,9 @@ pub const CCC_NOTIFY: u16 = 0x0001;
 pub const CCC_INDICATE: u16 = 0x0002;
 /// Client characteristic configuration descriptors a table may have.
 pub const CCCD_MAX: u8 = 16;
+// The input report and written CCCD bitmaps are u16, one bit per index, and
+// the engine reads bit `index` with a shift that must stay below the width.
+const _: () = assert!(u32::from(CCCD_MAX) <= u16::BITS, "the CCCD bitmaps are u16");
 /// Largest dynamic value: what one Read Response carries at the MTU of 23.
 pub const DYNAMIC_MAX: usize = 22;
 

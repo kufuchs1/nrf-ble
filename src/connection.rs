@@ -1137,7 +1137,7 @@ impl Connection {
             info!("authenticated payload timeout expired");
         } else if !pinged
             && self.ping_request.is_none()
-            && elapsed >= timeout.saturating_sub(timeout >> 2)
+            && elapsed >= timeout.saturating_sub(timeout.wrapping_shr(2))
             && self.encryption.phase == Phase::Idle
             && self.queue.is_empty()
         {
@@ -2319,7 +2319,7 @@ impl Connection {
             .filter_map(|request| if let Request::Requested(deadline) = request { Some(deadline) } else { None });
         let payload = self.payload_timer.into_iter().flat_map(|(last, pinged)| {
             let timeout = shared.payload_timeout();
-            let ping = (!pinged).then(|| last.wrapping_add(timeout.saturating_sub(timeout >> 2)));
+            let ping = (!pinged).then(|| last.wrapping_add(timeout.saturating_sub(timeout.wrapping_shr(2))));
             ping.into_iter().chain(iter::once(last.wrapping_add(timeout)))
         });
         [
@@ -3147,7 +3147,7 @@ impl Connection {
     /// neighbouring events.
     const fn widening(&self, elapsed: u32) -> u32 {
         let drift = u64::from(elapsed).saturating_mul(u64::from(self.sca_ppm)).div_ceil(1_000_000);
-        let limit = (self.interval >> 1).saturating_sub(T_IFS_US);
+        let limit = self.interval.wrapping_shr(1).saturating_sub(T_IFS_US);
         drift.saturating_cast::<u32>().saturating_add(WIDENING_FIXED_US).min(limit)
     }
 
@@ -3278,7 +3278,7 @@ const fn control_len(code: u8) -> Option<usize> {
 /// Power control flags of `level`: bit 0 at the lowest power, bit 1 at the
 /// highest.
 const fn limit_flags(level: usize) -> u8 {
-    u8::from(level == 0) | (u8::from(level.saturating_add(1) >= LEVELS_DBM.len()) << 1)
+    u8::from(level == 0) | u8::from(level.saturating_add(1) >= LEVELS_DBM.len()).wrapping_shl(1)
 }
 
 /// Whether a connection parameter request or response has parameters within

@@ -47,9 +47,9 @@ impl Aes for Device {
 impl Random for Device {
     fn fill(&mut self, out: &mut [u8]) {
         for octet in out {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
+            self.0 ^= self.0.wrapping_shl(13);
+            self.0 ^= self.0.wrapping_shr(7);
+            self.0 ^= self.0.wrapping_shl(17);
             *octet = self.0.to_le_bytes()[0];
         }
     }
@@ -967,7 +967,8 @@ impl Central {
         self.na[15] = round.wrapping_mul(7);
         let own_x = self.pair.public_key()[..KEY_LEN].try_into().unwrap();
         let peer_x = self.peer_key[..KEY_LEN].try_into().unwrap();
-        let confirm = f4(&Software, own_x, peer_x, &self.na, 0x80 | u8::from((passkey >> round) & 1 != 0));
+        let confirm =
+            f4(&Software, own_x, peer_x, &self.na, 0x80 | u8::from(passkey.unbounded_shr(u32::from(round)) & 1 != 0));
         pdu(PAIRING_CONFIRM, &reversed(&confirm))
     }
 
@@ -978,7 +979,7 @@ impl Central {
         self.nb = reversed(pdu[1..].try_into().unwrap());
         let own_x = self.pair.public_key()[..KEY_LEN].try_into().unwrap();
         let peer_x = self.peer_key[..KEY_LEN].try_into().unwrap();
-        let z = 0x80 | u8::from((passkey >> round) & 1 != 0);
+        let z = 0x80 | u8::from(passkey.unbounded_shr(u32::from(round)) & 1 != 0);
         assert_eq!(self.confirm, f4(&Software, peer_x, own_x, &self.nb, z), "Cb of round {round}");
     }
 }
@@ -1102,7 +1103,7 @@ fn passkey_entry_pairs_in_twenty_rounds_and_bonds_authenticated() {
 fn a_wrong_passkey_fails_with_confirm_value_failed_in_the_round_of_its_bit() {
     for bit in [0_u8, 7, 19] {
         let passkey = 123_456;
-        let wrong = passkey ^ (1 << bit);
+        let wrong = passkey ^ u32::unbounded_shl(1, u32::from(bit));
         let (mut responder, mut device, mut central) = passkey_pairing(0x04);
         run_jobs(&mut responder, &mut device);
         assert_eq!(responder.passkey(&mut device, Some(passkey), at(START + 30)), Ok(None));
