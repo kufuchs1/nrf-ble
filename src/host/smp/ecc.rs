@@ -8,23 +8,31 @@
 //! security manager reverses each one on the way in and out.
 //!
 //! All of the elliptic curve cryptography is that of the RustCrypto `p256`
-//! crate, through its public API only, in pure Rust and without tables kept
-//! in RAM (its `precomputed-tables` feature stays off):
+//! crate, in pure Rust and without tables kept in RAM (its
+//! `precomputed-tables` feature stays off), through the crate nrf-ble-p256 of
+//! this repository (p256/), the only crate that uses `p256`. Its API is not
+//! generic and its entry points are never inlined, so the generic point
+//! arithmetic of `primeorder` and `elliptic-curve` is compiled in that crate
+//! instead of here, and a firmware can build all of it for size with one
+//! profile override while nrf-ble stays at its own opt-level (the readme,
+//! section "Cryptography of pairing", gives the lines):
 //!
 //! - The private key is a [`SecretKey`] from the caller's random octets
-//!   ([`SecretKey::from_bytes`], which refuses zero and anything not below the
-//!   order of the curve), and overwrites itself when it is dropped.
+//!   ([`SecretKey::from_bytes`], `p256::SecretKey::from_bytes`, which refuses
+//!   zero and anything not below the order of the curve), and overwrites itself
+//!   when it is dropped.
 //! - The public key is [`SecretKey::public_key`], the generator times the
 //!   private key.
-//! - The central's key is decoded with
-//!   [`point::AffineCoordinates::from_coordinates`], which refuses a coordinate
-//!   not below the field prime and a point off the curve, and
-//!   [`PublicKey::from_affine`], which refuses the identity. P-256 has a
-//!   cofactor of 1, so every other point is of the prime order and no subgroup
-//!   check is needed: the invalid curve attack (a point of another curve, or of
-//!   a small subgroup) has no point to start from.
-//! - The Diffie-Hellman key is [`SecretKey::diffie_hellman`], whose
-//!   [`p256::ecdh::SharedSecret`] overwrites itself when it is dropped.
+//! - The central's key is decoded with [`PublicKey::from_coordinates`]
+//!   (`AffinePoint::from_coordinates` and `PublicKey::from_affine` of `p256`),
+//!   which refuses a coordinate not below the field prime, a point off the
+//!   curve and the identity. P-256 has a cofactor of 1, so every other point is
+//!   of the prime order and no subgroup check is needed: the invalid curve
+//!   attack (a point of another curve, or of a small subgroup) has no point to
+//!   start from.
+//! - The Diffie-Hellman key is [`SecretKey::diffie_hellman`]
+//!   (`p256::SecretKey::diffie_hellman`), whose `SharedSecret` overwrites
+//!   itself when it is dropped, before the key is returned.
 //!
 //! Both multiplications are `ProjectivePoint::mul` of the `primeorder` crate
 //! under `p256`: a fixed window of signed radix 16 digits, a table of 1 to 8
@@ -51,16 +59,15 @@
 //! the Core specification asks for beyond a valid point (the debug public
 //! key and our own public key are refused, see [`check_public_key`]), the
 //! hook before each multiplication, and overwriting the caller's copy of
-//! the private key. The library overwrites its [`SecretKey`] and its
-//! [`p256::ecdh::SharedSecret`] when they are dropped, and nothing else: the
-//! copy of the private key as a scalar that [`SecretKey::public_key`] and
-//! [`SecretKey::diffie_hellman`] make (`NonZeroScalar`, which is `Copy` and
-//! not overwritten), the recoded digits and the table of multiples of a
-//! multiplication, and in the Diffie-Hellman the shared point itself,
-//! projective and affine, whose X is the Diffie-Hellman key, all stay on the
-//! stack of the thread that ran the job until something else happens to
-//! write over them. The Diffie-Hellman key that [`KeyPair::dh_key`] returns
-//! is the caller's to wipe, once f5 has derived the keys from it.
+//! the private key. The library overwrites its private key and its shared
+//! secret when they are dropped, and nothing else: the copy of the private
+//! key as a scalar that `p256` makes for each multiplication (`NonZeroScalar`,
+//! which is `Copy` and not overwritten), the recoded digits and the table of
+//! multiples of a multiplication, and in the Diffie-Hellman the shared point
+//! itself, projective and affine, whose X is the Diffie-Hellman key, all stay
+//! on the stack of the thread that ran the job until something else happens
+//! to write over them. The Diffie-Hellman key that [`KeyPair::dh_key`]
+//! returns is the caller's to wipe, once f5 has derived the keys from it.
 //!
 //! Each multiplication blocks the thread for several seconds on the nRF51
 //! (the readme gives the emulated figures per build; not yet measured on the
@@ -69,13 +76,13 @@
 //! multiplication, for the firmware to feed its watchdog.
 
 use crate::crypto::wipe;
-use p256::{AffinePoint, FieldBytes, PublicKey, SecretKey, elliptic_curve::point};
+use nrf_ble_p256::{PublicKey, SecretKey};
 
 /// Octets of a private key, of one coordinate and of the Diffie-Hellman key.
-pub const KEY_LEN: usize = 32;
+pub const KEY_LEN: usize = nrf_ble_p256::KEY_LEN;
 
 /// Octets of a public key: X then Y.
-pub const PUBLIC_KEY_LEN: usize = 64;
+pub const PUBLIC_KEY_LEN: usize = nrf_ble_p256::PUBLIC_KEY_LEN;
 
 /// The public key of the debug key pair (Core specification, volume 3, part
 /// H, section 2.3.5.6.1), X then Y. Its private key is public, so a central
@@ -119,8 +126,8 @@ impl KeyError {
 }
 
 /// Our key pair for one pairing: the private key and the public key it
-/// gives. The private key, a [`SecretKey`] of the `p256` crate, overwrites
-/// itself when it is dropped.
+/// gives. The private key, a [`SecretKey`] of nrf-ble-p256 (that of the
+/// `p256` crate), overwrites itself when it is dropped.
 pub struct KeyPair {
     /// The public key, X then Y.
     public: [u8; PUBLIC_KEY_LEN],
@@ -146,9 +153,7 @@ impl KeyPair {
     {
         let key = decode(peer, &self.public)?;
         before_multiplication();
-        // The shared secret overwrites itself when it is dropped, here.
-        let shared = self.secret.diffie_hellman(&key);
-        Ok((*shared.raw_secret_bytes()).into())
+        Ok(self.secret.diffie_hellman(&key))
     }
 
     /// The key pair of the private key `secret`, random octets, or `None` if
@@ -166,13 +171,11 @@ impl KeyPair {
     where
         F: FnOnce(),
     {
-        let mut repr = FieldBytes::from(*secret);
+        let checked = SecretKey::from_bytes(secret);
         wipe(secret);
-        let checked = SecretKey::from_bytes(&repr);
-        wipe(&mut repr);
-        let key = checked.ok()?;
+        let key = checked?;
         before_multiplication();
-        let public = encode(key.public_key().as_affine());
+        let public = key.public_key();
         Some(Self { public, secret: key })
     }
 
@@ -185,10 +188,10 @@ impl KeyPair {
 /// Checks the central's public key `peer` against our own public key `own`.
 ///
 /// The key must be a point of the curve other than the identity, as the
-/// `p256` crate checks it (see the module documentation), and neither the
-/// debug public key nor our own, nor their negations. The security manager
-/// checks it when the Pairing Public Key PDU arrives, before the
-/// Diffie-Hellman key job.
+/// `p256` crate checks it through nrf-ble-p256 (see the module documentation),
+/// and neither the debug public key nor our own, nor their negations. The
+/// security manager checks it when the Pairing Public Key PDU arrives, before
+/// the Diffie-Hellman key job.
 ///
 /// # Errors
 ///
@@ -205,8 +208,7 @@ pub fn check_public_key(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN])
 /// Diffie-Hellman key depends on, so the debug key and our own key are
 /// recognised by X alone.
 fn decode(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN]) -> Result<PublicKey, KeyError> {
-    let (x, rest) = peer.split_first_chunk::<KEY_LEN>().ok_or(KeyError::Invalid)?;
-    let y = rest.first_chunk::<KEY_LEN>().ok_or(KeyError::Invalid)?;
+    let x = peer.first_chunk::<KEY_LEN>().ok_or(KeyError::Invalid)?;
     if Some(x) == DEBUG_PUBLIC_KEY.first_chunk::<KEY_LEN>() {
         return Err(KeyError::Debug);
     }
@@ -216,22 +218,7 @@ fn decode(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN]) -> Result<Pub
     // The coordinates are taken only below the field prime, the point only
     // if it satisfies the curve equation, and the key only if it is not the
     // identity.
-    let on_curve: Option<AffinePoint> =
-        <AffinePoint as point::AffineCoordinates>::from_coordinates(&FieldBytes::from(*x), &FieldBytes::from(*y))
-            .into();
-    on_curve.and_then(|valid| PublicKey::from_affine(valid).ok()).ok_or(KeyError::Invalid)
-}
-
-/// The coordinates of `key`, X then Y.
-fn encode(key: &AffinePoint) -> [u8; PUBLIC_KEY_LEN] {
-    let mut out = [0; PUBLIC_KEY_LEN];
-    if let Some((x, rest)) = out.split_first_chunk_mut::<KEY_LEN>() {
-        *x = point::AffineCoordinates::x(key).into();
-        if let Some(y) = rest.first_chunk_mut::<KEY_LEN>() {
-            *y = point::AffineCoordinates::y(key).into();
-        }
-    }
-    out
+    PublicKey::from_coordinates(peer).ok_or(KeyError::Invalid)
 }
 
 #[cfg(test)] mod tests;

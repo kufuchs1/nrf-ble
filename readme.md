@@ -31,7 +31,8 @@ What is done so far:
 - The host's AES seam (`host::Aes`, the hardware ECB behind `host::Ecb`, software AES in the tests).
 - The cryptography of pairing: f4, f5, f6, g2 and ah in `host::smp::toolbox`, over the AES-CMAC of the RustCrypto
   `cmac` crate, and P-256 key generation, Diffie-Hellman and public key checks in `host::smp::ecc`, from the RustCrypto
-  `p256` crate (see [Cryptography of pairing](#cryptography-of-pairing)).
+  `p256` crate behind the crate nrf-ble-p256 of this repository (`p256/`; see
+  [Cryptography of pairing](#cryptography-of-pairing)).
 - The security manager (`host::smp::Responder`): LE Secure Connections Just Works pairing as responder, with bonding and
   the identity keys both ways, as a state machine without input or output of its own. The P-256 multiplications are
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
@@ -273,8 +274,15 @@ writes on top of them, and the drivers: the formulas of f4, f5, f6, g2 and ah (w
 of the result; volume 3, part H, section 2.2), the byte order of the PDUs, the protocol checks of the central's key,
 and the ECB, CCM and RNG drivers ([`crypto`](src/crypto.rs), [`rng`](src/rng.rs)).
 
-P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomputed-tables`):
+P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomputed-tables`, through nrf-ble-p256):
 
+- nrf-ble-p256 ([`p256/`](p256/readme.md)), a crate of this repository and a path dependency of nrf-ble, is the only
+  crate that uses `p256`. Its API is not generic (byte arrays and two opaque key types, no type parameters, no
+  closures, no type of `p256` in a signature) and its four entry points are `#[inline(never)]`, so the generic point
+  arithmetic of `primeorder` and `elliptic-curve` that `p256` reaches its multiplication through is compiled in that
+  crate, not in nrf-ble: a firmware sets its opt-level with a profile override of nrf-ble-p256 (below), and nrf-ble,
+  link layer included, keeps the firmware's. nrf-ble keeps the protocol around it: the checks of the debug key and our
+  own key, the watchdog hook before each multiplication, overwriting the caller's octets, and its API.
 - The private key is `SecretKey::from_bytes` of 32 octets from the RNG, which refuses zero and anything not below the
   order of the curve (the caller then draws again); the public key is `SecretKey::public_key`, the Diffie-Hellman key
   `SecretKey::diffie_hellman`, whose X coordinate is the key f5 takes.
@@ -314,39 +322,91 @@ P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomput
   itself), the recoded digits and the table of multiples of each multiplication, and in the Diffie-Hellman the shared
   point, projective and affine, whose X is the Diffie-Hellman key. A firmware that wants them gone can overwrite the
   part of its crypto task's stack the job used, after each job.
-- Time: per multiplication on the nRF51 at 16 MHz, emulated (a Cortex-M0 with the single cycle multiplier and no flash
-  wait states; `p256` 0.14.0 from crates.io in a test harness, through `mul_by_generator` and `diffie_hellman`, as
-  here): 2.28 s at opt-level 3, 2.74 s at opt-level 3 with the crypto crates at "z" (the overrides below), 2.93 s with
-  everything at "z". With the 32 cycle multiplier, about 3.7 s more. Not measured on the chip yet, which has to be done
-  before release (TIMER or RTC around a job). The firmware's watchdog hook runs right before each multiplication.
+- Time and size per multiplication, emulated, of nrf-ble-p256 (`p256` 0.14.0 at 9c61da6) in a test harness that calls
+  `SecretKey::public_key` and `SecretKey::diffie_hellman` as nrf-ble does (fat LTO, the harness at opt-level 3; the
+  first opt-level is that of nrf-ble-p256, the second that of the five RustCrypto crates; code is the harness's
+  `.text`, nearly all of it P-256; stack is painted RAM):
+
+  | nrf-ble-p256, five crates | nRF51, 16 MHz | Code, stack (nRF51) | nRF52832, 64 MHz | Code, stack (nRF52832) |
+  |---|---|---|---|---|
+  | "z", "z" (the overrides below) | 3.28 s | 12,148 B, 3,348 B | 234 ms | 10,902 B, 3,360 B |
+  | "s", "z" | 3.27 s | 12,620 B, 3,228 B | 230 ms | 11,934 B, 3,248 B |
+  | "z", "s" | 3.02 s | 12,988 B, 3,436 B | 162 ms | 12,924 B, 3,272 B |
+  | "s", "s" | 3.01 s | 13,546 B, 3,316 B | 158 ms | 13,636 B, 3,112 B |
+  | 3, "z" (as at 184b694 with its overrides) | 3.23 s | 24,078 B, 4,492 B | 176 ms | 44,860 B, 3,996 B |
+  | 3, 3 | 2.68 s | 27,906 B, 4,548 B | 122 ms | 62,222 B, 4,132 B |
+
+  The nRF51 figures are a Cortex-M0 with the single cycle multiplier and no flash wait states, cycle by cycle after
+  its Technical Reference Manual; with the 32 cycle multiplier, about 3.7 s more. The nRF52832 figures are a rougher
+  estimate: the instructions the emulator ran, charged after the Cortex-M4 Technical Reference Manual (loads 2 cycles,
+  multiplies 1) with every basic block's end charged as a taken branch, and no flash wait states or cache misses. The
+  opt-level of nrf-ble-p256 hardly changes the time; that of the five crates does, as "z" keeps the field
+  multiplication of `crypto-bigint` out of line. Not measured on the chip yet, which has to be done before release
+  (TIMER or RTC around a job). The firmware's watchdog hook runs right before each multiplication.
 
 AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 at e905def with `zeroize`): the CMAC of RFC 4493 from the crate, over an
 adapter that implements the block cipher traits of the `cipher` crate for one key and hands each block to
 `host::Aes::encrypt`, the hardware ECB in the firmware. The crate overwrites its chaining value and pending block when
 dropped, the adapter its copy of the key. The host tests check the adapter against FIPS 197, the CMAC against the four
 examples of RFC 4493 with every split of the message, and f4, f5 (with its key T), f6, g2 and ah against the sample
-data of volume 3, part H, appendix D; P-256 against the debug key pair, data sets 1 and 2 of volume 2, part G, section
-7.1.2, edge scalars and 64 seeded random scalar pairs against `p256` used directly, and the refusal of a coordinate not
-below the field prime on either axis whose reduced value would be a point of the curve.
+data of volume 3, part H, appendix D; P-256 against the debug key pair and data sets 1 and 2 of volume 2, part G,
+section 7.1.2, with the hook, the wiping and every refusal of the central's key (debug, own, negated, off the curve, a
+coordinate not below the field prime). nrf-ble-p256's own tests (`cargo test -p nrf-ble-p256`) check its API against
+the same data sets both ways, edge scalars and 64 seeded random scalar pairs against `p256` used directly, and the
+refusal of a coordinate not below the field prime on either axis whose reduced value would be a point of the curve.
 
-What the crates cost, measured on the firmwares' release builds (fat LTO) with nrf-ble patched to this tree, against
-the loop and CMAC of our own before them (95ff5bf). "3" is the firmwares' opt-level 3 as they are; "z" adds the
-overrides below. Stack is the deepest static call path of the crypto task:
+What the crates cost, measured on the two nRF52832 firmwares (fat LTO, the firmware and nrf-ble at opt-level 3) with
+nrf-ble patched to a tree and the profile overrides given on the command line, nothing else changed: "own" is the
+loop and CMAC of our own before the crates (95ff5bf, no overrides); "184b694" is the crates called from nrf-ble itself,
+with the five RustCrypto crates at "z", as they were before nrf-ble-p256; "z" is this tree with the overrides below,
+all six crates at "z". Flash is text and data of the 253,952 B region (free in brackets, or how far over):
 
-| Firmware (flash region) | Flash before | Flash, 3 | Flash, z | Crypto task stack: before, 3, z |
-|---|---|---|---|---|
-| Presentation remote, nRF51 (258,048 B) | 183,744 B | 192,588 B (+8,844) | 189,112 B (+5,368) | 3,140, 4,932, 4,844 B |
-| MX Master 3S, nRF52832 (253,952 B) | 223,644 B | 267,112 B, 13,160 over | 249,464 B (+25,820) | 2,848, 4,536, 4,316 B |
-| MX Keys S, nRF52832 (253,952 B) | 213,304 B | 256,848 B, 2,896 over | 239,180 B (+25,876) | 2,848, 4,536, 4,324 B |
+| Build | Own (95ff5bf) | 184b694, five at "z" | This tree, six at "z" |
+|---|---|---|---|
+| MX Master 3S, release | 223,644 B (30,308) | 249,464 B (4,488) | 215,116 B (38,836) |
+| MX Master 3S, logging `defmt` | 238,608 B (15,344) | about 10,100 B over | 229,668 B (24,284) |
+| MX Master 3S, logging `defmt,wheel-trace` | 238,992 B (14,960) | about 10,500 B over | 230,044 B (23,908) |
+| MX Master 3S, logging `defmt,idle-diagnostics` | 239,628 B (14,324) | about 11,100 B over | 230,704 B (23,248) |
+| MX Master 3S, logging `defmt,wheel-trace,idle-diagnostics` | 240,076 B (13,876) | about 11,600 B over | 231,152 B (22,800) |
+| MX Master 3S, logging `defmt,lift-trace` | 239,064 B (14,888) | about 10,600 B over | 230,116 B (23,836) |
+| MX Master 3S, logging `defmt,shunt-trace` | 246,776 B (7,176) | about 18,300 B over | 237,876 B (16,076) |
+| MX Master 3S, logging `defmt,stronger-ratchet` | 238,664 B (15,288) | about 10,100 B over | 229,724 B (24,228) |
+| MX Keys S, release | 213,304 B (40,648) | 239,188 B (14,764) | 204,796 B (49,156) |
+| MX Keys S, release `mini` | 213,288 B (40,664) | 239,164 B (14,788) | 204,780 B (49,172) |
+| MX Keys S, logging `defmt` | 227,140 B (26,812) | 252,684 B (1,268) | 218,204 B (35,748) |
+| MX Keys S, logging `defmt,mini` | 227,156 B (26,796) | 252,700 B (1,252) | 218,228 B (35,724) |
 
-Static RAM grows by 8 B on the nRF52832 and not at all on the nRF51; the host task's stack by at most 56 B. At
-opt-level 3 the compiler inlines the field multiplication and the point formulas into `ProjectivePoint::mul` (36 KB on
-the nRF52832), so the two nRF52832 firmwares do not fit their flash. A firmware that uses this nrf-ble needs, in its
-own Cargo.toml (profile settings and patches apply only in the workspace being built, so nrf-ble cannot set them):
+The firmwares at 216fb09 (mouse) and 8e7c022 (keyboard), each with its full logging (`DEFMT_LOG` as committed); the
+overflows of 184b694 are the linker's for the last section. With nrf-ble-p256 the P-256 of pairing takes about 34.4 KB
+less than at 184b694 in every build, and 8.5 KB to 8.9 KB less than the code of our own before the crates did at the
+firmwares' opt-level 3, so every build fits with the firmwares' reserves (16 KB for release, 8 KB for a logging
+build). At 184b694 most of the cost was generic code of `primeorder` instantiated in nrf-ble and so built at its
+opt-level 3 (`ProjectivePoint::add` 12.6 KB, `mul` 11.2 KB, `LookupTable::select` 6.5 KB on the MX Master 3S); in
+nrf-ble-p256 the same functions take 0.6 KB, 0.8 KB and 0.2 KB, and all functions named after the P-256 crates
+about 8.8 KB (the logging build `defmt`). Other choices, same builds:
+
+- nrf-ble-p256 at "s", the five crates at "z": 1,564 B (release) to 1,580 B more than all at "z", for at most 2 % less
+  time per multiplication (the table under "Time" above).
+- All six at "s": 2,728 B to 2,752 B more, for about 30 % less time on the nRF52832 and 8 % on the nRF51.
+- nrf-ble-p256 at "z", the five crates left at the firmware's 3: 4,672 B more (mouse release), 4,664 B (keyboard).
+
+The presentation remote (nRF51, 258,048 B) was measured at 184b694 only: 183,744 B before the crates, 189,112 B with
+the five overrides (+5,368), with a crypto task stack of 4,844 B at its deepest static path (3,140 B before); on the
+nRF51 nrf-ble-p256 takes the generic code out of nrf-ble as on the nRF52832 (the harness above: 12.1 KB of code and
+3.3 KB of stack per multiplication at "z", against 24.1 KB and 4.5 KB with the generic code at 3), to be measured on
+the remote's own builds. A firmware that uses this nrf-ble needs, in its own Cargo.toml (profile settings and patches
+apply only in the workspace being built, so nrf-ble cannot set them; a profile that inherits `release`, such as a
+logging profile, inherits them):
 
 ```toml
-# The P-256 crates for size: the generic point code is still built at the
-# firmware's opt-level, the field arithmetic below it is not inlined.
+# The P-256 of nrf-ble's pairing for size: nrf-ble-p256 holds the point
+# arithmetic (the generic code of primeorder and elliptic-curve it
+# instantiates), the five RustCrypto crates the field and integer
+# arithmetic below it. Only nrf-ble's crypto task runs it, a pairing's two
+# multiplications; the firmware and nrf-ble, link layer included, stay at
+# their own opt-level.
+[profile.release.package.nrf-ble-p256]
+opt-level = "z"
 [profile.release.package.p256]
 opt-level = "z"
 [profile.release.package.primeorder]
@@ -367,9 +427,10 @@ cipher = { git = "https://github.com/RustCrypto/traits", branch = "master" }
 To keep every crate on its branch, a firmware also patches the rest of what `cmac` and `ecdh` bring in, as nrf-ble's
 own list does: `inout`, `dbl` and `block-buffer` from RustCrypto utils, `digest`, `hmac` and `hkdf`. The presentation
 remote's stack budget (`STACK_MIN` in its Makefile.toml, from a measured pairing peak of 4,844 B) has to grow with the
-crypto task, by about 1.7 KB with the overrides (1.8 KB without), to about 7.2 KB, and its `RAM_LIMIT` shrink to
-match (static RAM of 7,148 B still fits); the pairing peak is then measured again on the remote with its stack report
-build.
+crypto task, by about 1.7 KB with the five overrides at 184b694 (1.8 KB without), to about 7.2 KB, and its `RAM_LIMIT`
+shrink to match (static RAM of 7,148 B still fits); with nrf-ble-p256 at "z" the harness's multiplication needs about
+1.1 KB less stack than with its generic code at 3, so the growth is likely smaller. The pairing peak is measured again
+on the remote with its stack report build.
 
 ## Power
 

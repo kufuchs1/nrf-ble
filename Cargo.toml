@@ -73,12 +73,11 @@ embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" 
 cipher = { git = "https://github.com/RustCrypto/traits", branch = "master" }
 cmac = { git = "https://github.com/RustCrypto/MACs", branch = "master", features = ["zeroize"] }
 # P-256 for LE Secure Connections pairing: the private key, the public key,
-# the check of the central's key and the Diffie-Hellman key, all from the
-# crate's own API (src/host/smp/ecc.rs). `ecdh` for `SecretKey::diffie_hellman`
-# and its self-wiping `SharedSecret`; it adds hkdf and hmac to the build, which
-# nothing calls, so the linker drops them. Without `precomputed-tables`, which
-# would build about 25 KB of tables in RAM.
-p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master", default-features = false, features = ["arithmetic", "ecdh"] }
+# the check of the central's key and the Diffie-Hellman key, from the
+# RustCrypto `p256` crate behind the non-generic API of nrf-ble-p256, the
+# crate of this repository in p256/ (src/host/smp/ecc.rs; its readme says why
+# it is a crate of its own). It is the only crate that uses `p256`.
+nrf-ble-p256 = { path = "p256" }
 
 [dev-dependencies]
 # Software AES for the host tests, in place of the hardware ECB.
@@ -92,8 +91,13 @@ embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main",
 [target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
 critical-section = { git = "https://github.com/rust-embedded/critical-section", branch = "main", features = ["std"] }
 
-# Standalone: not a member of the workspace of a firmware that uses it.
+# Standalone: not a member of the workspace of a firmware that uses it. Its
+# one other member is nrf-ble-p256 (p256/), a path dependency, so a firmware
+# that takes nrf-ble from Git gets it from the same repository and revision.
+# Plain `cargo` commands here build and test nrf-ble alone; `-p nrf-ble-p256`
+# or `--workspace` take in the other.
 [workspace]
+members = ["p256"]
 
 [lib]
 test = true
@@ -193,10 +197,14 @@ num-traits = { git = "https://github.com/rust-num/num-traits", branch = "main" }
 stable_deref_trait = { git = "https://github.com/storyyeller/stable_deref_trait", branch = "master" }
 void = { git = "https://github.com/reem/rust-void", branch = "master" }
 
-[lints.rust]
+[lints]
+workspace = true
+
+# The lints of nrf-ble and nrf-ble-p256 alike.
+[workspace.lints.rust]
 warnings = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "deny", priority = 1 }
 pedantic = { level = "deny", priority = 1 }
 restriction = { level = "deny", priority = 1 }
