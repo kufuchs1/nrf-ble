@@ -64,18 +64,46 @@
 //!
 //! # P-256 jobs
 //!
-//! Each scalar multiplication blocks the thread for about 3 s on the nRF51, so
+//! Each scalar multiplication blocks the thread for about 2.7 s to 3.3 s on
+//! the nRF51 (emulated, by build; the readme gives the figures), so
 //! the state machine never runs one: it gives a [`Job`], which the firmware
 //! runs on a task of its own with [`Job::run`], calling its watchdog hook right
 //! before each multiplication and yielding between two jobs, and takes the
-//! [`JobResult`] back with [`Responder::job_done`]. A key pair job is asked for
-//! with [`Responder::prepare_key_pair`] before pairable advertising starts, so
-//! a reconnection never computes one, and by a Pairing Request if no key pair
-//! is ready. The Diffie-Hellman job starts once our public key and confirm
-//! value are queued, so the multiplication never holds them back; a `DHKey`
-//! check that arrives before the Diffie-Hellman key waits for it. The key pair
-//! moves into the Diffie-Hellman job, so each one serves one pairing; one
-//! whose pairing ended before it is kept for the next. A result that arrives
+//! [`JobResult`] back with [`Responder::job_done`].
+//!
+//! # The key pair slot
+//!
+//! A slot holds our key pair: empty, ready and unused, or used by the pairing
+//! under way. A key pair job fills it, from fresh random octets:
+//!
+//! - [`Responder::prepare_key_pair`], before pairable advertising starts, which
+//!   waits for it, so no central waits for the multiplication. A reconnection
+//!   computes nothing.
+//! - A pairing that finds the slot empty at the central's public key.
+//! - The refill, in idle time: after a pairing that used the key pair ended
+//!   without a bond (failed by either side, timed out or cut by the end of the
+//!   link), while Pairing Requests are taken, as soon as no job waits or runs
+//!   and no pairing is under way. The engine ends a link whose pairing failed,
+//!   and the next attempt follows on a new link, so the refill runs while the
+//!   link ends and the next pairable advertising starts at once. After a bond
+//!   nothing is computed: the link is in use (the central discovers the table,
+//!   the application sends its input), and the next pairing needs pairable
+//!   advertising again, which makes the key pair before it advertises.
+//!
+//! A key pair serves one pairing at most. It becomes the pairing's when its
+//! public key is queued for the central; from then on the Diffie-Hellman job
+//! takes it, or the end of the pairing drops it, and the next pairing gets a
+//! new one. A pairing that ends before its public key went out (the central's
+//! key refused, the pairing failed or the link ended earlier) leaves the key
+//! pair in the slot, as nothing of it was disclosed. The Core specification
+//! (volume 3, part H) does not require a new key pair for each pairing; the
+//! security manager makes one anyway, so no two centrals, and no two attempts
+//! of one central, ever see the same public key, and a private key never
+//! outlives its pairing.
+//!
+//! The Diffie-Hellman job starts once our public key and confirm value are
+//! queued, so the multiplication never holds them back; a `DHKey` check that
+//! arrives before the Diffie-Hellman key waits for it. A result that arrives
 //! after its pairing ended is dropped.
 //!
 //! # Secrets
@@ -83,7 +111,8 @@
 //! The Diffie-Hellman key is overwritten once f5 derived the keys from it, the
 //! `MacKey` once both check values are computed, and the long term key once the
 //! pairing ends: handed over in [`Bonded`], or failed. The private key is
-//! [`ecc::KeyPair`]'s to overwrite, when the Diffie-Hellman job drops it.
+//! [`ecc::KeyPair`]'s to overwrite, when the Diffie-Hellman job drops it, or
+//! the end of its pairing does.
 //!
 //! # Byte order
 //!
@@ -146,7 +175,7 @@ pub mod toolbox;
 #[cfg(feature = "passkey")]
 use crate::{bytes::be32_bytes, host::PasskeyError};
 use crate::{crypto::wipe, host::Aes, link::Info, pdu::Peer};
-use core::{array::TryFromSliceError, fmt, iter};
+use core::{array::TryFromSliceError, fmt, iter, mem};
 #[cfg(feature = "passkey")]
 use core::{
     hint::black_box,
@@ -423,13 +452,11 @@ pub struct Responder {
     na:             [u8; 16] = [0; 16],
     /// Our nonce Nb, most significant octet first.
     nb:             [u8; 16] = [0; 16],
-    /// The X coordinate of our public key, most significant octet first, for
-    /// the confirm values of Passkey Entry, once the key pair went to the
-    /// Diffie-Hellman job.
-    #[cfg(feature = "passkey")]
-    own_x:          [u8; KEY_LEN] = [0; KEY_LEN],
-    /// Our key pair, between its job and the Diffie-Hellman job.
-    pair:           Option<KeyPair> = None,
+    /// Our public key in the pairing under way, X then Y, most significant
+    /// octet first, from the moment it is queued: the Pairing Public Key PDU
+    /// is rendered from it and the confirm values take its X, so neither
+    /// depends on the key pair slot. Public, so never overwritten.
+    own_key:        [u8; PUBLIC_KEY_LEN] = [0; PUBLIC_KEY_LEN],
     /// Whether a Pairing Request is taken.
     pairable:       bool = false,
     /// The passkey of Passkey Entry, once the user gave it; otherwise
@@ -454,6 +481,11 @@ pub struct Responder {
     /// The central's identity keys received: [`ID_INFO`] and
     /// [`ID_ADDRESS`].
     received:       u8 = 0,
+    /// Whether the slot is refilled in idle time ([`Self::refill_due`]): set
+    /// when a pairing takes the key pair, cleared when it bonds or the slot
+    /// is filled. So only a pairing that used its key pair and ended without
+    /// a bond leads to a refill.
+    refill:         bool = false,
     /// Our identity keys the pairing distributes: 0 or [`KEY_DIST_ID`].
     resp_dist:      u8 = 0,
     /// The job being run, with its number.
@@ -463,6 +495,8 @@ pub struct Responder {
     security:       Security = Security::JUST_WORKS,
     /// The number of the last Diffie-Hellman job.
     serial:         u8 = 0,
+    /// The key pair slot: at most one key pair.
+    slot:           Slot = Slot::Empty,
     /// Where the pairing stands.
     state:          State = State::Idle,
 }
@@ -478,6 +512,20 @@ pub struct Security {
     /// refused: a central without input or output then gets Authentication
     /// Requirements (0x03) at its Pairing Request.
     pub require_mitm:  bool,
+}
+
+/// The key pair slot: our key pair, from its job to the Diffie-Hellman job.
+enum Slot {
+    /// No key pair: the crypto task refills the slot in idle time
+    /// ([`Responder::refill_due`]).
+    Empty,
+    /// A key pair, ready and unused, for the next pairing.
+    Ready(KeyPair),
+    /// The key pair of the pairing under way, whose public key was queued
+    /// for the central, until the Diffie-Hellman job takes it. It never
+    /// serves another pairing: the end of the pairing drops it, which
+    /// overwrites its private key.
+    Used(KeyPair),
 }
 
 /// Where a pairing stands.
@@ -559,8 +607,8 @@ impl Job {
     pub const fn is_key_pair(&self) -> bool { matches!(self.kind, JobKind::KeyPair) }
 
     /// Runs the job: one scalar multiplication, which blocks the thread for
-    /// about 3 s on the nRF51, with `before_multiplication` called right
-    /// before it, for the watchdog. A key pair takes its private key from
+    /// about 2.7 s to 3.3 s on the nRF51, with `before_multiplication` called
+    /// right before it, for the watchdog. A key pair takes its private key from
     /// `random`, and draws again in the rare case it is refused.
     #[inline]
     #[must_use = "the result goes to the security manager"]
@@ -649,20 +697,33 @@ impl Responder {
     where
         C: Aes + Random,
     {
-        let pair = self.pair.as_ref().ok_or(Reason::UNSPECIFIED)?;
+        let pair = match mem::replace(&mut self.slot, Slot::Empty) {
+            Slot::Ready(pair) => pair,
+            other @ (Slot::Empty | Slot::Used(_)) => {
+                self.slot = other;
+                return Err(Reason::UNSPECIFIED);
+            },
+        };
         if check_public_key(&self.peer_key, pair.public_key()).is_err() {
+            // Nothing of it was shown: it stays for the next pairing.
+            self.slot = Slot::Ready(pair);
             return Err(Reason::DHKEY_CHECK_FAILED);
         }
-        let own_x = pair.public_key().first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
+        // From here on the key pair is this pairing's: its public key goes to
+        // the central, and it serves no other pairing.
+        self.own_key = *pair.public_key();
+        self.slot = Slot::Used(pair);
+        // Should it end without a bond, the slot is refilled.
+        self.refill = true;
         #[cfg(feature = "passkey")]
         if self.authenticating {
             // Passkey Entry: our public key alone; the confirm values follow
             // in the rounds.
-            self.own_x = *own_x;
             self.pending |= OUT_PUBLIC_KEY;
             self.state = State::Confirm(0);
             return Ok(Some(Outcome::PasskeyRequested));
         }
+        let own_x = self.own_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
         let peer_x = self.peer_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
         crypto.fill(&mut self.nb);
         self.confirm = f4(&*crypto, own_x, peer_x, &self.nb, 0);
@@ -709,8 +770,9 @@ impl Responder {
         if self.dh == Dh::Ready { self.verify(aes) } else { Ok(None) }
     }
 
-    /// Forgets the link: its pairing and its secrets. The key pair and the
-    /// jobs being run stay; a result for this link is dropped.
+    /// Forgets the link: its pairing and its secrets. A key pair whose public
+    /// key went to the central is dropped, a ready one stays, and so do the
+    /// jobs being run; a result for this link is dropped.
     #[inline]
     pub fn disconnected(&mut self) {
         self.end();
@@ -745,8 +807,13 @@ impl Responder {
         self.peer_identity = None;
         self.received = 0;
         self.dh = Dh::Unasked;
+        if matches!(self.slot, Slot::Used(_)) {
+            // Its public key went to the central: it serves no other pairing.
+            // Dropping it overwrites its private key.
+            self.slot = Slot::Empty;
+        }
         if self.job == Some(Task::DhKey) {
-            // The key pair was never used: it stays for the next pairing.
+            // Its key pair is gone with the pairing.
             self.job = None;
         }
         if self.running.is_some_and(|(task, _)| task == Task::DhKey) {
@@ -789,20 +856,26 @@ impl Responder {
             #[cfg(feature = "passkey")]
             authenticated: self.authenticating,
         };
+        // No refill after a bond: the link is in use, and the next pairing
+        // needs pairable advertising again, which makes its key pair first.
+        self.refill = false;
         self.end();
         Some(Outcome::Bonded(bonded))
     }
 
-    /// Whether a job waits to be taken with [`Self::take_job`].
+    /// Whether a job waits to be taken with [`Self::take_job`]: one a pairing
+    /// or [`Self::prepare_key_pair`] asked for, or the refill of the key pair
+    /// slot after a pairing that used its key pair ended unbonded (see [the key
+    /// pair slot](self#the-key-pair-slot)).
     #[inline]
     #[must_use = "the state is only read"]
-    pub const fn has_job(&self) -> bool { self.job.is_some() }
+    pub const fn has_job(&self) -> bool { self.job.is_some() || self.refill_due() }
 
-    /// Whether a key pair is ready, so a pairing needs only the
-    /// Diffie-Hellman job.
+    /// Whether a key pair is ready and unused, so the next pairing needs
+    /// only the Diffie-Hellman job.
     #[inline]
     #[must_use = "the state is only read"]
-    pub const fn has_key_pair(&self) -> bool { self.pair.is_some() }
+    pub const fn has_key_pair(&self) -> bool { matches!(self.slot, Slot::Ready(_)) }
 
     /// Whether a PDU waits to be sent with [`Self::next_pdu`].
     #[inline]
@@ -865,7 +938,8 @@ impl Responder {
     pub const fn is_pairing(&self) -> bool { !matches!(self.state, State::Idle | State::TimedOut) }
 
     /// Takes the result of a job from [`Job::run`]. A result whose pairing
-    /// ended is dropped; a key pair is kept for the next pairing.
+    /// ended is dropped; a key pair goes into the empty slot, for the next
+    /// pairing (or the one under way, if it waits for it).
     #[inline]
     pub fn job_done<C>(&mut self, crypto: &mut C, result: JobResult) -> Option<Outcome>
     where
@@ -876,8 +950,9 @@ impl Responder {
                 if self.running.is_some_and(|(task, _)| task == Task::KeyPair) {
                     self.running = None;
                 }
-                if self.pair.is_none() {
-                    self.pair = Some(pair);
+                if matches!(self.slot, Slot::Empty) {
+                    self.slot = Slot::Ready(pair);
+                    self.refill = false;
                 }
                 if self.state == State::KeyPair { self.answer_public_key(crypto) } else { Ok(None) }
             },
@@ -956,10 +1031,7 @@ impl Responder {
                 self.init_dist,
                 self.resp_dist,
             ]])),
-            OUT_PUBLIC_KEY => {
-                let key = flip_coordinates(self.pair.as_ref()?.public_key());
-                Some(Output::new(PAIRING_PUBLIC_KEY, &[&key]))
-            },
+            OUT_PUBLIC_KEY => Some(Output::new(PAIRING_PUBLIC_KEY, &[&flip_coordinates(&self.own_key)])),
             OUT_CONFIRM => Some(Output::new(PAIRING_CONFIRM, &[&reversed(&self.confirm)])),
             OUT_RANDOM => Some(Output::new(PAIRING_RANDOM, &[&reversed(&self.nb)])),
             OUT_CHECK => Some(Output::new(PAIRING_DHKEY_CHECK, &[&reversed(&self.check)])),
@@ -1128,7 +1200,8 @@ impl Responder {
         }
         let na = reversed(params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?);
         let peer_x = self.peer_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
-        let expected = f4(aes, peer_x, &self.own_x, &na, self.passkey_bit(round));
+        let own_x = self.own_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
+        let expected = f4(aes, peer_x, own_x, &na, self.passkey_bit(round));
         if !same(&expected, &self.peer_confirm) {
             return Err(Reason::CONFIRM_VALUE_FAILED);
         }
@@ -1164,12 +1237,14 @@ impl Responder {
         self.finish()
     }
 
-    /// Asks for a key pair if none is ready or being made: before pairable
-    /// advertising starts, which then waits for [`Self::has_key_pair`].
+    /// Asks for a key pair if the slot is empty and none is being made:
+    /// before pairable advertising starts, which then waits for
+    /// [`Self::has_key_pair`], and when a pairing finds the slot empty (see
+    /// [the key pair slot](self#the-key-pair-slot)).
     #[inline]
     pub fn prepare_key_pair(&mut self) {
         let making = self.running.is_some_and(|(task, _)| task == Task::KeyPair);
-        if self.pair.is_none() && self.job.is_none() && !making {
+        if matches!(self.slot, Slot::Empty) && self.job.is_none() && !making {
             self.job = Some(Task::KeyPair);
         }
     }
@@ -1185,7 +1260,7 @@ impl Responder {
         let key: &[u8; PUBLIC_KEY_LEN] =
             params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?;
         self.peer_key = flip_coordinates(key);
-        if self.pair.is_some() {
+        if self.has_key_pair() {
             return self.answer_public_key(crypto);
         }
         self.state = State::KeyPair;
@@ -1260,6 +1335,22 @@ impl Responder {
         answer.unwrap_or_else(|reason| self.fail(reason, report))
     }
 
+    /// Whether the crypto task is to fill the key pair slot now, in idle
+    /// time: a pairing used the key pair and ended without a bond, Pairing
+    /// Requests are taken, the slot is empty, no job waits or runs and no
+    /// pairing is under way. Never during a pairing, so it neither delays a
+    /// Diffie-Hellman job nor blocks the thread while the user types a
+    /// passkey; never after a bond, while the link is in use; and never in
+    /// reconnection mode, which takes no Pairing Request.
+    const fn refill_due(&self) -> bool {
+        self.refill
+            && self.pairable
+            && matches!(self.slot, Slot::Empty)
+            && self.job.is_none()
+            && self.running.is_none()
+            && !self.is_pairing()
+    }
+
     /// Queues our confirm value of `round` of Passkey Entry, with a fresh
     /// nonce: `Cbi = f4(PKbx, PKax, Nbi, 0x80 | r_i)`.
     #[cfg(feature = "passkey")]
@@ -1269,8 +1360,10 @@ impl Responder {
     {
         crypto.fill(&mut self.nb);
         let bit = self.passkey_bit(round);
-        if let Some(peer_x) = self.peer_key.first_chunk::<KEY_LEN>() {
-            self.confirm = f4(&*crypto, &self.own_x, peer_x, &self.nb, bit);
+        if let Some(peer_x) = self.peer_key.first_chunk::<KEY_LEN>()
+            && let Some(own_x) = self.own_key.first_chunk::<KEY_LEN>()
+        {
+            self.confirm = f4(&*crypto, own_x, peer_x, &self.nb, bit);
         }
         self.pending |= OUT_CONFIRM;
         self.state = State::Nonce(round);
@@ -1300,12 +1393,23 @@ impl Responder {
         answer.unwrap_or_else(|reason| self.fail(reason, true))
     }
 
-    /// The next job for the crypto task, if one waits.
+    /// The next job for the crypto task, if one waits: one a pairing asked
+    /// for, else the refill of the key pair slot if it is due
+    /// (see [the key pair slot](self#the-key-pair-slot)).
     #[inline]
     pub fn take_job(&mut self) -> Option<Job> {
-        let kind = match self.job.take()? {
+        let task = self.job.take().or_else(|| self.refill_due().then_some(Task::KeyPair))?;
+        let kind = match task {
             Task::DhKey => {
-                let pair = self.pair.take()?;
+                // Only the pairing's own key pair, whose public key went to
+                // the central.
+                let pair = match mem::replace(&mut self.slot, Slot::Empty) {
+                    Slot::Used(pair) => pair,
+                    other @ (Slot::Empty | Slot::Ready(_)) => {
+                        self.slot = other;
+                        return None;
+                    },
+                };
                 self.serial = self.serial.wrapping_add(1);
                 self.running = Some((Task::DhKey, self.serial));
                 JobKind::DhKey { pair, peer: self.peer_key, serial: self.serial }

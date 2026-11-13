@@ -59,8 +59,9 @@ What is done so far:
 - The async glue (`host::Host`, `host::Conn`): a static `Host` whose engine sits behind a thread mode mutex, never a
   critical section. `Host::run` waits for the link layer, the next deadline, room in the link layer's queue while output
   waits, or a wake-up; `Host::crypto` runs the P-256 jobs with the firmware's watchdog hook before each multiplication
-  and a yield between jobs; `Host::advertise` waits for the key pair before pairable advertising, runs the schedule's
-  phases and keeps or ends a link that arrives after its future was dropped;
+  and a yield between jobs, only where a pairing needs them (see [Pairing timing](#pairing-timing)); `Host::advertise`
+  waits for the key pair before pairable advertising, runs the schedule's phases and keeps or ends a link that arrives
+  after its future was dropped;
   `Conn::notify` paces by acknowledgement, with at most `engine::Config::notify_depth` fragments in flight (two by
   default, three with `Config::with_notify_depth(3)`, which queues a button or key report behind the two movement
   reports before it at no RAM cost, as the link layer's queue is the same: on the nRF52832 it can ride their connection
@@ -69,8 +70,9 @@ What is done so far:
   `host::Port` trait, which `link::Link` implements; the host tests drive the whole host over a stand-in link layer.
   The module documentation of `host` shows how a device's firmware wires it.
 
-On the nRF51 (thumbv6m, measured with `-Zprint-type-sizes`) the static `Host<Link>` takes 896 bytes, 800 of them the
-engine (368 the security manager), the `Host::run` future 136 bytes, the `Host::crypto` future 32, a `Host::advertise`
+On the nRF51 (thumbv6m, measured with `-Zprint-type-sizes`) the static `Host<Link>` takes 976 bytes, 864 of them the
+engine (432 the security manager, of which 64 for the copy of the public key a pairing shows, so the key pair slot
+can drop a used key pair at once), the `Host::run` future 136 bytes, the `Host::crypto` future 32, a `Host::advertise`
 future 96 and a `Conn::notify` future 48.
 
 What has run on hardware: the nRF51 path, with BlueZ, in the presentation remote's firmware. The nRF52832 path has not:
@@ -431,6 +433,48 @@ crypto task, by about 1.7 KB with the five overrides at 184b694 (1.8 KB without)
 shrink to match (static RAM of 7,148 B still fits); with nrf-ble-p256 at "z" the harness's multiplication needs about
 1.1 KB less stack than with its generic code at 3, so the growth is likely smaller. The pairing peak is measured again
 on the remote with its stack report build.
+
+### Pairing timing
+
+An LE Secure Connections pairing needs two P-256 multiplications: our key pair (the generator times a fresh private
+key) and the Diffie-Hellman key. Each blocks the thread executor for its whole length; emulated, by build, about 2.7 s
+to 3.3 s on the nRF51 and about 120 ms to 235 ms on the nRF52832 (the table above). Not measured on the chips yet.
+
+What blocks and what does not, during a multiplication:
+
+- The link layer runs in its interrupt executor and is not held up: connection events, acknowledgements,
+  retransmissions, the supervision timeout and the answers to the central's LL procedures go on as before, and its
+  timing does not change. Its event queue holds 6 events and the connection 3 more for the time the host is blocked.
+- Everything in thread mode waits: the run task (ATT responses, the LTK reply to an encryption request, signalling,
+  the queueing of fragments), `Conn::notify` and the application's own tasks of the thread executor, with whatever
+  input they scan. A firmware whose input must not wait (a keyboard's matrix scan, which must not miss a short press)
+  runs it in an interrupt executor above thread mode and below the link layer's, so it preempts the multiplication.
+
+So the multiplications run only where a pairing needs them:
+
+- The key pair, when `Host::advertise` is called in pairing mode and none is ready, before it advertises, so no
+  central waits for it.
+- The Diffie-Hellman key, once our public key and confirm value are queued; with Passkey Entry, while the user types.
+- A new key pair after a pairing that used ours ended without a bond (failed by either side, timed out or cut by the
+  end of the link), while the engine is pairable, from 32 fresh octets of the RNG as for any key pair. The engine ends
+  a link whose pairing failed, so this runs while that link ends, and the next pairable call advertises at once. Never
+  during a pairing; a pairing that starts before it is done waits for it.
+
+Nothing else is computed. A reconnection computes nothing, so a device that wakes from System OFF and reconnects gets
+its LTK reply at once (the presentation remote must have the link encrypted within 3 s of the press that woke it). The
+link after a bond computes nothing either, while the central discovers the table and the application sends its first
+input; the next pairing needs pairable advertising again, which makes its key pair before it advertises.
+
+A key pair serves one pairing at most: it becomes the pairing's when its public key is queued for the central, and
+from then on the Diffie-Hellman job takes it or the end of the pairing drops it, which overwrites its private key. A
+pairing that ends before our public key went out (the central's key refused, the pairing failed or the link ended
+earlier) leaves the key pair ready, as nothing of it was shown, and the next pairing shows it. The Core specification
+(volume 3, part H) does not require a new key pair for each pairing; the security manager makes one anyway, so no two
+pairings, of different centrals or two attempts of one, see the same public key, and no private key outlives its
+pairing.
+
+The cost: one multiplication more after each pairing that showed our public key and failed, and none otherwise. RAM:
+64 bytes in the security manager and 12 for a signal of the host (above).
 
 ## Power
 

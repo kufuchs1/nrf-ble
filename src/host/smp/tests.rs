@@ -204,15 +204,23 @@ fn out(responder: &mut Responder, now: Instant) -> (Output, Option<Outcome>) {
     (output, outcome)
 }
 
-/// Runs every job that waits, as the crypto task does, and returns the
-/// last outcome.
+/// Runs every job that waits, as the crypto task does, the idle refill of
+/// the key pair slot included, and returns the last outcome there was.
 fn run_jobs(responder: &mut Responder, device: &mut Device) -> Option<Outcome> {
     let mut outcome = None;
     while let Some(job) = responder.take_job() {
         let result = job.run(&mut device.clone(), || ());
-        outcome = responder.job_done(device, result);
+        if let Some(last) = responder.job_done(device, result) {
+            outcome = Some(last);
+        }
     }
     outcome
+}
+
+/// The public key of the ready key pair in the slot.
+fn ready_key(responder: &Responder) -> [u8; PUBLIC_KEY_LEN] {
+    let Slot::Ready(pair) = &responder.slot else { panic!("no ready key pair") };
+    *pair.public_key()
 }
 
 /// A security manager for a link from the central's address to `local`,
@@ -540,7 +548,7 @@ fn pairing_at(step: usize) -> (Responder, Device, Central) {
 
 /// Sends `pdu`, `encrypted` or not, to the pairing at `step`, which must
 /// fail with `reason`.
-fn fails_with(step: usize, pdu: &[u8], encrypted: bool, reason: Reason) {
+fn fails_with(step: usize, pdu: &[u8], encrypted: bool, reason: Reason) -> Responder {
     let (mut responder, mut device, _) = pairing_at(step);
     let outcome = responder.receive(&mut device, pdu, encrypted, at(0));
     assert_eq!(outcome, Some(Outcome::Failed { by_central: false, reason }), "step {step}, {pdu:02X?}");
@@ -550,6 +558,7 @@ fn fails_with(step: usize, pdu: &[u8], encrypted: bool, reason: Reason) {
     assert_eq!(responder.ltk_request(0, [0; 8]), None);
     assert_eq!(responder.ltk, [0; 16]);
     assert_eq!(responder.dh_key, [0; KEY_LEN]);
+    responder
 }
 
 #[test]
@@ -598,7 +607,7 @@ fn pdus_of_the_wrong_length_get_invalid_parameters() {
 #[test]
 fn refused_public_keys_get_dhkey_check_failed() {
     let central = Central::new(linux_request(true, true), local_rpa());
-    let own = *pairing_at(0).0.pair.as_ref().unwrap().public_key();
+    let own = ready_key(&pairing_at(0).0);
     let mut off_curve = *central.pair.public_key();
     off_curve[63] ^= 1;
     // The negation: the same X, and the field prime less Y.
@@ -611,7 +620,12 @@ fn refused_public_keys_get_dhkey_check_failed() {
         own_negated[KEY_LEN + index] = (difference + 256 * borrow) as u8;
     }
     for key in [off_curve, ecc::DEBUG_PUBLIC_KEY, own, own_negated] {
-        fails_with(0, &pdu::<65>(PAIRING_PUBLIC_KEY, &flip_coordinates(&key)), false, Reason::DHKEY_CHECK_FAILED);
+        let refused = pdu::<65>(PAIRING_PUBLIC_KEY, &flip_coordinates(&key));
+        let responder = fails_with(0, &refused, false, Reason::DHKEY_CHECK_FAILED);
+        // Our public key never went out: the key pair stays ready, the same,
+        // and nothing is computed.
+        assert_eq!(ready_key(&responder), own);
+        assert!(!responder.has_job());
     }
     // A key that arrives before our key pair fails once the pair is there.
     let mut responder = responder(local_rpa());
@@ -623,8 +637,14 @@ fn refused_public_keys_get_dhkey_check_failed() {
     let outcome = run_jobs(&mut responder, &mut device);
     assert_eq!(outcome, Some(Outcome::Failed { by_central: false, reason: Reason::DHKEY_CHECK_FAILED }));
     assert_eq!(out(&mut responder, at(0)).0.bytes(), &[PAIRING_FAILED, 0x0B]);
-    // The key pair was never shown: it stays for the next pairing.
-    assert!(responder.has_key_pair());
+    // The key pair was never shown: it stays for the next pairing, which
+    // shows it.
+    let kept = ready_key(&responder);
+    assert!(!responder.has_job());
+    assert_eq!(responder.receive(&mut device, &central.request, false, at(0)), Some(Outcome::Started));
+    out(&mut responder, at(0));
+    responder.receive(&mut device, &central.public_key(), false, at(0));
+    assert_eq!(out(&mut responder, at(0)).0.bytes(), &pdu::<65>(PAIRING_PUBLIC_KEY, &flip_coordinates(&kept)));
 }
 
 #[test]
@@ -845,9 +865,12 @@ fn a_failure_waits_for_the_public_key_being_sent() {
     assert_eq!(responder.pdu_sent(at(0)), None);
     assert_eq!(out(&mut responder, at(0)).0.bytes(), &[PAIRING_FAILED, 0x07]);
     assert!(!responder.has_output());
-    // No Diffie-Hellman job for the failed pairing; the key pair stays.
-    assert!(!responder.has_job());
-    assert!(responder.has_key_pair());
+    // No Diffie-Hellman job for the failed pairing; its key pair, whose
+    // public key went out, is dropped, and the slot is refilled.
+    assert!(!responder.has_key_pair());
+    assert!(matches!(responder.slot, Slot::Empty));
+    assert_eq!(responder.job, None);
+    assert!(responder.take_job().is_some_and(|job| job.is_key_pair()));
 }
 
 #[test]
@@ -884,9 +907,165 @@ fn a_key_pair_is_made_once() {
     assert!(!responder.has_job());
     // A second key pair is dropped.
     let result = Job { kind: JobKind::KeyPair }.run(&mut Device(19), || ());
-    let first = *responder.pair.as_ref().unwrap().public_key();
+    let first = ready_key(&responder);
     assert_eq!(responder.job_done(&mut Device(19), result), None);
-    assert_eq!(responder.pair.as_ref().unwrap().public_key(), &first);
+    assert_eq!(ready_key(&responder), first);
+}
+
+#[test]
+fn nothing_is_computed_until_a_pairing_needs_it() {
+    // Reconnection mode, our identity set: no job, before and after a link.
+    let mut responder = Responder::new();
+    responder.set_identity(OUR_IRK, OUR_ADDRESS);
+    responder.set_pairable(false);
+    assert!(!responder.has_job());
+    responder.connected(&info(Peer::new(CENTRAL_ADDRESS, false), local_rpa()));
+    responder.disconnected();
+    assert!(!responder.has_job());
+    assert!(responder.take_job().is_none());
+    // Pairing mode alone computes nothing either, until the advertising
+    // call asks for the key pair.
+    responder.set_pairable(true);
+    assert!(!responder.has_job());
+    responder.prepare_key_pair();
+    assert!(responder.take_job().is_some_and(|job| job.is_key_pair()));
+}
+
+#[test]
+fn a_bond_leaves_the_slot_empty_and_the_next_pairing_gets_a_new_key_pair() {
+    let (mut responder, mut device, _, _) = pair(BOTH_WAYS);
+    let first = responder.own_key;
+    // No refill after the bond, while the link is in use.
+    assert!(!responder.is_pairing());
+    assert!(matches!(responder.slot, Slot::Empty));
+    assert!(!responder.has_job());
+    // The next pairing asks for its own key pair, and shows that one.
+    let mut central = Central::new(linux_request(true, true), local_rpa());
+    assert_eq!(responder.receive(&mut device, &central.request, true, at(0)), Some(Outcome::Started));
+    out(&mut responder, at(0));
+    assert_eq!(responder.receive(&mut device, &central.public_key(), true, at(0)), None);
+    assert!(responder.take_job().is_some_and(|job| job.is_key_pair()));
+    let result = Job { kind: JobKind::KeyPair }.run(&mut Device(29), || ());
+    assert_eq!(responder.job_done(&mut device, result), None);
+    let (public_key, _) = out(&mut responder, at(0));
+    assert_ne!(responder.own_key, first);
+    assert_eq!(public_key.bytes(), &pdu::<65>(PAIRING_PUBLIC_KEY, &flip_coordinates(&responder.own_key)));
+    central.take_public_key(public_key.bytes());
+    // It is the pairing's now: not ready for another.
+    assert!(!responder.has_key_pair());
+    assert!(matches!(responder.slot, Slot::Used(_)));
+}
+
+#[test]
+fn a_pairing_that_ends_before_our_public_key_keeps_the_key_pair() {
+    // Failed by either side, timed out or the link gone, after the request.
+    for end in 0..4 {
+        let (mut responder, mut device, central) = pairing_at(0);
+        let kept = ready_key(&responder);
+        match end {
+            0 => assert!(responder.receive(&mut device, &[PAIRING_FAILED, 0x08], false, at(0)).is_some()),
+            1 => assert!(responder.receive(&mut device, &[0xFF], false, at(0)).is_some()),
+            2 => assert_eq!(responder.on_time(at(40_000)), Some(Outcome::TimedOut)),
+            _ => responder.disconnected(),
+        }
+        assert!(!responder.is_pairing(), "end {end}");
+        assert_eq!(ready_key(&responder), kept, "end {end}");
+        assert!(!responder.has_job(), "end {end}");
+        // The next pairing shows it, without a job.
+        responder.connected(&info(Peer::new(CENTRAL_ADDRESS, false), local_rpa()));
+        assert_eq!(responder.receive(&mut device, &central.request, false, at(0)), Some(Outcome::Started));
+        out(&mut responder, at(0));
+        responder.receive(&mut device, &central.public_key(), false, at(0));
+        let shown = out(&mut responder, at(0)).0;
+        assert_eq!(shown.bytes(), &pdu::<65>(PAIRING_PUBLIC_KEY, &flip_coordinates(&kept)), "end {end}");
+        out(&mut responder, at(0));
+        // Only the Diffie-Hellman job, once our confirm value is queued.
+        assert_eq!(responder.job, Some(Task::DhKey), "end {end}");
+    }
+}
+
+#[test]
+fn a_key_pair_whose_public_key_went_out_serves_no_other_pairing() {
+    // However the pairing ends after our public key was queued: failed by
+    // either side, timed out, or the link gone; with the Diffie-Hellman job
+    // still waiting (step 0, the key just queued) or already run.
+    for step in 0..=3 {
+        for end in 0..4 {
+            let (mut responder, mut device, central) = pairing_at(step);
+            if step == 0 {
+                responder.receive(&mut device, &central.public_key(), false, at(0));
+                out(&mut responder, at(0));
+                out(&mut responder, at(0));
+                // The Diffie-Hellman job waits; the key pair is the pairing's.
+                assert_eq!(responder.job, Some(Task::DhKey));
+                assert!(matches!(responder.slot, Slot::Used(_)));
+            }
+            let shown = responder.own_key;
+            match end {
+                0 => assert!(responder.receive(&mut device, &[PAIRING_FAILED, 0x08], false, at(0)).is_some()),
+                1 => assert!(responder.receive(&mut device, &[0xFF], false, at(0)).is_some()),
+                2 => assert_eq!(responder.on_time(at(40_000)), Some(Outcome::TimedOut)),
+                _ => responder.disconnected(),
+            }
+            assert!(!responder.is_pairing(), "step {step}, end {end}");
+            assert!(matches!(responder.slot, Slot::Empty), "step {step}, end {end}");
+            assert_eq!(responder.job, None, "no Diffie-Hellman job for the ended pairing");
+            // The refill makes a new one, only while pairable.
+            responder.set_pairable(false);
+            assert!(!responder.has_job(), "step {step}, end {end}");
+            responder.set_pairable(true);
+            let job = responder.take_job().unwrap();
+            assert!(job.is_key_pair(), "step {step}, end {end}");
+            let result = job.run(&mut device.clone(), || ());
+            assert_eq!(responder.job_done(&mut device, result), None);
+            assert!(responder.has_key_pair());
+            assert_ne!(ready_key(&responder), shown, "step {step}, end {end}");
+        }
+    }
+}
+
+#[test]
+fn the_refill_waits_for_the_end_of_the_pairing() {
+    // The Diffie-Hellman job took the key pair: the slot is empty, but the
+    // pairing runs.
+    let (mut responder, mut device, central) = pairing_at(1);
+    assert!(matches!(responder.slot, Slot::Empty));
+    assert!(!responder.has_job());
+    assert!(responder.take_job().is_none());
+    responder.receive(&mut device, &central.random(), false, at(0));
+    out(&mut responder, at(0));
+    assert!(!responder.has_job());
+    // The pairing times out: now the slot is refilled.
+    assert_eq!(responder.on_time(at(40_000)), Some(Outcome::TimedOut));
+    assert!(responder.take_job().is_some_and(|job| job.is_key_pair()));
+}
+
+#[test]
+fn a_pairing_that_starts_during_the_refill_waits_for_it() {
+    // A pairing failed after our public key went out.
+    let (mut responder, mut device, _) = pairing_at(1);
+    assert!(responder.receive(&mut device, &[PAIRING_FAILED, 0x08], false, at(0)).is_some());
+    let mut central = Central::new(linux_request(true, true), local_rpa());
+    // The refill runs when the central's next Pairing Request arrives: no
+    // second key pair is asked for.
+    let refill = responder.take_job().unwrap();
+    assert!(refill.is_key_pair());
+    assert_eq!(responder.receive(&mut device, &central.request, false, at(0)), Some(Outcome::Started));
+    assert_eq!(responder.job, None);
+    out(&mut responder, at(0));
+    // The central's key waits for it.
+    assert_eq!(responder.receive(&mut device, &central.public_key(), false, at(0)), None);
+    assert!(!responder.has_output());
+    assert!(!responder.has_job());
+    let result = refill.run(&mut device.clone(), || ());
+    assert_eq!(responder.job_done(&mut device, result), None);
+    let (public_key, _) = out(&mut responder, at(0));
+    central.take_public_key(public_key.bytes());
+    central.take_confirm(out(&mut responder, at(0)).0.bytes());
+    // Then the Diffie-Hellman job, and no refill while the pairing runs.
+    let job = responder.take_job().unwrap();
+    assert!(!job.is_key_pair());
+    assert!(!responder.has_job());
 }
 
 #[test]

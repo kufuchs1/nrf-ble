@@ -490,9 +490,9 @@ impl Engine {
     /// Sets the engine up for an advertising call: whether a Pairing Request
     /// is taken, our `identity` for the security manager, the `bond` whose
     /// central may encrypt with its key, and the time a link gets to become
-    /// encrypted. A pairable call asks for a key pair at once, so pairing
-    /// never waits for one; the call waits for it before it advertises
-    /// ([`Self::has_key_pair`]).
+    /// encrypted. A pairable call asks for a key pair at once if the
+    /// security manager's slot is empty, so pairing never waits for one; the
+    /// call waits for it before it advertises ([`Self::has_key_pair`]).
     #[inline]
     pub fn advertise(&mut self, pairable: bool, identity: &identity::Local, bond: Option<Bond>, security: Duration) {
         self.smp.set_pairable(pairable);
@@ -766,12 +766,13 @@ impl Engine {
     #[must_use = "the state is only read"]
     pub const fn has_claimed_link(&self) -> bool { self.link.as_ref().is_some_and(const |link| link.fate.claimed) }
 
-    /// Whether a job waits for the crypto task.
+    /// Whether a job waits for the crypto task, the idle refill of the key
+    /// pair slot after a pairing that ended unbonded included.
     #[inline]
     #[must_use = "the state is only read"]
     pub const fn has_job(&self) -> bool { self.smp.has_job() }
 
-    /// Whether a key pair is ready for the next pairing.
+    /// Whether a key pair is ready and unused for the next pairing.
     #[inline]
     #[must_use = "the state is only read"]
     pub const fn has_key_pair(&self) -> bool { self.smp.has_key_pair() }

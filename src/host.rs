@@ -38,9 +38,10 @@
 //!   each, it makes the calls of the link layer the engine asks for and queues
 //!   the fragments the engine has, as long as there is room.
 //! - [`Host::crypto`] runs the P-256 jobs of pairing, each a multiplication
-//!   that blocks the thread for about 3 s on the nRF51, with the firmware's
-//!   watchdog hook right before each multiplication and a yield between two
-//!   jobs. No lock is held meanwhile; the link layer keeps the link.
+//!   that blocks the thread for about 2.7 s to 3.3 s on the nRF51, with the
+//!   firmware's watchdog hook right before each multiplication and a yield
+//!   between two jobs. No lock is held meanwhile; the link layer keeps the
+//!   link. See [Pairing timing](#pairing-timing) for when they run.
 //! - The application advertises with [`Host::advertise`], reads the link's
 //!   events with [`Conn::next`] and sends its reports with [`Conn::notify`].
 //!
@@ -75,6 +76,34 @@
 //! runs while a central waits; a reconnection never computes one. A central
 //! may connect after the call's future was dropped: [`engine::Config`] says
 //! whether that link is kept for the next call or ended.
+//!
+//! # Pairing timing
+//!
+//! An LE Secure Connections pairing needs two P-256 multiplications, our key
+//! pair and the Diffie-Hellman key, and each blocks the thread executor for
+//! its whole length: emulated, by build, about 2.7 s to 3.3 s on the nRF51
+//! and about 0.12 s to 0.23 s on the nRF52832 (the readme gives the figures).
+//! The link layer runs in its interrupt executor and is not held up; whatever
+//! else runs in thread mode waits: the run task (ATT responses, the LTK reply,
+//! signalling), the application's tasks and their input.
+//!
+//! So the multiplications run only where a pairing needs them (see [`smp`],
+//! "The key pair slot"):
+//!
+//! - The key pair, when [`Host::advertise`] is called in pairing mode with no
+//!   key pair ready, before it advertises: no central waits for it.
+//! - The Diffie-Hellman key, once our public key and confirm value are queued;
+//!   with Passkey Entry while the user types the passkey.
+//! - A new key pair after a pairing that used ours ended without a bond, while
+//!   the engine is pairable: it runs while the failed link ends, so the next
+//!   pairable call advertises at once and its pairing computes only the
+//!   Diffie-Hellman key. Never during a pairing; a pairing that starts before
+//!   it is done waits for it.
+//!
+//! A reconnection computes nothing, so a device that wakes from System OFF
+//! and reconnects gets its LTK reply at once; neither does the link after a
+//! bond, while the central discovers the table and the application sends its
+//! first input. A key pair never serves two pairings.
 //!
 //! # A device
 //!
@@ -674,12 +703,17 @@ pub struct Hardware;
 /// documentation.
 #[non_exhaustive]
 pub struct Host<P> {
-    /// A link arrived or the key pair is ready, for [`Host::advertise`].
+    /// A link arrived or ended, for [`Host::advertise`].
     advertised: Signal<StateMutex, ()>,
     /// Events arrived, for [`Conn::next`].
     events:     Signal<StateMutex, ()>,
     /// A job waits, for [`Host::crypto`].
     jobs:       Signal<StateMutex, ()>,
+    /// A key pair job ended, for [`Host::advertise`] in pairing mode. Not
+    /// [`Self::advertised`]: a job that ends while a reconnection advertises
+    /// (a refill taken before the call) would look like a link that ended,
+    /// and start its phase again.
+    key_pair:   Signal<StateMutex, ()>,
     /// One notification at a time, so one task waits for room.
     notifier:   AsyncMutex<StateMutex, ()>,
     /// The link layer.
@@ -1023,7 +1057,7 @@ where
         let mut waiting = Waiting { host: self, linked: false };
         self.jobs.signal(());
         while mode.pairable() && !self.with(|state| state.engine.has_key_pair()) {
-            self.advertised.wait().await;
+            self.key_pair.wait().await;
         }
         advertising.configure(&self.port, identity).map_err(AdvertiseError::Setup)?;
         let mut end = self.port.now();
@@ -1048,7 +1082,8 @@ where
 
     /// Runs the P-256 jobs of pairing, with `crypto`'s random numbers and
     /// AES, calling `before_multiplication` right before each
-    /// multiplication, for the watchdog, and yielding between two jobs.
+    /// multiplication, for the watchdog, and yielding between two jobs (see
+    /// [Pairing timing](self#pairing-timing)).
     /// Spawn it as a task of its own; both are [`Send`], so its future is.
     #[inline]
     pub async fn crypto<C, F>(&self, crypto: &mut C, mut before_multiplication: F) -> !
@@ -1061,12 +1096,15 @@ where
                 self.jobs.wait().await;
                 continue;
             };
+            let key_pair = job.is_key_pair();
             // No lock is held during the multiplication.
             let result = job.run(crypto, &mut before_multiplication);
             let now = self.port.now();
             self.with(|state| state.engine.job_done(crypto, result, now));
             self.wake.signal(());
-            self.advertised.signal(());
+            if key_pair {
+                self.key_pair.signal(());
+            }
             yield_now().await;
         }
     }
@@ -1158,6 +1196,7 @@ where
             advertised: Signal::new(),
             events: Signal::new(),
             jobs: Signal::new(),
+            key_pair: Signal::new(),
             notifier: AsyncMutex::new(()),
             port,
             room: Signal::new(),
