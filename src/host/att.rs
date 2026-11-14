@@ -50,25 +50,22 @@
 //! was declared with, also for a characteristic that can be neither read
 //! nor written.
 
-use crate::{
-    bytes::{le16, le16_bytes},
-    host::gatt::{
-        AttError,
-        Attr,
-        Char,
-        DYNAMIC_MAX,
-        Db,
-        Handler,
-        Kind,
-        PRIMARY_SERVICE,
-        PROP_INDICATE,
-        PROP_NOTIFY,
-        SECONDARY_SERVICE,
-        Sec,
-        Subscriptions,
-        Uuid,
-        Value,
-    },
+use crate::host::gatt::{
+    AttError,
+    Attr,
+    Char,
+    DYNAMIC_MAX,
+    Db,
+    Handler,
+    Kind,
+    PRIMARY_SERVICE,
+    PROP_INDICATE,
+    PROP_NOTIFY,
+    SECONDARY_SERVICE,
+    Sec,
+    Subscriptions,
+    Uuid,
+    Value,
 };
 
 /// The ATT MTU: the default, which the server never raises.
@@ -219,7 +216,7 @@ impl Server {
         if params.len() != 2 {
             return Err((0, AttError::INVALID_PDU));
         }
-        let [low, high] = le16_bytes(u16::try_from(MTU).unwrap_or_default());
+        let [low, high] = u16::try_from(MTU).unwrap_or_default().to_le_bytes();
         let mut writer = Writer::new(out, EXCHANGE_MTU_RESPONSE);
         writer.push(&[low, high]);
         Ok(writer.finish())
@@ -232,14 +229,14 @@ impl Server {
             return Err((0, AttError::INVALID_PDU));
         };
         let (start, end) = range([start0, start1], [end0, end1])?;
-        if le16([type0, type1]) != PRIMARY_SERVICE {
+        if u16::from_le_bytes([type0, type1]) != PRIMARY_SERVICE {
             return Err((start, AttError::ATTRIBUTE_NOT_FOUND));
         }
         let mut writer = Writer::new(out, FIND_BY_TYPE_VALUE_RESPONSE);
         for (handle, attr) in self.within(start, end) {
             if attr.kind() == Kind::Service && attr.uuid().matches(value) {
-                let [handle0, handle1] = le16_bytes(handle);
-                let [group0, group1] = le16_bytes(self.db.group_end(handle));
+                let [handle0, handle1] = handle.to_le_bytes();
+                let [group0, group1] = self.db.group_end(handle).to_le_bytes();
                 if !writer.push(&[handle0, handle1, group0, group1]) {
                     break;
                 }
@@ -264,7 +261,7 @@ impl Server {
                 writer.push(&[if uuid.wire_len() == 2 { FORMAT_16 } else { FORMAT_128 }]);
             }
             let mut entry: [u8; 18] = [0; 18];
-            let [handle0, handle1] = le16_bytes(handle);
+            let [handle0, handle1] = handle.to_le_bytes();
             entry[0] = handle0;
             entry[1] = handle1;
             let len = entry.get_mut(2..).map_or(0, |rest| uuid.write(rest)).saturating_add(2);
@@ -379,7 +376,7 @@ impl Server {
     /// Answers a Read Request.
     fn read(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Answer {
         let &[handle0, handle1] = params else { return Err((0, AttError::INVALID_PDU)) };
-        self.read_at(le16([handle0, handle1]), 0, level, app, Writer::new(out, READ_RESPONSE))
+        self.read_at(u16::from_le_bytes([handle0, handle1]), 0, level, app, Writer::new(out, READ_RESPONSE))
     }
 
     /// Answers a read of the attribute at `handle` from `offset` with the
@@ -396,8 +393,8 @@ impl Server {
     /// Answers a Read Blob Request.
     fn read_blob(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Answer {
         let &[handle0, handle1, offset0, offset1] = params else { return Err((0, AttError::INVALID_PDU)) };
-        let handle = le16([handle0, handle1]);
-        let offset = usize::from(le16([offset0, offset1]));
+        let handle = u16::from_le_bytes([handle0, handle1]);
+        let offset = usize::from(u16::from_le_bytes([offset0, offset1]));
         self.read_at(handle, offset, level, app, Writer::new(out, READ_BLOB_RESPONSE))
     }
 
@@ -427,8 +424,8 @@ impl Server {
                 writer.push(&[u8::try_from(entry_len).unwrap_or_default()]);
             }
             let mut entry: [u8; 20] = [0; 20];
-            let [handle0, handle1] = le16_bytes(handle);
-            let [group0, group1] = le16_bytes(self.db.group_end(handle));
+            let [handle0, handle1] = handle.to_le_bytes();
+            let [group0, group1] = self.db.group_end(handle).to_le_bytes();
             if let Some(header) = entry.first_chunk_mut::<4>() {
                 *header = [handle0, handle1, group0, group1];
             }
@@ -471,7 +468,7 @@ impl Server {
             if writer.rest().len() < entry_len {
                 break;
             }
-            writer.push(&le16_bytes(handle));
+            writer.push(&handle.to_le_bytes());
             writer.push(value.get(..len).unwrap_or_default());
         }
         writer.found(start)
@@ -516,7 +513,7 @@ impl Server {
         let len = match (attr.kind(), attr.value_source()) {
             (Kind::Service, _) => attr.uuid().write(&mut bytes),
             (Kind::Characteristic(props), _) => {
-                let [value0, value1] = le16_bytes(handle.saturating_add(1));
+                let [value0, value1] = handle.saturating_add(1).to_le_bytes();
                 if let Some(header) = bytes.first_chunk_mut::<3>() {
                     *header = [props, value0, value1];
                 }
@@ -524,7 +521,7 @@ impl Server {
             },
             (_, Value::Cccd(index)) => {
                 if let Some(target) = bytes.first_chunk_mut::<2>() {
-                    *target = le16_bytes(self.subscriptions.value(index));
+                    *target = self.subscriptions.value(index).to_le_bytes();
                 }
                 2
             },
@@ -554,14 +551,14 @@ impl Server {
         let Some((&[handle0, handle1], data)) = params.split_first_chunk::<2>() else {
             return Err((0, AttError::INVALID_PDU));
         };
-        let handle = le16([handle0, handle1]);
+        let handle = u16::from_le_bytes([handle0, handle1]);
         let attr = self.db.attr(handle).ok_or((handle, AttError::INVALID_HANDLE))?;
         permit(attr.access().write, level, AttError::WRITE_NOT_PERMITTED).map_err(|error| (handle, error))?;
         match attr.value_source() {
             Value::Cccd(index) => {
                 let &[value0, value1] = data else { return Err((handle, AttError::INVALID_ATTRIBUTE_VALUE_LENGTH)) };
                 let props = self.owner_props(handle);
-                self.subscriptions.set(index, le16([value0, value1]), props);
+                self.subscriptions.set(index, u16::from_le_bytes([value0, value1]), props);
                 Ok(())
             },
             Value::Dynamic(id) => app.write(id, data, with_response).map_err(|error| (handle, error)),
@@ -649,7 +646,7 @@ const fn check_notify(
 /// Writes an Error Response to the request `opcode` for `handle` with
 /// `error` into `out` and returns its length.
 const fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: AttError) -> usize {
-    let [handle0, handle1] = le16_bytes(handle);
+    let [handle0, handle1] = handle.to_le_bytes();
     let mut writer = Writer::new(out, ERROR_RESPONSE);
     writer.push(&[opcode, handle0, handle1, error.code()]);
     writer.finish()
@@ -659,7 +656,7 @@ const fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: Att
 /// into `out` and returns its length.
 const fn handle_value(out: &mut [u8; MTU], opcode: u8, handle: u16, data: &[u8]) -> usize {
     let mut writer = Writer::new(out, opcode);
-    writer.push(&le16_bytes(handle));
+    writer.push(&handle.to_le_bytes());
     writer.push(data);
     writer.finish()
 }
@@ -678,7 +675,7 @@ const fn permit(required: Option<Sec>, level: Sec, denied: AttError) -> Result<(
 /// The handle range of a request: Invalid Handle for a start of 0 or after
 /// the end.
 const fn range(start_bytes: [u8; 2], end_bytes: [u8; 2]) -> Result<(u16, u16), Failure> {
-    let (start, end) = (le16(start_bytes), le16(end_bytes));
+    let (start, end) = (u16::from_le_bytes(start_bytes), u16::from_le_bytes(end_bytes));
     if start == 0 || start > end {
         return Err((start, AttError::INVALID_HANDLE));
     }

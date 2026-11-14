@@ -10,7 +10,6 @@ mod transmit;
 #[cfg(feature = "event-timing")]
 use crate::clock::RESTART_EARLY_US;
 use crate::{
-    bytes::{le16, le16_bytes},
     channel::{Hopping, UsedChannels},
     chip,
     clock::{Clock, SETUP_US, reached},
@@ -496,7 +495,7 @@ impl DataLength {
         let mut pdu = [code, 0, 0, 0, 0, 0, 0, 0, 0];
         let [max_octets, max_time] = LENGTH_MAX;
         let values = [max_octets, max_time, self.local_tx[0], self.local_tx[1]];
-        for (target, source) in pdu.iter_mut().skip(1).zip(values.iter().flat_map(|&value| le16_bytes(value))) {
+        for (target, source) in pdu.iter_mut().skip(1).zip(values.iter().flat_map(|&value| value.to_le_bytes())) {
             *target = source;
         }
         pdu
@@ -509,7 +508,7 @@ impl DataLength {
         let mut values: [u16; 4] = [0; 4];
         let (pairs, _) = bytes.as_chunks::<2>();
         for (value, &pair) in values.iter_mut().zip(pairs) {
-            *value = le16(pair);
+            *value = u16::from_le_bytes(pair);
         }
         let [rx_octets, rx_time, tx_octets, tx_time] = values;
         let [default_octets, default_time] = LENGTH_DEFAULT;
@@ -1456,7 +1455,7 @@ impl Connection {
         let Some(deadline) = request.asked else {
             let field = |index: usize| {
                 let bytes = request.params.get(index..index.saturating_add(2)).unwrap_or_default();
-                bytes.first_chunk::<2>().map_or(0, |&pair| le16(pair))
+                bytes.first_chunk::<2>().map_or(0, |&pair| u16::from_le_bytes(pair))
             };
             let range = ParamRange::new(field(0), field(2), field(4), field(6));
             self.notify(Event::ParamsRequested(range), shared);
@@ -1476,7 +1475,7 @@ impl Connection {
         match reply {
             Ok(values) => {
                 let mut response: [u8; 24] = [0; 24];
-                let host = values.iter().flat_map(|&value| le16_bytes(value));
+                let host = values.iter().flat_map(|&value| value.to_le_bytes());
                 let offsets = request.params.iter().skip(8).copied();
                 for (target, source) in
                     response.iter_mut().zip(iter::once(OP_CONNECTION_PARAM_RSP).chain(host).chain(offsets))
@@ -1848,7 +1847,7 @@ impl Connection {
             OP_CHANNEL_MAP_IND => {
                 if let Some([map0, map1, map2, map3, map4, instant0, instant1]) = field::<7>(params, 0) {
                     let map = [map0, map1, map2, map3, map4];
-                    let instant = le16([instant0, instant1]);
+                    let instant = u16::from_le_bytes([instant0, instant1]);
                     if !valid_channel_map(map) {
                         self.abort = Some(ERROR_INVALID_PARAMETERS);
                     } else if !future_instant(self.counter, instant) {
@@ -2066,7 +2065,7 @@ impl Connection {
             self.abort = Some(ERROR_UNSUPPORTED_VALUE);
             return;
         };
-        let instant = le16([instant0, instant1]);
+        let instant = u16::from_le_bytes([instant0, instant1]);
         if !future_instant(self.counter, instant) {
             self.abort = Some(ERROR_INSTANT_PASSED);
         } else if self.phy_update.is_some()
@@ -3039,13 +3038,13 @@ impl Connection {
             let mut request: [u8; 24] = [0; 24];
             let fields = [
                 [OP_CONNECTION_PARAM_REQ].as_slice(),
-                &le16_bytes(min),
-                &le16_bytes(max),
-                &le16_bytes(latency),
-                &le16_bytes(timeout),
+                &min.to_le_bytes(),
+                &max.to_le_bytes(),
+                &latency.to_le_bytes(),
+                &timeout.to_le_bytes(),
                 // No preferred periodicity; offsets relative to this event.
                 &[0],
-                &le16_bytes(self.counter),
+                &self.counter.to_le_bytes(),
                 &NO_OFFSET,
                 &NO_OFFSET,
                 &NO_OFFSET,
@@ -3200,20 +3199,21 @@ const fn queue_lead(crystal_lead: u32) -> u32 {
 const fn parse_update(bytes: &[u8]) -> Option<Update> {
     let [win_size, offset0, offset1, interval0, interval1, latency0, latency1, timeout0, timeout1, instant0, instant1] =
         field::<11>(bytes, 0)?;
-    let params =
-        ConnectionParams::new(le16([interval0, interval1]), le16([latency0, latency1]), le16([timeout0, timeout1]));
-    if !valid_connection_parameters(params.interval, params.latency, params.timeout, win_size, le16([offset0, offset1]))
-    {
+    let interval = u16::from_le_bytes([interval0, interval1]);
+    let timeout = u16::from_le_bytes([timeout0, timeout1]);
+    let offset = u16::from_le_bytes([offset0, offset1]);
+    let params = ConnectionParams::new(interval, u16::from_le_bytes([latency0, latency1]), timeout);
+    if !valid_connection_parameters(params.interval, params.latency, params.timeout, win_size, offset) {
         return None;
     }
     Some(Update {
-        instant: le16([instant0, instant1]),
-        interval: u32::from(le16([interval0, interval1])).saturating_mul(UNIT_1250_US),
+        instant: u16::from_le_bytes([instant0, instant1]),
+        interval: u32::from(interval).saturating_mul(UNIT_1250_US),
         latency: params.latency,
         params,
         requested: false,
-        timeout: u32::from(le16([timeout0, timeout1])).saturating_mul(UNIT_10MS_US),
-        win_offset: u32::from(le16([offset0, offset1])).saturating_mul(UNIT_1250_US),
+        timeout: u32::from(timeout).saturating_mul(UNIT_10MS_US),
+        win_offset: u32::from(offset).saturating_mul(UNIT_1250_US),
         win_size: u32::from(win_size).saturating_mul(UNIT_1250_US),
     })
 }
@@ -3287,11 +3287,13 @@ const fn valid_request(params: &[u8]) -> bool {
     let Some([min0, min1, max0, max1, latency0, latency1, timeout0, timeout1]) = field::<8>(params, 0) else {
         return false;
     };
-    let min = le16([min0, min1]);
-    let max = le16([max0, max1]);
+    let min = u16::from_le_bytes([min0, min1]);
+    let max = u16::from_le_bytes([max0, max1]);
+    let latency = u16::from_le_bytes([latency0, latency1]);
+    let timeout = u16::from_le_bytes([timeout0, timeout1]);
     min <= max
-        && valid_connection_parameters(min, le16([latency0, latency1]), le16([timeout0, timeout1]), 1, 0)
-        && valid_connection_parameters(max, le16([latency0, latency1]), le16([timeout0, timeout1]), 1, 0)
+        && valid_connection_parameters(min, latency, timeout, 1, 0)
+        && valid_connection_parameters(max, latency, timeout, 1, 0)
 }
 
 #[cfg(test)] mod tests;

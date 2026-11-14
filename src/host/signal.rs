@@ -15,10 +15,7 @@
 //! length field that does not match the PDU, is dropped, as Linux drops them.
 //! The LE signalling channel carries one command per PDU.
 
-use crate::{
-    bytes::{le16, le16_bytes},
-    link::ParamRange,
-};
+use crate::link::ParamRange;
 
 /// Code of a Command Reject.
 pub const COMMAND_REJECT: u8 = 0x01;
@@ -113,7 +110,7 @@ impl Command {
                 len = len.saturating_add(1);
             }
         }
-        let [len0, len1] = le16_bytes(u16::try_from(len.saturating_sub(HEADER_LEN)).unwrap_or_default());
+        let [len0, len1] = u16::try_from(len.saturating_sub(HEADER_LEN)).unwrap_or_default().to_le_bytes();
         if let Some(header) = data.first_chunk_mut::<HEADER_LEN>() {
             *header = [code, identifier, len0, len1];
         }
@@ -123,7 +120,7 @@ impl Command {
     /// A Command Reject of the request with `identifier` for `reason`, with
     /// `data`.
     fn reject(identifier: u8, reason: u16, data: &[u8]) -> Self {
-        Self::new(COMMAND_REJECT, identifier, &[&le16_bytes(reason), data])
+        Self::new(COMMAND_REJECT, identifier, &[&reason.to_le_bytes(), data])
     }
 }
 
@@ -149,7 +146,7 @@ impl Signalling {
     #[must_use = "the answer is only computed"]
     pub fn receive(&mut self, pdu: &[u8]) -> Option<Action> {
         let (&[code, identifier, len0, len1], data) = pdu.split_first_chunk::<HEADER_LEN>()?;
-        if identifier == 0 || usize::from(le16([len0, len1])) != data.len() {
+        if identifier == 0 || usize::from(u16::from_le_bytes([len0, len1])) != data.len() {
             return None;
         }
         if RESPONSES.contains(&code) {
@@ -176,10 +173,10 @@ impl Signalling {
         self.identifier = self.identifier.checked_add(1).unwrap_or(1);
         self.pending = true;
         Some(Command::new(CONNECTION_PARAMETER_UPDATE_REQUEST, self.identifier, &[
-            &le16_bytes(range.interval_min),
-            &le16_bytes(range.interval_max),
-            &le16_bytes(range.latency),
-            &le16_bytes(range.timeout),
+            &range.interval_min.to_le_bytes(),
+            &range.interval_max.to_le_bytes(),
+            &range.latency.to_le_bytes(),
+            &range.timeout.to_le_bytes(),
         ]))
     }
 

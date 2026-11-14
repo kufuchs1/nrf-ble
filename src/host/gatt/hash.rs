@@ -19,7 +19,6 @@
 //! again.
 
 use super::{Access, Attr, Kind, Sec, Uuid, Value};
-use crate::bytes::{le16_bytes, le64_bytes};
 
 /// FNV-1a 64-bit offset basis, the first lane's start.
 const OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
@@ -66,8 +65,8 @@ impl Lanes {
     /// The 16 octets of the hash, least significant octet first, as the
     /// Database Hash characteristic carries them.
     const fn finish(self) -> [u8; 16] {
-        let [a0, a1, a2, a3, a4, a5, a6, a7] = le64_bytes(self.first);
-        let [b0, b1, b2, b3, b4, b5, b6, b7] = le64_bytes(self.second);
+        let [a0, a1, a2, a3, a4, a5, a6, a7] = self.first.to_le_bytes();
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = self.second.to_le_bytes();
         [a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7]
     }
 
@@ -83,7 +82,7 @@ impl Lanes {
 
     /// Takes `value` least significant octet first.
     const fn u16(self, value: u16) -> Self {
-        let [low, high] = le16_bytes(value);
+        let [low, high] = value.to_le_bytes();
         self.byte(low).byte(high)
     }
 

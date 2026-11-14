@@ -41,12 +41,7 @@
 //! [`crate::link::Link::add_peer`] takes it in. It is the AES output as it
 //! comes, as the MX firmwares hand it to the controller.
 
-use crate::{
-    bytes::{le16, le16_bytes, le32_bytes},
-    crypto::wipe,
-    host::Aes,
-    pdu::Peer,
-};
+use crate::{crypto::wipe, host::Aes, pdu::Peer};
 
 /// The device secret the identities derive from: the encryption root and the
 /// identity root, 16 octets each. Both are overwritten when it is dropped.
@@ -93,7 +88,7 @@ impl DeviceSecret {
         let octets = |words: [u32; 4]| {
             let mut root = [0; 16];
             for (chunk, word) in root.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-                *chunk = le32_bytes(word);
+                *chunk = word.to_le_bytes();
             }
             root
         };
@@ -177,7 +172,7 @@ impl Variant {
     /// The AES block the roots encrypt: the variant least significant octet
     /// first, then zeros.
     const fn block(self) -> [u8; 16] {
-        let [low, high] = le16_bytes(self.0);
+        let [low, high] = self.0.to_le_bytes();
         [low, high, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     }
 
@@ -190,14 +185,14 @@ impl Variant {
     #[inline]
     #[must_use = "the generation is only read"]
     pub const fn generation(self) -> u8 {
-        let [_, high] = le16_bytes(self.0);
+        let [_, high] = self.0.to_le_bytes();
         high
     }
 
     /// The variant of `slot` in `generation`.
     #[inline]
     #[must_use = "the variant is only built"]
-    pub const fn new(slot: u8, generation: u8) -> Self { Self(le16([slot, generation])) }
+    pub const fn new(slot: u8, generation: u8) -> Self { Self(u16::from_le_bytes([slot, generation])) }
 
     /// The same slot in the next generation, for a new pairing mode; after
     /// 255 comes 0.
@@ -209,7 +204,7 @@ impl Variant {
     #[inline]
     #[must_use = "the slot is only read"]
     pub const fn slot(self) -> u8 {
-        let [low, _] = le16_bytes(self.0);
+        let [low, _] = self.0.to_le_bytes();
         low
     }
 }

@@ -27,7 +27,6 @@
 //! no Protocol Mode and no boot report.
 
 use crate::{
-    bytes::le16,
     host::{
         adv::{Advertising, BATTERY_SERVICE, Content, HID_SERVICE, Mode, Overflow, Phase, Schedule},
         engine::{Config, Unclaimed},
@@ -199,7 +198,8 @@ pub const PAIRING: Schedule = Schedule::new(&PHASES, Duration::from_secs(60));
 pub const RECONNECT: Schedule = Schedule::new(&PHASES, Duration::from_secs(20));
 /// What the device advertises: its name and appearance, the HID and Battery
 /// services, no TX power level.
-pub const CONTENT: Content<'static> = Content::new(NAME, le16(APPEARANCE), &[HID_SERVICE, BATTERY_SERVICE]);
+pub const CONTENT: Content<'static> =
+    Content::new(NAME, u16::from_le_bytes(APPEARANCE), &[HID_SERVICE, BATTERY_SERVICE]);
 /// The engine's configuration: [`PARAMS`], and a link nobody waits for is
 /// kept.
 pub const CONFIG: Config = Config::new(Some(PARAMS), Unclaimed::Keep);

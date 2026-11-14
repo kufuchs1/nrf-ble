@@ -17,10 +17,7 @@
 //! ([`Segmenter::is_mid_pdu`]), so the fragments of two PDUs never
 //! interleave.
 
-use crate::{
-    bytes::{le16, le16_bytes},
-    link::AclIn,
-};
+use crate::link::AclIn;
 
 /// Length of the basic L2CAP header: payload length and channel identifier.
 pub const HEADER_LEN: usize = 4;
@@ -185,7 +182,7 @@ impl Reassembly {
         self.len = end;
         self.encrypted &= encrypted;
         let &[len0, len1, cid0, cid1] = self.buffer.first_chunk::<HEADER_LEN>().filter(const |_| end >= HEADER_LEN)?;
-        let expected = HEADER_LEN.saturating_add(usize::from(le16([len0, len1])));
+        let expected = HEADER_LEN.saturating_add(usize::from(u16::from_le_bytes([len0, len1])));
         if expected > RX_MAX || end > expected {
             // Longer than the buffer, or than the header announces.
             return self.drop_pdu();
@@ -195,7 +192,7 @@ impl Reassembly {
         }
         self.active = false;
         self.len = 0;
-        let channel = Channel::from_cid(le16([cid0, cid1]))?;
+        let channel = Channel::from_cid(u16::from_le_bytes([cid0, cid1]))?;
         let payload = self.buffer.get(HEADER_LEN..end)?;
         Some(Pdu { channel, encrypted: self.encrypted, payload })
     }
@@ -235,8 +232,8 @@ impl Segmenter {
         if payload.len() != usize::from(self.len) || self.is_done() {
             return None;
         }
-        let [len0, len1] = le16_bytes(self.len);
-        let [cid0, cid1] = le16_bytes(self.channel.cid());
+        let [len0, len1] = self.len.to_le_bytes();
+        let [cid0, cid1] = self.channel.cid().to_le_bytes();
         let header = [len0, len1, cid0, cid1];
         let count = fragment_len(self.total(), self.offset);
         let mut data: [u8; FRAGMENT_MAX] = [0; FRAGMENT_MAX];

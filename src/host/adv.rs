@@ -125,7 +125,6 @@
 
 use crate::{
     advertiser::legacy::{self, Kind},
-    bytes::le16_bytes,
     host::{bond::Bond, identity},
     link::{self, AdvParams, Link},
     pdu::Peer,
@@ -521,7 +520,7 @@ impl Data {
     /// [`Overflow`] if it does not fit.
     #[inline]
     pub const fn appearance(&mut self, appearance: u16) -> Result<&mut Self, Overflow> {
-        self.push(AD_APPEARANCE, &le16_bytes(appearance))
+        self.push(AD_APPEARANCE, &appearance.to_le_bytes())
     }
 
     /// The structures written so far.
@@ -617,7 +616,7 @@ impl Data {
         let (chunks, _) = target.as_chunks_mut::<2>();
         let mut index = 0;
         while let (Some(chunk), Some(&uuid)) = (chunks.get_mut(index), uuids.get(index)) {
-            *chunk = le16_bytes(uuid);
+            *chunk = uuid.to_le_bytes();
             index = index.saturating_add(1);
         }
         self.push(AD_SERVICES_16, target)

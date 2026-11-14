@@ -1553,11 +1553,9 @@ fn a_batch_of_skipped_events_ends_as_the_event_by_event_loop() {
         for instant in [1001_u16, 1015, 1029, 1030, 1031] {
             let shared = Shared::new();
             let (mut one, mut batch) = (latent(csa2), latent(csa2));
+            let [instant0, instant1] = instant.to_le_bytes();
             for link in [&mut one, &mut batch] {
-                link.handle_control(
-                    &[OP_CHANNEL_MAP_IND, 0x0F, 0xF0, 0x00, 0xFF, 0x01, instant as u8, instant.wrapping_shr(8) as u8],
-                    false,
-                );
+                link.handle_control(&[OP_CHANNEL_MAP_IND, 0x0F, 0xF0, 0x00, 0xFF, 0x01, instant0, instant1], false);
                 assert_eq!(link.abort, None);
             }
             // Event by event, as before.

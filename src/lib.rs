@@ -53,8 +53,6 @@ compile_error!("the nRF51 CCM encrypts payloads of up to 27 octets: the data-len
 mod log;
 /// Connectable advertising.
 pub mod advertiser;
-/// Integers to and from octets in a given byte order.
-mod bytes;
 /// Data channel map and channel selection.
 pub mod channel;
 /// Register code that differs between the chips.

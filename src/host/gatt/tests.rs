@@ -102,8 +102,10 @@ fn input_reports(map: &[u8]) -> [(u8, u32); 3] {
             3 => 4,
             other => usize::from(other),
         };
-        let data = &tail[..len];
-        let value = data.iter().rev().fold(0_u32, |value, &byte| value.wrapping_shl(8) | u32::from(byte));
+        // The item's data, 0 to 4 octets, least significant first.
+        let mut octets = [0_u8; 4];
+        octets[..len].copy_from_slice(&tail[..len]);
+        let value = u32::from_le_bytes(octets);
         match prefix & 0xFC {
             0x84 => {
                 let slot = reports.iter().position(|&(id, _)| id == 0).unwrap();
