@@ -12,10 +12,12 @@
 // a starting value stands at its field and the constructor writes `..`;
 // `saturating_cast` and `truncate` (`integer_casts`,
 // `integer_widen_truncate`) for the conversions that saturate or cannot
-// lose bits; and `#[rustc_unroll(never)]` (`loop_hints`) on four loops of
-// the host, off the link layer, which keeps them rolled: three of pairing and
-// the copy of an ATT read value. That is 3.2 KB less code in the library on
-// the nRF52832 (2.8 KB on the nRF51).
+// lose bits; and `#[rustc_unroll(never)]` (`loop_hints`) on two loops of
+// the host, off the link layer, which keeps them rolled: the byte order turn
+// of pairing's public keys and the copy of an ATT read value. (The 3.2 KB
+// once measured on the nRF52832 counted two more loops, of the P-256 code of
+// our own the `p256` crate has replaced; the two left are not measured on
+// their own.)
 #![feature(
     const_bool,
     const_closures,

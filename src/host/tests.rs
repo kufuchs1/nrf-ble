@@ -1872,3 +1872,77 @@ fn the_host_s_futures_over_the_link_layer_are_send() {
         super::Battery::update;
     send_fn3(update);
 }
+
+#[test]
+fn a_failed_pairing_is_followed_by_a_new_key_pair_and_a_bond_by_none() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    let local = local_rpa();
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+
+    // The central fails the pairing once it has our public key; the link
+    // ends.
+    let central = Central::new(linux_request(true, true), local);
+    smp(link, &mut tasks, &central.request, false);
+    let first = smp(link, &mut tasks, &central.public_key(), false);
+    assert_eq!(multiplications.get(), 2);
+    assert!(smp(link, &mut tasks, &[0x05, 0x04], false).is_empty());
+    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::CONFIRM_VALUE_FAILED));
+    // The key pair it saw is dropped, and a new one made in idle time.
+    assert_eq!(multiplications.get(), 3);
+    link.disconnect_link(0x05);
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Disconnected(0x05));
+    link.calls();
+
+    // The next pairable call advertises at once, and its pairing computes
+    // only the Diffie-Hellman key, with a public key never shown before.
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 0)));
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    let mut central = Central::new(linux_request(true, true), local);
+    smp(link, &mut tasks, &central.request, false);
+    let answer = smp(link, &mut tasks, &central.public_key(), false);
+    assert_eq!(answer.len(), 2);
+    assert_ne!(answer[0], first[0]);
+    assert_eq!(multiplications.get(), 4);
+    central.take_public_key(&answer[0]);
+    central.take_confirm(&answer[1]);
+    let random = smp(link, &mut tasks, &central.random(), false);
+    central.take_random(&random[0]);
+    let check = central.check();
+    assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
+    let mut ltk = central.ltk;
+    ltk.reverse();
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(Some(ltk))]);
+    assert_eq!(link.deliver().len(), 2);
+    link.ack();
+    assert!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true).is_empty());
+    let mut central_identity = [0x09, 0x00, 0, 0, 0, 0, 0, 0];
+    central_identity[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    assert!(smp(link, &mut tasks, &central_identity, true).is_empty());
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
+    assert!(matches!(next!(conn), ConnEvent::Bonded(_)));
+    // Nothing is computed after the bond, while the central discovers the
+    // table and the application sends its input.
+    link.advance(5_000);
+    tasks.step();
+    assert_eq!(multiplications.get(), 4);
+}

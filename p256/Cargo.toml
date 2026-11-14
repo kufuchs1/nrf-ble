@@ -1,0 +1,25 @@
+[package]
+name = "nrf-ble-p256"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The P-256 of nrf-ble's LE Secure Connections pairing, behind a non-generic API, so that a firmware can build it alone for size"
+readme = "readme.md"
+
+# The RustCrypto `p256` crate, as nrf-ble named it before: `arithmetic` for
+# the scalar multiplication, `ecdh` for `SecretKey::diffie_hellman` and its
+# self-wiping `SharedSecret` (it adds hkdf and hmac to the build, which
+# nothing calls, so the linker drops them). Without `precomputed-tables`,
+# which would build about 25 KB of tables in RAM. The branch follows that of
+# nrf-ble's other dependencies; the patches of nrf-ble's Cargo.toml, the
+# workspace root, apply here too.
+[dependencies]
+p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master", default-features = false, features = ["arithmetic", "ecdh"] }
+
+[lib]
+test = true
+bench = false
+
+# The same lints as nrf-ble: the workspace's, in nrf-ble's Cargo.toml.
+[lints]
+workspace = true

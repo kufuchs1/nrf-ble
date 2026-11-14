@@ -7,54 +7,82 @@
 //! in. The PDU carries each coordinate least significant octet first, so the
 //! security manager reverses each one on the way in and out.
 //!
-//! The field and point arithmetic is that of the `p256` crate, in pure Rust
-//! and without tables kept in RAM; the scalar multiplication loop is our own,
-//! a fixed window of signed radix 16 digits on `ProjectivePoint` with a
-//! table of 8 points selected in constant time, as `p256` does, but with the
-//! table on the multiplication's own frame and the point formulas called
-//! rather than inlined into the loop. The research benchmark of
-//! research-crypto.md, on an emulated nRF51 at opt level "z", found this loop
-//! as fast as `ProjectivePoint::mul` (2.94 s against 2.93 s per
-//! multiplication), with about 0.5 KB less stack (2.65 KB against 3.13 to
-//! 3.22 KB for the whole call) and about 0.2 KB less flash. These figures
-//! were not measured on this crate and are still to be checked on the chip.
-//! Public key and Diffie-Hellman key go through the same multiplication, so
-//! there is one copy of it.
+//! All of the elliptic curve cryptography is that of the RustCrypto `p256`
+//! crate, in pure Rust and without tables kept in RAM (its
+//! `precomputed-tables` feature stays off), through the crate nrf-ble-p256 of
+//! this repository (p256/), the only crate that uses `p256`. Its API is not
+//! generic and its entry points are never inlined, so the generic point
+//! arithmetic of `primeorder` and `elliptic-curve` is compiled in that crate
+//! instead of here, and a firmware can build all of it for size with one
+//! profile override while nrf-ble stays at its own opt-level (the readme,
+//! section "Cryptography of pairing", gives the lines):
 //!
-//! Secrets are overwritten once they are no longer needed: the private key
-//! when the [`KeyPair`] is dropped, the caller's random octets by
-//! [`KeyPair::generate`], and the recoded private key and the products on
-//! the multiplication's own frame. The Diffie-Hellman key that
-//! [`KeyPair::dh_key`] returns is the caller's to wipe, once f5 has derived
-//! the keys from it.
+//! - The private key is a [`SecretKey`] from the caller's random octets
+//!   ([`SecretKey::from_bytes`], `p256::SecretKey::from_bytes`, which refuses
+//!   zero and anything not below the order of the curve), and overwrites itself
+//!   when it is dropped.
+//! - The public key is [`SecretKey::public_key`], the generator times the
+//!   private key.
+//! - The central's key is decoded with [`PublicKey::from_coordinates`]
+//!   (`AffinePoint::from_coordinates` and `PublicKey::from_affine` of `p256`),
+//!   which refuses a coordinate not below the field prime, a point off the
+//!   curve and the identity. P-256 has a cofactor of 1, so every other point is
+//!   of the prime order and no subgroup check is needed: the invalid curve
+//!   attack (a point of another curve, or of a small subgroup) has no point to
+//!   start from.
+//! - The Diffie-Hellman key is [`SecretKey::diffie_hellman`]
+//!   (`p256::SecretKey::diffie_hellman`), whose `SharedSecret` overwrites
+//!   itself when it is dropped, before the key is returned.
 //!
-//! Each multiplication blocks the thread for about 3 s on the nRF51, so the
-//! security manager runs them as jobs outside its state machine, and each
-//! call here takes a hook it calls right before its multiplication, for the
-//! firmware to feed its watchdog.
+//! Both multiplications are `ProjectivePoint::mul` of the `primeorder` crate
+//! under `p256`: a fixed window of signed radix 16 digits, a table of 1 to 8
+//! times the point read in full for every digit and selected with the
+//! constant time operations of `subtle`, and the complete addition formulas
+//! of Renes, Costello and Batina, which have no exceptional cases to branch
+//! on. The field arithmetic below them is that of `p256` and `crypto-bigint`.
+//! What their own documentation claims (the README files of `p256` and
+//! `primeorder` at the revision in use): the code is designed so that the
+//! operations that depend on a secret run in constant time, but it has never
+//! been independently audited, and whether the generated machine code is
+//! constant time has not been assessed thoroughly. `crypto-bigint` was
+//! audited by NCC Group, before larger changes since; its CI checks the
+//! machine code of the functions its `checkct` driver names, on thumbv6m and
+//! thumbv7em among others, but those are its own building blocks (limb
+//! carries, wide multiplication, Montgomery multiplication and squaring,
+//! inversion, division), not the P-256 code built from them: the field
+//! functions of `p256`, the table selection and the point formulas of
+//! `primeorder` are not checked that way, nor the code the firmware's build
+//! makes of them. On the multipliers, the readme (section "Cryptography of
+//! pairing") gives the instruction timing of both cores and its sources.
+//!
+//! What stays ours is the protocol around it: the byte order, the checks
+//! the Core specification asks for beyond a valid point (the debug public
+//! key and our own public key are refused, see [`check_public_key`]), the
+//! hook before each multiplication, and overwriting the caller's copy of
+//! the private key. The library overwrites its private key and its shared
+//! secret when they are dropped, and nothing else: the copy of the private
+//! key as a scalar that `p256` makes for each multiplication (`NonZeroScalar`,
+//! which is `Copy` and not overwritten), the recoded digits and the table of
+//! multiples of a multiplication, and in the Diffie-Hellman the shared point
+//! itself, projective and affine, whose X is the Diffie-Hellman key, all stay
+//! on the stack of the thread that ran the job until something else happens
+//! to write over them. The Diffie-Hellman key that [`KeyPair::dh_key`]
+//! returns is the caller's to wipe, once f5 has derived the keys from it.
+//!
+//! Each multiplication blocks the thread for several seconds on the nRF51
+//! (the readme gives the emulated figures per build; not yet measured on the
+//! chip), so the security manager runs them as jobs outside its state
+//! machine, and each call here takes a hook it calls right before its
+//! multiplication, for the firmware to feed its watchdog.
 
 use crate::crypto::wipe;
-use core::{
-    hint::black_box,
-    sync::atomic::{Ordering, compiler_fence},
-};
-use p256::{
-    AffinePoint,
-    FieldBytes,
-    NonZeroScalar,
-    ProjectivePoint,
-    elliptic_curve::{
-        group::Group as _,
-        point::AffineCoordinates as _,
-        subtle::{Choice, ConditionallySelectable as _, ConstantTimeEq as _},
-    },
-};
+use nrf_ble_p256::{PublicKey, SecretKey};
 
 /// Octets of a private key, of one coordinate and of the Diffie-Hellman key.
-pub const KEY_LEN: usize = 32;
+pub const KEY_LEN: usize = nrf_ble_p256::KEY_LEN;
 
 /// Octets of a public key: X then Y.
-pub const PUBLIC_KEY_LEN: usize = 64;
+pub const PUBLIC_KEY_LEN: usize = nrf_ble_p256::PUBLIC_KEY_LEN;
 
 /// The public key of the debug key pair (Core specification, volume 3, part
 /// H, section 2.3.5.6.1), X then Y. Its private key is public, so a central
@@ -65,12 +93,6 @@ pub const DEBUG_PUBLIC_KEY: [u8; PUBLIC_KEY_LEN] = [
     0xEB, 0x6D, 0x63, 0x32, 0x9A, 0xBF, 0x5A, 0x52, 0x15, 0x5C, 0x76, 0x63, 0x45, 0xC2, 0x8F, 0xED, 0x30, 0x24, 0x74,
     0x1C, 0x8E, 0xD0, 0x15, 0x89, 0xD2, 0x8B,
 ];
-
-/// Signed radix 16 digits of a scalar: two per octet, and one for the carry
-/// out of the most significant one.
-const DIGITS: usize = 2 * KEY_LEN + 1;
-/// Doublings for each signed digit of four bits.
-const DOUBLINGS: u8 = 4;
 
 /// Why a public key is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,12 +126,13 @@ impl KeyError {
 }
 
 /// Our key pair for one pairing: the private key and the public key it
-/// gives, 96 octets. The private key is overwritten when it is dropped.
+/// gives. The private key, a [`SecretKey`] of nrf-ble-p256 (that of the
+/// `p256` crate), overwrites itself when it is dropped.
 pub struct KeyPair {
     /// The public key, X then Y.
     public: [u8; PUBLIC_KEY_LEN],
     /// The private key, from 1 to the order of the curve less 1.
-    secret: [u8; KEY_LEN],
+    secret: SecretKey,
 }
 
 impl KeyPair {
@@ -128,12 +151,9 @@ impl KeyPair {
     where
         F: FnOnce(),
     {
-        let point = decode(peer, &self.public)?;
+        let key = decode(peer, &self.public)?;
         before_multiplication();
-        let mut product = multiply(&self.secret, &ProjectivePoint::from(point));
-        let key = x_coordinate(&product).ok_or(KeyError::Invalid);
-        clear(&mut product);
-        key
+        Ok(self.secret.diffie_hellman(&key))
     }
 
     /// The key pair of the private key `secret`, random octets, or `None` if
@@ -151,20 +171,12 @@ impl KeyPair {
     where
         F: FnOnce(),
     {
-        let mut pair = Self { public: [0; PUBLIC_KEY_LEN], secret: *secret };
+        let checked = SecretKey::from_bytes(secret);
         wipe(secret);
-        let mut repr = FieldBytes::from(pair.secret);
-        let valid = bool::from(NonZeroScalar::from_repr(repr).is_some());
-        wipe(&mut repr);
-        if !valid {
-            return None;
-        }
+        let key = checked?;
         before_multiplication();
-        let mut product = multiply(&pair.secret, &ProjectivePoint::GENERATOR);
-        let public = encode(&product);
-        clear(&mut product);
-        pair.public = public?;
-        Some(pair)
+        let public = key.public_key();
+        Some(Self { public, secret: key })
     }
 
     /// The public key, X then Y.
@@ -173,21 +185,13 @@ impl KeyPair {
     pub const fn public_key(&self) -> &[u8; PUBLIC_KEY_LEN] { &self.public }
 }
 
-impl Drop for KeyPair {
-    #[inline]
-    fn drop(&mut self) { wipe(&mut self.secret); }
-}
-
-/// Adds `term` to `sum`, outside the loop, so the formulas are not inlined
-/// into it and their frame does not add to the loop's.
-#[inline(never)]
-fn add_in_place(sum: &mut ProjectivePoint, term: &ProjectivePoint) { *sum = sum.add(term); }
-
 /// Checks the central's public key `peer` against our own public key `own`.
 ///
-/// The key must be a point of the curve, and neither the debug public key
-/// nor our own, nor their negations. The security manager checks it when
-/// the Pairing Public Key PDU arrives, before the Diffie-Hellman key job.
+/// The key must be a point of the curve other than the identity, as the
+/// `p256` crate checks it through nrf-ble-p256 (see the module documentation),
+/// and neither the debug public key nor our own, nor their negations. The
+/// security manager checks it when the Pairing Public Key PDU arrives, before
+/// the Diffie-Hellman key job.
 ///
 /// # Errors
 ///
@@ -197,133 +201,24 @@ pub fn check_public_key(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN])
     decode(peer, own).map(drop)
 }
 
-/// The point of the central's public key `peer`, checked as
-/// [`check_public_key`] describes.
+/// The public key `peer` of the central, checked as [`check_public_key`]
+/// describes.
 ///
 /// A key and its negation share their X coordinate, which is all the
 /// Diffie-Hellman key depends on, so the debug key and our own key are
 /// recognised by X alone.
-fn decode(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN]) -> Result<AffinePoint, KeyError> {
-    let (x, rest) = peer.split_first_chunk::<KEY_LEN>().ok_or(KeyError::Invalid)?;
-    let y = rest.first_chunk::<KEY_LEN>().ok_or(KeyError::Invalid)?;
+fn decode(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN]) -> Result<PublicKey, KeyError> {
+    let x = peer.first_chunk::<KEY_LEN>().ok_or(KeyError::Invalid)?;
     if Some(x) == DEBUG_PUBLIC_KEY.first_chunk::<KEY_LEN>() {
         return Err(KeyError::Debug);
     }
     if Some(x) == own.first_chunk::<KEY_LEN>() {
         return Err(KeyError::Own);
     }
-    // The coordinates are taken only below the field prime, and the point
-    // only if it satisfies the curve equation.
-    let point: Option<AffinePoint> = AffinePoint::from_coordinates(&FieldBytes::from(*x), &FieldBytes::from(*y)).into();
-    point.filter(|valid| !bool::from(valid.is_identity())).ok_or(KeyError::Invalid)
-}
-
-/// Overwrites `point`, which depends on a private key, with the identity,
-/// so it does not stay in RAM.
-fn clear(point: &mut ProjectivePoint) {
-    *point = ProjectivePoint::IDENTITY;
-    // As in `wipe`: keeps the compiler from dropping the store.
-    black_box(point);
-    compiler_fence(Ordering::SeqCst);
-}
-
-/// Doubles `point`, outside the loop, as [`add_in_place`] adds.
-#[inline(never)]
-fn double_in_place(point: &mut ProjectivePoint) { *point = point.double(); }
-
-/// The affine coordinates of `point`, X then Y, or `None` for the identity.
-#[inline(never)]
-fn encode(point: &ProjectivePoint) -> Option<[u8; PUBLIC_KEY_LEN]> {
-    let affine = point.to_affine();
-    if bool::from(affine.is_identity()) {
-        return None;
-    }
-    let mut out = [0; PUBLIC_KEY_LEN];
-    #[rustc_unroll(never)]
-    for (target, &octet) in out.iter_mut().zip(affine.x().iter().chain(affine.y().iter())) {
-        *target = octet;
-    }
-    Some(out)
-}
-
-/// `secret` times `base`, in constant time: `secret` must be from 1 to the
-/// order of the curve less 1.
-///
-/// The table holds 1 to 8 times `base`; each digit, from the most
-/// significant, takes four doublings and the addition of the table entry
-/// of its magnitude, negated for a negative digit. The digits, which are
-/// the private key in another form, and the term are overwritten before it
-/// returns, and so is its copy of the product; the caller clears its own.
-#[inline(never)]
-fn multiply(secret: &[u8; KEY_LEN], base: &ProjectivePoint) -> ProjectivePoint {
-    let mut table = [ProjectivePoint::IDENTITY; 8];
-    let mut multiple = *base;
-    for entry in &mut table {
-        *entry = multiple;
-        add_in_place(&mut multiple, base);
-    }
-    let mut digits = recode(secret);
-    let mut product = ProjectivePoint::IDENTITY;
-    let mut term = ProjectivePoint::IDENTITY;
-    let mut first = true;
-    for &digit in digits.iter().rev() {
-        if !first {
-            for _ in 0..DOUBLINGS {
-                double_in_place(&mut product);
-            }
-        }
-        first = false;
-        select(&table, digit, &mut term);
-        add_in_place(&mut product, &term);
-    }
-    digits.fill(0);
-    black_box(&mut digits);
-    compiler_fence(Ordering::SeqCst);
-    clear(&mut term);
-    let result = product;
-    clear(&mut product);
-    result
-}
-
-/// The digits of `secret`, least significant first, each from -8 to 7 but
-/// the last, which is 0 or 1: the nibbles, each brought into range by
-/// carrying 16 into the next.
-fn recode(secret: &[u8; KEY_LEN]) -> [i8; DIGITS] {
-    let mut digits: [i8; DIGITS] = [0; DIGITS];
-    for (pair, &octet) in digits.as_chunks_mut::<2>().0.iter_mut().zip(secret.iter().rev()) {
-        *pair = [(octet & 0x0F).cast_signed(), octet.wrapping_shr(4).cast_signed()];
-    }
-    let mut carry: i8 = 0;
-    for digit in &mut digits {
-        let value = digit.wrapping_add(carry);
-        carry = value.wrapping_add(8).wrapping_shr(4);
-        *digit = value.wrapping_sub(carry.wrapping_shl(4));
-    }
-    digits
-}
-
-/// Sets `out` to `digit` times the base of `table`, which holds 1 to 8
-/// times it, reading every entry so the time does not depend on the digit.
-#[inline(never)]
-fn select(table: &[ProjectivePoint; 8], digit: i8, out: &mut ProjectivePoint) {
-    // All ones for a negative digit, zero otherwise.
-    let sign = digit.wrapping_shr(7);
-    let magnitude = (digit ^ sign).wrapping_sub(sign).cast_unsigned();
-    *out = ProjectivePoint::IDENTITY;
-    let mut index: u8 = 0;
-    #[rustc_unroll(never)]
-    for entry in table {
-        index = index.wrapping_add(1);
-        out.conditional_assign(entry, magnitude.ct_eq(&index));
-    }
-    let negated = out.neg();
-    out.conditional_assign(&negated, Choice::from(sign.cast_unsigned() & 1));
-}
-
-/// The X coordinate of `point`, or `None` for the identity.
-fn x_coordinate(point: &ProjectivePoint) -> Option<[u8; KEY_LEN]> {
-    let xy = encode(point)?;
-    xy.first_chunk::<KEY_LEN>().copied()
+    // The coordinates are taken only below the field prime, the point only
+    // if it satisfies the curve equation, and the key only if it is not the
+    // identity.
+    PublicKey::from_coordinates(peer).ok_or(KeyError::Invalid)
 }
 
 #[cfg(test)] mod tests;

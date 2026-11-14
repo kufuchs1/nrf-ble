@@ -66,16 +66,22 @@ embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "mai
 embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["unstable-pac"] }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-# P-256 for LE Secure Connections pairing: field and point arithmetic only,
-# with a scalar multiplication loop of our own (src/host/smp/ecc.rs).
-p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master", default-features = false, features = ["arithmetic"] }
+# AES-CMAC (RFC 4493) for f4, f5, f6 and g2 of LE Secure Connections
+# pairing, over the hardware ECB as its block cipher, which implements the
+# block cipher traits of `cipher` (src/host/smp/toolbox.rs). `zeroize`
+# overwrites the CMAC's state when it is dropped.
+cipher = { git = "https://github.com/RustCrypto/traits", branch = "master" }
+cmac = { git = "https://github.com/RustCrypto/MACs", branch = "master", features = ["zeroize"] }
+# P-256 for LE Secure Connections pairing: the private key, the public key,
+# the check of the central's key and the Diffie-Hellman key, from the
+# RustCrypto `p256` crate behind the non-generic API of nrf-ble-p256, the
+# crate of this repository in p256/ (src/host/smp/ecc.rs; its readme says why
+# it is a crate of its own). It is the only crate that uses `p256`.
+nrf-ble-p256 = { path = "p256" }
 
 [dev-dependencies]
 # Software AES for the host tests, in place of the hardware ECB.
 aes = { git = "https://github.com/RustCrypto/block-ciphers", branch = "master" }
-# The Diffie-Hellman of the p256 crate, to check our own scalar
-# multiplication against in the host tests.
-p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master", default-features = false, features = ["arithmetic", "ecdh"] }
 # The RTC time driver only provides the time symbols for the host tests; no
 # test starts it. The chip comes from the chip feature: features unify, and
 # naming one here would build both chips for the other.
@@ -85,8 +91,13 @@ embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main",
 [target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
 critical-section = { git = "https://github.com/rust-embedded/critical-section", branch = "main", features = ["std"] }
 
-# Standalone: not a member of the workspace of a firmware that uses it.
+# Standalone: not a member of the workspace of a firmware that uses it. Its
+# one other member is nrf-ble-p256 (p256/), a path dependency, so a firmware
+# that takes nrf-ble from Git gets it from the same repository and revision.
+# Plain `cargo` commands here build and test nrf-ble alone; `-p nrf-ble-p256`
+# or `--workspace` take in the other.
 [workspace]
+members = ["p256"]
 
 [lib]
 test = true
@@ -116,7 +127,8 @@ embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" 
 embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-# RustCrypto: P-256 and the traits, field and integer arithmetic below it.
+# RustCrypto: P-256, CMAC and the traits, field and integer arithmetic below
+# them.
 p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
 primefield = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
 primeorder = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
@@ -135,6 +147,7 @@ sec1 = { git = "https://github.com/RustCrypto/formats", branch = "master" }
 hkdf = { git = "https://github.com/RustCrypto/KDFs", branch = "master" }
 hmac = { git = "https://github.com/RustCrypto/MACs", branch = "master" }
 block-buffer = { git = "https://github.com/RustCrypto/utils", branch = "master" }
+dbl = { git = "https://github.com/RustCrypto/utils", branch = "master" }
 cmov = { git = "https://github.com/RustCrypto/utils", branch = "master" }
 cpubits = { git = "https://github.com/RustCrypto/utils", branch = "master" }
 cpufeatures = { git = "https://github.com/RustCrypto/utils", branch = "master" }
@@ -184,10 +197,14 @@ num-traits = { git = "https://github.com/rust-num/num-traits", branch = "main" }
 stable_deref_trait = { git = "https://github.com/storyyeller/stable_deref_trait", branch = "master" }
 void = { git = "https://github.com/reem/rust-void", branch = "master" }
 
-[lints.rust]
+[lints]
+workspace = true
+
+# The lints of nrf-ble and nrf-ble-p256 alike.
+[workspace.lints.rust]
 warnings = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "deny", priority = 1 }
 pedantic = { level = "deny", priority = 1 }
 restriction = { level = "deny", priority = 1 }

@@ -1,5 +1,6 @@
-//! Tests of the toolbox: RFC 4493 with the messages split in every way, and
-//! the sample data of the Core specification, volume 3, part H, appendix D.
+//! Tests of the toolbox: the block cipher adapter, RFC 4493 with the
+//! messages split in every way, and the sample data of the Core
+//! specification, volume 3, part H, appendix D.
 
 use super::*;
 use crate::host::test_aes::Software;
@@ -57,13 +58,67 @@ fn sample_a1() -> [u8; 7] { address(Peer::new([0xCE, 0xBF, 0x37, 0x37, 0x12, 0x5
 /// A2 of the samples: public device address A7:13:70:2D:CF:C1.
 fn sample_a2() -> [u8; 7] { address(Peer::new([0xC1, 0xCF, 0x2D, 0x70, 0x13, 0xA7], false)) }
 
+/// The first step of the subkeys of RFC 4493, section 4: L, the key's
+/// encryption of zero, through the block cipher traits as the `cmac` crate
+/// calls them.
 #[test]
-fn the_subkeys_match_rfc_4493() {
+fn the_keyed_aes_gives_l_of_rfc_4493() {
     let key = hex::<16>(RFC_KEY);
-    let zero = Software.encrypt(key, [0; 16]);
-    assert_eq!(zero, hex("7df76b0c 1ab899b3 3e42f047 b91b546f"));
-    assert_eq!(double(zero), hex("fbeed618 35713366 7c85e08f 7236a8de"));
-    assert_eq!(double(double(zero)), hex("f7ddac30 6ae266cc f90bc11e e46d513b"));
+    let expected = hex::<16>("7df76b0c 1ab899b3 3e42f047 b91b546f");
+    assert_eq!(Software.encrypt(key, [0; 16]), expected);
+    let mut block = Block::<KeyedAes<'_, Software>>::default();
+    BlockCipherEncrypt::encrypt_block(&KeyedAes::new(&Software, key), &mut block);
+    assert_eq!(<[u8; 16]>::from(block), expected);
+}
+
+/// The example of FIPS 197, appendix C.1, through every method of the
+/// block cipher traits.
+#[test]
+fn the_keyed_aes_matches_fips_197_in_every_method() {
+    let cipher = KeyedAes::new(&Software, hex("00010203 04050607 08090a0b 0c0d0e0f"));
+    let plain: Block<KeyedAes<'_, Software>> = hex::<16>("00112233 44556677 8899aabb ccddeeff").into();
+    let expected: Block<KeyedAes<'_, Software>> = hex::<16>("69c4e0d8 6a7b0430 d8cdb780 70b4c55a").into();
+    assert_eq!(KeyedAes::<Software>::block_size(), 16);
+
+    let mut block = plain;
+    BlockCipherEncrypt::encrypt_block(&cipher, &mut block);
+    assert_eq!(block, expected, "encrypt_block");
+    let mut block = plain;
+    cipher.encrypt_block_inplace(&mut block);
+    assert_eq!(block, expected, "encrypt_block_inplace");
+    let mut out = Block::<KeyedAes<'_, Software>>::default();
+    cipher.encrypt_block_b2b(&plain, &mut out);
+    assert_eq!(out, expected, "encrypt_block_b2b");
+    let mut out = Block::<KeyedAes<'_, Software>>::default();
+    cipher.encrypt_block_inout((&plain, &mut out).into());
+    assert_eq!(out, expected, "encrypt_block_inout");
+
+    let mut blocks = [plain; 3];
+    cipher.encrypt_blocks(&mut blocks);
+    assert_eq!(blocks, [expected; 3], "encrypt_blocks");
+    let mut out = [Block::<KeyedAes<'_, Software>>::default(); 3];
+    assert!(cipher.encrypt_blocks_b2b(&[plain; 3], &mut out).is_ok());
+    assert_eq!(out, [expected; 3], "encrypt_blocks_b2b");
+    assert!(cipher.encrypt_blocks_b2b(&[plain; 3], &mut out[..2]).is_err(), "lengths differ");
+    // A tail is shorter than the width of one block, so empty, the only
+    // length the trait allows.
+    let mut none: [Block<KeyedAes<'_, Software>>; 0] = [];
+    cipher.encrypt_tail_blocks_inplace(&mut none);
+
+    let mut par = [plain].into();
+    cipher.encrypt_par_blocks_inplace(&mut par);
+    assert_eq!(<[_; 1]>::from(par), [expected], "encrypt_par_blocks_inplace");
+}
+
+/// A tail of a block or more is outside the trait's contract, which a debug
+/// build checks, as the trait's default does.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a tail is shorter than the width of one block")]
+fn a_tail_of_a_whole_block_is_refused_in_a_debug_build() {
+    let cipher = KeyedAes::new(&Software, [0; 16]);
+    let mut blocks = [Block::<KeyedAes<'_, Software>>::default()];
+    cipher.encrypt_tail_blocks_inplace(&mut blocks);
 }
 
 #[test]
@@ -82,12 +137,9 @@ fn cmac_matches_rfc_4493_however_the_message_is_split() {
                 assert_eq!(cmac(&Software, key, &parts), expected, "{len} octets split at {first} and {second}");
             }
         }
-        // One octet at a time, through the streaming interface.
-        let mut mac = Cmac::new(&Software, key);
-        for octet in message {
-            mac.update(core::slice::from_ref(octet));
-        }
-        assert_eq!(mac.finish(), expected, "{len} octets one at a time");
+        // One octet at a time.
+        let octets: [&[u8]; 64] = core::array::from_fn(|index| &message[index.min(len)..(index + 1).min(len)]);
+        assert_eq!(cmac(&Software, key, &octets[..len]), expected, "{len} octets one at a time");
     }
 }
 
