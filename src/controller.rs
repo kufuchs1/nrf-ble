@@ -3,7 +3,6 @@
 
 use crate::{
     advertiser::legacy::{self, Kind, Settings},
-    bytes::le16,
     clock::{Clock, SETUP_US},
     connection::{Connection, Ended},
     health,
@@ -53,7 +52,7 @@ async fn interval(settings: &Settings) -> u32 {
     }
     let mut jitter: [u8; 2] = [0; 2];
     rng::fill_async(&mut jitter).await;
-    settings.interval.saturating_add(u32::from(le16(jitter)).checked_rem(ADV_DELAY_MAX_US).unwrap_or(0))
+    settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).checked_rem(ADV_DELAY_MAX_US).unwrap_or(0))
 }
 
 /// Logs the scan requests the advertiser decided only after the radio had

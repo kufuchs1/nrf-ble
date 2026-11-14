@@ -36,7 +36,6 @@
 //! the caller's to wipe.
 
 use crate::{
-    bytes::{le16, le16_bytes, le32, le32_bytes},
     crypto::wipe,
     host::{
         gatt::{Db, Subscriptions},
@@ -114,7 +113,7 @@ impl Bond {
         };
         // A layout may be zero; without one the octets must be.
         let layout = match (flags & FLAG_LAYOUT != 0, layout_octets == [0; 4]) {
-            (true, _) => Some(le32(layout_octets)),
+            (true, _) => Some(u32::from_le_bytes(layout_octets)),
             (false, true) => None,
             (false, false) => return None,
         };
@@ -123,9 +122,9 @@ impl Bond {
         }
         Some(Self {
             authenticated: flags & FLAG_AUTHENTICATED != 0,
-            cccd: le32(cccd),
+            cccd: u32::from_le_bytes(cccd),
             layout,
-            local: Variant::from_bits(le16(local)),
+            local: Variant::from_bits(u16::from_le_bytes(local)),
             ltk,
             peer,
             peer_irk,
@@ -184,9 +183,9 @@ impl Bond {
             &self.peer.address,
             &self.peer_irk.unwrap_or_default(),
             &self.ltk,
-            &le16_bytes(self.local.bits()),
-            &le32_bytes(self.cccd),
-            &le32_bytes(self.layout.unwrap_or_default()),
+            &self.local.bits().to_le_bytes(),
+            &self.cccd.to_le_bytes(),
+            &self.layout.unwrap_or_default().to_le_bytes(),
         ] {
             let (target, tail) = rest.split_at_mut(field.len().min(rest.len()));
             target.copy_from_slice(field.get(..target.len()).unwrap_or_default());
@@ -216,7 +215,7 @@ const fn is_identity(peer: Peer) -> bool {
 /// least significant octet first, for a table with the Service Changed
 /// characteristic.
 fn layout(db: &Db) -> Option<u32> {
-    db.service_changed().map(|_| le32(db.hash().first_chunk::<4>().copied().unwrap_or_default()))
+    db.service_changed().map(|_| u32::from_le_bytes(db.hash().first_chunk::<4>().copied().unwrap_or_default()))
 }
 
 #[cfg(test)] mod tests;

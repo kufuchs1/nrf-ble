@@ -239,3 +239,19 @@ question_mark_used = { level = "allow", priority = 2 }
 # splitting a long function into parts, each called once, which
 # `single_call_fn` refuses.
 single_call_fn = { level = "allow", priority = 2 }
+# `little_endian_bytes`, `big_endian_bytes` and `host_endian_bytes` together
+# refuse every conversion between an integer and its octets
+# (`{from,to}_{le,be,ne}_bytes`); they exist so that a crate allows the byte
+# orders it uses. The PDUs are least significant octet first (link layer:
+# Core, Vol 6, Part B, 1.2; host: Vol 3), and so is what the crate lays out
+# itself: the stored bond, the CCM counter, the table hash, the identity roots
+# from their FICR words. The security manager's functions are most significant
+# octet first (Core, Vol 3, Part H, 2.2): the Length of f5, the passkey in R
+# of f6, the result of g2. The other way, own helpers, needs `unsafe`
+# unaligned reads and writes to keep the code these methods compile to; built
+# from shifts instead, a value cut from a wider integer is stored octet by
+# octet at `opt-level = 3`, which made the connection event larger.
+# `host_endian_bytes` stays denied: it is the one that catches a conversion in
+# the CPU's byte order by mistake.
+little_endian_bytes = { level = "allow", priority = 2 }
+big_endian_bytes = { level = "allow", priority = 2 }

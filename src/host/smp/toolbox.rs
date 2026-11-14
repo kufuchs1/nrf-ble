@@ -32,12 +32,7 @@
 //! are derived. The keys these functions return, and those the caller passes
 //! in, are the caller's to wipe.
 
-use crate::{
-    bytes::{be16_bytes, be32},
-    crypto::wipe,
-    host::Aes,
-    pdu::Peer,
-};
+use crate::{crypto::wipe, host::Aes, pdu::Peer};
 use cipher::{
     Block,
     BlockCipherEncBackend,
@@ -61,7 +56,7 @@ const F5_SALT: [u8; 16] =
 const F5_KEY_ID: [u8; 4] = *b"btle";
 
 /// The Length of f5: the 256 bits of the `MacKey` and the LTK together.
-const F5_LENGTH: [u8; 2] = be16_bytes(256);
+const F5_LENGTH: [u8; 2] = u16::to_be_bytes(256);
 
 /// An [`Aes`] with one key, as the block cipher of the `cmac` crate.
 ///
@@ -306,7 +301,7 @@ pub fn g2<A>(aes: &A, u_x: &[u8; 32], v_x: &[u8; 32], key: &[u8; 16], y: &[u8; 1
 where
     A: Aes,
 {
-    be32(cmac(aes, *key, &[u_x, v_x, y]).last_chunk::<4>().copied().unwrap_or_default())
+    u32::from_be_bytes(cmac(aes, *key, &[u_x, v_x, y]).last_chunk::<4>().copied().unwrap_or_default())
 }
 
 #[cfg(test)] pub(crate) mod tests;

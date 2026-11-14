@@ -125,7 +125,7 @@
 /// The constant hash of the table's layout.
 pub mod hash;
 
-use crate::{bytes::le16_bytes, link::ParamRange};
+use crate::link::ParamRange;
 
 /// Builds an attribute table at compile time; see the [module
 /// documentation](crate::host::gatt) for the syntax.
@@ -816,7 +816,7 @@ impl Uuid {
     #[must_use = "the comparison is only computed"]
     pub const fn matches(&self, raw: &[u8]) -> bool {
         match (*self, raw.len()) {
-            (Self::U16(short), 2) => raw == le16_bytes(short),
+            (Self::U16(short), 2) => raw == short.to_le_bytes(),
             (_, 16) => raw == self.to_u128(),
             _ => false,
         }
@@ -829,7 +829,7 @@ impl Uuid {
         match *self {
             Self::U16(short) => {
                 let mut bytes = BASE_UUID;
-                let [low, high] = le16_bytes(short);
+                let [low, high] = short.to_le_bytes();
                 bytes[12] = low;
                 bytes[13] = high;
                 bytes
@@ -853,7 +853,7 @@ impl Uuid {
     #[inline]
     pub const fn write(&self, out: &mut [u8]) -> usize {
         match *self {
-            Self::U16(short) => copy(out, &le16_bytes(short)),
+            Self::U16(short) => copy(out, &short.to_le_bytes()),
             Self::U128(long) => copy(out, long),
         }
     }
@@ -1020,10 +1020,10 @@ const fn nth(attrs: &'static [Attr], index: u16) -> Option<&'static Attr> {
 #[inline]
 #[must_use = "the value is only built"]
 pub const fn ppcp(range: ParamRange) -> [u8; 8] {
-    let [min0, min1] = le16_bytes(range.interval_min);
-    let [max0, max1] = le16_bytes(range.interval_max);
-    let [latency0, latency1] = le16_bytes(range.latency);
-    let [timeout0, timeout1] = le16_bytes(range.timeout);
+    let [min0, min1] = range.interval_min.to_le_bytes();
+    let [max0, max1] = range.interval_max.to_le_bytes();
+    let [latency0, latency1] = range.latency.to_le_bytes();
+    let [timeout0, timeout1] = range.timeout.to_le_bytes();
     [min0, min1, max0, max1, latency0, latency1, timeout0, timeout1]
 }
 

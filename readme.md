@@ -771,7 +771,9 @@ Clippy runs on the library for the chip targets, as in nrf-ll. The tests are not
 fails on the test code under the `restriction` group, as in nrf-ll).
 
 Every Clippy group, `restriction` included, is an error. [`Cargo.toml`](Cargo.toml) allows only lints that another lint
-or the strict setup itself contradicts, each with the reason, and the code has no `#[allow]` or `#[expect]`.
+or the strict setup itself contradicts, and the two byte orders the code converts integers in (`little_endian_bytes`,
+`big_endian_bytes`; `host_endian_bytes` stays an error), each with the reason, and the code has no `#[allow]` or
+`#[expect]`.
 
 ## License
 

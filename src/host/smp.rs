@@ -173,7 +173,7 @@ pub mod ecc;
 pub mod toolbox;
 
 #[cfg(feature = "passkey")]
-use crate::{bytes::be32_bytes, host::PasskeyError};
+use crate::host::PasskeyError;
 use crate::{crypto::wipe, host::Aes, link::Info, pdu::Peer};
 use core::{array::TryFromSliceError, fmt, iter, mem};
 #[cfg(feature = "passkey")]
@@ -1280,7 +1280,7 @@ impl Responder {
             && self.passkey != NO_PASSKEY
             && let Some(low) = value.last_chunk_mut::<4>()
         {
-            *low = be32_bytes(self.passkey);
+            *low = self.passkey.to_be_bytes();
         }
         value
     }

@@ -10,7 +10,7 @@
 //! cannot start one of its own in between, and retries with interrupts on, so
 //! a radio event that aborted it is not delayed.
 
-use crate::{bytes::le64_bytes, chip, radio::Phy, sleep};
+use crate::{chip, radio::Phy, sleep};
 use core::{
     hint::black_box,
     slice,
@@ -282,7 +282,7 @@ pub(crate) const fn set_counter(config: &mut [u8; CONFIG_LEN], counter: u64) -> 
         return false;
     }
     if let Some(target) = config.get_mut(COUNTER_OFFSET..COUNTER_OFFSET.saturating_add(5))
-        && let Some(source) = le64_bytes(counter).first_chunk::<5>()
+        && let Some(source) = counter.to_le_bytes().first_chunk::<5>()
     {
         target.copy_from_slice(source);
     }

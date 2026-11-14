@@ -76,7 +76,6 @@
 
 use crate::{
     advertiser::legacy::{DATA_MAX, FILTER_LIST_SIZE, Kind, Settings as LegacySettings},
-    bytes::le16,
     chip,
     crypto,
     pdu::{Llid, Peer, valid_connection_parameters},
@@ -943,7 +942,7 @@ impl Shared {
             if !state.connected || state.ltk_pending {
                 return false;
             }
-            if self.events.try_send(Event::LtkRequest { ediv: le16(ediv), rand }).is_err() {
+            if self.events.try_send(Event::LtkRequest { ediv: u16::from_le_bytes(ediv), rand }).is_err() {
                 return false;
             }
             state.ltk_pending = true;

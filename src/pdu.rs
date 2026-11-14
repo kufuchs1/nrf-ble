@@ -1,9 +1,6 @@
 //! Link layer packet formats.
 
-use crate::{
-    bytes::{le16, le32, le32_bytes},
-    chip,
-};
+use crate::chip;
 
 /// Length of a device address.
 pub const ADDRESS_LEN: usize = 6;
@@ -268,19 +265,19 @@ impl ConnectInd {
             return None;
         }
         let request = Self {
-            access_address: le32(access_address),
+            access_address: u32::from_le_bytes(access_address),
             channel_map,
-            crc_init: le32([crc0, crc1, crc2, 0]),
+            crc_init: u32::from_le_bytes([crc0, crc1, crc2, 0]),
             csa2: kind & CH_SEL != 0,
             hop: hop_sca & 0x1F,
             initiator,
             initiator_random: kind & TX_ADD_RANDOM != 0,
-            interval: le16([interval0, interval1]),
-            latency: le16([latency0, latency1]),
+            interval: u16::from_le_bytes([interval0, interval1]),
+            latency: u16::from_le_bytes([latency0, latency1]),
             sca: hop_sca.wrapping_shr(5),
             sca_ppm: sca_ppm(hop_sca.wrapping_shr(5)),
-            timeout: le16([timeout0, timeout1]),
-            win_offset: le16([offset0, offset1]),
+            timeout: u16::from_le_bytes([timeout0, timeout1]),
+            win_offset: u16::from_le_bytes([offset0, offset1]),
             win_size,
         };
         request.is_valid().then_some(request)
@@ -312,7 +309,7 @@ pub(crate) const fn valid_connection_parameters(
 
 /// LE 1M data access address constraints (Core, Vol 6, Part B, 2.1.2).
 fn valid_access_address(address: u32) -> bool {
-    let bytes = le32_bytes(address);
+    let bytes = address.to_le_bytes();
     let transitions = address ^ address.wrapping_shr(1);
     let mut run: u8 = 1;
     for bit in 1..u32::BITS {
