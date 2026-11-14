@@ -136,7 +136,7 @@ macro_rules! gatt {
     ) => {
         $crate::gatt!(@munch $head
             [$($attrs)* $crate::host::gatt::Attr::service($crate::gatt!(@uuid $uuid)),]
-            [$($items)*] ($handle + 1) ($ccc) ($crate::host::gatt::Sec::Open)
+            [$($items)*] (::core::primitive::u16::strict_add($handle, 1)) ($ccc) ($crate::host::gatt::Sec::Open)
             $($body)* $($rest)*);
     };
     (@munch {[$($db_meta:tt)*] $vis:vis $db:ident} [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr)
@@ -154,7 +154,7 @@ macro_rules! gatt {
                 ),
             ]
             [$($items)* $(#[$meta])* $vis const $name: $crate::host::gatt::Char = $db.characteristic($handle);]
-            ($handle + 2) ($ccc) ($crate::gatt!(@sec $($level)?))
+            (::core::primitive::u16::strict_add($handle, 2)) ($ccc) ($crate::gatt!(@sec $($level)?))
             $($rest)*);
     };
     (@munch $head:tt [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr) ($sec:expr)
@@ -171,7 +171,7 @@ macro_rules! gatt {
                     $value,
                 ),
             ]
-            [$($items)*] ($handle + 2) ($ccc) ($crate::gatt!(@sec $($level)?))
+            [$($items)*] (::core::primitive::u16::strict_add($handle, 2)) ($ccc) ($crate::gatt!(@sec $($level)?))
             $($rest)*);
     };
     (@munch $head:tt [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr) ($sec:expr)
@@ -179,7 +179,8 @@ macro_rules! gatt {
     ) => {
         $crate::gatt!(@munch $head
             [$($attrs)* $crate::host::gatt::Attr::cccd($sec, $ccc),]
-            [$($items)*] ($handle + 1) ($ccc + 1) ($sec)
+            [$($items)*] (::core::primitive::u16::strict_add($handle, 1))
+            (::core::primitive::u8::strict_add($ccc, 1)) ($sec)
             $($rest)*);
     };
     (@munch $head:tt [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr) ($sec:expr)
@@ -194,7 +195,7 @@ macro_rules! gatt {
                     $value,
                 ),
             ]
-            [$($items)*] ($handle + 1) ($ccc) ($sec)
+            [$($items)*] (::core::primitive::u16::strict_add($handle, 1)) ($ccc) ($sec)
             $($rest)*);
     };
     (@munch {[$(#[$meta:meta])*] $vis:vis $db:ident} [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr)
@@ -335,18 +336,20 @@ pub enum Kind {
     Value(Access, Sec),
 }
 
-/// The security of a link, or the security an attribute needs.
+/// The security of a link, or the security an attribute needs, ordered by
+/// strength: open below encrypted below authenticated.
 #[derive(Clone, Copy, Debug, Eq)]
-#[derive_const(PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive_const(PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum Sec {
     /// Encrypted with a key from authenticated pairing (with protection
     /// against a man in the middle).
-    Authenticated,
+    Authenticated = 2,
     /// Encrypted.
-    Encrypted,
+    Encrypted     = 1,
     /// Not encrypted.
-    Open,
+    Open          = 0,
 }
 
 /// The client characteristic configuration of one link: two bits for each
@@ -598,7 +601,7 @@ impl Db {
         if handle == 0 {
             return None;
         }
-        nth(self.attrs, handle.wrapping_sub(1))
+        self.attrs.get(usize::from(handle.wrapping_sub(1)))
     }
 
     /// The attributes, handle 1 first.
@@ -719,29 +722,7 @@ impl Sec {
     /// Whether a link of security `level` meets this requirement.
     #[inline]
     #[must_use = "the comparison is only computed"]
-    pub const fn met_by(self, level: Self) -> bool { level.rank() >= self.rank() }
-
-    /// The name of the level, for a defmt log line (`{=istr}`): interned,
-    /// so the string stays in the `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::Authenticated => defmt::intern!("Authenticated"),
-            Self::Encrypted => defmt::intern!("Encrypted"),
-            Self::Open => defmt::intern!("Open"),
-        }
-    }
-
-    /// Rank of the level: open below encrypted below authenticated.
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Open => 0,
-            Self::Encrypted => 1,
-            Self::Authenticated => 2,
-        }
-    }
+    pub const fn met_by(self, level: Self) -> bool { level >= self }
 }
 
 impl Subscriptions {
@@ -764,9 +745,7 @@ impl Subscriptions {
     /// Whether the client wrote the descriptor `index` on this link.
     #[inline]
     #[must_use = "the bit is only read"]
-    pub const fn is_written(self, index: u8) -> bool {
-        self.written.checked_shr(u32::from(index)).unwrap_or(0) & 1 != 0
-    }
+    pub const fn is_written(self, index: u8) -> bool { self.written.unbounded_shr(u32::from(index)) & 1 != 0 }
 
     /// No subscriptions.
     #[inline]
@@ -794,17 +773,17 @@ impl Subscriptions {
             allowed |= u32::from(CCC_INDICATE);
         }
         let shift = u32::from(index).saturating_mul(2);
-        let mask = u32::checked_shl(3, shift).unwrap_or(0);
-        let bits = (u32::from(value) & allowed).checked_shl(shift).unwrap_or(0);
+        let mask = 3_u32.unbounded_shl(shift);
+        let bits = (u32::from(value) & allowed).unbounded_shl(shift);
         self.values = (self.values & !mask) | bits;
-        self.written |= u16::checked_shl(1, u32::from(index)).unwrap_or(0);
+        self.written |= 1_u16.unbounded_shl(u32::from(index));
     }
 
     /// The value of the descriptor `index`, as a Read gives it.
     #[inline]
     #[must_use = "the value is only read"]
     pub const fn value(self, index: u8) -> u16 {
-        (self.values.checked_shr(u32::from(index).saturating_mul(2)).unwrap_or(0) & 3).truncate()
+        (self.values.unbounded_shr(u32::from(index).saturating_mul(2)) & 3).truncate()
     }
 }
 
@@ -876,7 +855,7 @@ impl ValueId {
 /// the next declaration.
 const fn cccd_after(attrs: &'static [Attr], handle: u16) -> Option<u8> {
     let mut next = handle;
-    while let Some(attr) = nth(attrs, next) {
+    while let Some(attr) = attrs.get(usize::from(next)) {
         match (attr.kind, attr.value) {
             (Kind::Characteristic(_) | Kind::Service, _) => return None,
             (Kind::Descriptor(_), Value::Cccd(index)) => return Some(index),
@@ -963,8 +942,8 @@ const fn copy(out: &mut [u8], source: &[u8]) -> usize {
 
 /// The characteristic declared at `handle` of `attrs`, `None` if none is.
 const fn char_at(attrs: &'static [Attr], handle: u16) -> Option<Char> {
-    let declaration = nth(attrs, handle.wrapping_sub(1))?;
-    let value = nth(attrs, handle)?;
+    let declaration = attrs.get(usize::from(handle.wrapping_sub(1)))?;
+    let value = attrs.get(usize::from(handle))?;
     let (Kind::Characteristic(props), Kind::Value(_, sec)) = (declaration.kind, value.kind) else { return None };
     let value_handle = handle.saturating_add(1);
     Some(Char { cccd: cccd_after(attrs, value_handle), handle: value_handle, props, sec })
@@ -973,7 +952,7 @@ const fn char_at(attrs: &'static [Attr], handle: u16) -> Option<Char> {
 /// The Service Changed characteristic of `attrs`, if it has one.
 const fn find_service_changed(attrs: &'static [Attr]) -> Option<Char> {
     let mut handle: u16 = 1;
-    while let Some(attr) = nth(attrs, handle.wrapping_sub(1)) {
+    while let Some(attr) = attrs.get(usize::from(handle.wrapping_sub(1))) {
         if let (Kind::Characteristic(_), Uuid::U16(SERVICE_CHANGED)) = (attr.kind, attr.uuid) {
             return char_at(attrs, handle);
         }
@@ -999,19 +978,13 @@ const fn input_reports(attrs: &[Attr]) -> u16 {
             },
             (Kind::Service, _) => report = false,
             (Kind::Descriptor(_), Value::Cccd(index)) if report => {
-                inputs |= u16::checked_shl(1, u32::from(index)).unwrap_or(0);
+                inputs |= 1_u16.unbounded_shl(u32::from(index));
             },
             _ => {},
         }
         rest = tail;
     }
     inputs
-}
-
-/// The attribute at `index` of `attrs`.
-const fn nth(attrs: &'static [Attr], index: u16) -> Option<&'static Attr> {
-    let (_, rest) = attrs.split_at_checked(usize::from(index))?;
-    rest.first()
 }
 
 /// The Peripheral Preferred Connection Parameters value of `range`:

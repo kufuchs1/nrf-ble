@@ -96,6 +96,7 @@ pub const DEBUG_PUBLIC_KEY: [u8; PUBLIC_KEY_LEN] = [
 
 /// Why a public key is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum KeyError {
     /// The key is the debug public key or its negation, whose private key
@@ -108,21 +109,6 @@ pub enum KeyError {
     /// The key is our own public key or its negation, which a central only
     /// sends to reflect our own values back to us.
     Own,
-}
-
-impl KeyError {
-    /// The name of the error, for a defmt log line (`{=istr}`): interned,
-    /// so the string stays in the `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::Debug => defmt::intern!("Debug"),
-            Self::Invalid => defmt::intern!("Invalid"),
-            Self::Own => defmt::intern!("Own"),
-        }
-    }
 }
 
 /// Our key pair for one pairing: the private key and the public key it
@@ -208,11 +194,11 @@ pub fn check_public_key(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN])
 /// Diffie-Hellman key depends on, so the debug key and our own key are
 /// recognised by X alone.
 fn decode(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN]) -> Result<PublicKey, KeyError> {
-    let x = peer.first_chunk::<KEY_LEN>().ok_or(KeyError::Invalid)?;
-    if Some(x) == DEBUG_PUBLIC_KEY.first_chunk::<KEY_LEN>() {
+    let (x, _) = peer.split_array_ref::<KEY_LEN>();
+    if x == DEBUG_PUBLIC_KEY.split_array_ref::<KEY_LEN>().0 {
         return Err(KeyError::Debug);
     }
-    if Some(x) == own.first_chunk::<KEY_LEN>() {
+    if x == own.split_array_ref::<KEY_LEN>().0 {
         return Err(KeyError::Own);
     }
     // The coordinates are taken only below the field prime, the point only

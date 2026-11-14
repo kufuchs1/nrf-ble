@@ -52,7 +52,7 @@ async fn interval(settings: &Settings) -> u32 {
     }
     let mut jitter: [u8; 2] = [0; 2];
     rng::fill_async(&mut jitter).await;
-    settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).checked_rem(ADV_DELAY_MAX_US).unwrap_or(0))
+    settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).strict_rem(ADV_DELAY_MAX_US))
 }
 
 /// Logs the scan requests the advertiser decided only after the radio had
@@ -130,7 +130,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             stats.events, stats.missed, stats.crc_errors, stats.received
         );
         #[cfg(feature = "defmt")]
-        stats.log_answers("connection ended");
+        stats.log_answers(defmt::intern!("connection ended"));
         if matches!(ended, Ended::Reset) {
             radio.disable();
             clock.pause();

@@ -186,7 +186,7 @@ const EV_PASSKEY: Flags = 0x200;
 /// What the user typed for Passkey Entry when they gave up: out of the
 /// range of passkeys, as [`smp::NO_PASSKEY`] is.
 #[cfg(feature = "passkey")]
-const REFUSED: u32 = smp::NO_PASSKEY - 1;
+const REFUSED: u32 = smp::NO_PASSKEY.strict_sub(1);
 
 /// The events waiting, one `EV_` bit each: eight fit without the optional
 /// events.
@@ -424,26 +424,13 @@ enum Source {
 /// What happens to a link that arrives while no advertising call waits for
 /// one, because the call's future was dropped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Unclaimed {
     /// It ends at once with [`REMOTE_USER`].
     Disconnect,
     /// The next advertising call returns it without advertising.
     Keep,
-}
-
-impl Unclaimed {
-    /// The name of the choice, for a defmt log line (`{=istr}`): interned,
-    /// so the string stays in the `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::Disconnect => defmt::intern!("Disconnect"),
-            Self::Keep => defmt::intern!("Keep"),
-        }
-    }
 }
 
 impl Config {
@@ -524,7 +511,7 @@ impl Engine {
         let mut out: [u8; MTU] = [0; MTU];
         if let Some(len) = self.att.handle(pdu, level, app, &mut out) {
             if self.response.is_none() {
-                self.response = Some(Slot { bytes: out, len: u8::try_from(len).unwrap_or_default() });
+                self.response = Some(Slot { bytes: out, len: len.saturating_cast() });
                 if pdu.first() == Some(&WRITE_REQUEST)
                     && out.first() == Some(&WRITE_RESPONSE)
                     && self.inputs_written()
@@ -535,7 +522,7 @@ impl Engine {
                 }
             } else {
                 // A client waits for each response before its next request.
-                info!("att: a request before the response to the previous one");
+                warn!("att: a request before the response to the previous one");
             }
         }
         if matches!(pdu.first(), Some(&(WRITE_REQUEST | WRITE_COMMAND))) {
@@ -661,7 +648,7 @@ impl Engine {
                 }
                 self.restore();
             } else {
-                info!("encryption failed");
+                warn!("encryption failed");
             }
         }
         #[cfg(feature = "key-missing")]
@@ -676,7 +663,7 @@ impl Engine {
             // A reconnection: only the bonded central connects, and it has
             // no key the host knows. Waiting for the security deadline
             // would only keep it connected without encryption.
-            info!("the central has no key of the bond: the link ends");
+            warn!("the central has no key of the bond: the link ends");
             link.fate.closing = true;
             link.security = None;
             self.commands.disconnect = Some((link.info.epoch, SECURITY_FAILURE));
@@ -856,7 +843,7 @@ impl Engine {
         let Some(link) = self.link.as_mut() else { return };
         link.key = answer.map(|(_, source)| source);
         if answer.is_none() {
-            info!("no key for the central's request");
+            warn!("no key for the central's request");
         }
         self.commands.ltk = Some((link.info.epoch, answer.map(|(key, _)| key)));
     }
@@ -1005,7 +992,7 @@ impl Engine {
                         link.asking = None;
                     }
                     if outcome == signal::Outcome::Rejected {
-                        info!("the central rejected our connection parameters");
+                        warn!("the central rejected our connection parameters");
                         #[cfg(feature = "param-requests")]
                         {
                             self.events.flags |= EV_PARAMS_REJECTED;
@@ -1030,7 +1017,7 @@ impl Engine {
                     self.disconnected(epoch, reason);
                 }
             },
-            Event::Encryption { on, refresh, status: _status } => self.encryption(on, refresh, now),
+            Event::Encryption { on, refresh, status: _ } => self.encryption(on, refresh, now),
             Event::LtkRequest { ediv, rand } => self.ltk_request(ediv, rand),
             Event::ParamsUpdated { params, status } => {
                 if let Some(link) = self.link.as_mut()
@@ -1047,9 +1034,9 @@ impl Engine {
             | Event::DataLength(_)
             | Event::ParamsRequested(_)
             | Event::PayloadTimeout
+            | Event::PhyUpdated { rx: _, status: _, tx: _ }
+            | Event::RemoteFeatures { features: _, status: _ }
             | Event::RemoteVersion(_) => {},
-            Event::PhyUpdated { rx: _rx, status: _status, tx: _tx } => {},
-            Event::RemoteFeatures { features: _features, status: _status } => {},
         }
     }
 
@@ -1060,7 +1047,7 @@ impl Engine {
         self.outcome(outcome, now);
         let Some(link) = self.link.as_mut() else { return };
         if link.security.is_some_and(|deadline| now >= deadline) {
-            info!("the link was not encrypted in time");
+            warn!("the link was not encrypted in time");
             link.security = None;
             link.fate.closing = true;
             self.commands.disconnect = Some((link.info.epoch, SECURITY_FAILURE));
@@ -1131,7 +1118,7 @@ impl Engine {
             },
             Outcome::Started => info!("pairing"),
             Outcome::TimedOut => {
-                info!("pairing timed out");
+                warn!("pairing timed out");
                 link.fate.closing = true;
                 self.commands.disconnect = Some((link.info.epoch, REMOTE_USER));
             },

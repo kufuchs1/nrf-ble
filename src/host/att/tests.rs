@@ -1,12 +1,15 @@
 //! Tests of the attribute server: the whole `BlueZ` first connection as golden
 //! PDUs against the example table, and the error cases.
 
+extern crate alloc;
+
 use super::*;
 use crate::host::{
     example::{self, BATTERY_LEVEL_VALUE, DB, PARAMS, REPORT_MAP},
     gatt::{Value, ValueId, ppcp},
 };
-use core::{cell::Cell, ops::Deref};
+use alloc::vec::Vec;
+use core::cell::Cell;
 
 /// The application's side of the dynamic values in the tests.
 struct App {
@@ -48,27 +51,11 @@ impl Handler for App {
     }
 }
 
-/// Bytes of a PDU, without a heap.
-struct Bytes {
-    /// The bytes, of which the first `len` count.
-    data: [u8; 64],
-    /// Their number.
-    len:  usize,
-}
-
-impl Deref for Bytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] { &self.data[..self.len] }
-}
-
 /// Sends `request` at `level` and returns the response, if any.
-fn exchange(server: &mut Server, app: &App, request: &[u8], level: Sec) -> Option<Bytes> {
+fn exchange(server: &mut Server, app: &App, request: &[u8], level: Sec) -> Option<Vec<u8>> {
     let mut out = [0_u8; MTU];
     let len = server.handle(request, level, app, &mut out)?;
-    let mut data = [0; 64];
-    data[..len].copy_from_slice(&out[..len]);
-    Some(Bytes { data, len })
+    Some(out[..len].to_vec())
 }
 
 /// Sends `request` on an encrypted link and checks the response against
@@ -76,16 +63,6 @@ fn exchange(server: &mut Server, app: &App, request: &[u8], level: Sec) -> Optio
 fn golden(server: &mut Server, app: &App, request: &[u8], expected: &[u8]) {
     let response = exchange(server, app, request, Sec::Encrypted);
     assert_eq!(response.as_deref(), Some(expected), "request {request:02X?}");
-}
-
-/// Concatenates byte slices.
-fn join(parts: &[&[u8]]) -> Bytes {
-    let mut bytes = Bytes { data: [0; 64], len: 0 };
-    for part in parts {
-        bytes.data[bytes.len..bytes.len + part.len()].copy_from_slice(part);
-        bytes.len += part.len();
-    }
-    bytes
 }
 
 /// The whole first connection of `BlueZ` (research-bluez.md, section 1.1),
@@ -176,12 +153,17 @@ fn the_bluez_first_connection_gets_these_answers() {
 
     // The Database Hash, now that the table has it.
     let hash = DB.hash();
-    golden(s, &app, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B], &join(&[&[0x09, 0x12, 0x0A, 0x00], &hash]));
+    golden(
+        s,
+        &app,
+        &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B],
+        &<[&[u8]]>::concat(&[&[0x09, 0x12, 0x0A, 0x00], &hash]),
+    );
 
     // GAP: the name, the appearance and the preferred parameters.
-    golden(s, &app, &[0x0A, 0x03, 0x00], &join(&[&[0x0B], example::NAME]));
+    golden(s, &app, &[0x0A, 0x03, 0x00], &<[&[u8]]>::concat(&[&[0x0B], example::NAME]));
     golden(s, &app, &[0x0A, 0x05, 0x00], &[0x0B, 0xC1, 0x03]);
-    golden(s, &app, &[0x0A, 0x07, 0x00], &join(&[&[0x0B], &ppcp(PARAMS)]));
+    golden(s, &app, &[0x0A, 0x07, 0x00], &<[&[u8]]>::concat(&[&[0x0B], &ppcp(PARAMS)]));
     // Device information: the PnP ID.
     golden(s, &app, &[0x0A, 0x11, 0x00], &[0x0B, 0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01]);
     // Battery: the level, then its configuration.
@@ -190,12 +172,17 @@ fn the_bluez_first_connection_gets_these_answers() {
 
     // HID: the Report Map with Read and Read Blob while a full 22 octets
     // come back, then the HID Information.
-    golden(s, &app, &[0x0A, 0x16, 0x00], &join(&[&[0x0B], &REPORT_MAP[..22]]));
+    golden(s, &app, &[0x0A, 0x16, 0x00], &<[&[u8]]>::concat(&[&[0x0B], &REPORT_MAP[..22]]));
     for offset in [22_u8, 44, 66, 88] {
         let start = usize::from(offset);
-        golden(s, &app, &[0x0C, 0x16, 0x00, offset, 0x00], &join(&[&[0x0D], &REPORT_MAP[start..start + 22]]));
+        golden(
+            s,
+            &app,
+            &[0x0C, 0x16, 0x00, offset, 0x00],
+            &<[&[u8]]>::concat(&[&[0x0D], &REPORT_MAP[start..start + 22]]),
+        );
     }
-    golden(s, &app, &[0x0C, 0x16, 0x00, 110, 0x00], &join(&[&[0x0D], &REPORT_MAP[110..]]));
+    golden(s, &app, &[0x0C, 0x16, 0x00, 110, 0x00], &<[&[u8]]>::concat(&[&[0x0D], &REPORT_MAP[110..]]));
     // A value whose length is a multiple of 22 ends with an empty blob.
     golden(s, &app, &[0x0C, 0x16, 0x00, 126, 0x00], &[0x0D]);
     golden(s, &app, &[0x0A, 0x14, 0x00], &[0x0B, 0x11, 0x01, 0x00, 0x03]);
@@ -203,7 +190,7 @@ fn the_bluez_first_connection_gets_these_answers() {
     // Each input report: its value, its Report Reference, its
     // configuration read, then written.
     for (value, length, id) in [(0x1A_u8, 8, 1_u8), (0x1E, 2, 2), (0x22, 5, 3)] {
-        golden(s, &app, &[0x0A, value, 0x00], &join(&[&[0x0B], &[0; 8][..length]]));
+        golden(s, &app, &[0x0A, value, 0x00], &<[&[u8]]>::concat(&[&[0x0B], &[0; 8][..length]]));
         golden(s, &app, &[0x0A, value + 2, 0x00], &[0x0B, id, 0x01]);
         golden(s, &app, &[0x0A, value + 1, 0x00], &[0x0B, 0x00, 0x00]);
         golden(s, &app, &[0x12, value + 1, 0x00, 0x01, 0x00], &[0x13]);
@@ -217,7 +204,7 @@ fn the_bluez_first_connection_gets_these_answers() {
     let mut out = [0_u8; MTU];
     let report = [0, 0, 0x4B, 0, 0, 0, 0, 0];
     let len = s.notify(example::KEYBOARD, &report, Sec::Encrypted, &mut out).unwrap();
-    assert_eq!(&out[..len], &*join(&[&[0x1B, 0x1A, 0x00], &report]));
+    assert_eq!(&out[..len], &*<[&[u8]]>::concat(&[&[0x1B, 0x1A, 0x00], &report]));
     let len = s.notify(example::CONSUMER, &[0xE9, 0x00], Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &[0x1B, 0x1E, 0x00, 0xE9, 0x00]);
     let len = s.notify(example::MOUSE, &[0, 1, 0, 0xFF, 0xFF], Sec::Encrypted, &mut out).unwrap();
@@ -240,7 +227,7 @@ fn a_reconnection_reads_the_hash_and_restores_nothing_it_did_not_write() {
         &mut server,
         &app,
         &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B],
-        &join(&[&[0x09, 0x12, 0x0A, 0x00], &DB.hash()]),
+        &<[&[u8]]>::concat(&[&[0x09, 0x12, 0x0A, 0x00], &DB.hash()]),
     );
     // The restored bits read back, but count as written on no link.
     golden(&mut server, &app, &[0x0A, 0x1B, 0x00], &[0x0B, 0x01, 0x00]);
@@ -398,16 +385,16 @@ fn permissions_and_lengths_are_checked() {
     // Primary services by UUID, short and long.
     golden(&mut server, &app, &[0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28, 0x0F, 0x18], &[0x07, 0x0B, 0x00, 0x0E, 0x00]);
     let mut long = [0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x12, 0x18, 0x00, 0x00];
-    let request = join(&[&[0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28], &long]);
+    let request = <[&[u8]]>::concat(&[&[0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28], &long]);
     golden(&mut server, &app, &request, &[0x07, 0x12, 0x00, 0x24, 0x00]);
     long[12] = 0x13;
-    let request = join(&[&[0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28], &long]);
+    let request = <[&[u8]]>::concat(&[&[0x06, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28], &long]);
     golden(&mut server, &app, &request, &[0x01, 0x06, 0x01, 0x00, 0x0A]);
     golden(&mut server, &app, &[0x06, 0x01, 0x00, 0xFF, 0xFF, 0x03, 0x28, 0x19, 0x2A], &[0x01, 0x06, 0x01, 0x00, 0x0A]);
     // Read By Type with a 128-bit type.
     long[12] = 0x19;
     long[13] = 0x2A;
-    let request = join(&[&[0x08, 0x01, 0x00, 0xFF, 0xFF], &long]);
+    let request = <[&[u8]]>::concat(&[&[0x08, 0x01, 0x00, 0xFF, 0xFF], &long]);
     golden(&mut server, &app, &request, &[0x09, 0x03, 0x0D, 0x00, 90]);
 }
 
@@ -489,7 +476,7 @@ fn discovery_groups_entries_by_uuid_size_and_reports_real_ends() {
         &mut server,
         &app,
         &[0x10, 0x05, 0x00, 0xFF, 0xFF, 0x00, 0x28],
-        &join(&[&[0x11, 0x14, 0x05, 0x00, 0x0A, 0x00], &LONG_SERVICE]),
+        &<[&[u8]]>::concat(&[&[0x11, 0x14, 0x05, 0x00, 0x0A, 0x00], &LONG_SERVICE]),
     );
     // Characteristic declarations: 7 octets, then 21 in the next response.
     golden(&mut server, &app, &[0x08, 0x05, 0x00, 0x0A, 0x00, 0x03, 0x28], &[
@@ -499,7 +486,7 @@ fn discovery_groups_entries_by_uuid_size_and_reports_real_ends() {
         &mut server,
         &app,
         &[0x08, 0x07, 0x00, 0x0A, 0x00, 0x03, 0x28],
-        &join(&[&[0x09, 0x15, 0x08, 0x00, 0x0E, 0x09, 0x00], &LONG_CHAR]),
+        &<[&[u8]]>::concat(&[&[0x09, 0x15, 0x08, 0x00, 0x0E, 0x09, 0x00], &LONG_CHAR]),
     );
     // Find Information: 16-bit types, then a response of the 128-bit one.
     golden(&mut server, &app, &[0x04, 0x01, 0x00, 0xFF, 0xFF], &[
@@ -516,7 +503,12 @@ fn discovery_groups_entries_by_uuid_size_and_reports_real_ends() {
         0x07, 0x00, 0x00, 0x2A, //
         0x08, 0x00, 0x03, 0x28,
     ]);
-    golden(&mut server, &app, &[0x04, 0x09, 0x00, 0xFF, 0xFF], &join(&[&[0x05, 0x02, 0x09, 0x00], &LONG_CHAR]));
+    golden(
+        &mut server,
+        &app,
+        &[0x04, 0x09, 0x00, 0xFF, 0xFF],
+        &<[&[u8]]>::concat(&[&[0x05, 0x02, 0x09, 0x00], &LONG_CHAR]),
+    );
     golden(&mut server, &app, &[0x04, 0x0A, 0x00, 0xFF, 0xFF], &[0x05, 0x01, 0x0A, 0x00, 0x01, 0x29]);
     // An indicate-only value cannot be read.
     golden(&mut server, &app, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x05, 0x2A], &[0x01, 0x08, 0x03, 0x00, 0x02]);
@@ -525,7 +517,7 @@ fn discovery_groups_entries_by_uuid_size_and_reports_real_ends() {
         &mut server,
         &app,
         &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x01, 0x29],
-        &join(&[&[0x09, 0x0D, 0x0A, 0x00], b"description"]),
+        &<[&[u8]]>::concat(&[&[0x09, 0x0D, 0x0A, 0x00], b"description"]),
     );
 }
 

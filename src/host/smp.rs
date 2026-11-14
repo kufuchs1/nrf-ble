@@ -174,8 +174,13 @@ pub mod toolbox;
 
 #[cfg(feature = "passkey")]
 use crate::host::PasskeyError;
-use crate::{crypto::wipe, host::Aes, link::Info, pdu::Peer};
-use core::{array::TryFromSliceError, fmt, iter, mem};
+use crate::{
+    crypto::wipe,
+    host::Aes,
+    link::Info,
+    pdu::{Peer, concat_into},
+};
+use core::{array::TryFromSliceError, fmt, mem};
 #[cfg(feature = "passkey")]
 use core::{
     hint::black_box,
@@ -214,7 +219,7 @@ pub const PAIRING_DHKEY_CHECK: u8 = 0x0D;
 /// Code of a Keypress Notification.
 pub const KEYPRESS_NOTIFICATION: u8 = 0x0E;
 /// Longest PDU the security manager sends or takes: a Pairing Public Key.
-pub const PDU_MAX: usize = 1 + PUBLIC_KEY_LEN;
+pub const PDU_MAX: usize = 1_usize.strict_add(PUBLIC_KEY_LEN);
 /// The time a pairing has from the last PDU the security manager queued.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// IO capability: no input and no output, which makes pairing Just Works.
@@ -315,6 +320,7 @@ pub struct Identity {
 /// Our IO capability, as the Pairing Response gives it.
 #[cfg(feature = "passkey")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum IoCapability {
     /// A keyboard without a display (0x02): Passkey Entry with any central
@@ -643,14 +649,9 @@ impl Output {
     /// A PDU with `code` and the parameters `parts` in order.
     fn new(code: u8, parts: &[&[u8]]) -> Self {
         let mut data: [u8; PDU_MAX] = [0; PDU_MAX];
-        let mut len: usize = 0;
-        for &byte in iter::once(&code).chain(parts.iter().flat_map(|part| part.iter())) {
-            if let Some(slot) = data.get_mut(len) {
-                *slot = byte;
-                len = len.saturating_add(1);
-            }
-        }
-        Self { data, len: u8::try_from(len).unwrap_or_default() }
+        data[0] = code;
+        let len = concat_into(&mut data[1..], parts);
+        Self { data, len: len.saturating_add(1).saturating_cast() }
     }
 }
 
@@ -723,8 +724,8 @@ impl Responder {
             self.state = State::Confirm(0);
             return Ok(Some(Outcome::PasskeyRequested));
         }
-        let own_x = self.own_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
-        let peer_x = self.peer_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
+        let (own_x, _) = self.own_key.split_array_ref::<KEY_LEN>();
+        let (peer_x, _) = self.peer_key.split_array_ref::<KEY_LEN>();
         crypto.fill(&mut self.nb);
         self.confirm = f4(&*crypto, own_x, peer_x, &self.nb, 0);
         self.pending |= OUT_PUBLIC_KEY | OUT_CONFIRM;
@@ -1183,7 +1184,7 @@ impl Responder {
     #[cfg(feature = "passkey")]
     const fn passkey_bit(&self, round: u8) -> u8 {
         let passkey = if self.passkey == NO_PASSKEY { 0 } else { self.passkey };
-        let bit = passkey.checked_shr(u32::from(round)).unwrap_or_default() & 1;
+        let bit = passkey.unbounded_shr(u32::from(round)) & 1;
         0x80 | u8::from(bit != 0)
     }
 
@@ -1199,8 +1200,8 @@ impl Responder {
             return Err(Reason::UNSPECIFIED);
         }
         let na = reversed(params.try_into().map_err(|_error: TryFromSliceError| Reason::INVALID_PARAMETERS)?);
-        let peer_x = self.peer_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
-        let own_x = self.own_key.first_chunk::<KEY_LEN>().ok_or(Reason::UNSPECIFIED)?;
+        let (peer_x, _) = self.peer_key.split_array_ref::<KEY_LEN>();
+        let (own_x, _) = self.own_key.split_array_ref::<KEY_LEN>();
         let expected = f4(aes, peer_x, own_x, &na, self.passkey_bit(round));
         if !same(&expected, &self.peer_confirm) {
             return Err(Reason::CONFIRM_VALUE_FAILED);
@@ -1276,11 +1277,8 @@ impl Responder {
     #[cfg(feature = "passkey")]
     const fn r_value(&self) -> [u8; 16] {
         let mut value = R_ZERO;
-        if self.authenticating
-            && self.passkey != NO_PASSKEY
-            && let Some(low) = value.last_chunk_mut::<4>()
-        {
-            *low = self.passkey.to_be_bytes();
+        if self.authenticating && self.passkey != NO_PASSKEY {
+            value[12..].copy_from_slice(&self.passkey.to_be_bytes());
         }
         value
     }
@@ -1360,11 +1358,9 @@ impl Responder {
     {
         crypto.fill(&mut self.nb);
         let bit = self.passkey_bit(round);
-        if let Some(peer_x) = self.peer_key.first_chunk::<KEY_LEN>()
-            && let Some(own_x) = self.own_key.first_chunk::<KEY_LEN>()
-        {
-            self.confirm = f4(&*crypto, own_x, peer_x, &self.nb, bit);
-        }
+        let (peer_x, _) = self.peer_key.split_array_ref::<KEY_LEN>();
+        let (own_x, _) = self.own_key.split_array_ref::<KEY_LEN>();
+        self.confirm = f4(&*crypto, own_x, peer_x, &self.nb, bit);
         self.pending |= OUT_CONFIRM;
         self.state = State::Nonce(round);
     }
@@ -1485,19 +1481,6 @@ impl IoCapability {
         match self {
             Self::KeyboardOnly => KEYBOARD_ONLY,
             Self::NoInputNoOutput => NO_INPUT_NO_OUTPUT,
-        }
-    }
-
-    /// The name of the IO capability, for a defmt log line (`{=istr}`):
-    /// interned, so the string stays in the `.defmt` section, which takes no
-    /// flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::KeyboardOnly => defmt::intern!("KeyboardOnly"),
-            Self::NoInputNoOutput => defmt::intern!("NoInputNoOutput"),
         }
     }
 }

@@ -419,7 +419,7 @@ fn on_channel(
     let after = if listen { Turnaround::Receive } else { Turnaround::None };
     // SAFETY: the radio only reads the advertisement, which is borrowed for
     // this event; every path out waits until the radio is disabled.
-    let () = unsafe { radio.prepare(advertisement.as_bytes().as_ptr().cast_mut(), after) };
+    unsafe { radio.prepare(advertisement.as_bytes().as_ptr().cast_mut(), after) }
     radio.transmit();
     radio.wait_end();
     if !listen {
@@ -428,7 +428,7 @@ fn on_channel(
     }
     // SAFETY: `rx` is a full packet buffer borrowed for this event; every
     // path out waits until the radio is disabled.
-    let () = unsafe { radio.set_buffer(rx.as_mut_ptr()) };
+    unsafe { radio.set_buffer(rx.as_mut_ptr()) }
     radio.wait_switched();
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
@@ -443,12 +443,12 @@ fn on_channel(
     // The reception latched `rx`: the pointer now applies to the answer.
     // SAFETY: the radio only reads the scan response, borrowed for this
     // event, and is disabled before it returns.
-    let () = unsafe { radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut()) };
+    unsafe { radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut()) }
     radio.clear_ready();
     radio.wait_end();
     let end = clock.end_time();
     let valid = radio.crc_ok();
-    if valid && rx.first().copied().is_some_and(is_scan_request) {
+    if valid && is_scan_request(rx[0]) {
         let answer = scan_request(rx, settings.own).is_some_and(|scanner| settings.accepts_scan(scanner));
         if radio.tx_started() {
             LATE_SCAN_DECISIONS.store(late_scan_decisions().wrapping_add(1), Ordering::Relaxed);

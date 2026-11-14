@@ -19,7 +19,7 @@ use embassy_nrf::pac::{
 /// 107 (anomaly 182).
 const ANOMALY_182_REGISTER: usize = 0x4000_173C;
 /// Enable bit in [`ANOMALY_182_REGISTER`].
-const ANOMALY_182_BIT: u32 = u32::strict_shl(1, 10);
+const ANOMALY_182_BIT: u32 = 1_u32.strict_shl(10);
 /// Register of the workaround for nRF52832 anomaly 192: the RC oscillator's
 /// frequency can be off by more than 500 ppm after a calibration during
 /// which the CPU slept.
@@ -64,7 +64,7 @@ pub const PHY_2M: bool = true;
 pub const RX_READY_US: u32 = 40;
 /// CCM scratch space for every value of an untrusted eight-bit length field:
 /// RADIO MAXLEN bounds radio DMA but does not rewrite that field for the CCM.
-pub const SCRATCH_LEN: usize = 16 + 255;
+pub const SCRATCH_LEN: usize = 16_usize.strict_add(255);
 
 /// Sets the CCM mode for a packet on `phy`, in the extended length mode.
 #[inline]
@@ -100,7 +100,7 @@ pub fn radio_trim() {
     // SAFETY: the anomaly 182 register is a word-aligned RADIO register.
     let value = unsafe { read_volatile(register) };
     // SAFETY: Nordic documents this write for the anomaly 182 fix.
-    let () = unsafe { write_volatile(register, value | ANOMALY_182_BIT) };
+    unsafe { write_volatile(register, value | ANOMALY_182_BIT) }
 }
 
 /// Accuracy of the low frequency clock in ppm: the RC oscillator, which
@@ -125,7 +125,7 @@ pub fn self_disabling(channel: usize, group: usize) {
 pub fn set_calibration_workaround(calibrating: bool) {
     let register = with_exposed_provenance_mut::<u32>(ANOMALY_192_REGISTER);
     // SAFETY: Nordic documents these writes for the anomaly 192 workaround.
-    let () = unsafe { write_volatile(register, if calibrating { 2 } else { 0 }) };
+    unsafe { write_volatile(register, if calibrating { 2 } else { 0 }) }
 }
 
 /// Sets whether packets in RAM carry the S1 byte, which the CCM needs on

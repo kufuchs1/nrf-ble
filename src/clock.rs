@@ -321,7 +321,7 @@ impl<'peripherals> Clock<'peripherals> {
             return true;
         }
         self.late = self.late.wrapping_add(1);
-        info!("crystal stopped while in use");
+        warn!("crystal stopped while in use");
         CLOCK.tasks_hfclkstart().write_value(1);
         self.wait_crystal().await;
         false
@@ -365,7 +365,7 @@ impl<'peripherals> Clock<'peripherals> {
         if RTC.events_compare(RTC_RESUME).read() == 0 {
             REGS.tasks_start().write_value(1);
             started_at = rtc_now().wrapping_sub(tick) & RTC_MASK;
-            info!("clock restart missed its tick");
+            warn!("clock restart missed its tick");
         }
         PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
         self.base = time.wrapping_add(ticks_to_us(started_at));
@@ -693,7 +693,7 @@ pub async fn calibrate_rc(_temperature: Peri<'_, peripherals::TEMP>) -> ! {
                 calibrated_at = Some(temperature);
                 skipped = 0;
             } else {
-                info!("RC calibration timed out");
+                warn!("RC calibration timed out");
             }
         } else {
             skipped = skipped.saturating_add(1);
@@ -878,6 +878,4 @@ fn rtc_now() -> u32 { RTC.counter().read().counter() }
 const fn ticks_to_us(ticks: u32) -> u32 { u64::from(ticks).saturating_mul(15_625).wrapping_shr(9).saturating_cast() }
 
 /// Whole RTC ticks in `us` microseconds.
-const fn us_to_ticks(us: u32) -> u32 {
-    u64::from(us).wrapping_shl(9).checked_div(15_625).unwrap_or(0).saturating_cast()
-}
+const fn us_to_ticks(us: u32) -> u32 { u64::from(us).wrapping_shl(9).strict_div(15_625).saturating_cast() }

@@ -217,6 +217,7 @@ pub struct Data {
 
 /// Why advertising could not be set up or started.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
     /// The link layer refused a call.
@@ -224,26 +225,6 @@ pub enum Error {
     /// The bond of [`Mode::Reconnect`] was made under another identity than
     /// the one given: the central would not know our address.
     WrongIdentity,
-}
-
-impl Error {
-    /// The name of the error, with the link layer's error it carries, for a
-    /// defmt log line (`{=istr}`): interned, so the string stays in the
-    /// `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::Link(link::Error::Disallowed) => defmt::intern!("Link(Disallowed)"),
-            Self::Link(link::Error::Full) => defmt::intern!("Link(Full)"),
-            Self::Link(link::Error::Gone) => defmt::intern!("Link(Gone)"),
-            Self::Link(link::Error::Invalid) => defmt::intern!("Link(Invalid)"),
-            Self::Link(link::Error::Unsupported) => defmt::intern!("Link(Unsupported)"),
-            Self::Link(link::Error::UnsupportedRemote) => defmt::intern!("Link(UnsupportedRemote)"),
-            Self::WrongIdentity => defmt::intern!("WrongIdentity"),
-        }
-    }
 }
 
 /// How the device advertises.
@@ -258,23 +239,11 @@ pub enum Mode<'bond> {
 
 /// Why an AD structure was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Overflow {
     /// It does not fit in the [`DATA_MAX`] octets.
     TooLong,
-}
-
-impl Overflow {
-    /// The name of the error, for a defmt log line (`{=istr}`): interned,
-    /// so the string stays in the `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::TooLong => defmt::intern!("TooLong"),
-        }
-    }
 }
 
 /// One phase of advertising: its interval and how long it lasts, and with
@@ -788,8 +757,6 @@ impl Schedule {
 /// Whether `peer` is an identity address, which directed advertising can
 /// target: public, or static random.
 #[cfg(feature = "directed-advertising")]
-const fn is_identity(peer: Peer) -> bool {
-    peer.address.last().is_some_and(const |&top| !peer.random || top & STATIC_RANDOM == STATIC_RANDOM)
-}
+const fn is_identity(peer: Peer) -> bool { !peer.random || peer.address[5] & STATIC_RANDOM == STATIC_RANDOM }
 
 #[cfg(test)] mod tests;

@@ -12,12 +12,15 @@
 // a starting value stands at its field and the constructor writes `..`;
 // `saturating_cast` and `truncate` (`integer_casts`,
 // `integer_widen_truncate`) for the conversions that saturate or cannot
-// lose bits; and `#[rustc_unroll(never)]` (`loop_hints`) on two loops of
-// the host, off the link layer, which keeps them rolled: the byte order turn
-// of pairing's public keys and the copy of an ATT read value. (The 3.2 KB
-// once measured on the nRF52832 counted two more loops, of the P-256 code of
-// our own the `p256` crate has replaced; the two left are not measured on
-// their own.)
+// lose bits; `split_array_ref` (`split_array`) for the front of a fixed
+// array, such as the X coordinate of a public key, with no `Option` that
+// cannot be `None`; and `#[rustc_unroll(never)]` (`loop_hints`) on one loop of
+// the host, off the link layer, which keeps it rolled: the byte order turn
+// of pairing's public keys. (The 3.2 KB once measured on the nRF52832
+// counted three more loops: two of the P-256 code of our own the `p256`
+// crate has replaced, and the copy of an ATT read value, now core's
+// `copy_from_slice` and `fill`, which compile to calls of `memcpy` and
+// `memclr`. The loop left is not measured on its own.)
 #![feature(
     const_bool,
     const_closures,
@@ -34,7 +37,8 @@
     derive_const,
     integer_casts,
     integer_widen_truncate,
-    loop_hints
+    loop_hints,
+    split_array
 )]
 // Rustdoc marks each item behind a Cargo feature with the feature it needs.
 #![cfg_attr(doc, feature(doc_cfg))]
@@ -48,7 +52,7 @@ compile_error!("enable a chip feature: nrf52832, the default, or nrf51");
 #[cfg(all(feature = "nrf51", feature = "data-length"))]
 compile_error!("the nRF51 CCM encrypts payloads of up to 27 octets: the data-length feature needs the nRF52832");
 
-/// Logging, first: its macro serves the modules after it.
+/// Logging, first: its macros serve the modules after it.
 #[macro_use]
 mod log;
 /// Connectable advertising.

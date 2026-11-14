@@ -80,15 +80,13 @@ impl PowerControl {
     /// Received signal strength in dBm, averaged, once a packet arrived.
     #[inline]
     #[must_use = "the signal strength is only read"]
-    pub const fn average_dbm(&self) -> Option<i32> {
-        self.average.map(const |average| average.checked_div(SCALE).unwrap_or_default())
-    }
+    pub const fn average_dbm(&self) -> Option<i32> { self.average.map(const |average| average.strict_div(SCALE)) }
 
     /// Steps the power down or up by one level from the average.
     const fn decide(&mut self) {
         let Some(average) = self.average else { return };
         let own = i32::from(LEVELS_DBM.get(self.level).copied().unwrap_or_default());
-        let at_central = own.saturating_add(average.checked_div(SCALE).unwrap_or_default());
+        let at_central = own.saturating_add(average.strict_div(SCALE));
         if at_central > TARGET_HIGH_DBM && self.hold == 0 && self.level > self.floor {
             self.level = self.level.saturating_sub(1);
         } else if at_central < TARGET_LOW_DBM {
@@ -134,7 +132,7 @@ impl PowerControl {
     /// -dBm as the radio reports it.
     #[inline]
     pub const fn on_packet(&mut self, rssi: u8) {
-        let sample = i32::from(rssi).saturating_mul(-SCALE);
+        let sample = i32::from(rssi).saturating_mul(SCALE.strict_neg());
         self.average = Some(self.average.map_or(sample, const |average| {
             average.saturating_add(sample.saturating_sub(average).wrapping_shr(SMOOTHING_SHIFT))
         }));

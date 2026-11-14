@@ -104,10 +104,8 @@ impl Phy {
     pub const fn listen_offset_us(self) -> u32 {
         let rx_ready_ns = RX_READY_US.saturating_mul(1000);
         let tx_chain_ns: u32 = 600;
-        let Some(delay) = rx_ready_ns.saturating_add(tx_chain_ns).saturating_add(999).checked_div(1000) else {
-            return 0;
-        };
-        u32::saturating_sub(150, delay).saturating_sub(RX_EARLY_US)
+        let delay = rx_ready_ns.saturating_add(tx_chain_ns).div_ceil(1000);
+        150_u32.saturating_sub(delay).saturating_sub(RX_EARLY_US)
     }
 
     /// TIMER TXEN offset from RX END for a 150-us interframe space.
@@ -124,10 +122,8 @@ impl Phy {
             Self::M1 => 9400,
             Self::M2 => 5450,
         };
-        let Some(delay) = tx_ready_ns.saturating_add(rx_chain_ns).saturating_add(500).checked_div(1000) else {
-            return 0;
-        };
-        u32::saturating_sub(150, delay)
+        let delay = tx_ready_ns.saturating_add(rx_chain_ns).saturating_add(500).strict_div(1000);
+        150_u32.saturating_sub(delay)
     }
 }
 
@@ -265,7 +261,7 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub unsafe fn prepare(&mut self, buffer: *mut u8, turnaround: Turnaround) {
         // SAFETY: the caller upholds the contract of `set_buffer`.
-        let () = unsafe { self.set_buffer(buffer) };
+        unsafe { self.set_buffer(buffer) }
         self.set_turnaround(turnaround);
         REGS.events_address().write_value(0);
         REGS.events_end().write_value(0);
@@ -285,7 +281,7 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub unsafe fn rearm_receive(&mut self, buffer: *mut u8) {
         // SAFETY: the caller upholds the contract of `set_buffer`.
-        let () = unsafe { self.set_buffer(buffer) };
+        unsafe { self.set_buffer(buffer) }
         REGS.events_address().write_value(0);
         REGS.events_end().write_value(0);
         REGS.events_rssiend().write_value(0);
@@ -449,8 +445,8 @@ impl<'peripherals> Radio<'peripherals> {
 /// Radio frequency offset from 2400 MHz of a BLE channel index.
 const fn frequency(channel: u8) -> u8 {
     match channel {
-        0..=10 => u8::saturating_add(4, channel.saturating_mul(2)),
-        11..=36 => u8::saturating_add(6, channel.saturating_mul(2)),
+        0..=10 => 4_u8.saturating_add(channel.saturating_mul(2)),
+        11..=36 => 6_u8.saturating_add(channel.saturating_mul(2)),
         38 => 26,
         39 => 80,
         _ => 2,

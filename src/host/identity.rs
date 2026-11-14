@@ -128,15 +128,14 @@ impl Local {
     {
         let block = variant.block();
         let mut address_block = aes.encrypt(secret.er, block);
-        let address = static_random(address_block.first_chunk::<6>().copied().unwrap_or_default());
+        let [address0, address1, address2, address3, address4, address5, ..] = address_block;
+        let address = static_random([address0, address1, address2, address3, address4, address5]);
         wipe(&mut address_block);
         let mut irk = aes.encrypt(secret.ir, block);
         // An all zero key means "none" to the resolving list; the MX
         // firmwares take 1 in its place.
-        if irk == [0; 16]
-            && let Some(first) = irk.first_mut()
-        {
-            *first = 1;
+        if irk == [0; 16] {
+            irk[0] = 1;
         }
         Self { address, irk, variant }
     }
@@ -214,17 +213,11 @@ impl Variant {
 /// rest neither all zeros nor all ones, which flips the lowest bit.
 const fn static_random(mut octets: [u8; 6]) -> [u8; 6] {
     let mut random = octets;
-    if let Some(top) = random.last_mut() {
-        *top &= 0x3F;
+    random[5] &= 0x3F;
+    if random == [0; 6] || random == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F] {
+        octets[0] ^= 1;
     }
-    if (random == [0; 6] || random == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F])
-        && let Some(first) = octets.first_mut()
-    {
-        *first ^= 1;
-    }
-    if let Some(top) = octets.last_mut() {
-        *top |= 0xC0;
-    }
+    octets[5] |= 0xC0;
     octets
 }
 

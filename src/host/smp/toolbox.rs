@@ -56,7 +56,7 @@ const F5_SALT: [u8; 16] =
 const F5_KEY_ID: [u8; 4] = *b"btle";
 
 /// The Length of f5: the 256 bits of the `MacKey` and the LTK together.
-const F5_LENGTH: [u8; 2] = u16::to_be_bytes(256);
+const F5_LENGTH: [u8; 2] = 256_u16.to_be_bytes();
 
 /// An [`Aes`] with one key, as the block cipher of the `cmac` crate.
 ///
@@ -180,16 +180,9 @@ impl<A: Aes> ParBlocksSizeUser for KeyedAes<'_, A> {
 /// [`crate::link::Info::local`], not the identities.
 #[inline]
 #[must_use = "the address is only built"]
-pub fn address(peer: Peer) -> [u8; 7] {
-    let mut out = [0; 7];
-    let (kind, rest) = out.split_at_mut(1);
-    if let Some(octet) = kind.first_mut() {
-        *octet = u8::from(peer.random);
-    }
-    for (target, &octet) in rest.iter_mut().zip(peer.address.iter().rev()) {
-        *target = octet;
-    }
-    out
+pub const fn address(peer: Peer) -> [u8; 7] {
+    let [address0, address1, address2, address3, address4, address5] = peer.address;
+    [u8::from(peer.random), address5, address4, address3, address2, address1, address0]
 }
 
 /// The random address hash function ah (section 2.2.2): the least
@@ -204,10 +197,9 @@ where
     A: Aes,
 {
     let mut block = [0; 16];
-    if let Some(target) = block.last_chunk_mut::<3>() {
-        *target = prand;
-    }
-    aes.encrypt(*key, block).last_chunk::<3>().copied().unwrap_or_default()
+    block[13..].copy_from_slice(&prand);
+    let [.., hash0, hash1, hash2] = aes.encrypt(*key, block);
+    [hash0, hash1, hash2]
 }
 
 /// The AES-CMAC (RFC 4493) with `key` of the message made of `parts` in
@@ -301,7 +293,8 @@ pub fn g2<A>(aes: &A, u_x: &[u8; 32], v_x: &[u8; 32], key: &[u8; 16], y: &[u8; 1
 where
     A: Aes,
 {
-    u32::from_be_bytes(cmac(aes, *key, &[u_x, v_x, y]).last_chunk::<4>().copied().unwrap_or_default())
+    let [.., mac0, mac1, mac2, mac3] = cmac(aes, *key, &[u_x, v_x, y]);
+    u32::from_be_bytes([mac0, mac1, mac2, mac3])
 }
 
 #[cfg(test)] pub(crate) mod tests;
