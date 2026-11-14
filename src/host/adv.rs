@@ -34,13 +34,30 @@
 //! to it as to an undirected advertisement from a device of its accept list
 //! with auto-connect (and only to it for a device `BlueZ` merely allows to
 //! connect), so a first directed phase makes a reconnection about 30 to 50 ms
-//! faster than one at 20 ms. The target is the central's identity address,
-//! which a central scanning from its identity address takes: Linux without
-//! host privacy, which sends no identity resolving key at pairing. A central
-//! that sent one scans from resolvable private addresses (Linux with
-//! `Privacy = device`) and would drop an advertisement directed to its
-//! identity, so its bond is not directed to. Where a directed phase cannot be
-//! directed, in pairing mode, for a bond with the central's key and for one
+//! faster than one at 20 ms. For a central that sent no identity resolving
+//! key at pairing, Linux with `Privacy = off` in `BlueZ`'s `main.conf`, the
+//! target is its identity address, which it scans from. A central that sent
+//! one scans and initiates from resolvable private addresses: Linux with any
+//! `Privacy` value but `off` (`device`, `network`, `on` and the others alike).
+//! The target is then a new resolvable private address made with its key
+//! each time the phase starts, as the link layer makes it
+//! ([`crate::link::Link::advertise`]). The central's controller has to
+//! resolve that address itself, with its own key in its resolving list (LL
+//! privacy, address resolution in the controller): the host cannot help, as
+//! a controller that initiates a connection only answers directed
+//! advertising to its own address or one it resolves (Core, Vol 6, Part B,
+//! 4.4.4.1 and 6.4). Linux uses LL privacy from kernel 6.14 where the
+//! controller supports it and `BlueZ` sets the device's address resolution
+//! flag; before, only with its experimental feature. A central without it
+//! ignores the directed phase and connects to the undirected advertising
+//! after it, so the bond remembers that ([`Bond::directed_works`]) and its
+//! later reconnections skip the directed phase (`Mode::skips`): they start
+//! with the undirected phase after it, which [`Schedule::total`] and
+//! [`Schedule::phase_at`] still count the directed phase before. The link
+//! layer tells which advertising a connection request answered
+//! ([`crate::link::Info::directed`]), so a central that answered the directed
+//! advertising just before the phase ended is not taken for one that did not.
+//! Where a directed phase cannot be directed, in pairing mode and for a bond
 //! whose central has no identity address, public or static random, as right
 //! after pairing with a central that sent none (`Mode::directs`), it
 //! advertises undirected at 20 ms instead, for the same time. It is the
@@ -643,20 +660,22 @@ impl Control for Link<'_> {
 
 impl Mode<'_> {
     /// Whether the mode advertises `phase` directed: a directed phase in
-    /// [`Self::Reconnect`] for a bond without the central's identity
-    /// resolving key, whose central therefore scans from its identity
-    /// address, and only if that is an identity address, public or static
-    /// random, which directed advertising can target. A central that sent its
-    /// key scans from resolvable private addresses and would drop an
-    /// advertisement directed to its identity. Elsewhere a directed phase
-    /// advertises undirected at its interval, 20 ms.
+    /// [`Self::Reconnect`], for a bond whose central has an identity address,
+    /// public or static random, which directed advertising can target, and
+    /// whose directed advertising has not gone unanswered
+    /// ([`Bond::directed_works`]). With the central's identity resolving key
+    /// in the bond, the link layer targets a resolvable private address made
+    /// with it (see the module documentation). [`crate::host::Host::advertise`]
+    /// skips a directed phase of a bond whose directed advertising went
+    /// unanswered (`Self::skips`); elsewhere a directed phase advertises
+    /// undirected at its interval, 20 ms.
     #[cfg(feature = "directed-advertising")]
     #[inline]
     #[must_use = "the property is only read"]
     pub const fn directs(&self, phase: &Phase) -> bool {
         match *self {
             Self::Pairing => false,
-            Self::Reconnect(bond) => phase.directed && bond.peer_irk.is_none() && is_identity(bond.peer),
+            Self::Reconnect(bond) => phase.directed && bond.directed_works && is_identity(bond.peer),
         }
     }
 
@@ -675,7 +694,9 @@ impl Mode<'_> {
     /// filter accept list in [`Self::Reconnect`]; with the feature
     /// `directed-advertising`, for a phase the mode directs
     /// (`Self::directs`), high duty cycle directed advertising to the bonded
-    /// central's identity, from the same private address.
+    /// central's identity, from the same private address; the link layer
+    /// puts a resolvable private address of the central on air in its place
+    /// if the resolving list holds the central's key.
     #[inline]
     #[must_use = "the parameters are only built"]
     pub const fn params(&self, phase: &Phase) -> AdvParams {
@@ -694,6 +715,20 @@ impl Mode<'_> {
             return AdvParams { kind: Kind::DirectedHighDuty, peer: bond.peer, ..undirected };
         }
         undirected
+    }
+
+    /// Whether [`crate::host::Host::advertise`] skips `phase`: a directed
+    /// phase in [`Self::Reconnect`] for a bond whose directed advertising
+    /// went unanswered ([`Bond::directed_works`] false), which would only
+    /// delay the central.
+    #[cfg(feature = "directed-advertising")]
+    #[inline]
+    #[must_use = "the property is only read"]
+    pub const fn skips(&self, phase: &Phase) -> bool {
+        match *self {
+            Self::Pairing => false,
+            Self::Reconnect(bond) => phase.directed && !bond.directed_works,
+        }
     }
 }
 

@@ -196,15 +196,19 @@ impl ResolvingList {
     }
 
     /// The identity address of `address`: the identity whose key generated
-    /// it, if it is a resolvable private address of a listed peer.
-    fn identity(&self, address: Peer) -> Option<Peer> {
+    /// it, if it is a resolvable private address of a listed peer, as
+    /// `resolves` decides (on the chip [`crypto::resolves`]).
+    fn identity<Resolves>(&self, address: Peer, resolves: Resolves) -> Option<Peer>
+    where
+        Resolves: Fn([u8; 16], [u8; 6]) -> bool,
+    {
         if !address.random {
             return None;
         }
         self.entries
             .iter()
             .flatten()
-            .find(|entry| entry.irk != [0; 16] && crypto::resolves(entry.irk, address.address))
+            .find(|entry| entry.irk != [0; 16] && resolves(entry.irk, address.address))
             .map(|entry| entry.peer)
     }
 
@@ -227,6 +231,21 @@ impl ResolvingList {
     #[inline]
     #[must_use = "the list is only created"]
     pub const fn new() -> Self { Self { entries: [None; RESOLVING_LIST_SIZE] } }
+
+    /// The identity resolving key of the peer `identity`, if the list holds
+    /// a non-zero one: directed advertising from a private address targets a
+    /// resolvable private address made with it (Core, Vol 6, Part B, 6.2.2).
+    /// The copy holds the key and is the caller's to wipe.
+    #[cfg(feature = "directed-advertising")]
+    #[inline]
+    #[must_use = "the key is only read"]
+    pub fn peer_key(&self, identity: Peer) -> Option<[u8; 16]> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.peer == identity && entry.irk != [0; 16])
+            .map(|entry| entry.irk)
+    }
 
     /// Removes `identity`.
     #[inline]
@@ -275,7 +294,8 @@ pub struct Settings {
     /// Address on air: [`Self::address`], or a resolvable private address
     /// generated when the advertising starts.
     pub own:                Peer,
-    /// Target of directed advertising.
+    /// Target of directed advertising: its identity, which a connection
+    /// request is checked against.
     pub peer:               Peer,
     /// The host asked for a resolvable private address.
     pub private:            bool,
@@ -287,24 +307,38 @@ pub struct Settings {
     pub scan_data:          [u8; DATA_MAX],
     /// Length of [`Self::scan_data`].
     pub scan_len:           u8,
+    /// The target on air of directed advertising: [`Self::peer`], or with a
+    /// private address and the peer's key in [`Self::resolving`] a
+    /// resolvable private address made with that key when the advertising
+    /// starts.
+    #[cfg(feature = "directed-advertising")]
+    pub target:             Peer,
 }
 
 impl Settings {
     /// Whether a central may connect. With the filter accept list, a
     /// resolvable private address counts as the identity it resolves to.
-    fn accepts_connection(&self, central: Peer) -> bool {
+    fn accepts_connection(&self, central: Peer) -> bool { self.accepts_connection_with(central, crypto::resolves) }
+
+    /// [`Self::accepts_connection`], with `resolves` deciding whether an
+    /// address resolves with a key.
+    fn accepts_connection_with<Resolves>(&self, central: Peer, resolves: Resolves) -> bool
+    where
+        Resolves: Fn([u8; 16], [u8; 6]) -> bool + Copy,
+    {
         if self.resolution_enabled && !self.resolving.accepts_identity(central) {
             return false;
         }
         if self.kind.is_directed() {
             // A central with privacy answers from a resolvable private
-            // address of the identity the advertising is directed to.
-            return central == self.peer || self.resolve(central) == Some(self.peer);
+            // address of the identity the advertising is directed to, which
+            // should differ from the one targeted (Core, Vol 6, Part B, 6.4).
+            return central == self.peer || self.resolve_with(central, resolves) == Some(self.peer);
         }
         self.kind.is_connectable()
             && (self.filter_policy & 0x02 == 0
                 || self.filter.contains(central)
-                || self.resolve(central).is_some_and(|identity| self.filter.contains(identity)))
+                || self.resolve_with(central, resolves).is_some_and(|identity| self.filter.contains(identity)))
     }
 
     /// Whether a scanner gets a scan response. With the filter accept list,
@@ -327,21 +361,23 @@ impl Settings {
     #[must_use = "the settings are only created"]
     pub const fn new() -> Self {
         Self {
-            address:            Peer::new([0; 6], true),
-            channel_map:        0x07,
-            data:               [0; DATA_MAX],
-            filter:             FilterList::new(),
-            filter_policy:      0,
-            interval:           1_280_000,
-            kind:               Kind::ConnectableUndirected,
-            len:                0,
-            own:                Peer::new([0; 6], true),
-            peer:               Peer::new([0; 6], false),
-            private:            false,
-            resolving:          ResolvingList::new(),
+            address: Peer::new([0; 6], true),
+            channel_map: 0x07,
+            data: [0; DATA_MAX],
+            filter: FilterList::new(),
+            filter_policy: 0,
+            interval: 1_280_000,
+            kind: Kind::ConnectableUndirected,
+            len: 0,
+            own: Peer::new([0; 6], true),
+            peer: Peer::new([0; 6], false),
+            private: false,
+            resolving: ResolvingList::new(),
             resolution_enabled: false,
-            scan_data:          [0; DATA_MAX],
-            scan_len:           0,
+            scan_data: [0; DATA_MAX],
+            scan_len: 0,
+            #[cfg(feature = "directed-advertising")]
+            target: Peer::new([0; 6], false),
         }
     }
 
@@ -353,7 +389,7 @@ impl Settings {
         let scan_data = self.scan_data.get(..usize::from(self.scan_len)).unwrap_or_default();
         let primary = match self.kind {
             Kind::ConnectableUndirected => LegacyAdvertisement::undirected(ADV_IND, self.own, data),
-            Kind::DirectedHighDuty | Kind::DirectedLowDuty => LegacyAdvertisement::directed(self.own, self.peer),
+            Kind::DirectedHighDuty | Kind::DirectedLowDuty => LegacyAdvertisement::directed(self.own, self.target()),
             Kind::NonConnectable => LegacyAdvertisement::undirected(ADV_NONCONN_IND, self.own, data),
             Kind::Scannable => LegacyAdvertisement::undirected(ADV_SCAN_IND, self.own, data),
         };
@@ -363,9 +399,24 @@ impl Settings {
     /// Resolves a received private address only when resolution is enabled.
     #[must_use = "the identity is only read"]
     #[inline]
-    pub fn resolve(&self, peer: Peer) -> Option<Peer> {
-        self.resolution_enabled.then(|| self.resolving.identity(peer)).flatten()
+    pub fn resolve(&self, peer: Peer) -> Option<Peer> { self.resolve_with(peer, crypto::resolves) }
+
+    /// [`Self::resolve`], with `resolves` deciding whether an address
+    /// resolves with a key.
+    fn resolve_with<Resolves>(&self, peer: Peer, resolves: Resolves) -> Option<Peer>
+    where
+        Resolves: Fn([u8; 16], [u8; 6]) -> bool,
+    {
+        self.resolution_enabled.then(|| self.resolving.identity(peer, resolves)).flatten()
     }
+
+    /// The target on air of directed advertising: see [`Self::target`].
+    #[cfg(feature = "directed-advertising")]
+    const fn target(&self) -> Peer { self.target }
+
+    /// The target on air of directed advertising: the peer's identity.
+    #[cfg(not(feature = "directed-advertising"))]
+    const fn target(&self) -> Peer { self.peer }
 }
 
 impl Default for Settings {
@@ -472,3 +523,5 @@ fn on_channel(
         .filter(|request| settings.accepts_connection(request.central()))
         .map(|request| (request, end))
 }
+
+#[cfg(test)] mod tests;

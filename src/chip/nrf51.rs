@@ -220,7 +220,7 @@ pub fn self_disabling(channel: usize, group: usize) {
     let fork = fork_channel(channel);
     let stand_in = PPI.ch(fork);
     stand_in.eep().write_value(PPI.ch(channel).eep().read());
-    stand_in.tep().write_value(address(PPI.tasks_chg(group).dis().as_ptr()));
+    stand_in.tep().write_value(PPI.tasks_chg(group).dis().as_ptr().addr().strict_cast());
     PPI.chg(group).write(|w| {
         w.set_ch(channel, true);
         w.set_ch(fork, true);
@@ -299,9 +299,6 @@ const fn xtalfreq(high_frequency: HighFrequency) -> Xtalfreq {
         HighFrequency::Mhz32 => Xtalfreq::_32mHz,
     }
 }
-
-/// The address of a register for a PPI endpoint.
-fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
 
 #[cfg(test)]
 mod tests {

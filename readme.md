@@ -128,7 +128,9 @@ release build keeps its size to the byte):
   central with known passkeys, end to end through the host, with every failure, the timer and the toolbox's sample
   data of f4, f5, f6 and g2.
 - **`directed-advertising`**: a reconnection schedule may start with `Phase::directed(adv::DIRECTED_MAX)`, high duty
-  cycle directed advertising to the bonded central (see [A device](#a-device)). About 0.2 KB of flash.
+  cycle directed advertising to the bonded central, to a resolvable private address made with its key if it sent one
+  (see [A device](#a-device)). About 1.2 KB of flash on the nRF52832 and 1.4 KB on the nRF51 (measured in a keyboard
+  and a presenter firmware), and one AES block each time a directed phase starts.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
@@ -663,15 +665,26 @@ Everything that makes a device what it is lives in the device's own crate, typic
   `host::adv::Phase`s, one for pairing and one for reconnecting), joined by `host::adv::Advertising::new` for each
   mode. With the feature `directed-advertising`, a reconnection schedule may start with
   `Phase::directed(adv::DIRECTED_MAX)`: high duty cycle directed advertising (`ADV_DIRECT_IND` every 3.75 ms, at most
-  1.28 s) to the bonded central's identity address, then the undirected phases. The Linux kernel connects to directed
-  advertising from a device of its accept list whether BlueZ set it to auto-connect or only allows it to connect
-  (`check_pending_le_conn` in `net/bluetooth/hci_event.c`), which makes a reconnection about 30 to 50 ms faster than at
-  20 ms. It is opt-in, and not yet tried on hardware. A central with host privacy (`Privacy = device` in BlueZ's
-  `main.conf`) scans from a resolvable private address and would drop advertising directed at its identity; Linux
-  sends its identity resolving key at pairing only then, so a bond with the central's key is not directed to. The
-  all-zero key that a central without one may send with its identity address counts as none: its bond is directed to
-  and is stored. In pairing mode, for a bond with the central's key, and for one whose central has no identity
-  address, a directed phase advertises undirected at 20 ms instead, for the same time (`Mode::directs`).
+  1.28 s) to the bonded central, then the undirected phases. The Linux kernel connects to directed advertising from a
+  device of its accept list whether BlueZ set it to auto-connect or only allows it to connect (`check_pending_le_conn`
+  in `net/bluetooth/hci_event.c`), which makes a reconnection about 30 to 50 ms faster than at 20 ms. It is opt-in, and
+  not yet tried on hardware. With `Privacy = off` in BlueZ's `main.conf`, Linux sends no identity resolving key at
+  pairing and scans from its identity address, which the advertising targets. Any other `Privacy` value (`device`,
+  `network`, `on` and the rest) makes Linux send its key and scan and initiate from resolvable private addresses; the
+  link layer then targets a new resolvable private address made with the central's key each time the phase starts
+  (Core, Vol 6, Part B, 6.2.2). Only a central whose controller resolves addresses itself (LL privacy: Linux 6.14 or
+  later with a controller that supports it and BlueZ's address resolution flag set for the device, or an older kernel
+  with the experimental LL privacy feature) recognizes that target; the host cannot, as a controller that initiates a
+  connection answers only directed advertising to its own address or one it resolves (Core, Vol 6, Part B, 4.4.4.1
+  and 6.4). A central without it connects to the undirected advertising after the directed phase, about 1.28 s later
+  than without one. The host notes that in the bond (`Bond::directed_works`, bit 4 of its flags, reported with
+  `ConnEvent::BondUpdated` to store) once the bonded central connected with its key right after an unanswered
+  directed phase, its connection request answering the undirected advertising (the link layer reports which one it
+  answered, `link::Info::directed`, so a late answer to the directed advertising does not count), and later
+  reconnections skip that phase (`Mode::skips`); a new pairing directs again. The all-zero key that a central without
+  one may send with its identity address counts as none, and its bond is stored. In pairing mode, and for a bond
+  whose central has no identity address, a directed phase advertises undirected at 20 ms instead, for the same time
+  (`Mode::directs`).
 
 ```rust
 use embassy_time::Duration;

@@ -327,7 +327,7 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub unsafe fn set_buffer(&mut self, buffer: *mut u8) {
         compiler_fence(Ordering::SeqCst);
-        REGS.packetptr().write_value(u32::try_from(buffer.addr()).unwrap_or_default());
+        REGS.packetptr().write_value(buffer.addr().strict_cast());
     }
 
     /// Tunes to a BLE channel index and sets the matching whitening.

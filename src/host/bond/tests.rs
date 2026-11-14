@@ -60,6 +60,24 @@ fn every_field_survives_the_round_trip() {
     assert!(decoded.authenticated);
     assert_eq!(decoded.cccd, 0b10_01);
     assert_eq!(decoded.layout, Some(u32::from_le_bytes(CHANGED_DB.hash()[..4].try_into().unwrap())));
+    assert!(decoded.directed_works);
+}
+
+#[test]
+fn directed_advertising_that_went_unanswered_is_stored_in_bit_4() {
+    let mut bond = example_bond();
+    assert!(bond.directed_works);
+    bond.directed_works = false;
+    let bytes = bond.to_bytes();
+    assert_eq!(bytes[1], 0x10);
+    let decoded = Bond::from_bytes(&bytes).unwrap();
+    assert!(!decoded.directed_works);
+    assert!(decoded == bond);
+    // A record from before the bit has it clear: directed advertising
+    // works, as for a new bond.
+    let mut older = bytes;
+    older[1] = 0;
+    assert!(Bond::from_bytes(&older).unwrap().directed_works);
 }
 
 #[test]
@@ -80,7 +98,8 @@ fn contradicting_fields_are_refused() {
         Bond::from_bytes(&bytes).is_none()
     };
     // An unknown flag.
-    assert!(refused(&|bytes| bytes[1] |= 0x10));
+    assert!(refused(&|bytes| bytes[1] |= 0x20));
+    assert!(refused(&|bytes| bytes[1] |= 0x80));
     // A key without its flag, and the flag without a key.
     assert!(refused(&|bytes| bytes[8] = 1));
     assert!(refused(&|bytes| bytes[1] |= FLAG_IRK));

@@ -521,11 +521,11 @@ impl<'peripherals> Clock<'peripherals> {
         // after START before it is read; check the nRF51802 errata.
         RTC.tasks_start().write_value(1);
         let ch_resume = PPI.ch(PPI_RESUME);
-        ch_resume.eep().write_value(address(RTC.events_compare(RTC_RESUME).as_ptr()));
-        ch_resume.tep().write_value(address(REGS.tasks_start().as_ptr()));
+        ch_resume.eep().write_value(RTC.events_compare(RTC_RESUME).as_ptr().addr().strict_cast());
+        ch_resume.tep().write_value(REGS.tasks_start().as_ptr().addr().strict_cast());
         let ch_sync = PPI.ch(PPI_SYNC);
-        ch_sync.eep().write_value(address(RTC.events_compare(RTC_SYNC).as_ptr()));
-        ch_sync.tep().write_value(address(REGS.tasks_capture(CC_NOW).as_ptr()));
+        ch_sync.eep().write_value(RTC.events_compare(RTC_SYNC).as_ptr().addr().strict_cast());
+        ch_sync.tep().write_value(REGS.tasks_capture(CC_NOW).as_ptr().addr().strict_cast());
         chip::self_disabling(PPI_SYNC, PPI_GROUP_SYNC);
         PPI.chenset().write(|w| {
             w.set_ch(PPI_ADDRESS, true);
@@ -644,9 +644,6 @@ impl<'peripherals> Clock<'peripherals> {
     }
 }
 
-/// The address of a register for a PPI endpoint.
-fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
-
 /// Keeps the low frequency RC oscillator within 500 ppm forever.
 ///
 /// On the nRF51 it first waits until [`Clock::new`] or `Clock::with_config`
@@ -748,8 +745,8 @@ async fn calibrate() -> bool {
     CLOCK.events_done().write_value(0);
     chip::set_calibration_workaround(true);
     let channel = PPI.ch(PPI_CALIBRATE);
-    channel.eep().write_value(address(CLOCK.events_hfclkstarted().as_ptr()));
-    channel.tep().write_value(address(CLOCK.tasks_cal().as_ptr()));
+    channel.eep().write_value(CLOCK.events_hfclkstarted().as_ptr().addr().strict_cast());
+    channel.tep().write_value(CLOCK.tasks_cal().as_ptr().addr().strict_cast());
     chip::self_disabling(PPI_CALIBRATE, PPI_GROUP_CALIBRATE);
     // Enables PPI_CALIBRATE until the crystal's first start event.
     PPI.tasks_chg(PPI_GROUP_CALIBRATE).en().write_value(1);

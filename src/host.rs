@@ -410,8 +410,10 @@ pub type StateMutex = CriticalSectionRawMutex;
 #[derive(Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ConnEvent {
-    /// The bonded central changed its subscriptions: the bond to store in
-    /// place of the stored one.
+    /// The bonded central changed its subscriptions or, with the feature
+    /// `directed-advertising`, did not answer directed advertising
+    /// ([`Bond::directed_works`]): the bond to store in place of the stored
+    /// one.
     BondUpdated(Bond),
     /// A pairing made this bond, which the firmware stores: reported once
     /// the central acknowledged our identity keys.
@@ -992,7 +994,16 @@ where
         }
         advertising.configure(&self.port, identity).map_err(AdvertiseError::Setup)?;
         let mut end = self.port.now();
+        // Whether the phase before was directed and ran to its end.
+        #[cfg(feature = "directed-advertising")]
+        let mut unanswered = false;
         for phase in advertising.schedule().phases {
+            // A bond whose directed advertising went unanswered goes straight
+            // to the undirected phases.
+            #[cfg(feature = "directed-advertising")]
+            if mode.skips(phase) {
+                continue;
+            }
             match advertising.start(&self.port, phase) {
                 // A central connected: its link is on the way.
                 Ok(()) | Err(adv::Error::Link(link::Error::Disallowed)) => {},
@@ -1002,10 +1013,25 @@ where
             match select(self.link_arrived(advertising, phase), self.port.sleep_until(end)).await {
                 Either::First(Ok(epoch)) => {
                     waiting.linked = true;
+                    // The link arrived right after a directed phase ran to
+                    // its end. If its connection request answered the
+                    // undirected advertising, not a directed event just
+                    // before the end, the central does not answer directed
+                    // advertising: the engine checks that with the link
+                    // layer's information.
+                    #[cfg(feature = "directed-advertising")]
+                    if unanswered {
+                        info!("link right after the directed phase");
+                        self.with(|state| state.engine.directed_unanswered(epoch));
+                    }
                     return Ok(Conn { epoch, host: self });
                 },
                 Either::First(Err(error)) => return Err(AdvertiseError::Setup(error)),
                 Either::Second(()) => {},
+            }
+            #[cfg(feature = "directed-advertising")]
+            {
+                unanswered = mode.directs(phase);
             }
         }
         Err(AdvertiseError::Timeout)

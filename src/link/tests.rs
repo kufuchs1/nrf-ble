@@ -14,7 +14,7 @@ fn connect(shared: &Shared) -> Epoch {
     shared.set_info(
         (Peer::new([1, 2, 3, 4, 5, 0x40], true), None, Peer::new([9; 6], true)),
         ConnectionParams::new(12, 0, 600),
-        0,
+        (0, false),
     )
 }
 
@@ -123,12 +123,13 @@ fn info_keeps_the_addresses_on_the_air_and_the_identity_apart() {
     let on_air = Peer::new([1, 2, 3, 4, 5, 0x40], true);
     let identity = Peer::new([6; 6], false);
     let local = Peer::new([0xAA, 0xFB, 0x0D, 0x94, 0x81, 0x70], true);
-    let epoch = shared.set_info((on_air, Some(identity), local), ConnectionParams::new(12, 0, 600), 5);
+    let epoch = shared.set_info((on_air, Some(identity), local), ConnectionParams::new(12, 0, 600), (5, true));
     let info = link.info().unwrap();
     assert_eq!(info.epoch, epoch);
     assert!(info.peer == on_air && info.identity == Some(identity) && info.local == local);
     assert_eq!(info.params, ConnectionParams::new(12, 0, 600));
     assert_eq!(info.central_accuracy, 5);
+    assert!(info.directed);
     shared.set_connected(false);
     assert!(link.info().is_none());
 }
@@ -599,4 +600,78 @@ fn a_planned_event_converts_to_the_host_time_both_ways() {
     };
     assert_eq!(early.resolve().start, Instant::from_ticks(0));
     assert_eq!(early.resolve().queue_by, Instant::from_ticks(0));
+}
+
+/// The identity resolving key of the sample of the random address hash
+/// function ah (Core, Vol 3, Part H, D.7), least significant octet first.
+#[cfg(feature = "directed-advertising")]
+const SAMPLE_IRK: [u8; 16] =
+    [0x9B, 0x7D, 0x39, 0x0A, 0xA6, 0x10, 0x10, 0x34, 0x05, 0xAD, 0xC8, 0x57, 0xA3, 0x34, 0x02, 0xEC];
+/// The sample's prand, least significant octet first.
+#[cfg(feature = "directed-advertising")]
+const SAMPLE_PRAND: [u8; 3] = [0x94, 0x81, 0x70];
+/// The sample's resolvable private address: hash `0dfbaa` below prand.
+#[cfg(feature = "directed-advertising")]
+const SAMPLE_RPA: [u8; 6] = [0xAA, 0xFB, 0x0D, 0x94, 0x81, 0x70];
+
+/// Software AES-128 in place of the ECB.
+#[cfg(feature = "directed-advertising")]
+fn software(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
+    use crate::host::{Aes as _, test_aes::Software};
+    Software.encrypt(key, block)
+}
+
+/// Random bytes that must not be drawn.
+#[cfg(feature = "directed-advertising")]
+fn no_draw(_: &mut [u8]) { panic!("no random bytes are needed") }
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn directed_advertising_from_a_private_address_targets_a_new_address_of_the_peer_s_key() {
+    use crate::crypto::resolves_with;
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    let central = Peer::new([1, 2, 3, 4, 5, 6], false);
+    let local_irk = [0x5A; 16];
+    let other = Peer::new([6; 6], false);
+    let keyless = Peer::new([7; 6], false);
+    assert_eq!(link.add_peer(other, [0x77; 16], [0x78; 16]), Ok(()));
+    assert_eq!(link.add_peer(central, SAMPLE_IRK, local_irk), Ok(()));
+    // The sample's prand gives the sample's address: made with the
+    // central's key, not ours or another peer's, and random (RxAdd = 1).
+    let sample = |bytes: &mut [u8]| bytes.copy_from_slice(&SAMPLE_PRAND);
+    for kind in [Kind::DirectedHighDuty, Kind::DirectedLowDuty] {
+        let target = shared.directed_target_with((true, kind, central), sample, software);
+        assert!(target == Peer::new(SAMPLE_RPA, true));
+        assert!(resolves_with(SAMPLE_IRK, target.address, software));
+        assert!(!resolves_with(local_irk, target.address, software));
+        assert!(!resolves_with([0x77; 16], target.address, software));
+    }
+    // Every call draws new random bytes, and so a new address.
+    let draws = core::cell::Cell::new(0_u8);
+    let mut targets = [Peer::new([0; 6], false); 2];
+    for target in &mut targets {
+        let fill = |bytes: &mut [u8]| {
+            draws.set(draws.get() + 1);
+            bytes.fill(draws.get());
+        };
+        *target = shared.directed_target_with((true, Kind::DirectedHighDuty, central), fill, software);
+        assert!(target.random && resolves_with(SAMPLE_IRK, target.address, software));
+    }
+    assert_eq!(draws.get(), 2);
+    assert!(targets[0] != targets[1]);
+    // From the identity address, for undirected advertising, to a peer
+    // without a key or one the list does not hold: the identity, and no
+    // random bytes.
+    assert_eq!(link.remove_peer(other), Ok(()));
+    assert_eq!(link.add_peer(keyless, [0; 16], local_irk), Ok(()));
+    for (private, kind, peer) in [
+        (false, Kind::DirectedHighDuty, central),
+        (true, Kind::ConnectableUndirected, central),
+        (true, Kind::DirectedHighDuty, keyless),
+        (true, Kind::DirectedHighDuty, other),
+        (true, Kind::DirectedHighDuty, Peer::new(central.address, true)),
+    ] {
+        assert!(shared.directed_target_with((private, kind, peer), no_draw, software) == peer);
+    }
 }

@@ -412,16 +412,33 @@ fn a_directed_phase_targets_the_bonded_central_s_identity_only_when_reconnecting
 
 #[cfg(feature = "directed-advertising")]
 #[test]
-fn a_central_that_sent_its_key_is_not_directed_to() {
-    // It scans from resolvable private addresses and would drop an
-    // advertisement directed to its identity: the phase advertises
-    // undirected at 20 ms, from the accept list only.
+fn a_central_that_sent_its_key_is_directed_to_until_it_goes_unanswered() {
+    // It scans from resolvable private addresses: the host directs to its
+    // identity, and the link layer targets a private address made with the
+    // key the resolving list holds for it.
     let phase = Phase::directed(DIRECTED_MAX);
-    let bond = bond(true);
+    let mut bond = bond(true);
+    assert!(Mode::Reconnect(&bond).directs(&phase));
+    let params = Mode::Reconnect(&bond).params(&phase);
+    assert!(params.kind == Kind::DirectedHighDuty && params.peer == CENTRAL && params.private);
+    let recorder = Recorder::new();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    advertising.configure(&recorder, &identity(1)).unwrap();
+    assert!(recorder.calls.borrow().0.contains(&Some(Seen::AddPeer(CENTRAL, CENTRAL_IRK, identity(1).irk()))));
+    assert!(!Mode::Reconnect(&bond).skips(&phase) && !Mode::Pairing.skips(&phase));
+    // Once directed advertising went unanswered, the host skips the phase,
+    // whether the central sent its key or not; started anyway, it
+    // advertises undirected at 20 ms, from the accept list only. Undirected
+    // phases are never skipped.
+    bond.directed_works = false;
+    assert!(Mode::Reconnect(&bond).skips(&phase));
+    assert!(!Mode::Reconnect(&bond).skips(&Phase::new(32, DIRECTED_MAX)));
     assert!(!Mode::Reconnect(&bond).directs(&phase));
     let params = Mode::Reconnect(&bond).params(&phase);
     assert!(params.kind == Kind::ConnectableUndirected && params.interval == 32 && params.filter_policy == 0x03);
     assert!(params.private);
+    bond.peer_irk = None;
+    assert!(!Mode::Reconnect(&bond).directs(&phase));
 }
 
 #[cfg(feature = "directed-advertising")]
@@ -456,4 +473,16 @@ fn the_link_layer_takes_a_directed_phase() {
     assert!(!CENTRAL.random && header & 0x80 == 0);
     assert_eq!(primary.as_bytes()[2..8], identity.peer().address);
     assert_eq!(primary.as_bytes()[8..14], CENTRAL.address);
+    // From the identity address the target stays the central's identity,
+    // also with its key in the resolving list.
+    assert!(settings.target == CENTRAL);
+    let keyed = super::tests::bond(true);
+    let advertising = example::advertising(Mode::Reconnect(&keyed), None).unwrap();
+    advertising.configure(&link, &identity).unwrap();
+    assert!(shared.advertising().is_none());
+    let params = advertising.mode().params(&Phase::directed(DIRECTED_MAX));
+    link.advertise(&params.private(false), advertising.data().as_bytes(), &[]).unwrap();
+    let settings = shared.advertising().unwrap();
+    assert_eq!(settings.resolving.peer_key(CENTRAL), Some(CENTRAL_IRK));
+    assert!(settings.target == CENTRAL && settings.peer == CENTRAL);
 }

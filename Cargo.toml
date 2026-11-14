@@ -47,8 +47,11 @@ event-timing = []
 # `directed-advertising`: a reconnection schedule may start with high duty
 # cycle directed advertising to the bonded central (`host::adv::Phase::directed`),
 # which Linux connects to about 30 to 50 ms sooner than to undirected
-# advertising at 20 ms; a central with host privacy ignores it. About 0.2 KB of
-# flash.
+# advertising at 20 ms. A central that sent its identity resolving key is
+# targeted at a resolvable private address made with it, which only a central
+# with address resolution in its controller recognizes; the bond remembers one
+# that did not answer, and its reconnections skip the directed phase. About
+# 1.2 KB of flash on the nRF52832 and 1.4 KB on the nRF51.
 directed-advertising = []
 
 # Every dependency follows the main branch of its repository (the default

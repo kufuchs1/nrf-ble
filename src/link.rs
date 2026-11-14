@@ -175,7 +175,8 @@ pub enum Error {
 
 /// One connection. A request with the epoch of a link that has ended has
 /// no effect on the next one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq)]
+#[derive_const(PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Epoch(u32);
 
@@ -250,6 +251,10 @@ impl ParamRange {
 pub struct Info {
     /// The central's sleep clock accuracy as the connection request gave it.
     pub central_accuracy: u8,
+    /// Whether the connection request answered directed advertising
+    /// ([`Kind::is_directed`]), as the link layer sent it in that event,
+    /// rather than undirected advertising.
+    pub directed:         bool,
     /// The link.
     pub epoch:            Epoch,
     /// The central's identity address, if its address on the air is a
@@ -488,8 +493,10 @@ pub struct AdvParams {
     pub interval:      u16,
     /// Advertising type.
     pub kind:          Kind,
-    /// The peer of directed advertising, and whose local key gives the
-    /// resolvable private address.
+    /// The peer of directed advertising, its identity, and whose local key
+    /// gives the resolvable private address; with the feature
+    /// `directed-advertising` and its key in the resolving list, the target
+    /// on air is a resolvable private address of it ([`Link::advertise`]).
     pub peer:          Peer,
     /// Advertise from a resolvable private address made with the local key
     /// in the resolving list, rather than from the identity address.
@@ -770,6 +777,43 @@ impl Shared {
         self.reset_done.signal(());
     }
 
+    /// The target on air of advertising of the kind `kind` to the peer
+    /// `peer`, from a private address if `private`: for directed advertising
+    /// from a private address to a peer whose identity resolving key the
+    /// resolving list holds, a resolvable private address made with that key
+    /// and new random bytes (Core, Vol 6, Part B, 6.2.2); otherwise the
+    /// peer's identity. On the chip, [`Self::directed_target_with`] with the
+    /// RNG and the ECB.
+    #[cfg(feature = "directed-advertising")]
+    fn directed_target(&self, settings: (bool, Kind, Peer)) -> Peer {
+        self.directed_target_with(settings, rng::fill, crypto::encrypt_block)
+    }
+
+    /// [`Self::directed_target`], with `fill` drawing the random part and
+    /// `encrypt` running AES-128. The key is read under the lock, and the
+    /// random bytes and the AES come outside it. The key's copy read here
+    /// is overwritten afterwards; the AES works on copies of its own, and the
+    /// resolving list keeps the key in memory anyway.
+    #[cfg(feature = "directed-advertising")]
+    fn directed_target_with<Fill, Encrypt>(
+        &self,
+        (private, kind, peer): (bool, Kind, Peer),
+        fill: Fill,
+        encrypt: Encrypt,
+    ) -> Peer
+    where
+        Fill: FnOnce(&mut [u8]),
+        Encrypt: FnOnce([u8; 16], [u8; 16]) -> [u8; 16],
+    {
+        let mut key = (private && kind.is_directed())
+            .then(|| self.state.lock(|cell| cell.borrow().legacy.resolving.peer_key(peer)))
+            .flatten();
+        let Some(irk) = key.as_mut() else { return peer };
+        let target = new_private_address(*irk, fill, encrypt);
+        crypto::wipe(irk);
+        target
+    }
+
     /// Ends a central's connection parameter request the host was asked
     /// about, answered or not.
     pub(crate) fn end_parameter_request(&self) { self.complete_query(QUERY_REMOTE_PARAMETERS); }
@@ -827,9 +871,7 @@ impl Shared {
         if let Some(address) = self.state.lock(|cell| cell.borrow().cached_address(key, now)) {
             return address;
         }
-        let mut prand = [0; 3];
-        rng::fill(&mut prand);
-        let address = Peer::new(crypto::resolvable_address(key, prand), true);
+        let address = new_private_address(key, rng::fill, crypto::encrypt_block);
         self.state.lock(|cell| {
             cell.borrow_mut().private_address = Some((address, key, now.saturating_add(lifetime)));
         });
@@ -879,7 +921,8 @@ impl Shared {
 
     /// Moves running advertising to a new resolvable private address once
     /// the current one expired, so a device that advertises for long cannot
-    /// be followed by its address. Call it before each advertising event,
+    /// be followed by its address. The target of directed advertising stays
+    /// as [`Link::advertise`] made it. Call it before each advertising event,
     /// outside radio events.
     pub(crate) fn refresh_private_address(&self) {
         let enabled = self.state.lock(|cell| cell.borrow().legacy_enabled);
@@ -973,18 +1016,19 @@ impl Shared {
     }
 
     /// Records what the host learns about the link that just started, from
-    /// the central's address on the air, our own, the parameters and the
-    /// central's clock accuracy. Returns the link's epoch.
+    /// the central's address on the air, our own, the parameters, the
+    /// central's clock accuracy and whether the request answered directed
+    /// advertising. Returns the link's epoch.
     pub(crate) fn set_info(
         &self,
         (peer, identity, local): (Peer, Option<Peer>, Peer),
         params: ConnectionParams,
-        central_accuracy: u8,
+        (central_accuracy, directed): (u8, bool),
     ) -> Epoch {
         self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             let epoch = Epoch(state.epoch);
-            state.info = Some(Info { central_accuracy, epoch, identity, local, params, peer });
+            state.info = Some(Info { central_accuracy, directed, epoch, identity, local, params, peer });
             epoch
         })
     }
@@ -1189,7 +1233,19 @@ impl<'shared> Link<'shared> {
     /// [`Self::stop_advertising`]. Replaces advertising that runs. The own
     /// address is the identity of [`Self::set_identity`], or with
     /// [`AdvParams::private`] a resolvable private address made with the
-    /// local key in the resolving list.
+    /// local key in the resolving list. With the feature
+    /// `directed-advertising`, directed advertising from a private address
+    /// to a peer whose identity resolving key the resolving list holds
+    /// targets a new resolvable private address made with that key (Core,
+    /// Vol 6, Part B, 6.2.2), which only a central that resolves addresses
+    /// in its controller recognizes; a connection request is still checked
+    /// against the peer's identity, and its own private addresses resolve to
+    /// it. The target is made here and kept while the advertising runs: our
+    /// own private address moves on when the private address timeout expires,
+    /// the target does not (Core, Vol 6, Part B, 6.1 asks for both). The
+    /// host's directed phases last at most 1.28 s and each makes a new one;
+    /// a caller that directs for longer than the timeout calls this again to
+    /// renew it.
     ///
     /// # Errors
     ///
@@ -1220,6 +1276,8 @@ impl<'shared> Link<'shared> {
                 .lock(|cell| cell.borrow().legacy.resolving.local_key(params.kind.is_directed().then_some(params.peer)))
         });
         let own = self.shared.own_address(key.flatten());
+        #[cfg(feature = "directed-advertising")]
+        let on_air_target = self.shared.directed_target((params.private, params.kind, params.peer));
         let result = self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             if state.connected {
@@ -1230,6 +1288,8 @@ impl<'shared> Link<'shared> {
             legacy.private = params.private;
             legacy.interval = u32::from(params.interval).saturating_mul(625);
             legacy.peer = params.peer;
+            #[cfg(feature = "directed-advertising")]
+            legacy.target.clone_from(&on_air_target);
             legacy.channel_map = params.channel_map;
             legacy.filter_policy = params.filter_policy;
             for (target, len, source) in
@@ -1851,6 +1911,22 @@ fn phy_preferences(tx: Option<u8>, rx: Option<u8>) -> Result<[u8; 2], Error> {
         Some(bits) => Ok(bits),
     };
     Ok([check(tx)?, check(rx)?])
+}
+
+/// A new resolvable private address of the identity resolving key `key`
+/// (Core, Vol 6, Part B, 1.3.2.2), its random part drawn with `fill` and its
+/// hash made with `encrypt` running AES-128. Not inlined: our own address
+/// and, with the feature `directed-advertising`, the target of directed
+/// advertising share one copy of the RNG and ECB code.
+#[inline(never)]
+fn new_private_address<Fill, Encrypt>(key: [u8; 16], fill: Fill, encrypt: Encrypt) -> Peer
+where
+    Fill: FnOnce(&mut [u8]),
+    Encrypt: FnOnce([u8; 16], [u8; 16]) -> [u8; 16],
+{
+    let mut prand = [0; 3];
+    fill(&mut prand);
+    Peer::new(crypto::resolvable_address_with(key, prand, encrypt), true)
 }
 
 #[cfg(test)] mod tests;

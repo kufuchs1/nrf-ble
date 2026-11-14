@@ -121,7 +121,8 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         shown.reverse();
         info!("central {=[u8; 6]:02X} random {}", shown, central.random);
         let params = ConnectionParams::new(request.interval, request.latency, request.timeout);
-        let epoch = shared.set_info((central, settings.resolve(central), settings.own), params, request.sca);
+        let answered = (request.sca, settings.kind.is_directed());
+        let epoch = shared.set_info((central, settings.resolve(central), settings.own), params, answered);
         connection.notify(Event::Connected(epoch), shared);
         since = None;
         let (ended, stats) = connection.run(radio, clock, &mut rx, shared).await;

@@ -117,7 +117,7 @@ pub fn read_temperature() -> i32 { TEMP.temp().read().cast_signed() }
 #[inline]
 pub fn self_disabling(channel: usize, group: usize) {
     PPI.chg(group).write(|w| w.set_ch(channel, true));
-    PPI.fork(channel).tep().write_value(address(PPI.tasks_chg(group).dis().as_ptr()));
+    PPI.fork(channel).tep().write_value(PPI.tasks_chg(group).dis().as_ptr().addr().strict_cast());
 }
 
 /// Sets the workaround for anomaly 192 while an RC calibration may run, and
@@ -165,6 +165,3 @@ pub fn set_phy(phy: Phy) {
 /// supports: the register takes the level in dBm.
 #[inline]
 pub const fn txpower(dbm: i8) -> Txpower { Txpower::from_bits(dbm.cast_unsigned()) }
-
-/// The address of a register for a PPI endpoint.
-fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
