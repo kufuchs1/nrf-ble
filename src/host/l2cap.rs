@@ -17,7 +17,7 @@
 //! ([`Segmenter::is_mid_pdu`]), so the fragments of two PDUs never
 //! interleave.
 
-use crate::link::AclIn;
+use crate::{link::AclIn, pdu::concat_into};
 
 /// Length of the basic L2CAP header: payload length and channel identifier.
 pub const HEADER_LEN: usize = 4;
@@ -235,16 +235,15 @@ impl Segmenter {
         let [len0, len1] = self.len.to_le_bytes();
         let [cid0, cid1] = self.channel.cid().to_le_bytes();
         let header = [len0, len1, cid0, cid1];
-        let count = fragment_len(self.total(), self.offset);
         let mut data: [u8; FRAGMENT_MAX] = [0; FRAGMENT_MAX];
-        let mut position = usize::from(self.offset);
-        for slot in data.iter_mut().take(usize::from(count)) {
-            let byte =
-                position.checked_sub(HEADER_LEN).map_or_else(|| header.get(position), |index| payload.get(index));
-            *slot = byte.copied().unwrap_or_default();
-            position = position.saturating_add(1);
-        }
-        Some(Fragment { data, len: u8::try_from(count).unwrap_or_default(), start: self.offset == 0 })
+        // The fragment is header and payload from the offset, as far as
+        // the buffer holds them.
+        let offset = usize::from(self.offset);
+        let len = concat_into(&mut data, &[
+            header.get(offset..).unwrap_or_default(),
+            payload.get(offset.saturating_sub(HEADER_LEN)..).unwrap_or_default(),
+        ]);
+        Some(Fragment { data, len: len.saturating_cast(), start: self.offset == 0 })
     }
 
     /// Whether every fragment was queued.

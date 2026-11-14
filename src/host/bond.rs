@@ -41,7 +41,7 @@ use crate::{
         gatt::{Db, Subscriptions},
         identity::Variant,
     },
-    pdu::Peer,
+    pdu::{Peer, concat_into},
 };
 
 /// Octets of a stored bond.
@@ -156,7 +156,7 @@ impl Bond {
     #[must_use = "the subscriptions are only built"]
     pub const fn subscriptions(&self, db: &Db) -> Subscriptions {
         let bits = u32::from(db.cccds()).saturating_mul(2);
-        let mask = u32::checked_shl(1, bits).map_or(u32::MAX, const |bit| bit.wrapping_sub(1));
+        let mask = u32::unbounded_shl(1, bits).wrapping_sub(1);
         Subscriptions::from_bits(self.cccd & mask)
     }
 
@@ -177,20 +177,15 @@ impl Bond {
             }
         }
         let mut bytes = [0; BOND_LEN];
-        let mut rest = bytes.as_mut_slice();
-        for field in [
-            &[BOND_VERSION, flags][..],
+        concat_into(&mut bytes, &[
+            &[BOND_VERSION, flags],
             &self.peer.address,
             &self.peer_irk.unwrap_or_default(),
             &self.ltk,
             &self.local.bits().to_le_bytes(),
             &self.cccd.to_le_bytes(),
             &self.layout.unwrap_or_default().to_le_bytes(),
-        ] {
-            let (target, tail) = rest.split_at_mut(field.len().min(rest.len()));
-            target.copy_from_slice(field.get(..target.len()).unwrap_or_default());
-            rest = tail;
-        }
+        ]);
         bytes
     }
 }
@@ -207,15 +202,16 @@ impl Drop for Bond {
 
 /// Whether `peer` can be an identity address: a public address, or a static
 /// random one (two most significant bits set), and not zero.
-const fn is_identity(peer: Peer) -> bool {
-    peer.address != [0; 6] && (!peer.random || peer.address.last().is_some_and(const |&top| top & 0xC0 == 0xC0))
-}
+const fn is_identity(peer: Peer) -> bool { peer.address != [0; 6] && (!peer.random || peer.address[5] & 0xC0 == 0xC0) }
 
 /// The layout a bond with `db` keeps: the first four octets of its hash,
 /// least significant octet first, for a table with the Service Changed
 /// characteristic.
 fn layout(db: &Db) -> Option<u32> {
-    db.service_changed().map(|_| u32::from_le_bytes(db.hash().first_chunk::<4>().copied().unwrap_or_default()))
+    db.service_changed().map(|_| {
+        let [hash0, hash1, hash2, hash3, ..] = db.hash();
+        u32::from_le_bytes([hash0, hash1, hash2, hash3])
+    })
 }
 
 #[cfg(test)] mod tests;

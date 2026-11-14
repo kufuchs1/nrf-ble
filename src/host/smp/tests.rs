@@ -3,6 +3,8 @@
 //! compared octet for octet, and every way a pairing is refused, fails or
 //! times out.
 
+extern crate std;
+
 use super::*;
 use crate::{
     host::{smp::toolbox::tests::hex, test_aes::Software},
@@ -1112,9 +1114,7 @@ fn debug_output_leaves_the_keys_out() {
         identity: Some(Identity { address: Peer::new([1; 6], true), irk: [0xEE; 16] }),
         ltk: [0xDD; 16],
     };
-    let mut text = Text::default();
-    core::fmt::write(&mut text, format_args!("{:?}", Outcome::Bonded(bond))).unwrap();
-    let written = core::str::from_utf8(&text.bytes[..text.len]).unwrap();
+    let written = std::format!("{:?}", Outcome::Bonded(bond));
     assert!(written.contains("address"), "{written}");
     assert!(!written.contains("221") && !written.contains("238"), "{written}");
 }
@@ -1451,25 +1451,4 @@ fn a_just_works_responder_with_the_feature_answers_as_without_it() {
     // The default security: the response and checks of Just Works.
     let (.., bond) = pair(BOTH_WAYS);
     assert!(!bond.authenticated);
-}
-
-/// A fixed buffer for formatted text.
-struct Text {
-    /// The text.
-    bytes: [u8; 256],
-    /// Its length.
-    len:   usize,
-}
-
-impl Default for Text {
-    fn default() -> Self { Self { bytes: [0; 256], len: 0 } }
-}
-
-impl core::fmt::Write for Text {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let end = self.len + text.len();
-        self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?.copy_from_slice(text.as_bytes());
-        self.len = end;
-        Ok(())
-    }
 }

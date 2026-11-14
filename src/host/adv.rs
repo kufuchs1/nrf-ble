@@ -788,8 +788,6 @@ impl Schedule {
 /// Whether `peer` is an identity address, which directed advertising can
 /// target: public, or static random.
 #[cfg(feature = "directed-advertising")]
-const fn is_identity(peer: Peer) -> bool {
-    peer.address.last().is_some_and(const |&top| !peer.random || top & STATIC_RANDOM == STATIC_RANDOM)
-}
+const fn is_identity(peer: Peer) -> bool { !peer.random || peer.address[5] & STATIC_RANDOM == STATIC_RANDOM }
 
 #[cfg(test)] mod tests;

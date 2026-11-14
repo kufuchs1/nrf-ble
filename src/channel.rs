@@ -72,13 +72,13 @@ impl Hopping {
     pub fn channel(&mut self, map: &UsedChannels, counter: u16) -> u8 {
         match *self {
             Self::Csa1 { hop, last_unmapped } => {
-                let next = last_unmapped.saturating_add(hop).checked_rem(DATA_CHANNELS).unwrap_or(0);
+                let next = last_unmapped.saturating_add(hop).strict_rem(DATA_CHANNELS);
                 *self = Self::Csa1 { hop, last_unmapped: next };
                 map.remap(next)
             },
             Self::Csa2 { identifier } => {
                 let random = csa2_random(counter, identifier);
-                let unmapped = random.checked_rem(u16::from(DATA_CHANNELS)).unwrap_or(0).truncate::<u8>();
+                let unmapped = random.strict_rem(u16::from(DATA_CHANNELS)).truncate::<u8>();
                 if map.contains(unmapped) {
                     return unmapped;
                 }
@@ -119,9 +119,9 @@ const fn csa2_random(counter: u16, identifier: u16) -> u16 {
 // the access address 0x8E89BED6 (channel identifier 0x305F) are on channels
 // 20, 6 and 21.
 const _: () = assert!(
-    matches!(csa2_random(1, 0x305F).checked_rem(37), Some(20))
-        && matches!(csa2_random(2, 0x305F).checked_rem(37), Some(6))
-        && matches!(csa2_random(3, 0x305F).checked_rem(37), Some(21)),
+    csa2_random(1, 0x305F).strict_rem(37) == 20
+        && csa2_random(2, 0x305F).strict_rem(37) == 6
+        && csa2_random(3, 0x305F).strict_rem(37) == 21,
     "algorithm 2 departs from the specification's samples"
 );
 

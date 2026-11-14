@@ -34,7 +34,7 @@ impl<Item: Copy, const N: usize> Ring<Item, N> {
     /// Takes the first item off, if any.
     pub(super) const fn drop_front(&mut self) {
         if self.len != 0 {
-            self.head = u8::try_from(self.index(1)).unwrap_or(0);
+            self.head = self.index(1).saturating_cast();
             self.len = self.len.saturating_sub(1);
         }
     }
@@ -63,7 +63,8 @@ impl<Item: Copy, const N: usize> Ring<Item, N> {
 
     /// Storage index of the item `offset` places after the first.
     const fn index(&self, offset: usize) -> usize {
-        usize::from(self.head).wrapping_add(offset).checked_rem(N).unwrap_or(0)
+        const { assert!(N > 0, "a ring holds at least one item") };
+        usize::from(self.head).wrapping_add(offset).strict_rem(N)
     }
 
     /// Whether it holds no item.
@@ -100,9 +101,7 @@ impl TxSlot {
     /// A slot holding an empty PDU.
     pub(super) const fn empty() -> Self {
         let mut plain = [0; DATA_BUFFER_LEN];
-        if let Some(header) = plain.first_mut() {
-            *header = Llid::Continuation.bits();
-        }
+        plain[0] = Llid::Continuation.bits();
         Self {
             encrypted: false,
             kind:      TxKind::Empty,

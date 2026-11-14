@@ -208,11 +208,11 @@ pub fn check_public_key(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN])
 /// Diffie-Hellman key depends on, so the debug key and our own key are
 /// recognised by X alone.
 fn decode(peer: &[u8; PUBLIC_KEY_LEN], own: &[u8; PUBLIC_KEY_LEN]) -> Result<PublicKey, KeyError> {
-    let x = peer.first_chunk::<KEY_LEN>().ok_or(KeyError::Invalid)?;
-    if Some(x) == DEBUG_PUBLIC_KEY.first_chunk::<KEY_LEN>() {
+    let (x, _) = peer.split_array_ref::<KEY_LEN>();
+    if x == DEBUG_PUBLIC_KEY.split_array_ref::<KEY_LEN>().0 {
         return Err(KeyError::Debug);
     }
-    if Some(x) == own.first_chunk::<KEY_LEN>() {
+    if x == own.split_array_ref::<KEY_LEN>().0 {
         return Err(KeyError::Own);
     }
     // The coordinates are taken only below the field prime, the point only

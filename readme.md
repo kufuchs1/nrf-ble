@@ -619,14 +619,15 @@ the methods of `Option`, `Result`, `Ord` and `TryFrom`, `?`, `RangeInclusive::co
 enables default values on struct fields (`default_field_values`: each starting value stands at its field, the
 constructors of `Engine`, `Responder` and `Shared` name only what varies, and `Connection` takes its scalar starting
 values from its fields), `saturating_cast` and `truncate` (`integer_casts`, `integer_widen_truncate`) for the
-conversions that saturate or cannot lose bits, and `#[rustc_unroll(never)]` (`loop_hints`) on four loops of the host,
-which keeps them rolled: three of pairing (public key encoding, the constant-time table walk of the scalar
-multiplication and the coordinate flip) and the copy of the value of each ATT Read, Read Blob and Read By Type request.
-That is 3.2 KB less code in the library on the nRF52832 (2.8 KB on the nRF51) and 2.3 to 8 KB less flash in a firmware
-built with fat LTO, none of it in the radio or connection event code. By the instruction timings of its disassembly, the
-rolled ATT copy takes about 1 µs longer for a full 22-octet read on the nRF52832 and is faster on the nRF51. Its
-documentation, built with rustdoc, marks each item behind a Cargo feature with that feature (`doc_cfg`). A nightly that
-renames or changes one of those features breaks the build until the list there follows it.
+conversions that saturate or cannot lose bits, `split_array_ref` (`split_array`) for the front of a fixed array, such as
+the X coordinate of a public key, with no `Option` that cannot be `None`, and `#[rustc_unroll(never)]` (`loop_hints`) on
+one loop of the host, which keeps it rolled: the coordinate flip of pairing's public keys. When it was measured, on four
+loops (three of pairing, two of them in the P-256 code of our own the `p256` crate has since replaced, and the copy of
+the value of each ATT Read, Read Blob and Read By Type request), that was 3.2 KB less code in the library on the
+nRF52832 (2.8 KB on the nRF51) and 2.3 to 8 KB less flash in a firmware built with fat LTO, none of it in the radio or
+connection event code. The ATT copy is core's `copy_from_slice` and `fill` now, which compile to calls of `memcpy` and
+`memclr`. Its documentation, built with rustdoc, marks each item behind a Cargo feature with that feature (`doc_cfg`). A
+nightly that renames or changes one of those features breaks the build until the list there follows it.
 
 The crate follows the main branch of every dependency (the default branch, master, where a repository has none), and
 commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
@@ -771,9 +772,9 @@ Clippy runs on the library for the chip targets, as in nrf-ll. The tests are not
 fails on the test code under the `restriction` group, as in nrf-ll).
 
 Every Clippy group, `restriction` included, is an error. [`Cargo.toml`](Cargo.toml) allows only lints that another lint
-or the strict setup itself contradicts, and the two byte orders the code converts integers in (`little_endian_bytes`,
-`big_endian_bytes`; `host_endian_bytes` stays an error), each with the reason, and the code has no `#[allow]` or
-`#[expect]`.
+or the strict setup itself contradicts, the two byte orders the code converts integers in (`little_endian_bytes`,
+`big_endian_bytes`; `host_endian_bytes` stays an error), and `question_mark_used`, a choice of `?` over the early
+returns written out; each allowance gives its reason, and the code has no `#[allow]` or `#[expect]`.
 
 ## License
 

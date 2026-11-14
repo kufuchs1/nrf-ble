@@ -231,9 +231,18 @@ self_named_module_files = { level = "allow", priority = 2 }
 # refuses `pub(crate)`, the only two ways to write that visibility; the code
 # writes `pub(crate)`.
 pub_with_shorthand = { level = "allow", priority = 2 }
-# `question_mark` (style) demands `?` for every early return of `None` or an
-# error written out (let-else, `if let`, `match`), which `question_mark_used`
-# refuses.
+# `rest_pattern_accessible_field` refuses `..` in a struct pattern and
+# `unneeded_field_pattern` refuses `field: _`, the two ways to ignore a field
+# without binding it, so with both denied the only spelling left is an unused
+# `_name` binding. The code writes `field: _` (the defmt `name()` tables still
+# bind `_name`), which keeps every field named, so a new field still forces a
+# review of each match.
+unneeded_field_pattern = { level = "allow", priority = 2 }
+# Not a contradiction but a choice: `question_mark_used` refuses `?`, and
+# the code uses `?` for its early returns of `None` or an error. With this
+# clippy `question_mark` (style) stays silent on such a return written out
+# (let-else, `if let`, `match`) while `question_mark_used` is denied, so the
+# other spelling would pass too; `?` is the shorter one.
 question_mark_used = { level = "allow", priority = 2 }
 # `too_many_lines` (pedantic) and `cognitive_complexity` (nursery) are met by
 # splitting a long function into parts, each called once, which

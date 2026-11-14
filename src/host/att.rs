@@ -71,7 +71,7 @@ use crate::host::gatt::{
 /// The ATT MTU: the default, which the server never raises.
 pub const MTU: usize = 23;
 /// Longest value a notification or indication carries.
-pub const NOTIFY_MAX: usize = MTU - 3;
+pub const NOTIFY_MAX: usize = MTU.strict_sub(3);
 /// Opcode of an Error Response.
 pub const ERROR_RESPONSE: u8 = 0x01;
 /// Opcode of an Exchange MTU Request.
@@ -216,7 +216,7 @@ impl Server {
         if params.len() != 2 {
             return Err((0, AttError::INVALID_PDU));
         }
-        let [low, high] = u16::try_from(MTU).unwrap_or_default().to_le_bytes();
+        let [low, high] = MTU.saturating_cast::<u16>().to_le_bytes();
         let mut writer = Writer::new(out, EXCHANGE_MTU_RESPONSE);
         writer.push(&[low, high]);
         Ok(writer.finish())
@@ -264,7 +264,7 @@ impl Server {
             let [handle0, handle1] = handle.to_le_bytes();
             entry[0] = handle0;
             entry[1] = handle1;
-            let len = entry.get_mut(2..).map_or(0, |rest| uuid.write(rest)).saturating_add(2);
+            let len = uuid.write(&mut entry[2..]).saturating_add(2);
             if !writer.push(entry.get(..len).unwrap_or_default()) {
                 break;
             }
@@ -421,15 +421,13 @@ impl Server {
                 break;
             }
             if writer.len == 1 {
-                writer.push(&[u8::try_from(entry_len).unwrap_or_default()]);
+                writer.push(&[entry_len.saturating_cast()]);
             }
             let mut entry: [u8; 20] = [0; 20];
             let [handle0, handle1] = handle.to_le_bytes();
             let [group0, group1] = self.db.group_end(handle).to_le_bytes();
-            if let Some(header) = entry.first_chunk_mut::<4>() {
-                *header = [handle0, handle1, group0, group1];
-            }
-            entry.get_mut(4..).map(|rest| uuid.write(rest));
+            entry[..4].copy_from_slice(&[handle0, handle1, group0, group1]);
+            uuid.write(&mut entry[4..]);
             if !writer.push(entry.get(..entry_len).unwrap_or_default()) {
                 break;
             }
@@ -456,14 +454,14 @@ impl Server {
                 Err(error) if pair_len.is_none() => return Err((handle, error)),
                 Err(_) => break,
             };
-            let mut value: [u8; MTU - 4] = [0; MTU - 4];
+            let mut value: [u8; MTU.strict_sub(4)] = [0; MTU.strict_sub(4)];
             let len = source.copy(0, &mut value).unwrap_or_default();
             let entry_len = len.saturating_add(2);
             if *pair_len.get_or_insert(entry_len) != entry_len {
                 break;
             }
             if writer.len == 1 {
-                writer.push(&[u8::try_from(entry_len).unwrap_or_default()]);
+                writer.push(&[entry_len.saturating_cast()]);
             }
             if writer.rest().len() < entry_len {
                 break;
@@ -514,15 +512,11 @@ impl Server {
             (Kind::Service, _) => attr.uuid().write(&mut bytes),
             (Kind::Characteristic(props), _) => {
                 let [value0, value1] = handle.saturating_add(1).to_le_bytes();
-                if let Some(header) = bytes.first_chunk_mut::<3>() {
-                    *header = [props, value0, value1];
-                }
-                bytes.get_mut(3..).map_or(0, |rest| attr.uuid().write(rest)).saturating_add(3)
+                bytes[..3].copy_from_slice(&[props, value0, value1]);
+                attr.uuid().write(&mut bytes[3..]).saturating_add(3)
             },
             (_, Value::Cccd(index)) => {
-                if let Some(target) = bytes.first_chunk_mut::<2>() {
-                    *target = self.subscriptions.value(index).to_le_bytes();
-                }
+                bytes[..2].copy_from_slice(&self.subscriptions.value(index).to_le_bytes());
                 2
             },
             (_, Value::Const(constant)) => return Ok(Source::Static(constant)),
@@ -530,10 +524,8 @@ impl Server {
             (_, Value::Empty | Value::Sink) => 0,
             (_, Value::Hash) => {
                 let hash = self.db.hash();
-                bytes.first_chunk_mut::<16>().map_or(0, |target| {
-                    *target = hash;
-                    hash.len()
-                })
+                bytes[..16].copy_from_slice(&hash);
+                hash.len()
             },
             (_, Value::Zeros(len)) => return Ok(Source::Zeros(usize::from(len))),
         };
@@ -575,20 +567,21 @@ impl Source {
     /// returns the number of octets copied.
     fn copy(self, offset: usize, out: &mut [u8]) -> Result<usize, AttError> {
         let local;
-        let (bytes, len): (&[u8], usize) = match self {
+        let bytes: &[u8] = match self {
             Self::Local { bytes, len } => {
                 local = bytes;
-                (local.get(..len).unwrap_or_default(), len)
+                local.get(..len).unwrap_or_default()
             },
-            Self::Static(bytes) => (bytes, bytes.len()),
-            Self::Zeros(len) => (&[], len),
+            Self::Static(bytes) => bytes,
+            Self::Zeros(len) => {
+                let count = len.checked_sub(offset).ok_or(AttError::INVALID_OFFSET)?.min(out.len());
+                out.get_mut(..count).unwrap_or_default().fill(0);
+                return Ok(count);
+            },
         };
-        let left = len.checked_sub(offset).ok_or(AttError::INVALID_OFFSET)?;
-        let count = left.min(out.len());
-        #[rustc_unroll(never)]
-        for (index, slot) in out.iter_mut().take(count).enumerate() {
-            *slot = bytes.get(offset.saturating_add(index)).copied().unwrap_or_default();
-        }
+        let source = bytes.get(offset..).ok_or(AttError::INVALID_OFFSET)?;
+        let count = source.len().min(out.len());
+        out.get_mut(..count).unwrap_or_default().copy_from_slice(source.get(..count).unwrap_or_default());
         Ok(count)
     }
 }

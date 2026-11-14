@@ -412,14 +412,10 @@ impl Event {
     pub(crate) const fn is_connected(&self) -> bool { matches!(self, Self::Connected(_)) }
 
     /// Whether this reports connection parameters.
-    pub(crate) const fn is_params_update(&self) -> bool {
-        matches!(self, Self::ParamsUpdated { params: _params, status: _status })
-    }
+    pub(crate) const fn is_params_update(&self) -> bool { matches!(self, Self::ParamsUpdated { params: _, status: _ }) }
 
     /// Whether this reports a PHY.
-    pub(crate) const fn is_phy_update(&self) -> bool {
-        matches!(self, Self::PhyUpdated { rx: _rx, status: _status, tx: _tx })
-    }
+    pub(crate) const fn is_phy_update(&self) -> bool { matches!(self, Self::PhyUpdated { rx: _, status: _, tx: _ }) }
 
     /// The name of the event; its fields are logged on their own, for a defmt
     /// log line (`{=istr}`): interned, so the string stays in the `.defmt`
@@ -1279,7 +1275,7 @@ impl<'shared> Link<'shared> {
                 if let Some(destination) = target.get_mut(..source.len()) {
                     destination.copy_from_slice(source);
                 }
-                *len = u8::try_from(source.len()).unwrap_or_default();
+                *len = source.len().saturating_cast();
             }
             legacy.own = own;
             state.legacy_enabled = true;
@@ -1819,7 +1815,7 @@ impl<'shared> Link<'shared> {
         let Some(target) = data.get_mut(..fragment.len()) else { return Err(Error::Invalid) };
         target.copy_from_slice(fragment);
         let llid = if start && !fragment.is_empty() { Llid::Start } else { Llid::Continuation };
-        let len = u8::try_from(fragment.len()).unwrap_or_default();
+        let len: u8 = fragment.len().saturating_cast();
         // Queued under the lock of the check, so a fragment cannot reach the
         // next link.
         self.shared.state.lock(|cell| {

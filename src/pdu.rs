@@ -12,7 +12,7 @@ pub const ADV_CRC_INIT: u32 = 0x0055_5555;
 pub const ADV_PAYLOAD_MAX: usize = 255;
 /// Size of a packet buffer: header, S1 byte and the largest payload the
 /// radio accepts, 255 octets on the nRF52832 and 37 on the nRF51.
-pub const BUFFER_LEN: usize = HEADER_LEN + 1 + chip::PAYLOAD_MAX;
+pub const BUFFER_LEN: usize = HEADER_LEN.strict_add(1).strict_add(chip::PAYLOAD_MAX);
 /// Length of a PDU header.
 pub const HEADER_LEN: usize = 2;
 
@@ -129,35 +129,28 @@ pub struct Advertisement<const N: usize> {
 }
 
 /// A PDU of legacy advertising.
-pub type LegacyAdvertisement = Advertisement<{ HEADER_LEN + 37 }>;
+pub type LegacyAdvertisement = Advertisement<{ HEADER_LEN.strict_add(37) }>;
 
 impl<const N: usize> Advertisement<N> {
     /// The PDU bytes up to the end of the payload.
     #[inline]
     #[must_use = "the bytes are only borrowed"]
     pub const fn as_bytes(&self) -> &[u8] {
-        let len = usize::from(self.bytes.get(1).copied().unwrap_or_default());
+        const { assert!(N >= HEADER_LEN, "an advertising PDU holds its header") };
+        let len = usize::from(self.bytes[1]);
         self.bytes.get(..HEADER_LEN.saturating_add(len)).unwrap_or_default()
     }
 
     /// A PDU with `header` and the payload `parts` in order. Payload beyond
     /// the buffer is cut off.
     fn build(header: u8, parts: &[&[u8]]) -> Self {
+        const { assert!(N >= HEADER_LEN, "an advertising PDU holds its header") };
         let mut bytes: [u8; N] = [0; N];
-        let mut len: usize = 0;
-        for part in parts {
-            for &byte in *part {
-                if let Some(slot) = bytes.get_mut(HEADER_LEN.saturating_add(len))
-                    && len < ADV_PAYLOAD_MAX
-                {
-                    *slot = byte;
-                    len = len.saturating_add(1);
-                }
-            }
-        }
-        if let Some(header_bytes) = bytes.first_chunk_mut::<HEADER_LEN>() {
-            *header_bytes = [header, u8::try_from(len).unwrap_or_default()];
-        }
+        let (_, after_header) = bytes.split_at_mut(HEADER_LEN);
+        let (payload, _) = after_header.split_at_mut(after_header.len().min(ADV_PAYLOAD_MAX));
+        let len = concat_into(payload, parts);
+        bytes[0] = header;
+        bytes[1] = len.saturating_cast();
         Self { bytes }
     }
 
@@ -286,7 +279,7 @@ impl ConnectInd {
 
 /// Whether a data channel map has at least two channels and no reserved bits.
 pub(crate) fn valid_channel_map(map: [u8; 5]) -> bool {
-    map.last().is_some_and(|byte| byte & 0xE0 == 0) && map.iter().map(|byte| byte.count_ones()).sum::<u32>() >= 2
+    map[4] & 0xE0 == 0 && map.iter().map(|byte| byte.count_ones()).sum::<u32>() >= 2
 }
 
 /// Validates timing both when connecting and when updating an existing link.
@@ -348,6 +341,20 @@ pub const fn scan_request(pdu: &[u8], advertiser: Peer) -> Option<Peer> {
 #[inline]
 #[must_use = "the type is only checked"]
 pub const fn is_scan_request(header: u8) -> bool { header & PDU_TYPE_MASK == SCAN_REQ }
+
+/// Copies `parts` in order into the start of `target`, as far as it holds
+/// them, and returns the number of octets copied.
+pub(crate) fn concat_into(target: &mut [u8], parts: &[&[u8]]) -> usize {
+    let mut rest = target;
+    let mut len: usize = 0;
+    for part in parts {
+        let (head, tail) = rest.split_at_mut(part.len().min(rest.len()));
+        head.copy_from_slice(part.get(..head.len()).unwrap_or_default());
+        len = len.saturating_add(head.len());
+        rest = tail;
+    }
+    len
+}
 
 /// `N` bytes of `bytes` from `offset`, if present.
 #[inline]

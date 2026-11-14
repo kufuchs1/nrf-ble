@@ -33,7 +33,18 @@ use crate::{
         Shared,
     },
     maintenance,
-    pdu::{BUFFER_LEN, ConnectInd, LLID_MASK, Llid, NESN, SN, field, valid_channel_map, valid_connection_parameters},
+    pdu::{
+        BUFFER_LEN,
+        ConnectInd,
+        LLID_MASK,
+        Llid,
+        NESN,
+        SN,
+        concat_into,
+        field,
+        valid_channel_map,
+        valid_connection_parameters,
+    },
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
     radio::{Phy, RX_READY_US, Radio, TURNAROUND_IN_ANSWER, Turnaround},
 };
@@ -47,7 +58,7 @@ const CONTROL_PAYLOAD_MAX: usize = 27;
 /// Data PDU header in RAM: header, length and the RFU byte the CCM needs.
 const DATA_HEADER_LEN: usize = 3;
 /// Size of a data PDU buffer with the longest payload and a MIC.
-const DATA_BUFFER_LEN: usize = DATA_HEADER_LEN + ACL_MAX + MIC_LEN;
+const DATA_BUFFER_LEN: usize = DATA_HEADER_LEN.strict_add(ACL_MAX).strict_add(MIC_LEN);
 /// Error code: MIC failure.
 const ERROR_MIC_FAILURE: u8 = 0x3D;
 /// Error code: PIN or key missing.
@@ -210,9 +221,12 @@ const PREPARE_AGAIN_US: u32 = 200;
 const PREPARE_LATE_US: u32 = 200;
 // A crystal up to 70 us late still leaves the time.
 const _: () =
-    assert!(SETUP_US >= PREPARE_LATE_US.saturating_add(70), "a crystal up to 70 us late no longer leaves the time");
+    assert!(SETUP_US >= PREPARE_LATE_US.strict_add(70), "a crystal up to 70 us late no longer leaves the time");
 /// Highest transmit power in dBm.
-const MAX_POWER_DBM: i8 = LEVELS_DBM.last().copied().unwrap_or(0);
+const MAX_POWER_DBM: i8 = {
+    let [.., highest] = LEVELS_DBM;
+    highest
+};
 /// Acceptable power reduction when no packet has been measured yet.
 const UNKNOWN_REDUCTION: u8 = 0xFF;
 /// Error code: different transaction collision, another procedure with an
@@ -492,25 +506,25 @@ impl DataLength {
     /// effective once the central took it.
     fn pdu(&mut self, code: u8) -> [u8; 9] {
         self.offered_tx = Some(self.local_tx);
-        let mut pdu = [code, 0, 0, 0, 0, 0, 0, 0, 0];
         let [max_octets, max_time] = LENGTH_MAX;
-        let values = [max_octets, max_time, self.local_tx[0], self.local_tx[1]];
-        for (target, source) in pdu.iter_mut().skip(1).zip(values.iter().flat_map(|&value| value.to_le_bytes())) {
-            *target = source;
-        }
-        pdu
+        let [tx_octets, tx_time] = self.local_tx;
+        let [[max_octets0, max_octets1], [max_time0, max_time1], [tx_octets0, tx_octets1], [tx_time0, tx_time1]] =
+            [max_octets, max_time, tx_octets, tx_time].map(u16::to_le_bytes);
+        [code, max_octets0, max_octets1, max_time0, max_time1, tx_octets0, tx_octets1, tx_time0, tx_time1]
     }
 
     /// Takes the central's values from its `LL_LENGTH_REQ` or `LL_LENGTH_RSP`,
     /// within the specification's range.
     fn take_peer(&mut self, params: &[u8]) {
-        let Some(bytes) = field::<8>(params, 0) else { return };
-        let mut values: [u16; 4] = [0; 4];
-        let (pairs, _) = bytes.as_chunks::<2>();
-        for (value, &pair) in values.iter_mut().zip(pairs) {
-            *value = u16::from_le_bytes(pair);
-        }
-        let [rx_octets, rx_time, tx_octets, tx_time] = values;
+        let Some([rx_octets0, rx_octets1, rx_time0, rx_time1, tx_octets0, tx_octets1, tx_time0, tx_time1]) =
+            field::<8>(params, 0)
+        else {
+            return;
+        };
+        let rx_octets = u16::from_le_bytes([rx_octets0, rx_octets1]);
+        let rx_time = u16::from_le_bytes([rx_time0, rx_time1]);
+        let tx_octets = u16::from_le_bytes([tx_octets0, tx_octets1]);
+        let tx_time = u16::from_le_bytes([tx_time0, tx_time1]);
         let [default_octets, default_time] = LENGTH_DEFAULT;
         let octets = |value: u16| value.clamp(default_octets, LENGTH_MAX[0]);
         let time = |value: u16| value.clamp(default_time, LENGTH_TIME_MAX);
@@ -526,6 +540,23 @@ struct RemoteRequest {
     asked:  Option<u32>,
     /// The request's parameters, whose offsets the response repeats.
     params: [u8; 23],
+}
+
+impl RemoteRequest {
+    /// The interval range, latency and timeout the central asks for: the
+    /// first four fields, each least significant octet first.
+    fn range(&self) -> ParamRange {
+        // Read as one value: the eight octets bound one by one made
+        // `drive_host` about 110 bytes larger.
+        let (&octets, _) = self.params.split_array_ref::<8>();
+        let fields = u64::from_le_bytes(octets);
+        ParamRange::new(
+            fields.truncate(),
+            fields.unbounded_shr(16).truncate(),
+            fields.unbounded_shr(32).truncate(),
+            fields.unbounded_shr(48).truncate(),
+        )
+    }
 }
 
 /// A PDU of ours the central acknowledged, as the answer within the
@@ -605,7 +636,7 @@ struct Room {
 #[derive(Clone, Copy)]
 struct Pending {
     /// Header and payload.
-    bytes:     [u8; DATA_HEADER_LEN + CONTROL_PAYLOAD_MAX],
+    bytes:     [u8; DATA_HEADER_LEN.strict_add(CONTROL_PAYLOAD_MAX)],
     /// Whether it came encrypted.
     encrypted: bool,
 }
@@ -883,10 +914,7 @@ impl Connection {
             return (None, false);
         }
         self.seq.sn = !self.seq.sn;
-        let acked = Acked {
-            kind:   self.tx_kind,
-            opcode: self.current().plain.0.get(DATA_HEADER_LEN).copied().unwrap_or_default(),
-        };
+        let acked = Acked { kind: self.tx_kind, opcode: self.current().plain.0[DATA_HEADER_LEN] };
         if self.next_ready {
             self.commit_next();
             return (Some(acked), false);
@@ -943,7 +971,7 @@ impl Connection {
         if let Some(acked) = decision.acked {
             self.after_ack(acked);
             if matches!(self.tx_kind, TxKind::Control | TxKind::Terminate) {
-                let opcode = self.current().plain.0.get(DATA_HEADER_LEN).copied().unwrap_or_default();
+                let opcode = self.current().plain.0[DATA_HEADER_LEN];
                 self.trace.control(true, opcode);
             }
         } else if decision.nacked && !self.late_answer {
@@ -982,7 +1010,7 @@ impl Connection {
             && self.trace.first.is_none()
             && let Some(central) = decision.central
         {
-            let ours = self.current().plain.0.first().copied().unwrap_or_default();
+            let ours = self.current().plain.0[0];
             let flags = if self.seq.sn { SN } else { 0 }
                 | if self.seq.nesn { NESN } else { 0 }
                 | if decision.follow.md { MD } else { 0 };
@@ -1005,7 +1033,7 @@ impl Connection {
         }
         let before = i32::from(tx_power(*for_phy_mut(&mut self.announced_power, self.tx_phy)));
         let now = tx_power(level);
-        let delta = i8::try_from(i32::from(now).saturating_sub(before)).unwrap_or_default();
+        let delta: i8 = i32::from(now).saturating_sub(before).saturating_cast();
         self.enqueue(Llid::Control, &[
             OP_POWER_CHANGE_IND,
             self.tx_phy.hci(),
@@ -1023,9 +1051,7 @@ impl Connection {
     const fn answer_buffer(&mut self, md: bool) -> *mut u8 {
         let flags = if self.seq.sn { SN } else { 0 } | if self.seq.nesn { NESN } else { 0 } | if md { MD } else { 0 };
         let buffer = &mut self.current_mut().on_air().0;
-        if let Some(header) = buffer.first_mut() {
-            *header = (*header & LLID_MASK) | flags;
-        }
+        buffer[0] = (buffer[0] & LLID_MASK) | flags;
         buffer.as_mut_ptr()
     }
 
@@ -1093,7 +1119,7 @@ impl Connection {
         // SAFETY: the configuration, scratch and both buffers live in this
         // connection or are borrowed for the exchange, which ends the
         // decryption with `wait_decrypted`, `stop` or `disarm`.
-        let () = unsafe { crypto::arm_decrypt(&self.encryption.rx_config, pointers, scratch, self.phy) };
+        unsafe { crypto::arm_decrypt(&self.encryption.rx_config, pointers, scratch, self.phy) }
         true
     }
 
@@ -1221,9 +1247,7 @@ impl Connection {
     const fn commit_empty(&mut self) {
         let next = !self.cur;
         let slot = self.slot_mut(next);
-        if let Some(header) = slot.plain.0.first_chunk_mut::<DATA_HEADER_LEN>() {
-            *header = [Llid::Continuation.bits(), 0, 0];
-        }
+        slot.plain.0[..DATA_HEADER_LEN].copy_from_slice(&[Llid::Continuation.bits(), 0, 0]);
         slot.encrypted = false;
         slot.kind = TxKind::Empty;
         slot.source = Source::Empty;
@@ -1283,9 +1307,9 @@ impl Connection {
     /// Current connection parameters in link layer units.
     const fn current_params(&self) -> ConnectionParams {
         ConnectionParams::new(
-            self.interval.checked_div(UNIT_1250_US).unwrap_or(0).saturating_cast(),
+            self.interval.strict_div(UNIT_1250_US).saturating_cast(),
             self.latency,
-            self.timeout.checked_div(UNIT_10MS_US).unwrap_or(0).saturating_cast(),
+            self.timeout.strict_div(UNIT_10MS_US).saturating_cast(),
         )
     }
 
@@ -1444,21 +1468,14 @@ impl Connection {
             // Any parameters the central proposes suit the device.
             self.remote_request = None;
             let mut response: [u8; 24] = [0; 24];
-            for (target, source) in response.iter_mut().zip(iter::once(&OP_CONNECTION_PARAM_RSP).chain(&request.params))
-            {
-                *target = *source;
-            }
+            response[0] = OP_CONNECTION_PARAM_RSP;
+            response[1..].copy_from_slice(&request.params);
             self.enqueue(Llid::Control, &response);
             self.remote_update = Some(now.wrapping_add(PROCEDURE_TIMEOUT_US));
             return;
         }
         let Some(deadline) = request.asked else {
-            let field = |index: usize| {
-                let bytes = request.params.get(index..index.saturating_add(2)).unwrap_or_default();
-                bytes.first_chunk::<2>().map_or(0, |&pair| u16::from_le_bytes(pair))
-            };
-            let range = ParamRange::new(field(0), field(2), field(4), field(6));
-            self.notify(Event::ParamsRequested(range), shared);
+            self.notify(Event::ParamsRequested(request.range()), shared);
             shared.ask_parameters();
             self.remote_request = Some(RemoteRequest { asked: Some(now.wrapping_add(HOST_REPLY_US)), ..request });
             return;
@@ -1474,19 +1491,24 @@ impl Connection {
         self.remote_request = None;
         match reply {
             Ok(values) => {
+                let [[min0, min1], [max0, max1], [latency0, latency1], [timeout0, timeout1]] =
+                    values.map(u16::to_le_bytes);
                 let mut response: [u8; 24] = [0; 24];
-                let host = values.iter().flat_map(|&value| value.to_le_bytes());
-                let offsets = request.params.iter().skip(8).copied();
-                for (target, source) in
-                    response.iter_mut().zip(iter::once(OP_CONNECTION_PARAM_RSP).chain(host).chain(offsets))
-                {
-                    *target = source;
-                }
+                response[..9].copy_from_slice(&[
+                    OP_CONNECTION_PARAM_RSP,
+                    min0,
+                    min1,
+                    max0,
+                    max1,
+                    latency0,
+                    latency1,
+                    timeout0,
+                    timeout1,
+                ]);
+                response[9..].copy_from_slice(&request.params[8..]);
                 // No preferred periodicity of ours: the central's could exceed
                 // the host's interval range, which a central rejects.
-                if let Some(periodicity) = response.get_mut(9) {
-                    *periodicity = 0;
-                }
+                response[9] = 0;
                 self.enqueue(Llid::Control, &response);
                 self.remote_update = Some(now.wrapping_add(PROCEDURE_TIMEOUT_US));
             },
@@ -1543,7 +1565,7 @@ impl Connection {
         if let (Some(target), Some(source)) = (data.get_mut(..len), payload.get(..len)) {
             target.copy_from_slice(source);
         }
-        if !self.queue.push(Queued { data, len: u8::try_from(len).unwrap_or_default(), llid }) {
+        if !self.queue.push(Queued { data, len: len.saturating_cast(), llid }) {
             // Losing a control response would strand the peer in a procedure.
             self.abort = Some(ERROR_RESPONSE_TIMEOUT);
         }
@@ -1567,8 +1589,7 @@ impl Connection {
         let asymmetric = chip::PHY_2M && self.phy != self.tx_phy;
         // SAFETY: `rx` is a full packet buffer borrowed for this whole
         // exchange, which disables the radio on every path out.
-        let () =
-            unsafe { radio.prepare(rx.as_mut_ptr(), if asymmetric { Turnaround::None } else { Turnaround::Transmit }) };
+        unsafe { radio.prepare(rx.as_mut_ptr(), if asymmetric { Turnaround::None } else { Turnaround::Transmit }) }
         if !self.arm_decryption(rx) {
             return None;
         }
@@ -1631,7 +1652,7 @@ impl Connection {
             // The switch starts receiving one interframe space after the
             // end; the buffer and the decryption are ready before.
             // SAFETY: as for `prepare` above.
-            let () = unsafe { radio.rearm_receive(rx.as_mut_ptr()) };
+            unsafe { radio.rearm_receive(rx.as_mut_ptr()) }
             if !self.arm_decryption(rx) {
                 radio.disable();
                 crypto::disarm();
@@ -1679,7 +1700,7 @@ impl Connection {
     const fn exchanged(&mut self, address: u32) {
         if self.encryption.phase == Phase::Starting
             && self.tx_kind == TxKind::Control
-            && self.current().plain.0.get(DATA_HEADER_LEN) == Some(&OP_START_ENC_REQ)
+            && self.current().plain.0[DATA_HEADER_LEN] == OP_START_ENC_REQ
         {
             self.encryption.rx_on = true;
             self.encryption.phase = Phase::AwaitingStartResponse;
@@ -1688,7 +1709,7 @@ impl Connection {
         // plain text.
         if self.encryption.phase == Phase::Pausing
             && self.tx_kind == TxKind::Control
-            && self.current().plain.0.get(DATA_HEADER_LEN) == Some(&OP_PAUSE_ENC_RSP)
+            && self.current().plain.0[DATA_HEADER_LEN] == OP_PAUSE_ENC_RSP
         {
             self.encryption.rx_on = false;
             self.encryption.phase = Phase::AwaitingPauseResponse;
@@ -1732,19 +1753,10 @@ impl Connection {
     /// Consumes one complete prefetched block; no hardware RNG work runs here.
     const fn finish_encryption_request(&mut self, lookup: KeyLookup, material: &entropy::Material) {
         let mut response: [u8; 13] = [0; 13];
-        if let Some(code) = response.first_mut() {
-            *code = OP_ENC_RSP;
-        }
-        if let Some(own) = response.get_mut(1..) {
-            own.copy_from_slice(material.bytes());
-        }
-        let (own_skd, own_iv) = material.bytes().split_at(8);
-        if let Some(target) = self.encryption.skd.get_mut(8..) {
-            target.copy_from_slice(own_skd);
-        }
-        if let Some(target) = self.encryption.iv.get_mut(4..) {
-            target.copy_from_slice(own_iv);
-        }
+        response[0] = OP_ENC_RSP;
+        response[1..].copy_from_slice(material.bytes());
+        self.encryption.skd[8..].copy_from_slice(&material.bytes()[..8]);
+        self.encryption.iv[4..].copy_from_slice(&material.bytes()[8..]);
         self.enqueue(Llid::Control, &response);
         self.encryption.phase = Phase::AwaitingKey(lookup, false);
     }
@@ -1790,14 +1802,12 @@ impl Connection {
 
     /// Flushes retained events in order as host capacity becomes available.
     fn flush_notifications(&mut self, shared: &Shared) {
-        while let Some(event) = self.notifications.first().copied().flatten() {
+        while let Some(event) = self.notifications[0] {
             if !shared.try_push_event(event) {
                 return;
             }
-            self.notifications.rotate_left(1);
-            if let Some(last) = self.notifications.last_mut() {
-                *last = None;
-            }
+            let [_, second, third] = self.notifications;
+            self.notifications = [second, third, None];
         }
         let (owed, status, params) = self.updates_owed;
         for remaining in (0..owed).rev() {
@@ -1870,9 +1880,7 @@ impl Connection {
             OP_FEATURE_REQ | OP_FEATURE_RSP => self.handle_features(code, params),
             OP_VERSION_IND if self.version.is_none() => {
                 let mut response = [OP_VERSION_IND, 0, 0, 0, 0, 0];
-                if let Some(target) = response.get_mut(1..) {
-                    target.copy_from_slice(&VERSION);
-                }
+                response[1..].copy_from_slice(&VERSION);
                 if !matches!(self.version_request, Request::Requested(_)) {
                     self.enqueue(Llid::Control, &response);
                 }
@@ -1951,7 +1959,7 @@ impl Connection {
 
     /// Answers the feature exchange of the central, and takes its answer to
     /// ours. The first byte holds the features both sides use.
-    fn handle_features(&mut self, code: u8, params: &[u8]) {
+    const fn handle_features(&mut self, code: u8, params: &[u8]) {
         let Some(&features) = params.first_chunk::<8>() else { return };
         let [central, ..] = features;
         self.central_features = Some(features);
@@ -1960,12 +1968,8 @@ impl Connection {
             return;
         }
         let mut response = [OP_FEATURE_RSP, 0, 0, 0, 0, 0, 0, 0, 0];
-        for (target, source) in response.iter_mut().skip(1).zip(FEATURES) {
-            *target = source;
-        }
-        if let Some(first) = response.get_mut(1) {
-            *first &= central;
-        }
+        response[1..].copy_from_slice(&FEATURES);
+        response[1] &= central;
         self.enqueue(Llid::Control, &response);
     }
 
@@ -2117,7 +2121,7 @@ impl Connection {
         self.power_reporting |= phy;
         let level = for_phy_mut(&mut self.power, request_phy).level();
         let now = tx_power(level);
-        let change = i8::try_from(i32::from(now).saturating_sub(i32::from(before))).unwrap_or_default();
+        let change: i8 = i32::from(now).saturating_sub(i32::from(before)).saturating_cast();
         let reduction = UNKNOWN_REDUCTION;
         self.enqueue(Llid::Control, &[
             OP_POWER_CONTROL_RSP,
@@ -2284,7 +2288,10 @@ impl Connection {
             report_at: end.wrapping_add(REPORT_INTERVAL_US),
             reported: (Stats::default(), 0),
             queue: Ring::new(Queued { data: [0; CONTROL_PAYLOAD_MAX], len: 0, llid: Llid::Continuation }),
-            pending: Ring::new(Pending { bytes: [0; DATA_HEADER_LEN + CONTROL_PAYLOAD_MAX], encrypted: false }),
+            pending: Ring::new(Pending {
+                bytes:     [0; DATA_HEADER_LEN.strict_add(CONTROL_PAYLOAD_MAX)],
+                encrypted: false,
+            }),
             room: Room { acl: 0, control: 0 },
             peaks: Peaks::default(),
             trace: Trace::default(),
@@ -2382,7 +2389,7 @@ impl Connection {
         let buffer = self.current_mut().on_air().0.as_mut_ptr();
         // SAFETY: the slots belong to this connection, and the exchange
         // disables the radio before it returns.
-        let () = unsafe { radio.set_buffer(buffer) };
+        unsafe { radio.set_buffer(buffer) }
         radio.clear_ready();
     }
 
@@ -2443,7 +2450,7 @@ impl Connection {
         let limit = self.tx_payload_max();
         let free = !self.cur;
         let slot = if free { &mut self.slots.1 } else { &mut self.slots.0 };
-        let payload = slot.plain.0.get_mut(DATA_HEADER_LEN..).unwrap_or_default();
+        let payload = &mut slot.plain.0[DATA_HEADER_LEN..];
         let (kind, llid, len, source) = if let Some(control) = self.queue.front() {
             let size = usize::from(control.len);
             if let (Some(target), Some(data)) = (payload.get_mut(..size), control.data.get(..size)) {
@@ -2462,16 +2469,14 @@ impl Connection {
             }
             let llid = if start == 0 { packet.llid } else { Llid::Continuation };
             let last = end >= usize::from(packet.len);
-            let source = Source::Acl { end: u8::try_from(end).unwrap_or(u8::MAX), last };
-            (if last { TxKind::Acl } else { TxKind::AclPart }, llid, u8::try_from(size).unwrap_or(u8::MAX), source)
+            let source = Source::Acl { end: end.saturating_cast(), last };
+            (if last { TxKind::Acl } else { TxKind::AclPart }, llid, size.saturating_cast(), source)
         } else {
             (TxKind::Empty, Llid::Continuation, 0, Source::Empty)
         };
-        if let Some(header) = slot.plain.0.first_chunk_mut::<DATA_HEADER_LEN>() {
-            // The S1 byte stays zero: on the nRF51 its bits are sent as the
-            // top bits of the length.
-            *header = [llid.bits(), len, 0];
-        }
+        // The S1 byte stays zero: on the nRF51 its bits are sent as the top
+        // bits of the length.
+        slot.plain.0[..DATA_HEADER_LEN].copy_from_slice(&[llid.bits(), len, 0]);
         slot.kind = kind;
         slot.source = source;
         slot.encrypted = self.encryption.tx_on && len != 0;
@@ -2653,8 +2658,8 @@ impl Connection {
         // CCM must not start again at ours.
         crypto::disarm();
         let packet = if radio.crc_ok() {
-            let header = rx.first().copied().unwrap_or_default();
-            let len = rx.get(1).copied().unwrap_or_default();
+            let header = rx[0];
+            let len = rx[1];
             let mic_ok = if self.encryption.rx_on && len != 0 {
                 let Some(valid) = crypto::wait_decrypted() else {
                     self.abort = Some(ERROR_HARDWARE_FAILURE);
@@ -2680,7 +2685,7 @@ impl Connection {
         let buffer = self.answer_buffer(decision.follow.md);
         // SAFETY: the slots belong to this connection, and the exchange
         // disables the radio before it returns.
-        let () = unsafe { radio.set_buffer(buffer) };
+        unsafe { radio.set_buffer(buffer) }
         if TURNAROUND_IN_ANSWER {
             // Before our answer ends, also a late one: the radio's own
             // turnaround follows that END (see `switch_tifs`).
@@ -2883,9 +2888,7 @@ impl Connection {
                 && self.queue.is_empty()
             {
                 let mut version = [OP_VERSION_IND, 0, 0, 0, 0, 0];
-                if let Some(bytes) = version.get_mut(1..) {
-                    bytes.copy_from_slice(&VERSION);
-                }
+                version[1..].copy_from_slice(&VERSION);
                 self.enqueue(Llid::Control, &version);
                 self.version_request = Request::Requested(now.wrapping_add(PROCEDURE_TIMEOUT_US));
             } else {
@@ -2944,12 +2947,8 @@ impl Connection {
         };
         crypto::wipe(&mut self.encryption.skd);
         crypto::wipe(&mut self.encryption.iv);
-        if let Some(target) = self.encryption.skd.get_mut(..8) {
-            target.copy_from_slice(&central_skd);
-        }
-        if let Some(target) = self.encryption.iv.get_mut(..4) {
-            target.copy_from_slice(&central_iv);
-        }
+        self.encryption.skd[..8].copy_from_slice(&central_skd);
+        self.encryption.iv[..4].copy_from_slice(&central_iv);
         self.encryption.phase = Phase::AwaitingEntropy(KeyLookup { ediv, rand });
     }
 
@@ -3000,9 +2999,7 @@ impl Connection {
             && self.central_features.is_none()
         {
             let mut request = [OP_PERIPHERAL_FEATURE_REQ, 0, 0, 0, 0, 0, 0, 0, 0];
-            for (target, source) in request.iter_mut().skip(1).zip(FEATURES) {
-                *target = source;
-            }
+            request[1..].copy_from_slice(&FEATURES);
             self.enqueue(Llid::Control, &request);
             self.features_request = Request::Requested(deadline);
         } else if (self.host_phy.is_some() || (chip::PHY_2M && encrypted && self.phy == Phy::M1))
@@ -3052,9 +3049,7 @@ impl Connection {
                 &NO_OFFSET,
                 &NO_OFFSET,
             ];
-            for (target, source) in request.iter_mut().zip(fields.into_iter().flatten()) {
-                *target = *source;
-            }
+            concat_into(&mut request, &fields);
             self.enqueue(Llid::Control, &request);
             self.param_request = Some(deadline);
             info!("asking for connection parameters");
@@ -3083,11 +3078,11 @@ impl Connection {
         self.seq.received = false;
         self.stats.received = self.stats.received.wrapping_add(1);
         // A payload, encrypted or not, holds the latency off for a while.
-        if rx.get(1).is_some_and(|&len| len != 0) {
+        if rx[1] != 0 {
             self.hold_latency_from(self.last_valid);
         }
         // Empty PDUs have no MIC and need not produce a CCM output packet.
-        let source = if encrypted && rx.get(1) != Some(&0) { self.rx_plain.as_slice() } else { rx.as_slice() };
+        let source = if encrypted && rx[1] != 0 { self.rx_plain.as_slice() } else { rx.as_slice() };
         let header = source.first().copied().unwrap_or_default();
         let len = source.get(1).copied().unwrap_or_default();
         if encrypted && len != 0 {

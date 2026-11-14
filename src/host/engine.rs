@@ -186,7 +186,7 @@ const EV_PASSKEY: Flags = 0x200;
 /// What the user typed for Passkey Entry when they gave up: out of the
 /// range of passkeys, as [`smp::NO_PASSKEY`] is.
 #[cfg(feature = "passkey")]
-const REFUSED: u32 = smp::NO_PASSKEY - 1;
+const REFUSED: u32 = smp::NO_PASSKEY.strict_sub(1);
 
 /// The events waiting, one `EV_` bit each: eight fit without the optional
 /// events.
@@ -524,7 +524,7 @@ impl Engine {
         let mut out: [u8; MTU] = [0; MTU];
         if let Some(len) = self.att.handle(pdu, level, app, &mut out) {
             if self.response.is_none() {
-                self.response = Some(Slot { bytes: out, len: u8::try_from(len).unwrap_or_default() });
+                self.response = Some(Slot { bytes: out, len: len.saturating_cast() });
                 if pdu.first() == Some(&WRITE_REQUEST)
                     && out.first() == Some(&WRITE_RESPONSE)
                     && self.inputs_written()
@@ -1030,7 +1030,7 @@ impl Engine {
                     self.disconnected(epoch, reason);
                 }
             },
-            Event::Encryption { on, refresh, status: _status } => self.encryption(on, refresh, now),
+            Event::Encryption { on, refresh, status: _ } => self.encryption(on, refresh, now),
             Event::LtkRequest { ediv, rand } => self.ltk_request(ediv, rand),
             Event::ParamsUpdated { params, status } => {
                 if let Some(link) = self.link.as_mut()
@@ -1047,9 +1047,9 @@ impl Engine {
             | Event::DataLength(_)
             | Event::ParamsRequested(_)
             | Event::PayloadTimeout
+            | Event::PhyUpdated { rx: _, status: _, tx: _ }
+            | Event::RemoteFeatures { features: _, status: _ }
             | Event::RemoteVersion(_) => {},
-            Event::PhyUpdated { rx: _rx, status: _status, tx: _tx } => {},
-            Event::RemoteFeatures { features: _features, status: _status } => {},
         }
     }
 

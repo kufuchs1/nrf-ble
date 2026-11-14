@@ -15,7 +15,7 @@
 //! length field that does not match the PDU, is dropped, as Linux drops them.
 //! The LE signalling channel carries one command per PDU.
 
-use crate::link::ParamRange;
+use crate::{link::ParamRange, pdu::concat_into};
 
 /// Code of a Command Reject.
 pub const COMMAND_REJECT: u8 = 0x01;
@@ -37,7 +37,7 @@ const HEADER_LEN: usize = 4;
 /// Response, Credit Based Connection and Reconfigure Response.
 const RESPONSES: [u8; 10] = [0x01, 0x03, 0x05, 0x07, 0x09, 0x0B, 0x13, 0x15, 0x18, 0x1A];
 /// Largest command the host sends: a Connection Parameter Update Request.
-const COMMAND_MAX: usize = HEADER_LEN + 8;
+const COMMAND_MAX: usize = HEADER_LEN.strict_add(8);
 
 /// What a received command asks of the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,18 +103,10 @@ impl Command {
     /// A command with `code`, `identifier` and the data `parts` in order.
     fn new(code: u8, identifier: u8, parts: &[&[u8]]) -> Self {
         let mut data: [u8; COMMAND_MAX] = [0; COMMAND_MAX];
-        let mut len = HEADER_LEN;
-        for &byte in parts.iter().flat_map(|part| part.iter()) {
-            if let Some(slot) = data.get_mut(len) {
-                *slot = byte;
-                len = len.saturating_add(1);
-            }
-        }
-        let [len0, len1] = u16::try_from(len.saturating_sub(HEADER_LEN)).unwrap_or_default().to_le_bytes();
-        if let Some(header) = data.first_chunk_mut::<HEADER_LEN>() {
-            *header = [code, identifier, len0, len1];
-        }
-        Self { data, len: u8::try_from(len).unwrap_or_default() }
+        let len = concat_into(&mut data[HEADER_LEN..], parts);
+        let [len0, len1] = len.saturating_cast::<u16>().to_le_bytes();
+        data[..HEADER_LEN].copy_from_slice(&[code, identifier, len0, len1]);
+        Self { data, len: HEADER_LEN.saturating_add(len).saturating_cast() }
     }
 
     /// A Command Reject of the request with `identifier` for `reason`, with

@@ -878,6 +878,4 @@ fn rtc_now() -> u32 { RTC.counter().read().counter() }
 const fn ticks_to_us(ticks: u32) -> u32 { u64::from(ticks).saturating_mul(15_625).wrapping_shr(9).saturating_cast() }
 
 /// Whole RTC ticks in `us` microseconds.
-const fn us_to_ticks(us: u32) -> u32 {
-    u64::from(us).wrapping_shl(9).checked_div(15_625).unwrap_or(0).saturating_cast()
-}
+const fn us_to_ticks(us: u32) -> u32 { u64::from(us).wrapping_shl(9).strict_div(15_625).saturating_cast() }

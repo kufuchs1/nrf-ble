@@ -165,9 +165,7 @@ unsafe fn seal_stand_in(config: &[u8; CONFIG_LEN], (input, output): (*const u8, 
         return false;
     };
     *sealed_head = *head;
-    if let Some(sealed_length) = sealed_head.get_mut(1) {
-        *sealed_length = length.wrapping_add(4);
-    }
+    sealed_head[1] = length.wrapping_add(4);
     let Some((sealed_payload, mic)) = sealed_rest.split_at_mut_checked(payload.len()) else { return false };
     for (target, source) in sealed_payload.iter_mut().zip(payload) {
         *target = !*source;
@@ -182,15 +180,9 @@ unsafe fn seal_stand_in(config: &[u8; CONFIG_LEN], (input, output): (*const u8, 
 #[must_use = "the configuration is only built"]
 pub(crate) const fn config(key: [u8; 16], iv: [u8; 8], central_to_peripheral: bool) -> [u8; CONFIG_LEN] {
     let mut config: [u8; CONFIG_LEN] = [0; CONFIG_LEN];
-    if let Some(target) = config.get_mut(..16) {
-        target.copy_from_slice(&key);
-    }
-    if let Some(direction) = config.get_mut(DIRECTION_OFFSET) {
-        *direction = u8::from(central_to_peripheral);
-    }
-    if let Some(target) = config.get_mut(IV_OFFSET..) {
-        target.copy_from_slice(&iv);
-    }
+    config[..16].copy_from_slice(&key);
+    config[DIRECTION_OFFSET] = u8::from(central_to_peripheral);
+    config[IV_OFFSET..].copy_from_slice(&iv);
     config
 }
 
@@ -225,13 +217,13 @@ pub(crate) fn session_key(ltk: [u8; 16], skd: [u8; 16]) -> Option<[u8; 16]> { de
 pub fn encrypt_block(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
     static ECB_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
     let mut data: [u8; 48] = [0; 48];
-    for (target, source) in data.iter_mut().zip(key.iter().chain(block.iter())) {
-        *target = *source;
-    }
+    data[..16].copy_from_slice(&key);
+    data[16..32].copy_from_slice(&block);
     // An abort only happens during a radio event, which is over once the
     // link layer interrupt that the lock held back has run.
     while !ECB_LOCK.lock(|&()| ecb(&mut data)) {}
-    let result = data.last_chunk::<16>().copied().unwrap_or_default();
+    let mut result: [u8; 16] = [0; 16];
+    result.copy_from_slice(&data[32..]);
     wipe(&mut data);
     result
 }
@@ -264,12 +256,16 @@ fn derive_session_key<Encrypt>(ltk: [u8; 16], skd: [u8; 16], encrypt: Encrypt) -
 where
     Encrypt: FnOnce(&mut [u8; 48]) -> bool,
 {
+    // The ECB takes both most significant octet first.
     let mut data: [u8; 48] = [0; 48];
-    for (target, source) in data.iter_mut().zip(ltk.iter().rev().chain(skd.iter().rev())) {
-        *target = *source;
-    }
+    data[..16].copy_from_slice(&u128::from_le_bytes(ltk).to_be_bytes());
+    data[16..32].copy_from_slice(&u128::from_le_bytes(skd).to_be_bytes());
     let completed = encrypt(&mut data);
-    let key = data.last_chunk::<16>().copied().filter(|_| completed);
+    let key = completed.then(|| {
+        let mut key: [u8; 16] = [0; 16];
+        key.copy_from_slice(&data[32..]);
+        key
+    });
     wipe(&mut data);
     key
 }
@@ -385,9 +381,7 @@ where
     let mut key = irk;
     key.reverse();
     let mut block: [u8; 16] = [0; 16];
-    if let Some(tail) = block.last_chunk_mut::<3>() {
-        *tail = [prand2, prand1, prand0];
-    }
+    block[13..].copy_from_slice(&[prand2, prand1, prand0]);
     let [.., hash2, hash1, hash0] = encrypt(key, block);
     [hash0, hash1, hash2]
 }
