@@ -313,9 +313,9 @@ impl Stats {
     /// Logs the counters of the interframe space answers, after `label`.
     #[cfg(feature = "defmt")]
     #[inline]
-    pub fn log_answers(&self, label: &str) {
+    pub fn log_answers(&self, label: defmt::Str) {
         info!(
-            "{=str}: {} retx ({} with ack), {} acked ({} data), {} late ({} on ack), answer max {} us (ack {} us), {} fallback, prepare max {} us, setup max {} us",
+            "{=istr}: {} retx ({} with ack), {} acked ({} data), {} late ({} on ack), answer max {} us (ack {} us), {} fallback, prepare max {} us, setup max {} us",
             label,
             self.retx,
             self.retx_with_ack,
@@ -1159,7 +1159,7 @@ impl Connection {
                 self.notify(Event::PayloadTimeout, shared);
             }
             self.payload_timer = Some((now, false));
-            info!("authenticated payload timeout expired");
+            warn!("authenticated payload timeout expired");
         } else if !pinged
             && self.ping_request.is_none()
             && elapsed >= timeout.saturating_sub(timeout.wrapping_shr(2))
@@ -3118,7 +3118,7 @@ impl Connection {
     /// many as fit the effective time on the transmit PHY with the MIC.
     const fn tx_payload_max(&self) -> usize {
         let [octets, time, ..] = self.length.effective();
-        let per_byte = u32::checked_div(8, u32::from(self.tx_phy.hci())).unwrap_or(8);
+        let per_byte = 8_u32.checked_div(u32::from(self.tx_phy.hci())).unwrap_or(8);
         let mic = if self.encryption.tx_on { MIC_LEN } else { 0 };
         // Preamble and access address, header and CRC.
         let overhead = self.tx_phy.address_offset_us().checked_div(per_byte).unwrap_or(0).saturating_add(5);

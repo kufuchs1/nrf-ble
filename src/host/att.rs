@@ -132,6 +132,7 @@ const LOCAL_MAX: usize = DYNAMIC_MAX;
 
 /// Why a notification or an indication cannot be sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum NotifyError {
     /// The link lacks the security the characteristic needs.
@@ -142,22 +143,6 @@ pub enum NotifyError {
     Pending,
     /// The value is longer than [`NOTIFY_MAX`].
     TooLong,
-}
-
-impl NotifyError {
-    /// The name of the error, for a defmt log line (`{=istr}`): interned,
-    /// so the string stays in the `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::Insecure => defmt::intern!("Insecure"),
-            Self::NotSubscribed => defmt::intern!("NotSubscribed"),
-            Self::Pending => defmt::intern!("Pending"),
-            Self::TooLong => defmt::intern!("TooLong"),
-        }
-    }
 }
 
 /// The attribute server of one link: the table, the link's client

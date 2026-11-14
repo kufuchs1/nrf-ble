@@ -130,7 +130,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             stats.events, stats.missed, stats.crc_errors, stats.received
         );
         #[cfg(feature = "defmt")]
-        stats.log_answers("connection ended");
+        stats.log_answers(defmt::intern!("connection ended"));
         if matches!(ended, Ended::Reset) {
             radio.disable();
             clock.pause();

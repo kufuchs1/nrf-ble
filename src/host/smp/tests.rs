@@ -1282,7 +1282,7 @@ fn passkey_entry_pairs_in_twenty_rounds_and_bonds_authenticated() {
 fn a_wrong_passkey_fails_with_confirm_value_failed_in_the_round_of_its_bit() {
     for bit in [0_u8, 7, 19] {
         let passkey = 123_456;
-        let wrong = passkey ^ u32::unbounded_shl(1, u32::from(bit));
+        let wrong = passkey ^ 1_u32.unbounded_shl(u32::from(bit));
         let (mut responder, mut device, mut central) = passkey_pairing(0x04);
         run_jobs(&mut responder, &mut device);
         assert_eq!(responder.passkey(&mut device, Some(passkey), at(START + 30)), Ok(None));

@@ -56,7 +56,7 @@ const F5_SALT: [u8; 16] =
 const F5_KEY_ID: [u8; 4] = *b"btle";
 
 /// The Length of f5: the 256 bits of the `MacKey` and the LTK together.
-const F5_LENGTH: [u8; 2] = u16::to_be_bytes(256);
+const F5_LENGTH: [u8; 2] = 256_u16.to_be_bytes();
 
 /// An [`Aes`] with one key, as the block cipher of the `cmac` crate.
 ///

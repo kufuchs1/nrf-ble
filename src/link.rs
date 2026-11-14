@@ -154,6 +154,7 @@ const QUERY_REMOTE_PARAMETERS: u8 = 0x10;
 
 /// Why the link layer refused a request of the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
     /// Not now: advertising runs, a procedure of the same kind runs, the
@@ -172,27 +173,10 @@ pub enum Error {
     UnsupportedRemote,
 }
 
-impl Error {
-    /// The name of the error, for a defmt log line (`{=istr}`): interned,
-    /// so the string stays in the `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::Disallowed => defmt::intern!("Disallowed"),
-            Self::Full => defmt::intern!("Full"),
-            Self::Gone => defmt::intern!("Gone"),
-            Self::Invalid => defmt::intern!("Invalid"),
-            Self::Unsupported => defmt::intern!("Unsupported"),
-            Self::UnsupportedRemote => defmt::intern!("UnsupportedRemote"),
-        }
-    }
-}
-
 /// One connection. A request with the epoch of a link that has ended has
 /// no effect on the next one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Epoch(u32);
 
 impl Epoch {
@@ -203,6 +187,7 @@ impl Epoch {
 
 /// Connection parameters in link layer units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct ConnectionParams {
     /// Interval in units of 1.25 ms.
@@ -226,6 +211,7 @@ impl ConnectionParams {
 /// The same range serves the link layer procedure, the L2CAP request and the
 /// peripheral preferred connection parameters characteristic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct ParamRange {
     /// Longest interval in units of 1.25 ms.
@@ -342,6 +328,7 @@ impl Planned {
 
 /// An event of the link layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Event {
     /// High duty cycle directed advertising ended without a connection.
@@ -416,29 +403,6 @@ impl Event {
 
     /// Whether this reports a PHY.
     pub(crate) const fn is_phy_update(&self) -> bool { matches!(self, Self::PhyUpdated { rx: _, status: _, tx: _ }) }
-
-    /// The name of the event; its fields are logged on their own, for a defmt
-    /// log line (`{=istr}`): interned, so the string stays in the `.defmt`
-    /// section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::AdvertisingTimeout => defmt::intern!("AdvertisingTimeout"),
-            Self::Connected(_) => defmt::intern!("Connected"),
-            Self::DataLength(_) => defmt::intern!("DataLength"),
-            Self::Disconnected(_) => defmt::intern!("Disconnected"),
-            Self::Encryption { on: _on, refresh: _refresh, status: _status } => defmt::intern!("Encryption"),
-            Self::LtkRequest { ediv: _ediv, rand: _rand } => defmt::intern!("LtkRequest"),
-            Self::ParamsRequested(_) => defmt::intern!("ParamsRequested"),
-            Self::ParamsUpdated { params: _params, status: _status } => defmt::intern!("ParamsUpdated"),
-            Self::PayloadTimeout => defmt::intern!("PayloadTimeout"),
-            Self::PhyUpdated { rx: _rx, status: _status, tx: _tx } => defmt::intern!("PhyUpdated"),
-            Self::RemoteFeatures { features: _features, status: _status } => defmt::intern!("RemoteFeatures"),
-            Self::RemoteVersion(_) => defmt::intern!("RemoteVersion"),
-        }
-    }
 }
 
 /// A received ACL fragment.

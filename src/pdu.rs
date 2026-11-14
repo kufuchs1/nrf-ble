@@ -405,7 +405,7 @@ mod tests {
     fn advertising_and_weak_access_addresses_are_rejected() {
         assert!(!valid_access_address(ADV_ACCESS_ADDRESS));
         for bit in 0..32 {
-            assert!(!valid_access_address(ADV_ACCESS_ADDRESS ^ u32::unbounded_shl(1, bit)));
+            assert!(!valid_access_address(ADV_ACCESS_ADDRESS ^ 1_u32.unbounded_shl(bit)));
         }
         for address in [0, u32::MAX, 0xAAAA_AAAA, 0x0000_5678, 0xFF00_7F00] {
             assert!(!valid_access_address(address));

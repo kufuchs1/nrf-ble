@@ -219,7 +219,7 @@ pub const PAIRING_DHKEY_CHECK: u8 = 0x0D;
 /// Code of a Keypress Notification.
 pub const KEYPRESS_NOTIFICATION: u8 = 0x0E;
 /// Longest PDU the security manager sends or takes: a Pairing Public Key.
-pub const PDU_MAX: usize = usize::strict_add(1, PUBLIC_KEY_LEN);
+pub const PDU_MAX: usize = 1_usize.strict_add(PUBLIC_KEY_LEN);
 /// The time a pairing has from the last PDU the security manager queued.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// IO capability: no input and no output, which makes pairing Just Works.
@@ -320,6 +320,7 @@ pub struct Identity {
 /// Our IO capability, as the Pairing Response gives it.
 #[cfg(feature = "passkey")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum IoCapability {
     /// A keyboard without a display (0x02): Passkey Entry with any central
@@ -1480,19 +1481,6 @@ impl IoCapability {
         match self {
             Self::KeyboardOnly => KEYBOARD_ONLY,
             Self::NoInputNoOutput => NO_INPUT_NO_OUTPUT,
-        }
-    }
-
-    /// The name of the IO capability, for a defmt log line (`{=istr}`):
-    /// interned, so the string stays in the `.defmt` section, which takes no
-    /// flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::KeyboardOnly => defmt::intern!("KeyboardOnly"),
-            Self::NoInputNoOutput => defmt::intern!("NoInputNoOutput"),
         }
     }
 }

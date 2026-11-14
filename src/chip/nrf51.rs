@@ -95,7 +95,7 @@ pub const PHY_2M: bool = false;
 pub const RX_READY_US: u32 = 140;
 /// CCM scratch space: 16 octets and the 27-octet payload the nRF51 CCM
 /// handles at most, whatever the length field holds.
-pub const SCRATCH_LEN: usize = usize::strict_add(16, 27);
+pub const SCRATCH_LEN: usize = 16_usize.strict_add(27);
 /// Number of programmable PPI channels.
 const PROGRAMMABLE_CHANNELS: usize = 16;
 /// Whether the firmware configured the clock sources.

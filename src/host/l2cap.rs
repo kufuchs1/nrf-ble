@@ -36,6 +36,7 @@ pub const CID_SECURITY_MANAGER: u16 = 0x0006;
 
 /// A fixed channel the host serves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Channel {
     /// The attribute protocol, CID 4.
@@ -118,19 +119,6 @@ impl Channel {
             CID_SIGNALLING => Some(Self::Signalling),
             CID_SECURITY_MANAGER => Some(Self::SecurityManager),
             _ => None,
-        }
-    }
-
-    /// The name of the channel, for a defmt log line (`{=istr}`): interned,
-    /// so the string stays in the `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::Att => defmt::intern!("Att"),
-            Self::SecurityManager => defmt::intern!("SecurityManager"),
-            Self::Signalling => defmt::intern!("Signalling"),
         }
     }
 }

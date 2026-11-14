@@ -210,7 +210,7 @@ pedantic = { level = "deny", priority = 1 }
 restriction = { level = "deny", priority = 1 }
 nursery = { level = "deny", priority = 1 }
 # The only lints allowed. Each comment says why, and what the other way
-# would cost where one exists.
+# would cost where one exists. No clippy.toml loosens any lint.
 #
 # It refuses enabling the restriction group as a whole. The other way, a deny
 # list of every restriction lint by name, would no longer take in the lints
@@ -222,31 +222,36 @@ blanket_clippy_restriction_lints = { level = "allow", priority = 2 }
 # `implicit_return` demands at the end of every function.
 implicit_return = { level = "allow", priority = 2 }
 # `mod_module_files` refuses `foo/mod.rs`, `self_named_module_files` refuses
-# `foo.rs` beside `foo/`; the code uses `foo.rs`. Both look only at those two
-# layouts, so children loaded with `#[path]` from folders that have no
-# same-named file would pass both; that layout is not Rust's convention and
-# changes no code, so the allow stays.
+# `foo.rs` beside `foo/`; the code uses `foo.rs`. With `inline_modules`, which
+# refuses `mod foo { .. }` outside the tests, the three leave one layout: every
+# child module loaded with `#[path]` from a folder that has no same-named file.
+# That layout is not Rust's convention and changes no code, so the allow stays.
 self_named_module_files = { level = "allow", priority = 2 }
-# `pub_without_shorthand` refuses `pub(in crate)`, `pub_with_shorthand`
-# refuses `pub(crate)`, the only two ways to write that visibility; the code
-# writes `pub(crate)`.
+# `pub_without_shorthand` refuses `pub(in crate)` and `pub(in super)`,
+# `pub_with_shorthand` refuses `pub(crate)` and `pub(super)`, the only two ways
+# to write those visibilities; the code writes the shorthand.
 pub_with_shorthand = { level = "allow", priority = 2 }
+# `unseparated_literal_suffix` refuses `5u32`, `separated_literal_suffix`
+# refuses `5_u32`: opposites by definition. With both denied a literal gets its
+# type only through the context or a type path (`u32::saturating_sub(150,
+# delay)`); the suffix says it at the literal, and the code writes `150_u32`.
+separated_literal_suffix = { level = "allow", priority = 2 }
 # `rest_pattern_accessible_field` refuses `..` in a struct pattern and
 # `unneeded_field_pattern` refuses `field: _`, the two ways to ignore a field
 # without binding it, so with both denied the only spelling left is an unused
-# `_name` binding. The code writes `field: _` (the defmt `name()` tables still
-# bind `_name`), which keeps every field named, so a new field still forces a
-# review of each match.
+# `_name` binding. The code writes `field: _`, which keeps every field named,
+# so a new field still forces a review of each match.
 unneeded_field_pattern = { level = "allow", priority = 2 }
 # Not a contradiction but a choice: `question_mark_used` refuses `?`, and
-# the code uses `?` for its early returns of `None` or an error. With this
-# clippy `question_mark` (style) stays silent on such a return written out
-# (let-else, `if let`, `match`) while `question_mark_used` is denied, so the
-# other spelling would pass too; `?` is the shorter one.
+# the code uses `?` for its early returns of `None` or an error. While
+# `question_mark_used` is denied, clippy's `question_mark` (style) stays silent
+# on such a return written out (let-else, `if let`, `match`), so that spelling
+# would pass too; `?` is the shorter one.
 question_mark_used = { level = "allow", priority = 2 }
 # `too_many_lines` (pedantic) and `cognitive_complexity` (nursery) are met by
 # splitting a long function into parts, each called once, which
-# `single_call_fn` refuses.
+# `single_call_fn` refuses; inlining them back would make the long functions
+# those two refuse.
 single_call_fn = { level = "allow", priority = 2 }
 # `little_endian_bytes`, `big_endian_bytes` and `host_endian_bytes` together
 # refuse every conversion between an integer and its octets
@@ -264,3 +269,9 @@ single_call_fn = { level = "allow", priority = 2 }
 # the CPU's byte order by mistake.
 little_endian_bytes = { level = "allow", priority = 2 }
 big_endian_bytes = { level = "allow", priority = 2 }
+# defmt's `derive(Format)` and its level macros (`info!`, `warn!` and the
+# others, whenever `DEFMT_LOG` enables the level) expand to slice indexing that
+# this lint refuses, and no code can change a third-party expansion. For the
+# crate's own code `indexing_slicing` (still denied) refuses every slice index
+# anyway, so nothing is lost.
+missing_asserts_for_indexing = { level = "allow", priority = 2 }

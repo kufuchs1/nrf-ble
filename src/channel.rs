@@ -128,7 +128,7 @@ const _: () = assert!(
 /// Whether a channel bit is set in a link layer channel map.
 const fn is_set(bits: [u8; 5], channel: u8) -> bool {
     bits.get(usize::from(channel.wrapping_shr(3)))
-        .is_some_and(const |&byte| byte & u8::wrapping_shl(1, u32::from(channel & 7)) != 0)
+        .is_some_and(const |&byte| byte & 1_u8.wrapping_shl(u32::from(channel & 7)) != 0)
 }
 
 #[cfg(test)]

@@ -156,7 +156,7 @@ impl Bond {
     #[must_use = "the subscriptions are only built"]
     pub const fn subscriptions(&self, db: &Db) -> Subscriptions {
         let bits = u32::from(db.cccds()).saturating_mul(2);
-        let mask = u32::unbounded_shl(1, bits).wrapping_sub(1);
+        let mask = 1_u32.unbounded_shl(bits).wrapping_sub(1);
         Subscriptions::from_bits(self.cccd & mask)
     }
 

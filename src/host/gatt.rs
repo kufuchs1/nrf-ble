@@ -339,6 +339,7 @@ pub enum Kind {
 /// The security of a link, or the security an attribute needs, ordered by
 /// strength: open below encrypted below authenticated.
 #[derive(Clone, Copy, Debug, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive_const(PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum Sec {
@@ -722,19 +723,6 @@ impl Sec {
     #[inline]
     #[must_use = "the comparison is only computed"]
     pub const fn met_by(self, level: Self) -> bool { level >= self }
-
-    /// The name of the level, for a defmt log line (`{=istr}`): interned,
-    /// so the string stays in the `.defmt` section, which takes no flash.
-    #[cfg(feature = "defmt")]
-    #[inline]
-    #[must_use = "the name is only read"]
-    pub fn name(self) -> defmt::Str {
-        match self {
-            Self::Authenticated => defmt::intern!("Authenticated"),
-            Self::Encrypted => defmt::intern!("Encrypted"),
-            Self::Open => defmt::intern!("Open"),
-        }
-    }
 }
 
 impl Subscriptions {
@@ -785,10 +773,10 @@ impl Subscriptions {
             allowed |= u32::from(CCC_INDICATE);
         }
         let shift = u32::from(index).saturating_mul(2);
-        let mask = u32::unbounded_shl(3, shift);
+        let mask = 3_u32.unbounded_shl(shift);
         let bits = (u32::from(value) & allowed).unbounded_shl(shift);
         self.values = (self.values & !mask) | bits;
-        self.written |= u16::unbounded_shl(1, u32::from(index));
+        self.written |= 1_u16.unbounded_shl(u32::from(index));
     }
 
     /// The value of the descriptor `index`, as a Read gives it.
@@ -990,7 +978,7 @@ const fn input_reports(attrs: &[Attr]) -> u16 {
             },
             (Kind::Service, _) => report = false,
             (Kind::Descriptor(_), Value::Cccd(index)) if report => {
-                inputs |= u16::unbounded_shl(1, u32::from(index));
+                inputs |= 1_u16.unbounded_shl(u32::from(index));
             },
             _ => {},
         }

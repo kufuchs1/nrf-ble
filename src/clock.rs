@@ -321,7 +321,7 @@ impl<'peripherals> Clock<'peripherals> {
             return true;
         }
         self.late = self.late.wrapping_add(1);
-        info!("crystal stopped while in use");
+        warn!("crystal stopped while in use");
         CLOCK.tasks_hfclkstart().write_value(1);
         self.wait_crystal().await;
         false
@@ -365,7 +365,7 @@ impl<'peripherals> Clock<'peripherals> {
         if RTC.events_compare(RTC_RESUME).read() == 0 {
             REGS.tasks_start().write_value(1);
             started_at = rtc_now().wrapping_sub(tick) & RTC_MASK;
-            info!("clock restart missed its tick");
+            warn!("clock restart missed its tick");
         }
         PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
         self.base = time.wrapping_add(ticks_to_us(started_at));
@@ -693,7 +693,7 @@ pub async fn calibrate_rc(_temperature: Peri<'_, peripherals::TEMP>) -> ! {
                 calibrated_at = Some(temperature);
                 skipped = 0;
             } else {
-                info!("RC calibration timed out");
+                warn!("RC calibration timed out");
             }
         } else {
             skipped = skipped.saturating_add(1);

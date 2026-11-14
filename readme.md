@@ -606,10 +606,13 @@ costs about 1.5 KB more static RAM, which on the nRF52832 comes out of the stack
 central's data length request with the 27-octet default. The host's `param-requests`, `key-missing` and `passkey` are
 described in [Optional features](#optional-features); they work on both chips.
 
-With `defmt`, the public enums (the errors, `link::Event`, `gatt::Sec`, `l2cap::Channel` and the like) give the name of
-their variant as an interned string, `name()`, for a `{=istr}` placeholder: `info!("notify: {=istr}", error.name())`.
-No type implements `defmt::Format`, whose derive expands to indexing that the Clippy setup below refuses; a struct is
-logged through its fields or accessors.
+With `defmt`, the error enums (`host::RequestError`, `host::NotifyError`, `host::PasskeyError`,
+`host::AdvertiseError`, `adv::Error`, `adv::Overflow`, `att::NotifyError`, `ecc::KeyError`, `link::Error`),
+`link::Event` and the structs it carries (`link::Epoch`, `link::ConnectionParams`, `link::ParamRange`), `gatt::Sec`,
+`l2cap::Channel`, `signal::Outcome`, `smp::IoCapability` and `engine::Unclaimed` implement `defmt::Format`, for a `{}`
+placeholder: `info!("notify: {}", error)`. Other types are logged through their fields or accessors. The crate's own
+lines log at `info` and, for failures, refusals and timeouts, at `warn`: a firmware keeps them with `nrf_ble=info` in
+its `DEFMT_LOG`.
 
 The crate needs a nightly toolchain, which its [`rust-toolchain.toml`](rust-toolchain.toml) names, and so does a
 firmware that uses it: [`src/lib.rs`](src/lib.rs) enables the unstable const trait implementations of the standard
@@ -772,8 +775,10 @@ Clippy runs on the library for the chip targets, as in nrf-ll. The tests are not
 fails on the test code under the `restriction` group, as in nrf-ll).
 
 Every Clippy group, `restriction` included, is an error. [`Cargo.toml`](Cargo.toml) allows only lints that another lint
-or the strict setup itself contradicts, the two byte orders the code converts integers in (`little_endian_bytes`,
-`big_endian_bytes`; `host_endian_bytes` stays an error), and `question_mark_used`, a choice of `?` over the early
+or the strict setup itself contradicts (`separated_literal_suffix` among them: a literal is written `150_u32`), the two
+byte orders the code converts integers in (`little_endian_bytes`, `big_endian_bytes`; `host_endian_bytes` stays an
+error), `missing_asserts_for_indexing`, which the expansions of defmt's derive and level macros trip (`indexing_slicing`
+still refuses every slice index of the crate's own code), and `question_mark_used`, a choice of `?` over the early
 returns written out; each allowance gives its reason, and the code has no `#[allow]` or `#[expect]`.
 
 ## License

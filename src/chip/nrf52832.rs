@@ -19,7 +19,7 @@ use embassy_nrf::pac::{
 /// 107 (anomaly 182).
 const ANOMALY_182_REGISTER: usize = 0x4000_173C;
 /// Enable bit in [`ANOMALY_182_REGISTER`].
-const ANOMALY_182_BIT: u32 = u32::strict_shl(1, 10);
+const ANOMALY_182_BIT: u32 = 1_u32.strict_shl(10);
 /// Register of the workaround for nRF52832 anomaly 192: the RC oscillator's
 /// frequency can be off by more than 500 ppm after a calibration during
 /// which the CPU slept.
@@ -64,7 +64,7 @@ pub const PHY_2M: bool = true;
 pub const RX_READY_US: u32 = 40;
 /// CCM scratch space for every value of an untrusted eight-bit length field:
 /// RADIO MAXLEN bounds radio DMA but does not rewrite that field for the CCM.
-pub const SCRATCH_LEN: usize = usize::strict_add(16, 255);
+pub const SCRATCH_LEN: usize = 16_usize.strict_add(255);
 
 /// Sets the CCM mode for a packet on `phy`, in the extended length mode.
 #[inline]
