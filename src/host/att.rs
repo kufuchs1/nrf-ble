@@ -626,10 +626,10 @@ impl<'out> Writer<'out> {
 
     /// Appends `bytes` if they fit; returns whether they did.
     const fn push(&mut self, bytes: &[u8]) -> bool {
-        let end = self.len.saturating_add(bytes.len());
-        let Some(target) = self.buf.get_mut(self.len..end) else { return false };
+        let Some(rest) = self.buf.get_mut(self.len..) else { return false };
+        let Some(target) = rest.get_mut(..bytes.len()) else { return false };
         target.copy_from_slice(bytes);
-        self.len = end;
+        self.len = self.len.saturating_add(bytes.len());
         true
     }
 
