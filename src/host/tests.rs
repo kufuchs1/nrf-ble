@@ -26,7 +26,7 @@ use super::{
     test_aes::Software,
 };
 use crate::{
-    advertiser::legacy::Kind,
+    advertiser::Kind,
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Rx},
     pdu::Peer,
 };

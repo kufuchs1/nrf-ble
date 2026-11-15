@@ -75,7 +75,7 @@
 //! timeout shorter than a few latencies holds.
 
 use crate::{
-    advertiser::legacy::{DATA_MAX, FILTER_LIST_SIZE, Kind, Settings as LegacySettings},
+    advertiser::{DATA_MAX, Kind, SCAN_DATA_MAX, Settings as AdvSettings, privacy::FILTER_LIST_SIZE},
     chip,
     crypto,
     pdu::{Llid, Peer, valid_connection_parameters},
@@ -521,8 +521,7 @@ impl AdvParams {
 
     /// Whether the parameters are in range.
     const fn is_valid(&self) -> bool {
-        let interval_valid =
-            self.kind == Kind::DirectedHighDuty || (ADV_INTERVAL_MIN..=ADV_INTERVAL_MAX).contains(&self.interval);
+        let interval_valid = self.kind.is_high_duty() || (ADV_INTERVAL_MIN..=ADV_INTERVAL_MAX).contains(&self.interval);
         interval_valid && (1..=0x07).contains(&self.channel_map) && self.filter_policy <= 3
     }
 
@@ -569,16 +568,16 @@ struct HostState {
     acked:            u32,
     /// Host query bits already accepted but not completed.
     active_queries:   u8,
+    /// Advertising parameters.
+    adv:              AdvSettings,
+    /// Whether the host enabled advertising.
+    adv_enabled:      bool,
     /// Whether a connection exists.
     connected:        bool,
     /// Changes at each link boundary so requests cannot cross links.
     epoch:            u32,
     /// What the host learns about the current link.
     info:             Option<Info>,
-    /// Legacy advertising parameters.
-    legacy:           LegacySettings,
-    /// Whether the host enabled legacy advertising.
-    legacy_enabled:   bool,
     /// An LTK request waits for the host's answer.
     ltk_pending:      bool,
     /// Connection updates the host asked for while it answered a central's
@@ -634,7 +633,7 @@ impl HostState {
     /// Overwrites every identity resolving key before it is dropped.
     fn forget_keys(&mut self) {
         self.forget_address();
-        self.legacy.resolving.clear();
+        self.adv.resolving.clear();
     }
 
     /// The state after power-on or a reset, in the generation `epoch`.
@@ -642,11 +641,11 @@ impl HostState {
         Self {
             acked: 0,
             active_queries: 0,
+            adv: AdvSettings::new(),
+            adv_enabled: false,
             connected: false,
             epoch,
             info: None,
-            legacy: LegacySettings::new(),
-            legacy_enabled: false,
             ltk_pending: false,
             merged_updates: 0,
             #[cfg(feature = "event-timing")]
@@ -741,10 +740,10 @@ impl Shared {
 
     /// The advertising to run, if the host enabled it and no connection
     /// exists.
-    pub(crate) fn advertising(&self) -> Option<LegacySettings> {
+    pub(crate) fn advertising(&self) -> Option<AdvSettings> {
         self.state.lock(|cell| {
             let state = cell.borrow();
-            (!state.connected && state.legacy_enabled).then_some(state.legacy)
+            (!state.connected && state.adv_enabled).then_some(state.adv)
         })
     }
 
@@ -806,7 +805,7 @@ impl Shared {
         Encrypt: FnOnce([u8; 16], [u8; 16]) -> [u8; 16],
     {
         let mut key = (private && kind.is_directed())
-            .then(|| self.state.lock(|cell| cell.borrow().legacy.resolving.peer_key(peer)))
+            .then(|| self.state.lock(|cell| cell.borrow().adv.resolving.peer_key(peer)))
             .flatten();
         let Some(irk) = key.as_mut() else { return peer };
         let target = new_private_address(*irk, fill, encrypt);
@@ -864,7 +863,7 @@ impl Shared {
     fn own_address(&self, private_key: Option<[u8; 16]>) -> Peer {
         let (fallback, lifetime) = self.state.lock(|cell| {
             let state = cell.borrow();
-            (state.legacy.address, state.private_timeout)
+            (state.adv.address, state.private_timeout)
         });
         let Some(key) = private_key else { return fallback };
         let now = Instant::now();
@@ -891,8 +890,8 @@ impl Shared {
     fn private_key(&self) -> Option<[u8; 16]> {
         self.state.lock(|cell| {
             let state = cell.borrow();
-            let legacy = &state.legacy;
-            legacy.resolving.local_key(legacy.kind.is_directed().then_some(legacy.peer)).filter(|_| legacy.private)
+            let adv = &state.adv;
+            adv.resolving.local_key(adv.kind.is_directed().then_some(adv.peer)).filter(|_| adv.private)
         })
     }
 
@@ -925,13 +924,13 @@ impl Shared {
     /// as [`Link::advertise`] made it. Call it before each advertising event,
     /// outside radio events.
     pub(crate) fn refresh_private_address(&self) {
-        let enabled = self.state.lock(|cell| cell.borrow().legacy_enabled);
+        let enabled = self.state.lock(|cell| cell.borrow().adv_enabled);
         let Some(key) = self.private_key().filter(|_| enabled) else { return };
         let address = self.own_address(Some(key));
         self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            if state.legacy_enabled && state.legacy.private && state.legacy.own != address {
-                state.legacy.own = address;
+            if state.adv_enabled && state.adv.private && state.adv.own != address {
+                state.adv.own = address;
                 info!("new private address");
             }
         });
@@ -992,7 +991,7 @@ impl Shared {
             }
             state.connected = connected;
             if connected {
-                state.legacy_enabled = false;
+                state.adv_enabled = false;
             }
             changed
         });
@@ -1068,7 +1067,7 @@ impl Shared {
     }
 
     /// Ends advertising that ran out of time.
-    pub(crate) fn stop_advertising(&self) { self.state.lock(|cell| cell.borrow_mut().legacy_enabled = false); }
+    pub(crate) fn stop_advertising(&self) { self.state.lock(|cell| cell.borrow_mut().adv_enabled = false); }
 
     /// Data length new links start with: payload octets and time.
     pub(crate) fn suggested_length(&self) -> [u16; 2] { self.state.lock(|cell| cell.borrow().suggested_length) }
@@ -1159,7 +1158,7 @@ impl<'shared> Link<'shared> {
     /// [`Error::Full`] if it holds [`FILTER_LIST_SIZE`] devices.
     #[inline]
     pub fn accept_list_add(&self, peer: Peer) -> Result<(), Error> {
-        self.with_filter_list(|legacy| if legacy.filter.add(peer) { Ok(()) } else { Err(Error::Full) })
+        self.with_filter_list(|settings| if settings.filter.add(peer) { Ok(()) } else { Err(Error::Full) })
     }
 
     /// Empties the filter accept list.
@@ -1169,8 +1168,8 @@ impl<'shared> Link<'shared> {
     /// [`Error::Disallowed`] while advertising filters on the list.
     #[inline]
     pub fn accept_list_clear(&self) -> Result<(), Error> {
-        self.with_filter_list(|legacy| {
-            legacy.filter.clear();
+        self.with_filter_list(|settings| {
+            settings.filter.clear();
             Ok(())
         })
     }
@@ -1182,8 +1181,8 @@ impl<'shared> Link<'shared> {
     /// [`Error::Disallowed`] while advertising filters on the list.
     #[inline]
     pub fn accept_list_remove(&self, peer: Peer) -> Result<(), Error> {
-        self.with_filter_list(|legacy| {
-            legacy.filter.remove(peer);
+        self.with_filter_list(|settings| {
+            settings.filter.remove(peer);
             Ok(())
         })
     }
@@ -1207,13 +1206,13 @@ impl<'shared> Link<'shared> {
     #[inline]
     pub fn add_peer(&self, identity: Peer, peer_irk: [u8; 16], local_irk: [u8; 16]) -> Result<(), Error> {
         self.check_resolving_change()?;
-        if !self.shared.state.lock(|cell| cell.borrow().legacy.resolving.can_add(identity)) {
+        if !self.shared.state.lock(|cell| cell.borrow().adv.resolving.can_add(identity)) {
             return Err(Error::Full);
         }
         let needs_address = local_irk != [0; 16]
             && self.shared.state.lock(|cell| {
                 let state = cell.borrow();
-                state.legacy_enabled && state.legacy.private && state.legacy.own == state.legacy.address
+                state.adv_enabled && state.adv.private && state.adv.own == state.adv.address
             });
         let own = needs_address.then(|| self.shared.own_address(Some(local_irk)));
         let added = self.shared.state.lock(|cell| {
@@ -1221,9 +1220,9 @@ impl<'shared> Link<'shared> {
             // Advertising that started before the key arrived moves to a
             // private address now.
             if let Some(address) = own {
-                state.legacy.own = address;
+                state.adv.own = address;
             }
-            state.legacy.resolving.add_keys(identity, peer_irk, local_irk)
+            state.adv.resolving.add_keys(identity, peer_irk, local_irk)
         });
         if added { Ok(()) } else { Err(Error::Full) }
     }
@@ -1254,13 +1253,12 @@ impl<'shared> Link<'shared> {
     /// connection exists.
     #[inline]
     pub fn advertise(&self, params: &AdvParams, adv: &[u8], scan: &[u8]) -> Result<(), Error> {
-        let max = DATA_MAX;
-        if !params.is_valid() || adv.len() > max || scan.len() > max {
+        if !params.is_valid() || adv.len() > DATA_MAX || scan.len() > SCAN_DATA_MAX {
             return Err(Error::Invalid);
         }
         let (address, connected) = self.shared.state.lock(|cell| {
             let state = cell.borrow();
-            (state.legacy.address, state.connected)
+            (state.adv.address, state.connected)
         });
         if address.address == [0; 6] {
             return Err(Error::Invalid);
@@ -1273,7 +1271,7 @@ impl<'shared> Link<'shared> {
         let key = params.private.then(|| {
             self.shared
                 .state
-                .lock(|cell| cell.borrow().legacy.resolving.local_key(params.kind.is_directed().then_some(params.peer)))
+                .lock(|cell| cell.borrow().adv.resolving.local_key(params.kind.is_directed().then_some(params.peer)))
         });
         let own = self.shared.own_address(key.flatten());
         #[cfg(feature = "directed-advertising")]
@@ -1283,26 +1281,20 @@ impl<'shared> Link<'shared> {
             if state.connected {
                 return Err(Error::Disallowed);
             }
-            let legacy = &mut state.legacy;
-            legacy.kind = params.kind;
-            legacy.private = params.private;
-            legacy.interval = u32::from(params.interval).saturating_mul(625);
-            legacy.peer = params.peer;
-            #[cfg(feature = "directed-advertising")]
-            legacy.target.clone_from(&on_air_target);
-            legacy.channel_map = params.channel_map;
-            legacy.filter_policy = params.filter_policy;
-            for (target, len, source) in
-                [(&mut legacy.data, &mut legacy.len, adv), (&mut legacy.scan_data, &mut legacy.scan_len, scan)]
-            {
-                target.fill(0);
-                if let Some(destination) = target.get_mut(..source.len()) {
-                    destination.copy_from_slice(source);
-                }
-                *len = source.len().saturating_cast();
+            let settings = &mut state.adv;
+            if !settings.set_data(adv, scan) {
+                return Err(Error::Invalid);
             }
-            legacy.own = own;
-            state.legacy_enabled = true;
+            settings.kind = params.kind;
+            settings.private = params.private;
+            settings.interval = u32::from(params.interval).saturating_mul(625);
+            settings.peer = params.peer;
+            #[cfg(feature = "directed-advertising")]
+            settings.target.clone_from(&on_air_target);
+            settings.channel_map = params.channel_map;
+            settings.filter_policy = params.filter_policy;
+            settings.own = own;
+            state.adv_enabled = true;
             Ok(())
         });
         if result.is_ok() {
@@ -1316,7 +1308,7 @@ impl<'shared> Link<'shared> {
     fn check_resolving_change(self) -> Result<(), Error> {
         let busy = self.shared.state.lock(|cell| {
             let state = cell.borrow();
-            state.legacy_enabled && state.legacy.resolution_enabled
+            state.adv_enabled && state.adv.resolution_enabled
         });
         if busy { Err(Error::Disallowed) } else { Ok(()) }
     }
@@ -1532,7 +1524,7 @@ impl<'shared> Link<'shared> {
         self.check_resolving_change()?;
         self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            state.legacy.resolving.remove(identity);
+            state.adv.resolving.remove(identity);
             state.forget_address();
         });
         Ok(())
@@ -1659,8 +1651,8 @@ impl<'shared> Link<'shared> {
     /// [`Error::Disallowed`] while advertising runs.
     #[inline]
     pub fn set_address_resolution(&self, enable: bool) -> Result<(), Error> {
-        self.with_idle_advertising(|legacy| {
-            legacy.resolution_enabled = enable;
+        self.with_idle_advertising(|settings| {
+            settings.resolution_enabled = enable;
             Ok(())
         })
     }
@@ -1711,9 +1703,9 @@ impl<'shared> Link<'shared> {
     /// [`Error::Disallowed`] while advertising runs.
     #[inline]
     pub fn set_identity(&self, address: [u8; 6]) -> Result<(), Error> {
-        self.with_idle_advertising(|legacy| {
-            legacy.address = Peer::new(address, true);
-            legacy.own = legacy.address;
+        self.with_idle_advertising(|settings| {
+            settings.address = Peer::new(address, true);
+            settings.own = settings.address;
             Ok(())
         })
     }
@@ -1770,8 +1762,8 @@ impl<'shared> Link<'shared> {
     /// the peer is not listed.
     #[inline]
     pub fn set_privacy_mode(&self, identity: Peer, device: bool) -> Result<(), Error> {
-        self.with_idle_advertising(|legacy| {
-            if legacy.resolving.set_mode(identity, device) { Ok(()) } else { Err(Error::Invalid) }
+        self.with_idle_advertising(|settings| {
+            if settings.resolving.set_mode(identity, device) { Ok(()) } else { Err(Error::Invalid) }
         })
     }
 
@@ -1806,7 +1798,7 @@ impl<'shared> Link<'shared> {
     /// Ends advertising.
     #[inline]
     pub fn stop_advertising(&self) {
-        let was = self.shared.state.lock(|cell| mem::take(&mut cell.borrow_mut().legacy_enabled));
+        let was = self.shared.state.lock(|cell| mem::take(&mut cell.borrow_mut().adv_enabled));
         if was {
             self.shared.changed.signal(());
             info!("advertising stopped");
@@ -1866,24 +1858,24 @@ impl<'shared> Link<'shared> {
 
     /// Runs `change` on the advertising settings unless advertising filters
     /// on the accept list.
-    fn with_filter_list(self, change: impl FnOnce(&mut LegacySettings) -> Result<(), Error>) -> Result<(), Error> {
+    fn with_filter_list(self, change: impl FnOnce(&mut AdvSettings) -> Result<(), Error>) -> Result<(), Error> {
         self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            if state.legacy_enabled && state.legacy.filter_policy != 0 {
+            if state.adv_enabled && state.adv.filter_policy != 0 {
                 return Err(Error::Disallowed);
             }
-            change(&mut state.legacy)
+            change(&mut state.adv)
         })
     }
 
     /// Runs `change` on the advertising settings unless advertising runs.
-    fn with_idle_advertising(self, change: impl FnOnce(&mut LegacySettings) -> Result<(), Error>) -> Result<(), Error> {
+    fn with_idle_advertising(self, change: impl FnOnce(&mut AdvSettings) -> Result<(), Error>) -> Result<(), Error> {
         self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            if state.legacy_enabled {
+            if state.adv_enabled {
                 return Err(Error::Disallowed);
             }
-            change(&mut state.legacy)
+            change(&mut state.adv)
         })
     }
 }

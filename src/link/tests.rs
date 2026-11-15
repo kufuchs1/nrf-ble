@@ -102,13 +102,13 @@ fn privacy_enable_mode_and_list_changes_are_enforced() {
     assert_eq!(link.set_privacy_mode(peer, true), Ok(()));
     assert_eq!(link.set_privacy_mode(Peer::new([2; 6], true), true), Err(Error::Invalid));
     assert_eq!(link.set_address_resolution(true), Ok(()));
-    shared.state.lock(|cell| cell.borrow_mut().legacy_enabled = true);
+    shared.state.lock(|cell| cell.borrow_mut().adv_enabled = true);
     assert_eq!(link.clear_peers(), Err(Error::Disallowed));
     assert_eq!(link.set_address_resolution(false), Err(Error::Disallowed));
-    shared.state.lock(|cell| cell.borrow_mut().legacy_enabled = false);
+    shared.state.lock(|cell| cell.borrow_mut().adv_enabled = false);
     assert_eq!(link.set_address_resolution(false), Ok(()));
-    assert!(!shared.state.lock(|cell| cell.borrow().legacy.resolution_enabled));
-    for slot in 2..=u8::try_from(crate::advertiser::legacy::RESOLVING_LIST_SIZE).unwrap() {
+    assert!(!shared.state.lock(|cell| cell.borrow().adv.resolution_enabled));
+    for slot in 2..=u8::try_from(crate::advertiser::privacy::RESOLVING_LIST_SIZE).unwrap() {
         assert_eq!(link.add_peer(Peer::new([slot; 6], true), [0; 16], [0; 16]), Ok(()));
     }
     assert_eq!(link.add_peer(Peer::new([0xEE; 6], true), [0; 16], [0; 16]), Err(Error::Full));
@@ -376,7 +376,7 @@ fn reset_forgets_keys_settings_and_the_link() {
     shared.complete_reset();
     shared.state.lock(|cell| {
         let state = cell.borrow();
-        assert!(state.legacy.resolving.is_empty());
+        assert!(state.adv.resolving.is_empty());
         assert_eq!(state.payload_timeout, DEFAULT_PAYLOAD_TIMEOUT);
         assert_eq!(state.private_timeout, PRIVATE_ADDRESS_TIMEOUT);
         assert!(!state.connected);
@@ -489,6 +489,7 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
     assert_eq!(link.advertise(&params.interval(0x001F), &[], &[]), Err(Error::Invalid));
     assert_eq!(link.advertise(&params.channel_map(0), &[], &[]), Err(Error::Invalid));
     assert_eq!(link.advertise(&params, &[0; 32], &[]), Err(Error::Invalid));
+    assert_eq!(link.advertise(&params, &[], &[0; 32]), Err(Error::Invalid));
     assert_eq!(link.advertise(&params, &[2, 1, 6], &[3, 9, 0x41, 0x42]), Ok(()));
     let settings = shared.advertising().unwrap();
     assert_eq!(settings.own.address, [1, 2, 3, 4, 5, 0xC6]);

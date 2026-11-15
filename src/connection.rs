@@ -10,6 +10,7 @@ mod transmit;
 #[cfg(feature = "event-timing")]
 use crate::clock::RESTART_EARLY_US;
 use crate::{
+    advertiser::Setup,
     channel::{Hopping, UsedChannels},
     chip,
     clock::{Clock, SETUP_US, reached},
@@ -817,7 +818,7 @@ pub struct Connection {
     /// Whether the free slot holds a prepared PDU to send next.
     next_ready:             bool = false,
     /// Transmit PHY to apply with the next PHY instant.
-    next_tx_phy:            Phy = Phy::M1,
+    next_tx_phy:            Phy,
     /// Ordered host notifications retained while its queue is full.
     notifications:          [Option<Event>; 3],
     /// Deadline of the host's connection parameter request, while it runs.
@@ -837,7 +838,7 @@ pub struct Connection {
     /// after the event.
     pending:                Ring<Pending, RX_SLOTS>,
     /// PHY both ways.
-    phy:                    Phy = Phy::M1,
+    phy:                    Phy,
     /// The PHY update this side asks for.
     phy_request:            Request = Request::NotStarted,
     /// PHY procedure completion awaiting notification.
@@ -893,7 +894,7 @@ pub struct Connection {
     /// Kind of the PDU on the air.
     tx_kind:                TxKind = TxKind::Empty,
     /// Transmit PHY, independent of the receive PHY.
-    tx_phy:                 Phy = Phy::M1,
+    tx_phy:                 Phy,
     /// Parameter update events still owed to the host beyond
     /// the retained notifications, with their status and parameters.
     updates_owed:           (u8, u8, ConnectionParams),
@@ -2239,13 +2240,17 @@ impl Connection {
         !self.queue.is_empty() || self.acl.is_some() || shared.has_acl_out()
     }
 
-    /// Starts a connection from a request whose packet ended at `end`.
+    /// Starts a connection from a request whose packet ended at `end`, as
+    /// `setup` says for the kind of request: its transmit window comes
+    /// `setup.window_delay_us` and the window offset after `end`, and the
+    /// link starts on `setup.phy` both ways.
     #[inline]
     #[must_use = "the connection does nothing until run"]
-    pub fn new(request: &ConnectInd, end: u32) -> Self {
+    pub fn new(request: &ConnectInd, end: u32, setup: Setup) -> Self {
         let interval = u32::from(request.interval).saturating_mul(UNIT_1250_US);
-        let start =
-            end.wrapping_add(UNIT_1250_US).wrapping_add(u32::from(request.win_offset).saturating_mul(UNIT_1250_US));
+        let start = end
+            .wrapping_add(setup.window_delay_us)
+            .wrapping_add(u32::from(request.win_offset).saturating_mul(UNIT_1250_US));
         // The fields with a scalar starting value take it from the struct.
         // The aggregates are built here: a default field value is a
         // constant, which the compiler copies from flash or clears with a
@@ -2281,6 +2286,7 @@ impl Connection {
             last_valid: end,
             latency: request.latency,
             map: UsedChannels::new(request.channel_map),
+            next_tx_phy: setup.phy,
             param_update: None,
             payload_timer: None,
             phy_update: None,
@@ -2294,7 +2300,9 @@ impl Connection {
             }),
             room: Room { acl: 0, control: 0 },
             peaks: Peaks::default(),
+            phy: setup.phy,
             trace: Trace::default(),
+            tx_phy: setup.phy,
             slots: (TxSlot::empty(), TxSlot::empty()),
             remote_request: None,
             updates_owed: (

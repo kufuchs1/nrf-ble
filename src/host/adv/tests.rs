@@ -463,7 +463,7 @@ fn the_link_layer_takes_a_directed_phase() {
     assert!(settings.kind == Kind::DirectedHighDuty && settings.peer == CENTRAL);
     assert!(settings.filter_policy == 0x03 && settings.own == identity.peer());
     assert_eq!(settings.resolving.local_key(Some(CENTRAL)), Some(identity.irk()));
-    let (primary, _) = settings.pdus();
+    let (primary, _) = advertiser::legacy::pdus(&settings);
     let header = primary.as_bytes()[0];
     assert_eq!(header & 0x0F, crate::pdu::ADV_DIRECT_IND);
     // TxAdd: our address is random, as a private one is; RxAdd: the

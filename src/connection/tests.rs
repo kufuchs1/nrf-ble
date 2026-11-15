@@ -6,6 +6,25 @@ use crate::link::{Epoch, Link, ParamRange};
 /// The answer path against a central that follows the specification.
 mod central;
 
+/// The connection request of the tests' connections: CONNECT_IND
+/// parameters, window offset 0 and size 1.
+const REQUEST: ConnectInd = ConnectInd {
+    access_address:   0x9A32_8370,
+    channel_map:      [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
+    crc_init:         1,
+    csa2:             false,
+    hop:              5,
+    initiator:        [1; 6],
+    initiator_random: false,
+    interval:         12,
+    latency:          0,
+    sca:              0,
+    sca_ppm:          500,
+    timeout:          600,
+    win_offset:       0,
+    win_size:         1,
+};
+
 /// Fills the host's event queue.
 fn fill(shared: &Shared) { while shared.try_push_event(Event::PayloadTimeout) {} }
 
@@ -16,27 +35,7 @@ fn queued(shared: &Shared) -> usize { core::iter::from_fn(|| shared.take_event()
 /// changes the sleep clock all tests share holds meanwhile.
 fn connection() -> Connection { critical_section::with(|_| new_connection()) }
 
-fn new_connection() -> Connection {
-    Connection::new(
-        &ConnectInd {
-            access_address:   0x9A32_8370,
-            channel_map:      [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
-            crc_init:         1,
-            csa2:             false,
-            hop:              5,
-            initiator:        [1; 6],
-            initiator_random: false,
-            interval:         12,
-            latency:          0,
-            sca:              0,
-            sca_ppm:          500,
-            timeout:          600,
-            win_offset:       0,
-            win_size:         1,
-        },
-        100,
-    )
-}
+fn new_connection() -> Connection { Connection::new(&REQUEST, 100, Setup::LEGACY) }
 
 /// The steps of `Connection::respond` that need no radio, as before the
 /// split: the room counted, the packet validated and taken, and the
@@ -72,6 +71,26 @@ impl Connection {
             }
         }
     }
+}
+
+#[test]
+fn the_transmit_window_and_the_phy_follow_the_setup() {
+    let window = |link: &Connection| match link.expect {
+        Expect::Window { start, size } => Some((start, size)),
+        Expect::Anchor => None,
+    };
+    let phys = |link: &Connection| [link.phy, link.tx_phy, link.next_tx_phy];
+    // After a CONNECT_IND: 1.25 ms after the end at 100 us, then the window
+    // offset 0; one unit of 1.25 ms wide; LE 1M.
+    let legacy = connection();
+    assert_eq!(window(&legacy), Some((1350, 1250)));
+    assert!(phys(&legacy) == [Phy::M1; 3]);
+    // Another delay, a window offset of 3 units and LE 2M.
+    let setup = Setup { phy: Phy::M2, window_delay_us: 2500 };
+    let request = ConnectInd { win_offset: 3, ..REQUEST };
+    let other = critical_section::with(|_| Connection::new(&request, 100, setup));
+    assert_eq!(window(&other), Some((6350, 1250)));
+    assert!(phys(&other) == [Phy::M2; 3]);
 }
 
 #[test]

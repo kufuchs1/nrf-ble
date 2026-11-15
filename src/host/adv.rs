@@ -141,7 +141,7 @@
 //! reason 0x13, as [`crate::host::engine::Unclaimed`] says.
 
 use crate::{
-    advertiser::legacy::{self, Kind},
+    advertiser::{self, Kind},
     host::{bond::Bond, identity},
     link::{self, AdvParams, Link},
     pdu::Peer,
@@ -149,7 +149,7 @@ use crate::{
 use embassy_time::Duration;
 
 /// Largest advertising or scan response data.
-pub const DATA_MAX: usize = legacy::DATA_MAX;
+pub const DATA_MAX: usize = advertiser::DATA_MAX;
 /// AD type: flags.
 pub const AD_FLAGS: u8 = 0x01;
 /// AD type: the complete list of 16-bit service UUIDs.
