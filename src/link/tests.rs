@@ -522,6 +522,17 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
         assert_eq!(link.advertise(&directed, &[0; 246][..directed_max], &[]), Ok(()));
         let settings = shared.advertising().unwrap();
         assert!(settings.kind == Kind::DirectedLowDuty && usize::from(settings.len) == directed_max && settings.stale);
+        // The secondary channel on LE 1M by default; LE 2M where the radio
+        // has it, refused on the nRF51.
+        assert!(settings.secondary_phy == crate::radio::Phy::M1);
+        let fast = params.secondary_phy(crate::radio::Phy::M2);
+        if cfg!(feature = "nrf51") {
+            assert_eq!(link.advertise(&fast, &[2, 1, 6], &[]), Err(Error::Invalid));
+            assert!(shared.advertising().unwrap().secondary_phy == crate::radio::Phy::M1);
+        } else {
+            assert_eq!(link.advertise(&fast, &[2, 1, 6], &[]), Ok(()));
+            assert!(shared.advertising().unwrap().secondary_phy == crate::radio::Phy::M2);
+        }
     }
     link.stop_advertising();
     assert!(shared.advertising().is_none());

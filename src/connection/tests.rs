@@ -93,6 +93,53 @@ fn the_transmit_window_and_the_phy_follow_the_setup() {
     assert!(phys(&other) == [Phy::M2; 3]);
 }
 
+#[cfg(feature = "extended-advertising")]
+#[test]
+fn a_connection_from_an_aux_connect_req_starts_2_5_ms_later_with_csa2_on_the_secondary_phy() {
+    use crate::advertiser::extended::SECONDARY_PHYS;
+    // The request as it comes on air: AUX_CONNECT_REQ from a public central
+    // to a static random advertiser, ChSel 0 as it is reserved, window
+    // offset 3 and size 1, interval 12, hop 5.
+    let advertiser = crate::pdu::Peer::new([1, 2, 3, 4, 5, 0xC6], true);
+    let mut pdu = [0_u8; 36];
+    pdu[0] = 0x05 | 0x80;
+    pdu[1] = 34;
+    pdu[2..8].copy_from_slice(&[1; 6]);
+    pdu[8..14].copy_from_slice(&advertiser.address);
+    pdu[14..18].copy_from_slice(&0x9A32_8370_u32.to_le_bytes());
+    pdu[18] = 1;
+    pdu[21] = 1;
+    pdu[22..24].copy_from_slice(&3_u16.to_le_bytes());
+    pdu[24] = 12;
+    pdu[28..30].copy_from_slice(&600_u16.to_le_bytes());
+    pdu[30..35].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F]);
+    pdu[35] = 5;
+    let request = ConnectInd::parse_aux(&pdu, advertiser).unwrap();
+    assert!(request.csa2 && request.win_offset == 3);
+    for phy in SECONDARY_PHYS {
+        // The request ended at 100 us: the transmit window opens 2500 us
+        // later plus 3 units of 1250 us, one unit wide.
+        let link = critical_section::with(|_| Connection::new(&request, 100, Setup::aux(phy)));
+        assert!(matches!(link.expect, Expect::Window { start: 6350, size: 1250 }));
+        // Channel selection algorithm 2 from the access address, whatever
+        // ChSel said: the identifier is its two halves XORed, 0x9A32 ^ 0x8370.
+        assert!(matches!(link.hopping, Hopping::Csa2 { identifier: 0x1942 }));
+        // Both ways on the secondary channel's PHY.
+        assert!([link.phy, link.tx_phy, link.next_tx_phy] == [phy; 3]);
+    }
+    // A CONNECT_IND keeps the legacy setup: 1.25 ms, LE 1M.
+    assert!(Setup::LEGACY.window_delay_us == 1250 && Setup::LEGACY.phy == Phy::M1);
+    assert!(Setup::aux(Phy::M1).window_delay_us == 2500);
+}
+
+#[test]
+fn the_extended_advertising_feature_bit_follows_the_feature() {
+    // Bit 12 (Core, Vol 6, Part B, 4.6): LE Extended Advertising, octet 1.
+    assert_eq!(FEATURES[1] & 0x10 != 0, cfg!(feature = "extended-advertising"));
+    // The rest of octet 1: LE 2M where the radio has it, CSA #2.
+    assert_eq!(FEATURES[1] & !0x10, if cfg!(feature = "nrf51") { 0x40 } else { 0x41 });
+}
+
 #[test]
 fn version_indication_is_queued_only_once_per_connection() {
     let mut link = connection();

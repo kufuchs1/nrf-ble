@@ -159,6 +159,8 @@ use crate::{
     link::{self, AdvParams, Link},
     pdu::Peer,
 };
+#[cfg(feature = "extended-advertising")]
+use crate::{chip, radio::Phy};
 use embassy_time::Duration;
 
 /// Largest advertising or scan response data.
@@ -233,14 +235,17 @@ const NO_PEER: Peer = Peer::new([0; 6], false);
 /// scan response data.
 pub struct Advertising<'bond> {
     /// The advertising data.
-    data:     Data,
+    data:          Data,
     /// The mode.
-    mode:     Mode<'bond>,
+    mode:          Mode<'bond>,
     /// The scan response data.
     #[cfg(not(feature = "extended-advertising"))]
-    scan:     Data,
+    scan:          Data,
     /// The phases and the security deadline.
-    schedule: &'static Schedule,
+    schedule:      &'static Schedule,
+    /// The PHY of the secondary channel.
+    #[cfg(feature = "extended-advertising")]
+    secondary_phy: Phy,
 }
 
 /// What a device advertises: its name, appearance, services and,
@@ -466,8 +471,15 @@ impl<'bond> Advertising<'bond> {
             #[cfg(not(feature = "extended-advertising"))]
             scan,
             schedule,
+            #[cfg(feature = "extended-advertising")]
+            secondary_phy: Phy::M1,
         })
     }
+
+    /// The link layer's parameters for `phase`: the mode's
+    /// ([`Mode::params`]), on the secondary channel's PHY.
+    #[cfg(feature = "extended-advertising")]
+    const fn params(&self, phase: &Phase) -> AdvParams { self.mode.params(phase).secondary_phy(self.secondary_phy) }
 
     /// The scan response data.
     #[cfg(not(feature = "extended-advertising"))]
@@ -490,6 +502,12 @@ impl<'bond> Advertising<'bond> {
     #[must_use = "the schedule is only read"]
     pub const fn schedule(&self) -> &'static Schedule { self.schedule }
 
+    /// The PHY of the secondary channel.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the PHY is only read"]
+    pub const fn secondary_phy(&self) -> Phy { self.secondary_phy }
+
     /// Advertises with `phase`'s interval until a central connects, or
     /// until [`Link::stop_advertising`] or another call replaces it; a
     /// directed phase ends by itself after 1.28 s, as the link layer ends
@@ -507,8 +525,22 @@ impl<'bond> Advertising<'bond> {
     where
         C: Control,
     {
+        #[cfg(not(feature = "extended-advertising"))]
         let params = self.mode.params(phase);
+        #[cfg(feature = "extended-advertising")]
+        let params = self.params(phase);
         Ok(control.call(Call::Advertise { adv: self.data.as_bytes(), params, scan: self.scan().as_bytes() })?)
+    }
+
+    /// With `phy` on the secondary channel, LE 1M by default: the
+    /// `AUX_ADV_IND`, the connection request and its answer, and the
+    /// connection's start. LE 2M halves their airtime, for centrals that
+    /// take it; the nRF51, which has LE 1M alone, keeps LE 1M.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the advertising is only built"]
+    pub const fn with_secondary_phy(self, phy: Phy) -> Self {
+        Self { secondary_phy: if chip::PHY_2M { phy } else { Phy::M1 }, ..self }
     }
 }
 

@@ -1,6 +1,8 @@
 //! The link layer task: advertises as the host configured it and runs the
 //! resulting connection.
 
+#[cfg(feature = "extended-advertising")]
+use crate::advertiser::Setup;
 use crate::{
     advertiser::{self, Accepted, Counters, Settings},
     clock::{Clock, SETUP_US},
@@ -55,6 +57,15 @@ async fn interval(settings: &Settings) -> u32 {
     settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).strict_rem(ADV_DELAY_MAX_US))
 }
 
+/// Publishes the PHY of a link that starts after an `AUX_CONNECT_REQ`, the
+/// secondary channel's both ways, and logs how it starts. Call it after the
+/// link was recorded as connected, which resets the PHY to LE 1M.
+#[cfg(feature = "extended-advertising")]
+fn start_after_aux(setup: Setup, shared: &Shared) {
+    shared.set_phys(setup.phy.hci(), setup.phy.hci());
+    info!("connection from AUX_CONNECT_REQ: window +{} us, csa2, phy {}M", setup.window_delay_us, setup.phy.hci());
+}
+
 /// Runs the link layer forever.
 #[inline]
 pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) -> ! {
@@ -86,7 +97,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             continue;
         }
         clock.resume_now().await;
-        let (started, event) = advertiser::event(radio, clock, &settings, &mut rx);
+        let (started, event) = advertiser::event(radio, clock, &settings, &mut counters, &mut rx);
         counters.log();
         let Some(Accepted { end, request, setup }) = event else {
             let next = started.wrapping_add(interval(&settings).await);
@@ -112,6 +123,8 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         let mut shown = central.address;
         shown.reverse();
         info!("central {=[u8; 6]:02X} random {}", shown, central.random);
+        #[cfg(feature = "extended-advertising")]
+        start_after_aux(setup, shared);
         let params = ConnectionParams::new(request.interval, request.latency, request.timeout);
         let answered = (request.sca, settings.kind.is_directed());
         let epoch = shared.set_info((central, settings.resolve(central), settings.own), params, answered);

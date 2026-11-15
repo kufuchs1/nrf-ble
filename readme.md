@@ -132,16 +132,25 @@ release build keeps its size to the byte):
   (see [A device](#a-device)). About 1.2 KB of flash on the nRF52832 and 1.4 KB on the nRF51 (measured in a keyboard
   and a presenter firmware), and one AES block each time a directed phase starts.
 - **`extended-advertising`**: Bluetooth 5 extended advertising in place of legacy advertising, for centrals that scan
-  with the extended commands (Linux with a Bluetooth 5 adapter). An `ADV_EXT_IND` on each primary channel points to one
-  `AUX_ADV_IND` on a secondary channel (LE 1M; LE 2M on the nRF52832 is planned), which holds up to 245 octets of
-  advertising data (239 when directed; 242 and 236 on the nRF51, whose radio takes at most 254 octets of a packet from
-  RAM) and no scan response: `Content::data` puts the TX power level and the complete name in the advertising data. The
-  ADI's advertising data ID is random and changes, never to the value last sent, with every new data and every new
-  private address, and so does the secondary channel sequence. A central is to connect with `AUX_CONNECT_REQ`, on
-  channel selection algorithm 2. No legacy advertising is compiled in. With `directed-advertising`, a directed phase is
-  low duty cycle directed advertising, an `AUX_ADV_IND` with the target at the phase's interval. Work in progress: the
-  PDUs, the data limits and the timing plan are in; the advertising event itself is not yet, so a build with the feature
-  does not advertise yet.
+  with the extended commands (Linux with a Bluetooth 5 adapter). An `ADV_EXT_IND` on each primary channel points to
+  one `AUX_ADV_IND` on a secondary channel, which holds up to 245 octets of advertising data (239 when directed; 242
+  and 236 on the nRF51, whose radio takes at most 254 octets of a packet from RAM) and no scan response:
+  `Content::data` puts the TX power level and the complete name in the advertising data. The ADI's advertising data ID
+  is random and changes, never to the value last sent, with every new data and every new private address, and so does
+  the secondary channel sequence. A central connects with `AUX_CONNECT_REQ`, which the `AUX_CONNECT_RSP` answers
+  within the interframe space; the connection's transmit window opens 2.5 ms after the request, on the secondary
+  channel's PHY and channel selection algorithm 2. The secondary channel runs on LE 1M, or on the nRF52832 on LE 2M
+  with `Advertising::with_secondary_phy(Phy::M2)` (`AdvParams::secondary_phy` at the link API), half the airtime for a
+  central that takes it; the nRF51 stays on LE 1M. Every packet starts at a time of TIMER0, so each `ADV_EXT_IND`'s
+  `AuxPtr` names the same 30 us unit; a packet whose start is too close when the radio is armed is skipped and
+  counted, and so is a request decided late: its answer in place only after the radio started sending it, or its check
+  ended only after the answer did, when a refusal no longer stops it (342 us after the request on LE 1M, 250 us on LE
+  2M; both counters in the log with `defmt`, with a timing sample every 1024th event). The answer's `TargetA` is the
+  request's `InitA` also for a central in device privacy mode that sends its identity address, against a
+  recommendation of the specification, as initiators take no other. With the feature the link layer sets bit 12 (LE
+  Extended Advertising) of its features. No legacy advertising is compiled in. With `directed-advertising`, a directed
+  phase is low duty cycle directed advertising, an `AUX_ADV_IND` with the target at the phase's interval. Not yet
+  tried on hardware.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride

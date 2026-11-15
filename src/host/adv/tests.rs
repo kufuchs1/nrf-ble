@@ -415,6 +415,35 @@ fn the_link_layer_refuses_to_start_while_a_central_is_connected() {
     assert!(shared.advertising().is_none());
 }
 
+#[cfg(feature = "extended-advertising")]
+#[test]
+fn the_secondary_phy_reaches_the_link_layer_where_the_chip_has_it() {
+    use crate::radio::Phy;
+    use core::cell::Cell;
+    /// A stand-in that keeps the parameters of the last advertising.
+    struct Params(Cell<Option<AdvParams>>);
+    impl Control for Params {
+        fn call(&self, call: Call<'_>) -> Result<(), link::Error> {
+            if let Call::Advertise { params, .. } = call {
+                self.0.set(Some(params));
+            }
+            Ok(())
+        }
+    }
+    let control = Params(Cell::new(None));
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    assert!(advertising.secondary_phy() == Phy::M1);
+    advertising.start(&control, &example::PHASES[0]).unwrap();
+    assert!(control.0.get().unwrap().secondary_phy == Phy::M1);
+    // LE 2M on the nRF52832; the nRF51, with LE 1M alone, keeps it.
+    let fast = advertising.with_secondary_phy(Phy::M2);
+    let expected = if cfg!(feature = "nrf51") { Phy::M1 } else { Phy::M2 };
+    assert!(fast.secondary_phy() == expected);
+    fast.start(&control, &example::PHASES[0]).unwrap();
+    let params = control.0.get().unwrap();
+    assert!(params.secondary_phy == expected && params.kind == Kind::ConnectableUndirected && params.private);
+}
+
 #[test]
 fn the_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() {
     let (adv, scan) = example::CONTENT.data(true).unwrap();

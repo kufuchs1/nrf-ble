@@ -579,6 +579,32 @@ impl<'peripherals> Clock<'peripherals> {
         true
     }
 
+    /// Starts the radio through `channel` at `at` if `at` is at least `lead`
+    /// microseconds ahead. Returns whether it does.
+    ///
+    /// [`Self::start_at`] arms first and checks after, so a compare that
+    /// fires between the two starts the radio although it reports a start
+    /// in the past. Here the time is checked before arming, and the compare
+    /// event after: if the compare came around the arming, the start is
+    /// cancelled and reported as missed, and the radio may have started
+    /// all the same, so the caller disables it.
+    #[cfg(feature = "extended-advertising")]
+    fn start_ahead(&mut self, at: u32, lead: u32, channel: usize) -> bool {
+        self.cancel_start();
+        REGS.cc(CC_START).write_value(at.wrapping_sub(self.base));
+        REGS.events_compare(CC_START).write_value(0);
+        let ahead = at.wrapping_sub(self.now());
+        if !is_ahead(ahead) || ahead < lead {
+            return false;
+        }
+        PPI.chenset().write(|w| w.set_ch(channel, true));
+        if REGS.events_compare(CC_START).read() != 0 {
+            self.cancel_start();
+            return false;
+        }
+        true
+    }
+
     /// Starts the radio through `channel` at `at`. Returns how long before
     /// `at` the start was programmed, or `None` if `at` is not in the future.
     fn start_at(&mut self, at: u32, channel: usize) -> Option<u32> {
@@ -596,6 +622,14 @@ impl<'peripherals> Clock<'peripherals> {
         REGS.intenclr().write(|w| w.set_compare(CC_START, true));
         REGS.events_compare(CC_START).write_value(0);
     }
+
+    /// Starts sending at `at` if `at` is at least `lead` microseconds ahead.
+    /// Returns whether it does; when not, nothing is armed, but a start
+    /// that raced the check may have enabled the radio, which the caller
+    /// then disables.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    pub fn transmit_ahead(&mut self, at: u32, lead: u32) -> bool { self.start_ahead(at, lead, PPI_TXEN) }
 
     /// Starts sending at `at`. Returns false if `at` is not in the future.
     #[inline]

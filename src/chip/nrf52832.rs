@@ -30,7 +30,8 @@ pub const CRYSTAL_LEAD_US: u32 = 800;
 /// Bounds of the crystal lead time.
 pub const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 1500);
 /// Largest advertising channel payload the radio accepts: as on the data
-/// channels.
+/// channels, which takes in the longest `AUX_ADV_IND` of extended
+/// advertising.
 pub const ADV_MAXLEN: u8 = MAX_PAYLOAD;
 /// Busy-wait iterations for a decryption to finish after the packet end,
 /// about 250 us at 64 MHz.

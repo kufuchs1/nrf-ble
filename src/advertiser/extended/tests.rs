@@ -253,3 +253,128 @@ fn an_aux_connect_req_is_accepted_as_the_filter_policy_says() {
     assert!(accepted_request(&directed, &request(CENTRAL, directed.own)).is_some());
     assert!(accepted_request(&directed, &request(Peer::new([9; 6], false), directed.own)).is_none());
 }
+
+#[test]
+fn an_event_s_pdus_point_to_the_auxiliary_packet_on_its_channel_and_phy() {
+    let mut settings = undirected();
+    settings.channel_map = 0x05;
+    settings.aux_id = 0x1234;
+    settings.secondary_phy = Phy::M2;
+    let pdus = Pdus::new(&settings, 7);
+    // Channels 37 and 39; the secondary channel of event 7.
+    assert_eq!((pdus.channels, pdus.count), ([37, 39, 0], 2));
+    assert_eq!(pdus.aux_channel, aux_channel(0x1234, 7));
+    // LE 2M where the chip has it; the nRF51 stays on LE 1M whatever the
+    // settings hold.
+    let phy = if cfg!(feature = "nrf51") { Phy::M1 } else { Phy::M2 };
+    assert!(pdus.phy == phy && secondary_phy(&settings) == phy);
+    // Each primary points with its own offset to the one auxiliary packet:
+    // channel, offset and PHY in its AuxPtr.
+    for (index, pdu) in pdus.primaries.iter().take(2).enumerate() {
+        let expected = primary(&settings, AuxPtr::new(pdus.aux_channel, aux_offset(2, index), phy));
+        assert_eq!(pdu.as_bytes(), expected.as_bytes());
+        let [channel, offset0, offset1] = pdu.as_bytes()[6..9] else { unreachable!() };
+        assert_eq!(channel, pdus.aux_channel);
+        let field = u16::from_le_bytes([offset0, offset1]);
+        assert_eq!(field & 0x1FFF, aux_offset(2, index));
+        assert_eq!(field >> 13, if phy == Phy::M2 { 1 } else { 0 });
+    }
+    // The auxiliary packet in its buffer, which also takes the request.
+    let auxiliary = auxiliary(&settings);
+    assert_eq!(pdus.auxiliary[..auxiliary.as_bytes().len()], *auxiliary.as_bytes());
+    assert_eq!(pdus.auxiliary.len(), 2 + usize::from(crate::chip::ADV_MAXLEN));
+    // Another event, another channel in time: CSA #2 over the 37 channels.
+    assert!((0..8).any(|counter| Pdus::new(&settings, counter).aux_channel != pdus.aux_channel));
+}
+
+#[test]
+fn the_event_plan_keeps_its_times_and_budgets_on_every_secondary_phy() {
+    // The first primary on air at 1000 us of the clock.
+    let first = 1000;
+    for phy in SECONDARY_PHYS {
+        for channels in 1..=3 {
+            // The primaries are a spacing apart on air, each TXEN its LE 1M
+            // ramp-up before.
+            for index in 0..channels {
+                let on_air = primary_txen(first, index) + tx_ready_us(Phy::M1);
+                assert_eq!(on_air, first + u32::try_from(index).unwrap() * PRIMARY_SPACING_US);
+                // Seen from each primary, the auxiliary packet starts 12 us
+                // into the unit its Aux Offset names, on either PHY.
+                let aux_on_air = aux_txen(first, channels, phy) + tx_ready_us(phy);
+                assert_eq!(aux_on_air - on_air - u32::from(aux_offset(channels, index)) * UNIT_US, 12);
+            }
+            // The CPU's time from the last primary's DISABLED to the
+            // auxiliary packet's TXEN.
+            let last_end = primary_txen(first, channels - 1) + tx_ready_us(Phy::M1) + PRIMARY_US;
+            let budget = aux_txen(first, channels, phy) - last_end - DISABLE_US;
+            assert!(budget >= CPU_SLACK_MIN_US);
+            assert_eq!(budget, match (cfg!(feature = "nrf51"), phy) {
+                (true, _) => 180,
+                (false, Phy::M1) => 279,
+                (false, Phy::M2) => 280,
+            });
+        }
+        // The request's access address comes before the listen ends: T_IFS
+        // and the preamble and access address on the PHY.
+        let address = T_IFS_US + phy.address_offset_us();
+        assert_eq!(address, if phy == Phy::M2 { 174 } else { 190 });
+        assert!(address < LISTEN_US);
+        // The answer after a request: 2.5 ms to the transmit window, on
+        // the secondary channel's PHY.
+        let setup = Setup::aux(phy);
+        assert!(setup.phy == phy && setup.window_delay_us == 2500);
+    }
+    // Between two primaries, on LE 1M alone.
+    let between = PRIMARY_SPACING_US - PRIMARY_US - DISABLE_US - tx_ready_us(Phy::M1);
+    assert!(between >= CPU_SLACK_MIN_US);
+    // A whole event with the reconnection data, three channels, request and
+    // answer: on the nRF52832 2211 us on LE 1M and on LE 2M 60 + 41 + 540 +
+    // 462 + 136 + 150 + 180 + 150 + 100 = 1819 us; on the nRF51 its
+    // longer spacing and ramp-up.
+    let reconnect = AUX_HEADER_LEN + 13;
+    if cfg!(feature = "nrf51") {
+        assert_eq!(event_us(3, Phy::M1, reconnect), 120 + 140 + 780 + 462 + 264 + 150 + 352 + 150 + 192);
+    } else {
+        assert_eq!(event_us(3, Phy::M1, reconnect), 2211);
+        assert_eq!(event_us(3, Phy::M2, reconnect), 1819);
+    }
+    // The longest, 20 ms at the shortest interval, on every PHY.
+    for phy in SECONDARY_PHYS {
+        assert!(event_us(3, phy, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US);
+    }
+}
+
+#[test]
+fn a_connection_request_is_decided_before_its_answer_ends() {
+    // One interframe space and the 14-octet AUX_CONNECT_RSP: 192 us on
+    // LE 1M, 100 us on LE 2M.
+    assert_eq!(decision_budget_us(Phy::M1), 342);
+    assert_eq!(decision_budget_us(Phy::M2), 250);
+    // Less the nRF52832's receive chain delay before the END event and its
+    // TIMER1 turnaround, the answer ends about 245 us after the END on
+    // LE 2M, and 333 us on LE 1M.
+    #[cfg(feature = "nrf52832")]
+    for (phy, from_end) in [(Phy::M1, 333), (Phy::M2, 245)] {
+        let ends = phy.response_offset_us(phy) + tx_ready_us(phy) + airtime_us(phy, AUX_CONNECT_RSP_LEN);
+        assert_eq!(ends, from_end);
+        assert!(decision_budget_us(phy) - ends <= 10);
+    }
+}
+
+#[test]
+fn no_channel_no_primary() {
+    // Not a valid map (the link layer refuses it), but no offset is
+    // computed for a channel that is not there.
+    let mut settings = undirected();
+    settings.channel_map = 0;
+    let pdus = Pdus::new(&settings, 0);
+    assert_eq!(pdus.count, 0);
+}
+
+#[test]
+fn nothing_is_late_before_the_first_event() {
+    let mut counters = Counters::new();
+    assert_eq!((late_starts(), late_connect_decisions()), (0, 0));
+    counters.log();
+    assert!(counters.sent.is_none() && counters.shown.is_none());
+}

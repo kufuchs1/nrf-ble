@@ -111,6 +111,11 @@ pub struct Settings {
     /// Scan response data.
     #[cfg(not(feature = "extended-advertising"))]
     pub scan_data:          [u8; SCAN_DATA_MAX],
+    /// PHY of the `AUX_ADV_IND`, of the `AUX_CONNECT_REQ` and
+    /// `AUX_CONNECT_RSP`, and of the connection's start: LE 1M, or LE 2M on
+    /// the nRF52832. The nRF51 takes LE 1M whatever it holds.
+    #[cfg(feature = "extended-advertising")]
+    pub secondary_phy:      Phy,
     /// Length of [`Self::scan_data`].
     #[cfg(not(feature = "extended-advertising"))]
     pub scan_len:           u8,
@@ -181,6 +186,8 @@ impl Settings {
             scan_data: [0; SCAN_DATA_MAX],
             #[cfg(not(feature = "extended-advertising"))]
             scan_len: 0,
+            #[cfg(feature = "extended-advertising")]
+            secondary_phy: Phy::M1,
             #[cfg(feature = "extended-advertising")]
             stale: true,
             #[cfg(feature = "directed-advertising")]
@@ -253,6 +260,14 @@ pub struct Setup {
 impl Setup {
     /// After a `CONNECT_IND`: 1.25 ms (Core, Vol 6, Part B, 4.5.3), on LE 1M.
     pub const LEGACY: Self = Self { phy: Phy::M1, window_delay_us: 1250 };
+
+    /// After an `AUX_CONNECT_REQ` on `phy`: 2.5 ms from the end of the
+    /// request on LE 1M and LE 2M (Core, Vol 6, Part B, 4.5.3), and the
+    /// connection starts on `phy` both ways (4.5).
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the setup is only built"]
+    pub const fn aux(phy: Phy) -> Self { Self { phy, window_delay_us: 2500 } }
 }
 
 /// Runs one advertising event on the enabled channels.
@@ -262,12 +277,17 @@ impl Setup {
 /// built, right before the first goes out, so that the next event, timed from
 /// it, starts an advertising interval after this one however long the PDUs
 /// took.
+///
+/// `counters` carries the advertiser's state from one event to the next.
+/// Legacy advertising keeps none there; its event receives a request into
+/// `rx`.
 #[cfg(not(feature = "extended-advertising"))]
 #[inline]
 pub fn event(
     radio: &mut Radio<'_>,
     clock: &Clock<'_>,
     settings: &Settings,
+    _counters: &mut Counters,
     rx: &mut [u8; BUFFER_LEN],
 ) -> (u32, Option<Accepted>) {
     let (primary, scan_response) = legacy::pdus(settings);
@@ -277,21 +297,28 @@ pub fn event(
     (started, accepted)
 }
 
-/// Runs one advertising event on the enabled channels: with extended
-/// advertising, not yet.
+/// Runs one extended advertising event on the enabled channels.
 ///
-/// The extended advertising event is the next step of its implementation;
-/// until then an event sends nothing and returns the time it started, and
-/// no connection request.
+/// Returns the time the event started, in microseconds of the clock, and the
+/// connection request it accepted, if any. The time is read once the PDUs are
+/// built, right before the first goes out, so that the next event, timed from
+/// it, starts an advertising interval after this one however long the PDUs
+/// took.
+///
+/// `counters` carries the event counter of the secondary channel's
+/// selection from one event to the next, and the late counts. The request
+/// comes into the buffer of the `AUX_ADV_IND`, which takes any packet the
+/// advertising channels admit, not into `rx`.
 #[cfg(feature = "extended-advertising")]
 #[inline]
 pub fn event(
-    _radio: &mut Radio<'_>,
-    clock: &Clock<'_>,
-    _settings: &Settings,
+    radio: &mut Radio<'_>,
+    clock: &mut Clock<'_>,
+    settings: &Settings,
+    counters: &mut Counters,
     _rx: &mut [u8; BUFFER_LEN],
 ) -> (u32, Option<Accepted>) {
-    (clock.now(), None)
+    extended::event(radio, clock, settings, counters)
 }
 
 #[cfg(test)] mod tests;

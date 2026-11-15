@@ -12,8 +12,13 @@ pub const ADV_ACCESS_ADDRESS: u32 = 0x8E89_BED6;
 pub const ADV_CRC_INIT: u32 = 0x0055_5555;
 /// Largest advertising channel payload.
 pub const ADV_PAYLOAD_MAX: usize = 255;
-/// Size of a packet buffer: header, S1 byte and the largest payload the
-/// radio accepts, 255 octets on the nRF52832 and 37 on the nRF51.
+/// Size of a packet buffer of the data channels and of legacy advertising:
+/// header, S1 byte and the largest payload the radio accepts there.
+///
+/// That is 255 octets on the nRF52832 and 37 on the nRF51. With
+/// `extended-advertising` the advertising channels receive into the
+/// advertiser's own buffer instead, of `HEADER_LEN` and `AUX_PAYLOAD_MAX`
+/// octets.
 pub const BUFFER_LEN: usize = HEADER_LEN.strict_add(1).strict_add(chip::PAYLOAD_MAX);
 /// Length of a PDU header.
 pub const HEADER_LEN: usize = 2;
@@ -48,10 +53,17 @@ pub const AUX_PAYLOAD_MAX: usize = {
     if in_ram < ADV_PAYLOAD_MAX { in_ram } else { ADV_PAYLOAD_MAX }
 };
 #[cfg(feature = "extended-advertising")]
-const _: () = assert!(
-    HEADER_LEN.strict_add(AUX_PAYLOAD_MAX) <= chip::PACKET_RAM_MAX,
-    "the largest AUX_ADV_IND exceeds the radio's packet in RAM"
-);
+const _: () = {
+    assert!(
+        HEADER_LEN.strict_add(AUX_PAYLOAD_MAX) <= chip::PACKET_RAM_MAX,
+        "the largest AUX_ADV_IND exceeds the radio's packet in RAM"
+    );
+    // The listen after the `AUX_ADV_IND` receives into its buffer.
+    assert!(
+        usize::from(chip::ADV_MAXLEN) == AUX_PAYLOAD_MAX,
+        "the advertising channels' MAXLEN does not admit exactly the largest AUX_ADV_IND"
+    );
+};
 /// Header bit marking the receiver address as random.
 const RX_ADD_RANDOM: u8 = 0x80;
 /// Header bit marking the sender address as random.
@@ -360,6 +372,15 @@ impl<const N: usize> Advertisement<N> {
         Self::build(header, &[&advertiser.address, &target.address])
     }
 
+    /// The whole buffer: the PDU, then zeros. The extended advertising
+    /// event sends an `AUX_ADV_IND` from it and receives the request after
+    /// it into the same buffer, which holds the longest packet the
+    /// advertising channels admit.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the buffer is only taken"]
+    pub const fn into_buffer(self) -> [u8; N] { self.bytes }
+
     /// An undirected advertisement or scan response of PDU type `kind` from
     /// `advertiser`. Data beyond 31 bytes is cut off.
     #[cfg(not(feature = "extended-advertising"))]
@@ -626,6 +647,22 @@ pub fn aux_connect_rsp(advertiser: Peer, initiator: Peer) -> AuxConnectRsp {
         &advertiser.address,
         &initiator.address,
     ])
+}
+
+/// The initiator of a received `AUX_CONNECT_REQ`: its `InitA` and `TxAdd`,
+/// if `pdu` has the type and length of a connection request.
+///
+/// A quick look within the interframe space, for the `AUX_CONNECT_RSP`
+/// ([`retarget`]); [`ConnectInd::parse_aux`] checks the whole request.
+#[cfg(feature = "extended-advertising")]
+#[inline]
+#[must_use = "the address is only read"]
+pub const fn aux_connect_initiator(pdu: &[u8]) -> Option<Peer> {
+    let (Some([header, len]), Some(initiator)) = (field::<2>(pdu, 0), field::<ADDRESS_LEN>(pdu, 2)) else {
+        return None;
+    };
+    (header & PDU_TYPE_MASK == CONNECT_IND && len == CONNECT_IND_LEN)
+        .then(const || Peer::new(initiator, header & TX_ADD_RANDOM != 0))
 }
 
 /// Puts `initiator` in place of the initiator of `response`.
@@ -922,5 +959,35 @@ mod tests {
         other = bytes;
         other[1] = 35;
         assert!(ConnectInd::parse_aux(&other, OWN).is_none());
+    }
+
+    #[cfg(feature = "extended-advertising")]
+    #[test]
+    fn the_initiator_of_an_aux_connect_req_is_read_from_its_first_octets() {
+        let mut pdu = [0_u8; 36];
+        pdu[0] = 0x05 | TX_ADD_RANDOM | RX_ADD_RANDOM;
+        pdu[1] = 34;
+        pdu[2..8].copy_from_slice(&[1, 2, 3, 4, 5, 0x46]);
+        assert!(aux_connect_initiator(&pdu) == Some(Peer::new([1, 2, 3, 4, 5, 0x46], true)));
+        // A public initiator.
+        pdu[0] = 0x05;
+        assert!(aux_connect_initiator(&pdu) == Some(Peer::new([1, 2, 3, 4, 5, 0x46], false)));
+        // Not a connection request: another type or length, or too short.
+        pdu[0] = 0x03;
+        assert!(aux_connect_initiator(&pdu).is_none());
+        pdu[0] = 0x05;
+        pdu[1] = 12;
+        assert!(aux_connect_initiator(&pdu).is_none());
+        pdu[1] = 34;
+        assert!(aux_connect_initiator(&pdu[..7]).is_none());
+        // The answer to it names it.
+        let mut response = aux_connect_rsp(Peer::new([9; 6], true), Peer::new([0; 6], false));
+        retarget(&mut response, aux_connect_initiator(&pdu).unwrap());
+        assert_eq!(response.as_bytes()[0], AUX_CONNECT_RSP | TX_ADD_RANDOM);
+        assert_eq!(response.as_bytes()[10..16], [1, 2, 3, 4, 5, 0x46]);
+        // The whole buffer of a PDU, for the reception after it.
+        let buffer = aux_connect_rsp(Peer::new([9; 6], true), Peer::new([0; 6], false)).into_buffer();
+        assert_eq!(buffer.len(), HEADER_LEN + AUX_CONNECT_RSP_LEN);
+        assert_eq!(buffer[..2], [AUX_CONNECT_RSP | TX_ADD_RANDOM, 14]);
     }
 }

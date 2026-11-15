@@ -75,7 +75,7 @@
 //! timeout shorter than a few latencies holds.
 
 #[cfg(feature = "extended-advertising")]
-use crate::advertiser::extended::RENEWAL_LEN;
+use crate::{advertiser::extended::RENEWAL_LEN, radio::Phy};
 use crate::{
     advertiser::{Kind, SCAN_DATA_MAX, Settings as AdvSettings, privacy::FILTER_LIST_SIZE},
     chip,
@@ -505,6 +505,12 @@ pub struct AdvParams {
     /// Advertise from a resolvable private address made with the local key
     /// in the resolving list, rather than from the identity address.
     pub private:       bool,
+    /// PHY of the secondary channel: of the `AUX_ADV_IND`, the
+    /// `AUX_CONNECT_REQ` and `AUX_CONNECT_RSP`, and of the connection's
+    /// start. LE 1M, or LE 2M on the nRF52832, half the airtime for a
+    /// central that takes it; the nRF51 refuses LE 2M.
+    #[cfg(feature = "extended-advertising")]
+    pub secondary_phy: Phy,
 }
 
 impl AdvParams {
@@ -526,6 +532,10 @@ impl AdvParams {
     /// Whether the parameters are in range.
     const fn is_valid(&self) -> bool {
         let interval_valid = self.kind.is_high_duty() || (ADV_INTERVAL_MIN..=ADV_INTERVAL_MAX).contains(&self.interval);
+        #[cfg(feature = "extended-advertising")]
+        if !chip::PHY_2M && matches!(self.secondary_phy, Phy::M2) {
+            return false;
+        }
         interval_valid && (1..=0x07).contains(&self.channel_map) && self.filter_policy <= 3
     }
 
@@ -541,6 +551,8 @@ impl AdvParams {
             kind,
             peer: Peer::new([0; 6], false),
             private: false,
+            #[cfg(feature = "extended-advertising")]
+            secondary_phy: Phy::M1,
         }
     }
 
@@ -553,6 +565,12 @@ impl AdvParams {
     #[inline]
     #[must_use = "the parameters are only built"]
     pub const fn private(self, private: bool) -> Self { Self { private, ..self } }
+
+    /// With the PHY of the secondary channel.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the parameters are only built"]
+    pub const fn secondary_phy(self, secondary_phy: Phy) -> Self { Self { secondary_phy, ..self } }
 }
 
 /// The host's answer to a long term key request. Without [`Debug`] beyond
@@ -1342,6 +1360,8 @@ impl<'shared> Link<'shared> {
             settings.target.clone_from(&on_air_target);
             settings.channel_map = params.channel_map;
             settings.filter_policy = params.filter_policy;
+            #[cfg(feature = "extended-advertising")]
+            settings.secondary_phy.clone_from(&params.secondary_phy);
             settings.own = own;
             state.adv_enabled = true;
             Ok(())

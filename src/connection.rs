@@ -94,11 +94,13 @@ const PROCEDURE_TIMEOUT_US: u32 = 40_000_000;
 ///
 /// LE encryption, the connection parameters request procedure, the extended
 /// reject indication, the peripheral-initiated feature exchange and LE ping
-/// (bits 0 to 4), the LE 2M PHY (bit 8) where the radio has it, channel
+/// (bits 0 to 4), the LE 2M PHY (bit 8) where the radio has it, LE extended
+/// advertising (bit 12) with the feature `extended-advertising`, channel
 /// selection algorithm 2 (bit 14) and LE power control (bits 33 and 34).
 pub const FEATURES: [u8; 8] = [
     0x1F | if cfg!(feature = "data-length") { FEATURE_DATA_LENGTH } else { 0 },
-    if chip::PHY_2M { 0x41 } else { 0x40 },
+    if chip::PHY_2M { 0x41 } else { 0x40 }
+        | if cfg!(feature = "extended-advertising") { FEATURE_EXTENDED_ADVERTISING } else { 0 },
     0,
     0,
     0x06,
@@ -108,6 +110,8 @@ pub const FEATURES: [u8; 8] = [
 ];
 /// Feature bit in the first octet: LE data packet length extension.
 const FEATURE_DATA_LENGTH: u8 = 0x20;
+/// Feature bit in the second octet: LE extended advertising (bit 12).
+const FEATURE_EXTENDED_ADVERTISING: u8 = 0x10;
 /// Longest time on the air of a data PDU the specification allows.
 const LENGTH_TIME_MAX: u16 = 17_040;
 /// Length of a message integrity check.
