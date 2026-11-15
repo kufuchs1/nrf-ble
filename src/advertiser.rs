@@ -3,35 +3,50 @@
 //! The settings hold the filter accept list and the resolving list. The
 //! advertising event returns the connection request a central sent, with
 //! how its connection starts. The PDUs and their event live in the variant
-//! module; the link layer uses the items here.
+//! module, `legacy`, or with the feature `extended-advertising`
+//! `extended`, which replaces it: only one is compiled in. The link layer
+//! uses the items here.
 
+/// Extended advertising.
+#[cfg(feature = "extended-advertising")]
+pub mod extended;
 /// Legacy advertising.
+#[cfg(not(feature = "extended-advertising"))]
 pub mod legacy;
 /// The filter accept list and the resolving list.
 pub mod privacy;
 
+#[cfg(feature = "extended-advertising")]
+use crate::pdu::Adi;
 use crate::{
     clock::Clock,
     crypto,
     pdu::{BUFFER_LEN, ConnectInd, Peer},
     radio::{Phy, Radio},
 };
+#[cfg(feature = "extended-advertising")]
+use extended as variant;
+#[cfg(not(feature = "extended-advertising"))]
+use legacy as variant;
 use privacy::{FilterList, ResolvingList};
 
 /// Advertising channels with their bit in the channel map.
 const CHANNELS: [(u8, u8); 3] = [(37, 0x01), (38, 0x02), (39, 0x04)];
-/// Largest advertising data.
-pub const DATA_MAX: usize = legacy::DATA_MAX;
+/// Largest advertising data: 31 octets, or with extended advertising 245
+/// on the nRF52832 and 242 on the nRF51 (six less when directed, see
+/// `Kind::data_max`).
+pub const DATA_MAX: usize = variant::DATA_MAX;
 /// Time after the end of a packet until a request's access address must have
 /// arrived: interframe space, preamble and access address, margin.
 const LISTEN_US: u32 = 300;
-/// Largest scan response data.
-pub const SCAN_DATA_MAX: usize = legacy::SCAN_DATA_MAX;
+/// Largest scan response data: 31 octets, or none with extended
+/// advertising.
+pub const SCAN_DATA_MAX: usize = variant::SCAN_DATA_MAX;
 
 /// The advertiser's counters as last logged.
-pub type Counters = legacy::Counters;
+pub type Counters = variant::Counters;
 /// Advertising type.
-pub type Kind = legacy::Kind;
+pub type Kind = variant::Kind;
 
 /// A connection request the advertising accepted.
 #[derive(Clone, Copy)]
@@ -51,6 +66,15 @@ pub struct Accepted {
 pub struct Settings {
     /// Own address as the host set it, the identity address with privacy.
     pub address:            Peer,
+    /// The ADI of the advertising set: SID 0 and the advertising data ID,
+    /// random and renewed with each change of the data or our address
+    /// ([`Self::stale`]).
+    #[cfg(feature = "extended-advertising")]
+    pub adi:                Adi,
+    /// Identifier of channel selection algorithm 2 for the secondary
+    /// channel, random and renewed with the advertising data ID.
+    #[cfg(feature = "extended-advertising")]
+    pub aux_id:             u16,
     /// Advertising channels, bit 0 for channel 37.
     pub channel_map:        u8,
     /// Advertising data.
@@ -63,6 +87,13 @@ pub struct Settings {
     pub interval:           u32,
     /// Advertising type.
     pub kind:               Kind,
+    /// The ADI of the settings an advertising event last took, which may
+    /// have gone on air: a renewal avoids its advertising data ID as well as
+    /// the current one, so that two renewals with no event between them
+    /// never return to the ID scanners last received (Core, Vol 6, Part B,
+    /// 4.4.2.11: not the most recently used value).
+    #[cfg(feature = "extended-advertising")]
+    pub last_used:          Adi,
     /// Length of [`Self::data`].
     pub len:                u8,
     /// Address on air: [`Self::address`], or a resolvable private address
@@ -78,9 +109,16 @@ pub struct Settings {
     /// Peers whose private addresses the filter accept list resolves.
     pub resolving:          ResolvingList,
     /// Scan response data.
+    #[cfg(not(feature = "extended-advertising"))]
     pub scan_data:          [u8; SCAN_DATA_MAX],
     /// Length of [`Self::scan_data`].
+    #[cfg(not(feature = "extended-advertising"))]
     pub scan_len:           u8,
+    /// The data or our address changed since [`Self::adi`] and
+    /// [`Self::aux_id`] were drawn: the link layer task draws new ones
+    /// before the next event, which runs only then.
+    #[cfg(feature = "extended-advertising")]
+    pub stale:              bool,
     /// The target on air of directed advertising: [`Self::peer`], or with a
     /// private address and the peer's key in [`Self::resolving`] a
     /// resolvable private address made with that key when the advertising
@@ -121,24 +159,41 @@ impl Settings {
     pub const fn new() -> Self {
         Self {
             address: Peer::new([0; 6], true),
+            #[cfg(feature = "extended-advertising")]
+            adi: Adi::new(0, 0),
+            #[cfg(feature = "extended-advertising")]
+            aux_id: 0,
             channel_map: 0x07,
             data: [0; DATA_MAX],
             filter: FilterList::new(),
             filter_policy: 0,
             interval: 1_280_000,
             kind: Kind::ConnectableUndirected,
+            #[cfg(feature = "extended-advertising")]
+            last_used: Adi::new(0, 0),
             len: 0,
             own: Peer::new([0; 6], true),
             peer: Peer::new([0; 6], false),
             private: false,
             resolving: ResolvingList::new(),
             resolution_enabled: false,
+            #[cfg(not(feature = "extended-advertising"))]
             scan_data: [0; SCAN_DATA_MAX],
+            #[cfg(not(feature = "extended-advertising"))]
             scan_len: 0,
+            #[cfg(feature = "extended-advertising")]
+            stale: true,
             #[cfg(feature = "directed-advertising")]
             target: Peer::new([0; 6], false),
         }
     }
+
+    /// Gives the advertising set a new advertising data ID and secondary
+    /// channel identifier from the random octets `random`, never the last
+    /// ID, and clears [`Self::stale`].
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    pub const fn renew(&mut self, random: [u8; extended::RENEWAL_LEN]) { extended::renew(self, random); }
 
     /// Resolves a received private address only when resolution is enabled.
     #[must_use = "the identity is only read"]
@@ -156,10 +211,18 @@ impl Settings {
 
     /// Sets the advertising data and the scan response data. Returns false,
     /// changing neither, if one is longer than [`DATA_MAX`] or
-    /// [`SCAN_DATA_MAX`].
+    /// [`SCAN_DATA_MAX`]. With extended advertising the advertising set then
+    /// waits for its renewal (`Settings::stale`).
     #[inline]
     #[must_use = "data that does not fit is refused"]
-    pub fn set_data(&mut self, adv: &[u8], scan: &[u8]) -> bool { legacy::set_data(self, adv, scan) }
+    pub fn set_data(&mut self, adv: &[u8], scan: &[u8]) -> bool { variant::set_data(self, adv, scan) }
+
+    /// Sets our address on air. With extended advertising, a new one
+    /// waits for the renewal of the advertising set (`Settings::stale`), so
+    /// that neither its ADI nor its secondary channels link it to the old
+    /// one.
+    #[inline]
+    pub const fn set_own(&mut self, own: Peer) { variant::set_own(self, own); }
 
     /// The target on air of directed advertising: see [`Self::target`].
     #[cfg(feature = "directed-advertising")]
@@ -199,6 +262,7 @@ impl Setup {
 /// built, right before the first goes out, so that the next event, timed from
 /// it, starts an advertising interval after this one however long the PDUs
 /// took.
+#[cfg(not(feature = "extended-advertising"))]
 #[inline]
 pub fn event(
     radio: &mut Radio<'_>,
@@ -211,6 +275,23 @@ pub fn event(
     let accepted = legacy::event(radio, clock, settings, (&primary, &scan_response), rx)
         .map(|(request, end)| Accepted { end, request, setup: Setup::LEGACY });
     (started, accepted)
+}
+
+/// Runs one advertising event on the enabled channels: with extended
+/// advertising, not yet.
+///
+/// The extended advertising event is the next step of its implementation;
+/// until then an event sends nothing and returns the time it started, and
+/// no connection request.
+#[cfg(feature = "extended-advertising")]
+#[inline]
+pub fn event(
+    _radio: &mut Radio<'_>,
+    clock: &Clock<'_>,
+    _settings: &Settings,
+    _rx: &mut [u8; BUFFER_LEN],
+) -> (u32, Option<Accepted>) {
+    (clock.now(), None)
 }
 
 #[cfg(test)] mod tests;

@@ -77,6 +77,11 @@ pub const PREPARE_AFTER_RESTART: bool = false;
 /// prepare time of the 10 s report): it prepares between events only, and
 /// sends one new PDU per event.
 pub const PREPARE_IN_EVENT: bool = false;
+/// The most octets of a packet in RAM: S0, length, S1 and payload together
+/// cannot exceed 254 bytes, whatever MAXLEN holds (nRF51 Series Reference
+/// Manual v3.0, 17.1.3). With the advertising channels' one-octet S0 and
+/// length and no S1, a payload of 252 octets at most.
+pub const PACKET_RAM_MAX: usize = 254;
 /// Largest payload the radio accepts on any channel, for the size of the
 /// packet buffers: an advertising payload, as a data payload with its MIC
 /// takes 31 octets at most.

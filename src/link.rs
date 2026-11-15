@@ -74,13 +74,17 @@
 //! anchor costs one interval, not the whole latency, and a supervision
 //! timeout shorter than a few latencies holds.
 
+#[cfg(feature = "extended-advertising")]
+use crate::advertiser::extended::RENEWAL_LEN;
 use crate::{
-    advertiser::{DATA_MAX, Kind, SCAN_DATA_MAX, Settings as AdvSettings, privacy::FILTER_LIST_SIZE},
+    advertiser::{Kind, SCAN_DATA_MAX, Settings as AdvSettings, privacy::FILTER_LIST_SIZE},
     chip,
     crypto,
     pdu::{Llid, Peer, valid_connection_parameters},
     rng,
 };
+#[cfg(feature = "extended-advertising")]
+use core::ops::{AsyncFnMut, ControlFlow};
 use core::{
     cell::RefCell,
     mem,
@@ -739,7 +743,9 @@ impl Shared {
     pub(crate) fn acl_room(&self) -> usize { self.acl_in.free_capacity() }
 
     /// The advertising to run, if the host enabled it and no connection
-    /// exists.
+    /// exists. With extended advertising the link layer task takes it
+    /// through [`Self::renewed_advertising`] instead.
+    #[cfg(any(test, not(feature = "extended-advertising")))]
     pub(crate) fn advertising(&self) -> Option<AdvSettings> {
         self.state.lock(|cell| {
             let state = cell.borrow();
@@ -930,10 +936,50 @@ impl Shared {
         self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             if state.adv_enabled && state.adv.private && state.adv.own != address {
-                state.adv.own = address;
+                state.adv.set_own(address);
                 info!("new private address");
             }
         });
+    }
+
+    /// [`Self::advertising`], once the advertising set is renewed.
+    ///
+    /// After a change of the data or our address it first draws a new
+    /// advertising data ID and secondary channel identifier, from the RNG
+    /// while other tasks run, and again if another change came meanwhile, so
+    /// that no event sends new data or a new address with the old ones. Call
+    /// it before each advertising event, outside radio events: the settings
+    /// it returns are taken as used ([`AdvSettings::last_used`]).
+    #[cfg(feature = "extended-advertising")]
+    pub(crate) async fn renewed_advertising(&self) -> Option<AdvSettings> {
+        self.renewed_advertising_with(rng::fill_async).await
+    }
+
+    /// [`Self::renewed_advertising`], with `fill` drawing the random octets.
+    #[cfg(feature = "extended-advertising")]
+    async fn renewed_advertising_with(&self, mut fill: impl AsyncFnMut(&mut [u8])) -> Option<AdvSettings> {
+        loop {
+            // No copy of the settings lives across the wait.
+            let step = self.state.lock(|cell| {
+                let mut state = cell.borrow_mut();
+                if state.connected || !state.adv_enabled {
+                    return ControlFlow::Break(None);
+                }
+                if state.adv.stale {
+                    return ControlFlow::Continue(());
+                }
+                // The event may send this DID: a renewal avoids it from now
+                // on, until another event takes a newer one.
+                state.adv.last_used = state.adv.adi;
+                ControlFlow::Break(Some(state.adv))
+            });
+            if let ControlFlow::Break(current) = step {
+                return current;
+            }
+            let mut random = [0; RENEWAL_LEN];
+            fill(&mut random).await;
+            self.state.lock(|cell| cell.borrow_mut().adv.renew(random));
+        }
     }
 
     /// Queues a key request and authorizes one answer of the host. Returns
@@ -1220,7 +1266,7 @@ impl<'shared> Link<'shared> {
             // Advertising that started before the key arrived moves to a
             // private address now.
             if let Some(address) = own {
-                state.adv.own = address;
+                state.adv.set_own(address);
             }
             state.adv.resolving.add_keys(identity, peer_irk, local_irk)
         });
@@ -1248,12 +1294,15 @@ impl<'shared> Link<'shared> {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for parameters out of range, data longer than 31
-    /// octets or without an identity address, [`Error::Disallowed`] while a
-    /// connection exists.
+    /// [`Error::Invalid`] for parameters out of range, advertising data
+    /// longer than the type takes ([`Kind::data_max`]: 31 octets, or with
+    /// extended advertising 245 and 239 when directed, 242 and 236 on the
+    /// nRF51), scan response data longer than 31 octets or any with extended
+    /// advertising, or without an identity address, [`Error::Disallowed`]
+    /// while a connection exists.
     #[inline]
     pub fn advertise(&self, params: &AdvParams, adv: &[u8], scan: &[u8]) -> Result<(), Error> {
-        if !params.is_valid() || adv.len() > DATA_MAX || scan.len() > SCAN_DATA_MAX {
+        if !params.is_valid() || adv.len() > params.kind.data_max() || scan.len() > SCAN_DATA_MAX {
             return Err(Error::Invalid);
         }
         let (address, connected) = self.shared.state.lock(|cell| {

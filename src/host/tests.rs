@@ -26,7 +26,6 @@ use super::{
     test_aes::Software,
 };
 use crate::{
-    advertiser::Kind,
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Rx},
     pdu::Peer,
 };
@@ -256,7 +255,7 @@ impl Control for MockLink {
                     return Err(link::Error::Disallowed);
                 }
                 self.directing.set(params.kind.is_directed());
-                if params.kind == Kind::DirectedHighDuty {
+                if params.kind.is_directed() {
                     Seen::Directed(params.peer)
                 } else {
                     Seen::Advertise(params.interval, params.filter_policy)

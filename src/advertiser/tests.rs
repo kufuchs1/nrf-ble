@@ -73,9 +73,18 @@ fn connect_ind(central: Peer, advertiser: Peer) -> [u8; 36] {
 /// Whether `settings` accept a connection request from `central`, parsed
 /// as the advertising event parses it, resolving in software.
 fn accepts(settings: &Settings, central: Peer) -> bool {
-    ConnectInd::parse(&connect_ind(central, settings.own), settings.own)
+    parse(&connect_ind(central, settings.own), settings.own)
         .is_some_and(|request| settings.accepts_connection_with(request.central(), resolves))
 }
+
+/// A connection request as the variant's event parses it: a `CONNECT_IND`.
+#[cfg(not(feature = "extended-advertising"))]
+fn parse(pdu: &[u8], advertiser: Peer) -> Option<ConnectInd> { ConnectInd::parse(pdu, advertiser) }
+
+/// A connection request as the variant's event parses it: an
+/// `AUX_CONNECT_REQ`, of the same layout.
+#[cfg(feature = "extended-advertising")]
+fn parse(pdu: &[u8], advertiser: Peer) -> Option<ConnectInd> { ConnectInd::parse_aux(pdu, advertiser) }
 
 #[test]
 fn the_sample_key_makes_the_sample_address_and_resolves_it() {
@@ -114,7 +123,7 @@ fn a_directed_connection_request_from_another_private_address_of_the_key_is_acce
     assert!(!accepts(&settings, rpa([0x77; 16], [0x12, 0x34, 0x56])));
     assert!(!accepts(&settings, Peer::new([1, 2, 3, 4, 5, 7], false)));
     assert!(!accepts(&settings, Peer::new([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], true)));
-    assert!(ConnectInd::parse(&connect_ind(initiator, CENTRAL), settings.own).is_none());
+    assert!(parse(&connect_ind(initiator, CENTRAL), settings.own).is_none());
     // The resolved identity is what the link reports.
     assert_eq!(settings.resolve_with(initiator, resolves), Some(CENTRAL));
     // Without address resolution only the identity counts, and in network

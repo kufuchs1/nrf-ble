@@ -78,6 +78,20 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The largest advertising data of the type: [`DATA_MAX`], whatever
+    /// the type.
+    #[inline]
+    #[must_use = "the length is only read"]
+    pub const fn data_max(self) -> usize {
+        match self {
+            Self::ConnectableUndirected
+            | Self::DirectedHighDuty
+            | Self::DirectedLowDuty
+            | Self::NonConnectable
+            | Self::Scannable => DATA_MAX,
+        }
+    }
+
     /// The type for an HCI advertising type value.
     #[inline]
     #[must_use = "the type is only decoded"]
@@ -263,5 +277,9 @@ pub fn set_data(settings: &mut Settings, adv: &[u8], scan: &[u8]) -> bool {
     }
     true
 }
+
+/// Sets our address on air.
+#[inline]
+pub const fn set_own(settings: &mut Settings, own: Peer) { settings.own = own; }
 
 #[cfg(test)] mod tests;

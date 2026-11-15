@@ -55,6 +55,11 @@ pub const PREPARE_IN_EVENT: bool = true;
 pub const LEVELS_DBM: [i8; 8] = [-20, -16, -12, -8, -4, 0, 3, 4];
 /// Largest payload the radio accepts on any channel.
 const MAX_PAYLOAD: u8 = 255;
+/// The most octets of a packet in RAM: S0, length, S1 and payload together
+/// cannot exceed 258 bytes, whatever MAXLEN holds (nRF52832 Product
+/// Specification v1.0, 23.3): every payload of 255 octets fits, also with
+/// the data channels' S1 octet.
+pub const PACKET_RAM_MAX: usize = 258;
 /// Largest payload the radio accepts on any channel, for the size of the
 /// packet buffers.
 pub const PAYLOAD_MAX: usize = 255;

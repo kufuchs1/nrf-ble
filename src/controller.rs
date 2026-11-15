@@ -71,7 +71,11 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             shared.complete_reset();
         }
         shared.refresh_private_address();
-        let Some(settings) = shared.advertising() else {
+        #[cfg(not(feature = "extended-advertising"))]
+        let current = shared.advertising();
+        #[cfg(feature = "extended-advertising")]
+        let current = shared.renewed_advertising().await;
+        let Some(settings) = current else {
             since = None;
             clock.pause();
             health::suspend();

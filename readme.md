@@ -131,6 +131,17 @@ release build keeps its size to the byte):
   cycle directed advertising to the bonded central, to a resolvable private address made with its key if it sent one
   (see [A device](#a-device)). About 1.2 KB of flash on the nRF52832 and 1.4 KB on the nRF51 (measured in a keyboard
   and a presenter firmware), and one AES block each time a directed phase starts.
+- **`extended-advertising`**: Bluetooth 5 extended advertising in place of legacy advertising, for centrals that scan
+  with the extended commands (Linux with a Bluetooth 5 adapter). An `ADV_EXT_IND` on each primary channel points to one
+  `AUX_ADV_IND` on a secondary channel (LE 1M; LE 2M on the nRF52832 is planned), which holds up to 245 octets of
+  advertising data (239 when directed; 242 and 236 on the nRF51, whose radio takes at most 254 octets of a packet from
+  RAM) and no scan response: `Content::data` puts the TX power level and the complete name in the advertising data. The
+  ADI's advertising data ID is random and changes, never to the value last sent, with every new data and every new
+  private address, and so does the secondary channel sequence. A central is to connect with `AUX_CONNECT_REQ`, on
+  channel selection algorithm 2. No legacy advertising is compiled in. With `directed-advertising`, a directed phase is
+  low duty cycle directed advertising, an `AUX_ADV_IND` with the target at the phase's interval. Work in progress: the
+  PDUs, the data limits and the timing plan are in; the advertising event itself is not yet, so a build with the feature
+  does not advertise yet.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
@@ -774,7 +785,8 @@ target again, so `cargo test` runs on the PC.
 
 ```sh
 cargo test                                         # host tests, also with --features data-length, event-timing,
-                                                   # directed-advertising, param-requests,key-missing,passkey
+                                                   # directed-advertising, param-requests,key-missing,passkey,
+                                                   # extended-advertising (with and without directed-advertising)
 cargo test --no-default-features --features nrf51  # host tests for the nRF51
 cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt and data-length
 cargo clippy --target thumbv6m-none-eabi --no-default-features --features nrf51   # also with defmt

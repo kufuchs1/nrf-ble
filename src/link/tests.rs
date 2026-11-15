@@ -488,22 +488,102 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
     assert_eq!(link.set_identity([1, 2, 3, 4, 5, 0xC6]), Ok(()));
     assert_eq!(link.advertise(&params.interval(0x001F), &[], &[]), Err(Error::Invalid));
     assert_eq!(link.advertise(&params.channel_map(0), &[], &[]), Err(Error::Invalid));
-    assert_eq!(link.advertise(&params, &[0; 32], &[]), Err(Error::Invalid));
+    assert_eq!(link.advertise(&params, &[0; crate::advertiser::DATA_MAX + 1], &[]), Err(Error::Invalid));
     assert_eq!(link.advertise(&params, &[], &[0; 32]), Err(Error::Invalid));
-    assert_eq!(link.advertise(&params, &[2, 1, 6], &[3, 9, 0x41, 0x42]), Ok(()));
+    #[cfg(not(feature = "extended-advertising"))]
+    let scan = [3, 9, 0x41, 0x42];
+    // Extended advertising has no scan response.
+    #[cfg(feature = "extended-advertising")]
+    let scan = [];
+    #[cfg(feature = "extended-advertising")]
+    assert_eq!(link.advertise(&params, &[2, 1, 6], &[3]), Err(Error::Invalid));
+    assert_eq!(link.advertise(&params, &[2, 1, 6], &scan), Ok(()));
     let settings = shared.advertising().unwrap();
     assert_eq!(settings.own.address, [1, 2, 3, 4, 5, 0xC6]);
     assert_eq!(settings.interval, 0x30 * 625);
     assert_eq!(&settings.data[..usize::from(settings.len)], &[2, 1, 6]);
-    assert_eq!(&settings.scan_data[..usize::from(settings.scan_len)], &[3, 9, 0x41, 0x42]);
+    #[cfg(not(feature = "extended-advertising"))]
+    assert_eq!(&settings.scan_data[..usize::from(settings.scan_len)], &scan);
     assert_eq!(link.set_identity([7; 6]), Err(Error::Disallowed));
     // Advertising again replaces the data.
     assert_eq!(link.advertise(&params, &[2, 1, 4], &[]), Ok(()));
+    #[cfg(not(feature = "extended-advertising"))]
     assert_eq!(shared.advertising().unwrap().scan_len, 0);
+    // Extended advertising takes 245 octets, directed 239: the target
+    // takes the room of six; on the nRF51, whose radio sends 252 octets of
+    // payload at most, 242 and 236.
+    #[cfg(feature = "extended-advertising")]
+    {
+        let (undirected, directed_max) = if cfg!(feature = "nrf51") { (242, 236) } else { (245, 239) };
+        let directed = AdvParams::new(Kind::DirectedLowDuty).interval(0x0030).peer(Peer::new([9; 6], false));
+        assert_eq!(link.advertise(&params, &[0; 246][..=undirected], &[]), Err(Error::Invalid));
+        assert_eq!(link.advertise(&params, &[0; 246][..undirected], &[]), Ok(()));
+        assert_eq!(link.advertise(&directed, &[0; 246][..=directed_max], &[]), Err(Error::Invalid));
+        assert_eq!(link.advertise(&directed, &[0; 246][..directed_max], &[]), Ok(()));
+        let settings = shared.advertising().unwrap();
+        assert!(settings.kind == Kind::DirectedLowDuty && usize::from(settings.len) == directed_max && settings.stale);
+    }
     link.stop_advertising();
     assert!(shared.advertising().is_none());
     connect(&shared);
     assert_eq!(link.advertise(&params, &[], &[]), Err(Error::Disallowed));
+}
+
+/// The advertising set's renewal before an event, with extended
+/// advertising: a draw only after a change, which also covers a change
+/// during the draw, never back to the advertising data ID of the last
+/// event, and none without advertising.
+#[cfg(feature = "extended-advertising")]
+#[test]
+fn an_event_takes_the_advertising_set_only_once_it_is_renewed() {
+    use core::cell::Cell;
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    let draws = Cell::new(0_u8);
+    // Each draw gives the DID 0x0ABC and the identifier 0x1234 plus the
+    // number of draws so far.
+    let counted = async |bytes: &mut [u8]| {
+        draws.set(draws.get() + 1);
+        bytes.copy_from_slice(&[0xBC, 0x0A, 0x34 + draws.get(), 0x12]);
+    };
+    // Not advertising: nothing to renew, no draw.
+    assert!(run(shared.renewed_advertising_with(counted)).is_none());
+    assert_eq!(draws.get(), 0);
+    // New advertising is stale: one draw renews it, and the event takes it.
+    assert_eq!(link.set_identity([1, 2, 3, 4, 5, 0xC6]), Ok(()));
+    let params = AdvParams::new(Kind::ConnectableUndirected).interval(0x0030);
+    assert_eq!(link.advertise(&params, &[2, 1, 6], &[]), Ok(()));
+    let settings = run(shared.renewed_advertising_with(counted)).unwrap();
+    assert_eq!(draws.get(), 1);
+    assert!(!settings.stale && settings.adi.did() == 0x0ABC && settings.aux_id == 0x1235);
+    assert!(settings.last_used == settings.adi && shared.advertising().unwrap().last_used == settings.adi);
+    // Unchanged: no draw.
+    let again = run(shared.renewed_advertising_with(counted)).unwrap();
+    assert!(again.adi == settings.adi && again.aux_id == settings.aux_id);
+    assert_eq!(draws.get(), 1);
+    // New data that changes again while the renewal draws: the renewal,
+    // which comes after both, covers both, and the event gets the second
+    // data with it. The draw gives the DID the last event took, 0x0ABC,
+    // which moves on to 0x0ABD.
+    assert_eq!(link.advertise(&params, &[2, 1, 4], &[]), Ok(()));
+    let changing = async |bytes: &mut [u8]| {
+        counted(bytes).await;
+        assert_eq!(link.advertise(&params, &[2, 1, 5], &[]), Ok(()));
+        assert!(shared.advertising().unwrap().stale);
+    };
+    let settings = run(shared.renewed_advertising_with(changing)).unwrap();
+    assert_eq!(draws.get(), 2);
+    assert!(!settings.stale && settings.adi.did() == 0x0ABD && settings.aux_id == 0x1236);
+    assert_eq!(settings.data[..usize::from(settings.len)], [2, 1, 5]);
+    assert!(shared.advertising().unwrap().last_used.did() == 0x0ABD);
+    // A connection, or advertising stopped: nothing, and no draw.
+    assert_eq!(link.advertise(&params, &[2, 1, 6], &[]), Ok(()));
+    link.stop_advertising();
+    assert!(run(shared.renewed_advertising_with(counted)).is_none());
+    assert_eq!(link.advertise(&params, &[2, 1, 6], &[]), Ok(()));
+    connect(&shared);
+    assert!(run(shared.renewed_advertising_with(counted)).is_none());
+    assert_eq!(draws.get(), 2);
 }
 
 #[test]
@@ -622,6 +702,10 @@ fn software(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
     Software.encrypt(key, block)
 }
 
+/// The directed advertising type of the host's directed phases.
+#[cfg(feature = "directed-advertising")]
+use crate::host::adv::DIRECTED;
+
 /// Random bytes that must not be drawn.
 #[cfg(feature = "directed-advertising")]
 fn no_draw(_: &mut [u8]) { panic!("no random bytes are needed") }
@@ -641,7 +725,7 @@ fn directed_advertising_from_a_private_address_targets_a_new_address_of_the_peer
     // The sample's prand gives the sample's address: made with the
     // central's key, not ours or another peer's, and random (RxAdd = 1).
     let sample = |bytes: &mut [u8]| bytes.copy_from_slice(&SAMPLE_PRAND);
-    for kind in [Kind::DirectedHighDuty, Kind::DirectedLowDuty] {
+    for kind in [DIRECTED, Kind::DirectedLowDuty] {
         let target = shared.directed_target_with((true, kind, central), sample, software);
         assert!(target == Peer::new(SAMPLE_RPA, true));
         assert!(resolves_with(SAMPLE_IRK, target.address, software));
@@ -656,7 +740,7 @@ fn directed_advertising_from_a_private_address_targets_a_new_address_of_the_peer
             draws.set(draws.get() + 1);
             bytes.fill(draws.get());
         };
-        *target = shared.directed_target_with((true, Kind::DirectedHighDuty, central), fill, software);
+        *target = shared.directed_target_with((true, DIRECTED, central), fill, software);
         assert!(target.random && resolves_with(SAMPLE_IRK, target.address, software));
     }
     assert_eq!(draws.get(), 2);
@@ -667,11 +751,11 @@ fn directed_advertising_from_a_private_address_targets_a_new_address_of_the_peer
     assert_eq!(link.remove_peer(other), Ok(()));
     assert_eq!(link.add_peer(keyless, [0; 16], local_irk), Ok(()));
     for (private, kind, peer) in [
-        (false, Kind::DirectedHighDuty, central),
+        (false, DIRECTED, central),
         (true, Kind::ConnectableUndirected, central),
-        (true, Kind::DirectedHighDuty, keyless),
-        (true, Kind::DirectedHighDuty, other),
-        (true, Kind::DirectedHighDuty, Peer::new(central.address, true)),
+        (true, DIRECTED, keyless),
+        (true, DIRECTED, other),
+        (true, DIRECTED, Peer::new(central.address, true)),
     ] {
         assert!(shared.directed_target_with((private, kind, peer), no_draw, software) == peer);
     }

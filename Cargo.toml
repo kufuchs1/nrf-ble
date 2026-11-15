@@ -53,6 +53,20 @@ event-timing = []
 # that did not answer, and its reconnections skip the directed phase. About
 # 1.2 KB of flash on the nRF52832 and 1.4 KB on the nRF51.
 directed-advertising = []
+# `extended-advertising`: Bluetooth 5 extended advertising in place of legacy
+# advertising, for centrals that scan with the extended commands: an
+# ADV_EXT_IND on each primary channel points to one AUX_ADV_IND on a secondary
+# channel, which holds up to 245 octets of advertising data (239 when
+# directed; 242 and 236 on the nRF51, whose radio sends a shorter payload) and
+# no scan response, and a central is to connect with AUX_CONNECT_REQ and
+# AUX_CONNECT_RSP. No legacy advertising is compiled in: no ADV_IND,
+# ADV_DIRECT_IND or scan response. With `directed-advertising`, a directed
+# phase is low duty cycle directed advertising, an AUX_ADV_IND with the
+# central as its target, at the phase's interval. The secondary channel runs
+# on LE 1M; LE 2M on the nRF52832 is planned. WORK IN PROGRESS: the PDUs, the
+# data limits and the timing plan are in, the advertising event is not, so a
+# build with this feature does not advertise at all yet.
+extended-advertising = []
 
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main): the crate's own dependencies name their git
