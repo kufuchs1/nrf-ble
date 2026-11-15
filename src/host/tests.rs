@@ -26,7 +26,6 @@ use super::{
     test_aes::Software,
 };
 use crate::{
-    advertiser::legacy::Kind,
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Rx},
     pdu::Peer,
 };
@@ -107,6 +106,21 @@ struct MockLink {
     capacity:  SyncCell<usize>,
     /// Whether a link exists.
     connected: SyncCell<bool>,
+    /// The link layer's own state, which every call also reaches while
+    /// [`Self::mirror`] is set, with the RNG and the ECB in software: the
+    /// advertising settings the link layer would put on air.
+    #[cfg(feature = "directed-advertising")]
+    air:       link::Shared,
+    /// Random bytes drawn for [`Self::air`] so far: each draw fills its
+    /// bytes with their number.
+    #[cfg(feature = "directed-advertising")]
+    draws:     SyncCell<u8>,
+    /// Whether the calls also reach [`Self::air`].
+    #[cfg(feature = "directed-advertising")]
+    mirror:    SyncCell<bool>,
+    /// Whether the advertising that runs is directed, which a connection
+    /// then answers.
+    directing: SyncCell<bool>,
     /// The current link.
     epoch:     SyncCell<u32>,
     /// The link's information.
@@ -142,13 +156,15 @@ impl MockLink {
     fn calls(&self) -> Vec<Seen> { core::mem::take(&mut *self.calls.borrow_mut()) }
 
     /// A central connects from `peer`, resolved to `identity`, to our
-    /// address `local`.
+    /// address `local`, answering the advertising that runs, directed or
+    /// not.
     fn connect(&self, peer: Peer, identity: Option<Peer>, local: Peer) -> Epoch {
         let epoch = Epoch::for_test(self.epoch.get() + 1);
         self.epoch.set(self.epoch.get() + 1);
         self.connected.set(true);
         self.info.set(Some(Info {
             central_accuracy: 0,
+            directed: self.directing.get(),
             epoch,
             identity,
             local,
@@ -192,16 +208,23 @@ impl MockLink {
     /// A link layer with four places and no link.
     fn new() -> Self {
         Self {
-            calls:     SyncCell::new(Vec::new()),
-            capacity:  SyncCell::new(4),
+            calls: SyncCell::new(Vec::new()),
+            capacity: SyncCell::new(4),
             connected: SyncCell::new(false),
-            epoch:     SyncCell::new(0),
-            info:      SyncCell::new(None),
-            now:       SyncCell::new(1_000),
-            queue:     SyncCell::new(VecDeque::new()),
-            room:      SyncCell::new(false),
-            rx:        SyncCell::new(VecDeque::new()),
-            unacked:   SyncCell::new(0),
+            #[cfg(feature = "directed-advertising")]
+            air: link::Shared::new(),
+            #[cfg(feature = "directed-advertising")]
+            draws: SyncCell::new(0),
+            #[cfg(feature = "directed-advertising")]
+            mirror: SyncCell::new(false),
+            directing: SyncCell::new(false),
+            epoch: SyncCell::new(0),
+            info: SyncCell::new(None),
+            now: SyncCell::new(1_000),
+            queue: SyncCell::new(VecDeque::new()),
+            room: SyncCell::new(false),
+            rx: SyncCell::new(VecDeque::new()),
+            unacked: SyncCell::new(0),
         }
     }
 
@@ -249,19 +272,42 @@ impl Control for MockLink {
                 if self.connected.get() {
                     return Err(link::Error::Disallowed);
                 }
-                if params.kind == Kind::DirectedHighDuty {
+                self.directing.set(params.kind.is_directed());
+                if params.kind.is_directed() {
                     Seen::Directed(params.peer)
                 } else {
                     Seen::Advertise(params.interval, params.filter_policy)
                 }
             },
-            Call::StopAdvertising => Seen::StopAdvertising,
+            Call::StopAdvertising => {
+                self.directing.set(false);
+                Seen::StopAdvertising
+            },
             _ => Seen::Setup,
         };
+        #[cfg(feature = "directed-advertising")]
+        if self.mirror.get() {
+            let air = link::Link::new(&self.air);
+            let result = match call {
+                Call::Advertise { adv, params, scan } => {
+                    let fill = |bytes: &mut [u8]| {
+                        self.draws.set(self.draws.get() + 1);
+                        bytes.fill(self.draws.get());
+                    };
+                    air.advertise_drawn(&params, (adv, scan), fill, software)
+                },
+                other => air.call(other),
+            };
+            assert_eq!(result, Ok(()), "the link layer refused {seen:?}");
+        }
         self.calls.borrow_mut().push(seen);
         Ok(())
     }
 }
+
+/// Software AES-128 in place of the ECB.
+#[cfg(feature = "directed-advertising")]
+fn software(key: [u8; 16], block: [u8; 16]) -> [u8; 16] { Software.encrypt(key, block) }
 
 impl Port for MockLink {
     fn end_link(&self, epoch: Epoch, reason: u8) -> Result<(), link::Error> {
@@ -1294,6 +1340,250 @@ fn a_reconnection_advertises_directed_to_the_bonded_central_first() {
     assert_eq!(multiplications.get(), 0);
 }
 
+/// A directed phase, then the example's first two phases.
+#[cfg(feature = "directed-advertising")]
+static DIRECTED_THEN_TWO: [Phase; 3] = [Phase::directed(DIRECTED_MAX), example::PHASES[0], example::PHASES[1]];
+/// A schedule that starts with [`DIRECTED_THEN_TWO`]'s directed phase.
+#[cfg(feature = "directed-advertising")]
+static DIRECTED_THEN_TWO_SCHEDULE: Schedule = Schedule::new(&DIRECTED_THEN_TWO, embassy_time::Duration::from_secs(20));
+
+/// Runs a reconnection of `bond` on [`DIRECTED_THEN_TWO_SCHEDULE`] whose
+/// central connects from a private address of its key `phase` phases after
+/// the directed one, which goes unanswered, and encrypts with the bond's key;
+/// returns the bond the host reported to store, if any.
+#[cfg(feature = "directed-advertising")]
+fn reconnect_after_directed(bond: &Bond, phase: usize) -> Option<Bond> {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = Advertising::new(Mode::Reconnect(bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    // Directed to its identity: the link layer puts a private address made
+    // with the key of its resolving list entry on air.
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    if phase > 0 {
+        link.advance(1_279);
+        link.event(Event::AdvertisingTimeout);
+        link.advance(2);
+        tasks.step();
+        assert!(poll(advertise.as_mut()).is_pending());
+        assert_eq!(link.calls(), [Seen::Advertise(32, 3)]);
+    }
+    if phase > 1 {
+        link.advance(3_000);
+        assert!(poll(advertise.as_mut()).is_pending());
+        assert_eq!(link.calls(), [Seen::Advertise(80, 3)]);
+    }
+    link.advance(10);
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Hold(true), Seen::Ltk(Some(bond.ltk))]);
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
+    assert_eq!(multiplications.get(), 0);
+    match poll(pin!(conn.next())) {
+        Poll::Ready(ConnEvent::BondUpdated(updated)) => Some(updated),
+        Poll::Ready(other) => panic!("unexpected event {other:?}"),
+        Poll::Pending => None,
+    }
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_central_that_sent_its_key_is_directed_to() {
+    // BlueZ with any Privacy value but off sends its key.
+    let identity = identity(1);
+    let bond = bond(&identity);
+    assert!(bond.peer_irk.is_some() && bond.directed_works);
+    // It connects during the directed phase: directed advertising works,
+    // and the bond stays as it is.
+    assert!(reconnect_after_directed(&bond, 0).is_none());
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_central_that_connects_right_after_an_unanswered_directed_phase_is_no_longer_directed_to() {
+    let identity = identity(1);
+    let bond = bond(&identity);
+    // Its controller does not resolve the target: it connects to the
+    // undirected advertising right after the directed phase, and the host
+    // reports the bond to store with directed advertising off.
+    let updated = reconnect_after_directed(&bond, 1).unwrap();
+    assert!(!updated.directed_works);
+    assert!(updated.ltk == bond.ltk && updated.peer == bond.peer && updated.cccd == bond.cccd);
+    let stored = Bond::from_bytes(&updated.to_bytes()).unwrap();
+    assert!(!stored.directed_works);
+    // Its next reconnection skips the directed phase: it starts with the
+    // undirected phase after it, from the accept list, and goes on to the
+    // next one 3 s later, not 1.28 s more.
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let advertising =
+        Advertising::new(Mode::Reconnect(&stored), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    assert!(advertising.mode().skips(&DIRECTED_THEN_TWO[0]));
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 3)));
+    link.advance(1_281);
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert!(link.calls().is_empty());
+    link.advance(1_719);
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls(), [Seen::Advertise(80, 3)]);
+    // It connects then: no directed phase ran, and there is nothing to
+    // report.
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(stored.peer), local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
+    assert!(poll(pin!(conn.next())).is_pending());
+    assert_eq!(multiplications.get(), 0);
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_late_answer_to_the_directed_phase_keeps_directed_advertising() {
+    // The central answers the directed advertising just before the phase
+    // ends, and the run task hands the link over only after it: the next
+    // phase finds the link layer connected, and the link arrives in it.
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let bond = bond(&identity);
+    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    link.advance(1_279);
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    link.advance(2);
+    // The link layer refuses the next phase: it is connected.
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert!(link.calls().is_empty());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    assert!(conn.info().is_some_and(|info| info.directed));
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
+    // The request answered the directed advertising: nothing to report.
+    assert!(poll(pin!(conn.next())).is_pending());
+    assert!(host.with(|state| state.engine.bond().is_some_and(|kept| kept.directed_works)));
+    assert_eq!(multiplications.get(), 0);
+}
+
+/// Two directed phases, then the example's first phase: directed advertising
+/// for longer than the link layer's 1.28 s.
+#[cfg(feature = "directed-advertising")]
+static TWO_DIRECTED: [Phase; 3] = [Phase::directed(DIRECTED_MAX), Phase::directed(DIRECTED_MAX), example::PHASES[0]];
+/// A schedule of [`TWO_DIRECTED`].
+#[cfg(feature = "directed-advertising")]
+static TWO_DIRECTED_SCHEDULE: Schedule = Schedule::new(&TWO_DIRECTED, embassy_time::Duration::from_secs(20));
+
+/// Runs a reconnection of a bond on [`TWO_DIRECTED_SCHEDULE`] whose central
+/// connects during the second directed phase if `second`, otherwise in the
+/// undirected phase after it, and encrypts with the bond's key; returns the
+/// bond the host reported to store, if any.
+#[cfg(feature = "directed-advertising")]
+fn reconnect_after_two_directed(second: bool) -> Option<Bond> {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let bond = bond(&identity);
+    let advertising = Advertising::new(Mode::Reconnect(&bond), &TWO_DIRECTED_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    let mut expected = [Seen::Directed(bond.peer), Seen::Advertise(32, 3)].into_iter();
+    for _ in 0..if second { 1 } else { 2 } {
+        link.advance(1_279);
+        link.event(Event::AdvertisingTimeout);
+        link.advance(2);
+        tasks.step();
+        assert!(poll(advertise.as_mut()).is_pending());
+        assert_eq!(link.calls(), [expected.next().unwrap()]);
+    }
+    link.advance(10);
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
+    assert_eq!(multiplications.get(), 0);
+    match poll(pin!(conn.next())) {
+        Poll::Ready(ConnEvent::BondUpdated(updated)) => Some(updated),
+        Poll::Ready(other) => panic!("unexpected event {other:?}"),
+        Poll::Pending => None,
+    }
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn an_answer_to_a_second_directed_phase_keeps_directed_advertising() {
+    // The first directed phase went unanswered, but the central answered
+    // the second.
+    assert!(reconnect_after_two_directed(true).is_none());
+    // Only the undirected phase after both counts against it.
+    assert!(reconnect_after_two_directed(false).is_some_and(|updated| !updated.directed_works));
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_central_that_connects_later_keeps_directed_advertising() {
+    // It was not there during the directed phase and the one after it, as
+    // when it was asleep: that says nothing about directed advertising.
+    let identity = identity(1);
+    let bond = bond(&identity);
+    assert!(reconnect_after_directed(&bond, 2).is_none());
+}
+
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn an_unanswered_directed_phase_needs_the_bond_s_key_to_count() {
+    // A device that took the central's address but has no key of the bond
+    // cannot turn directed advertising off.
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let bond = bond(&identity);
+    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    link.advance(1_281);
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.calls();
+    link.connect(bond.peer, None, local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.event(Event::LtkRequest { ediv: 0, rand: [1; 8] });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Hold(true), Seen::Ltk(None)]);
+    assert!(poll(pin!(conn.next())).is_pending());
+    assert!(host.with(|state| state.engine.bond().is_some_and(|kept| kept.directed_works)));
+    assert_eq!(multiplications.get(), 0);
+}
+
 #[cfg(feature = "directed-advertising")]
 #[test]
 fn pairing_advertises_a_directed_phase_undirected_at_20_ms() {
@@ -1319,6 +1609,227 @@ fn pairing_advertises_a_directed_phase_undirected_at_20_ms() {
     link.advance(2);
     assert!(matches!(ready(advertise.as_mut()), Err(AdvertiseError::Timeout)));
     assert_eq!(multiplications.get(), 1);
+}
+
+/// A resolvable private address of `irk` from `prand`, in software.
+#[cfg(feature = "directed-advertising")]
+fn rpa(irk: [u8; 16], prand: [u8; 3]) -> Peer {
+    Peer::new(crate::crypto::resolvable_address_with(irk, prand, software), true)
+}
+
+/// Whether `address` resolves with `irk`, in software.
+#[cfg(feature = "directed-advertising")]
+fn resolves(irk: [u8; 16], address: [u8; 6]) -> bool { crate::crypto::resolves_with(irk, address, software) }
+
+/// The advertising settings the link layer runs, which [`MockLink::air`]
+/// took from the host's calls.
+#[cfg(feature = "directed-advertising")]
+fn on_air(link: &MockLink) -> crate::advertiser::Settings { link.air.advertising().unwrap() }
+
+/// Whether the advertising of `settings` accepts a connection request
+/// from `central`, as the advertising event parses and checks it, resolving
+/// in software: an `AUX_CONNECT_REQ`, or a `CONNECT_IND` without the feature
+/// `extended-advertising`.
+#[cfg(feature = "directed-advertising")]
+fn accepts(settings: &crate::advertiser::Settings, central: Peer) -> bool {
+    let mut request = [0; 36];
+    // ChSel set, as a CONNECT_IND of BlueZ has it; reserved and ignored in an
+    // AUX_CONNECT_REQ.
+    request[0] = 0x05 | 0x20 | if central.random { 0x40 } else { 0 } | if settings.own.random { 0x80 } else { 0 };
+    request[1] = 34;
+    request[2..8].copy_from_slice(&central.address);
+    request[8..14].copy_from_slice(&settings.own.address);
+    request[14..18].copy_from_slice(&0x9A32_8370_u32.to_le_bytes());
+    request[21] = 1;
+    request[24] = 12;
+    request[28..30].copy_from_slice(&600_u16.to_le_bytes());
+    request[30..35].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F]);
+    request[35] = 5;
+    #[cfg(feature = "extended-advertising")]
+    let accepted = crate::advertiser::extended::accepted_request_with(settings, &request, |central| {
+        settings.accepts_connection_with(central, resolves)
+    });
+    #[cfg(not(feature = "extended-advertising"))]
+    let accepted = crate::pdu::ConnectInd::parse(&request, settings.own)
+        .filter(|parsed| settings.accepts_connection_with(parsed.central(), resolves));
+    accepted.is_some_and(|parsed| parsed.central() == central)
+}
+
+/// The directed PDU of `settings` as it goes on air: its header's first
+/// octet, our address and the target. An `AUX_ADV_IND` with `AdvA`,
+/// `TargetA` and the ADI, connectable, or without the feature
+/// `extended-advertising` an `ADV_DIRECT_IND`.
+#[cfg(feature = "directed-advertising")]
+fn directed_pdu(settings: &crate::advertiser::Settings) -> (u8, [u8; 6], [u8; 6]) {
+    #[cfg(feature = "extended-advertising")]
+    let (pdu, ext_header) = {
+        let pdu = crate::advertiser::extended::auxiliary(settings);
+        let bytes = pdu.as_bytes();
+        // Extended header of 15 octets, AdvMode connectable; AdvA, TargetA
+        // and the ADI; the ADI, then the data.
+        assert_eq!(bytes[2..4], [0x4F, 0x0B]);
+        assert_eq!(bytes[16..18], settings.adi.to_bytes());
+        (pdu, 4)
+    };
+    #[cfg(not(feature = "extended-advertising"))]
+    let (pdu, ext_header) = (crate::advertiser::legacy::pdus(settings).0, 2);
+    let bytes = pdu.as_bytes();
+    let field = |at: usize| <[u8; 6]>::try_from(&bytes[at..at + 6]).unwrap();
+    (bytes[0], field(ext_header), field(ext_header + 6))
+}
+
+/// A reconnection of a bond whose central sent its key: the directed phase
+/// puts a directed `AUX_ADV_IND` on air every 20 ms, to a new resolvable
+/// private address of the central's key, which only the central answers;
+/// then undirected advertising from the accept list. A central whose
+/// controller does not resolve the target connects to that, and its next
+/// reconnection advertises undirected from the start.
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_reconnection_targets_a_private_address_of_the_central_s_key_until_it_goes_unanswered() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    link.mirror.set(true);
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let bond = bond(&identity);
+    assert!(bond.peer_irk == Some(CENTRAL_IRK) && bond.directed_works);
+    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    let directed = on_air(&link);
+    assert!(directed.kind.is_directed() && directed.peer == bond.peer);
+    // Low duty cycle at the phase's 20 ms with extended advertising; the
+    // link layer's 3.75 ms of high duty cycle without.
+    #[cfg(feature = "extended-advertising")]
+    assert!(directed.kind == crate::advertiser::Kind::DirectedLowDuty && directed.interval == 20_000);
+    #[cfg(not(feature = "extended-advertising"))]
+    assert!(directed.kind.is_high_duty());
+    // On air: from our private address to a private address of the
+    // central's key (RxAdd), not its identity, each made from random bytes
+    // this call drew: our address from the first draw, the target from the
+    // second, so a new directed phase targets a new address.
+    let (header, adv_a, target_a) = directed_pdu(&directed);
+    #[cfg(feature = "extended-advertising")]
+    assert_eq!(header, 0x07 | 0x40 | 0x80);
+    // ADV_DIRECT_IND with ChSel, channel selection algorithm 2.
+    #[cfg(not(feature = "extended-advertising"))]
+    assert_eq!(header, 0x01 | 0x20 | 0x40 | 0x80);
+    assert!(adv_a == directed.own.address && resolves(identity.irk(), adv_a));
+    assert!(target_a == directed.target.address && directed.target.random);
+    assert!(resolves(CENTRAL_IRK, target_a) && !resolves(identity.irk(), target_a));
+    assert!(target_a != CENTRAL_IDENTITY);
+    assert_eq!(link.draws.get(), 2);
+    assert!(adv_a == rpa(identity.irk(), [1; 3]).address && target_a == rpa(CENTRAL_IRK, [2; 3]).address);
+    // The link layer task renews the advertising set before the first
+    // event, from random octets that are the same each renewal here.
+    #[cfg(feature = "extended-advertising")]
+    let directed_adi = {
+        let renewed = ready(pin!(link.air.renewed_advertising_with(async |bytes: &mut [u8]| bytes.fill(0x5A))));
+        assert!(renewed.is_some_and(|renewed| !renewed.stale) && !on_air(&link).stale);
+        on_air(&link).adi
+    };
+    // Only the central connects: from another private address of its key,
+    // as Linux initiates, or from its identity (device privacy mode); not
+    // from another key's or another device's address.
+    assert!(accepts(&directed, rpa(CENTRAL_IRK, [0x12, 0x34, 0x56])));
+    assert!(accepts(&directed, bond.peer));
+    assert!(!accepts(&directed, rpa([0x77; 16], [0x12, 0x34, 0x56])));
+    assert!(!accepts(&directed, Peer::new([9; 6], false)));
+    // The central does not answer. The phase ends after 1.28 s (and the link
+    // layer's high duty cycle advertising with it); undirected advertising
+    // at 20 ms from the accept list follows, from the same kind of address,
+    // with the central's private addresses resolved.
+    link.advance(1_279);
+    #[cfg(not(feature = "extended-advertising"))]
+    link.event(Event::AdvertisingTimeout);
+    link.advance(2);
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    assert_eq!(link.calls(), [Seen::Advertise(32, 3)]);
+    let undirected = on_air(&link);
+    assert!(!undirected.kind.is_directed() && undirected.interval == 20_000 && undirected.filter_policy == 0x03);
+    assert!(undirected.own.random && resolves(identity.irk(), undirected.own.address));
+    #[cfg(feature = "extended-advertising")]
+    {
+        let pdu = crate::advertiser::extended::auxiliary(&undirected);
+        // AdvA and the ADI, no TargetA; the set waits for its renewal,
+        // which gives it a new advertising data ID even from the same random
+        // octets.
+        assert_eq!(pdu.as_bytes()[..4], [0x47, pdu.as_bytes()[1], 0x49, 0x09]);
+        assert!(undirected.stale);
+        let renewed = ready(pin!(link.air.renewed_advertising_with(async |bytes: &mut [u8]| bytes.fill(0x5A))));
+        assert!(renewed.is_some_and(|renewed| !renewed.stale && renewed.adi.did() != directed_adi.did()));
+    }
+    assert!(accepts(&undirected, rpa(CENTRAL_IRK, [0x12, 0x34, 0x56])));
+    assert!(!accepts(&undirected, rpa([0x77; 16], [0x12, 0x34, 0x56])));
+    // It connects to that from a private address and encrypts with the
+    // bond's key: the host reports the bond to store, directed advertising
+    // off.
+    link.advance(10);
+    link.connect(rpa(CENTRAL_IRK, [0x12, 0x34, 0x56]), Some(bond.peer), local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    assert!(conn.info().is_some_and(|info| !info.directed));
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
+    let Poll::Ready(ConnEvent::BondUpdated(updated)) = poll(pin!(conn.next())) else {
+        panic!("no bond to store");
+    };
+    let stored = Bond::from_bytes(&updated.to_bytes()).unwrap();
+    assert!(!stored.directed_works && stored.peer_irk == Some(CENTRAL_IRK));
+    assert_eq!(multiplications.get(), 0);
+    // The next reconnection skips the directed phase: undirected advertising
+    // from the start, and nothing directed on air.
+    let host = self::host(Unclaimed::Keep);
+    let link = host.port();
+    link.mirror.set(true);
+    tasks!(host, tasks, multiplications);
+    let advertising =
+        Advertising::new(Mode::Reconnect(&stored), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    let calls = link.calls();
+    assert!(!calls.iter().any(|call| matches!(call, Seen::Directed(_))), "{calls:?}");
+    assert_eq!(calls.last(), Some(&Seen::Advertise(32, 3)));
+    let skipped = on_air(&link);
+    assert!(!skipped.kind.is_directed() && skipped.filter_policy == 0x03);
+    assert_eq!(multiplications.get(), 0);
+}
+
+/// A bond whose central sent no key, as `BlueZ` with `Privacy = off`: the
+/// directed phase targets its identity, which it scans from.
+#[cfg(feature = "directed-advertising")]
+#[test]
+fn a_reconnection_targets_the_identity_of_a_central_without_a_key() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    link.mirror.set(true);
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let mut bond = bond(&identity);
+    bond.peer_irk = None;
+    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    let directed = on_air(&link);
+    let (header, adv_a, target_a) = directed_pdu(&directed);
+    // TxAdd for our private address, no RxAdd: the public identity.
+    assert_eq!(header & 0xC0, 0x40);
+    assert!(resolves(identity.irk(), adv_a) && target_a == CENTRAL_IDENTITY && directed.target == bond.peer);
+    assert!(accepts(&directed, bond.peer));
+    assert!(!accepts(&directed, Peer::new([9; 6], false)));
+    // No random bytes for the target: only our own address took a draw.
+    assert_eq!(link.draws.get(), 1);
+    assert_eq!(multiplications.get(), 0);
 }
 
 #[test]

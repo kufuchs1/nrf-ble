@@ -521,11 +521,11 @@ impl<'peripherals> Clock<'peripherals> {
         // after START before it is read; check the nRF51802 errata.
         RTC.tasks_start().write_value(1);
         let ch_resume = PPI.ch(PPI_RESUME);
-        ch_resume.eep().write_value(address(RTC.events_compare(RTC_RESUME).as_ptr()));
-        ch_resume.tep().write_value(address(REGS.tasks_start().as_ptr()));
+        ch_resume.eep().write_value(RTC.events_compare(RTC_RESUME).as_ptr().addr().strict_cast());
+        ch_resume.tep().write_value(REGS.tasks_start().as_ptr().addr().strict_cast());
         let ch_sync = PPI.ch(PPI_SYNC);
-        ch_sync.eep().write_value(address(RTC.events_compare(RTC_SYNC).as_ptr()));
-        ch_sync.tep().write_value(address(REGS.tasks_capture(CC_NOW).as_ptr()));
+        ch_sync.eep().write_value(RTC.events_compare(RTC_SYNC).as_ptr().addr().strict_cast());
+        ch_sync.tep().write_value(REGS.tasks_capture(CC_NOW).as_ptr().addr().strict_cast());
         chip::self_disabling(PPI_SYNC, PPI_GROUP_SYNC);
         PPI.chenset().write(|w| {
             w.set_ch(PPI_ADDRESS, true);
@@ -579,6 +579,32 @@ impl<'peripherals> Clock<'peripherals> {
         true
     }
 
+    /// Starts the radio through `channel` at `at` if `at` is at least `lead`
+    /// microseconds ahead. Returns whether it does.
+    ///
+    /// [`Self::start_at`] arms first and checks after, so a compare that
+    /// fires between the two starts the radio although it reports a start
+    /// in the past. Here the time is checked before arming, and the compare
+    /// event after: if the compare came around the arming, the start is
+    /// cancelled and reported as missed, and the radio may have started
+    /// all the same, so the caller disables it.
+    #[cfg(feature = "extended-advertising")]
+    fn start_ahead(&mut self, at: u32, lead: u32, channel: usize) -> bool {
+        self.cancel_start();
+        REGS.cc(CC_START).write_value(at.wrapping_sub(self.base));
+        REGS.events_compare(CC_START).write_value(0);
+        let ahead = at.wrapping_sub(self.now());
+        if !is_ahead(ahead) || ahead < lead {
+            return false;
+        }
+        PPI.chenset().write(|w| w.set_ch(channel, true));
+        if REGS.events_compare(CC_START).read() != 0 {
+            self.cancel_start();
+            return false;
+        }
+        true
+    }
+
     /// Starts the radio through `channel` at `at`. Returns how long before
     /// `at` the start was programmed, or `None` if `at` is not in the future.
     fn start_at(&mut self, at: u32, channel: usize) -> Option<u32> {
@@ -596,6 +622,14 @@ impl<'peripherals> Clock<'peripherals> {
         REGS.intenclr().write(|w| w.set_compare(CC_START, true));
         REGS.events_compare(CC_START).write_value(0);
     }
+
+    /// Starts sending at `at` if `at` is at least `lead` microseconds ahead.
+    /// Returns whether it does; when not, nothing is armed, but a start
+    /// that raced the check may have enabled the radio, which the caller
+    /// then disables.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    pub fn transmit_ahead(&mut self, at: u32, lead: u32) -> bool { self.start_ahead(at, lead, PPI_TXEN) }
 
     /// Starts sending at `at`. Returns false if `at` is not in the future.
     #[inline]
@@ -643,9 +677,6 @@ impl<'peripherals> Clock<'peripherals> {
         Self::setup(timer, rtc)
     }
 }
-
-/// The address of a register for a PPI endpoint.
-fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
 
 /// Keeps the low frequency RC oscillator within 500 ppm forever.
 ///
@@ -748,8 +779,8 @@ async fn calibrate() -> bool {
     CLOCK.events_done().write_value(0);
     chip::set_calibration_workaround(true);
     let channel = PPI.ch(PPI_CALIBRATE);
-    channel.eep().write_value(address(CLOCK.events_hfclkstarted().as_ptr()));
-    channel.tep().write_value(address(CLOCK.tasks_cal().as_ptr()));
+    channel.eep().write_value(CLOCK.events_hfclkstarted().as_ptr().addr().strict_cast());
+    channel.tep().write_value(CLOCK.tasks_cal().as_ptr().addr().strict_cast());
     chip::self_disabling(PPI_CALIBRATE, PPI_GROUP_CALIBRATE);
     // Enables PPI_CALIBRATE until the crystal's first start event.
     PPI.tasks_chg(PPI_GROUP_CALIBRATE).en().write_value(1);

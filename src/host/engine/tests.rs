@@ -45,6 +45,7 @@ fn identity() -> identity::Local {
 fn info(peer: Peer, identity: Option<Peer>) -> Info {
     Info {
         central_accuracy: 0,
+        directed: false,
         epoch: Epoch::for_test(1),
         identity,
         local: local_rpa(),

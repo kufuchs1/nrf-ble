@@ -30,7 +30,8 @@ pub const CRYSTAL_LEAD_US: u32 = 800;
 /// Bounds of the crystal lead time.
 pub const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 1500);
 /// Largest advertising channel payload the radio accepts: as on the data
-/// channels.
+/// channels, which takes in the longest `AUX_ADV_IND` of extended
+/// advertising.
 pub const ADV_MAXLEN: u8 = MAX_PAYLOAD;
 /// Busy-wait iterations for a decryption to finish after the packet end,
 /// about 250 us at 64 MHz.
@@ -55,6 +56,11 @@ pub const PREPARE_IN_EVENT: bool = true;
 pub const LEVELS_DBM: [i8; 8] = [-20, -16, -12, -8, -4, 0, 3, 4];
 /// Largest payload the radio accepts on any channel.
 const MAX_PAYLOAD: u8 = 255;
+/// The most octets of a packet in RAM: S0, length, S1 and payload together
+/// cannot exceed 258 bytes, whatever MAXLEN holds (nRF52832 Product
+/// Specification v1.0, 23.3): every payload of 255 octets fits, also with
+/// the data channels' S1 octet.
+pub const PACKET_RAM_MAX: usize = 258;
 /// Largest payload the radio accepts on any channel, for the size of the
 /// packet buffers.
 pub const PAYLOAD_MAX: usize = 255;
@@ -117,7 +123,7 @@ pub fn read_temperature() -> i32 { TEMP.temp().read().cast_signed() }
 #[inline]
 pub fn self_disabling(channel: usize, group: usize) {
     PPI.chg(group).write(|w| w.set_ch(channel, true));
-    PPI.fork(channel).tep().write_value(address(PPI.tasks_chg(group).dis().as_ptr()));
+    PPI.fork(channel).tep().write_value(PPI.tasks_chg(group).dis().as_ptr().addr().strict_cast());
 }
 
 /// Sets the workaround for anomaly 192 while an RC calibration may run, and
@@ -165,6 +171,3 @@ pub fn set_phy(phy: Phy) {
 /// supports: the register takes the level in dBm.
 #[inline]
 pub const fn txpower(dbm: i8) -> Txpower { Txpower::from_bits(dbm.cast_unsigned()) }
-
-/// The address of a register for a PPI endpoint.
-fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }

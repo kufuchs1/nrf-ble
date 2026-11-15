@@ -24,9 +24,6 @@ pub const SET_IN_ANSWER: bool = false;
 /// TIMER1 ticks per microsecond, at 16 MHz.
 const SWITCH_TICKS_PER_US: u32 = 16;
 
-/// The address of a register for a PPI endpoint.
-fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
-
 /// Sets what `radio` does after the current packet, timed for its PHY.
 #[inline]
 pub fn arm(radio: &Radio<'_>, turnaround: Turnaround) {
@@ -52,7 +49,7 @@ pub fn arm(radio: &Radio<'_>, turnaround: Turnaround) {
         Turnaround::Transmit => (REGS.tasks_txen().as_ptr(), radio.phy.response_offset_us(radio.phy)),
     };
     SWITCH.cc(0).write_value(offset.saturating_mul(SWITCH_TICKS_PER_US));
-    PPI.ch(PPI_SWITCH_ENABLE).tep().write_value(address(task));
+    PPI.ch(PPI_SWITCH_ENABLE).tep().write_value(task.addr().strict_cast());
     compiler_fence(Ordering::SeqCst);
     PPI.chenset().write(|w| {
         w.set_ch(PPI_SWITCH_START, true);
@@ -73,9 +70,9 @@ pub fn init() {
     });
     SWITCH.tasks_clear().write_value(1);
     let start = PPI.ch(PPI_SWITCH_START);
-    start.eep().write_value(address(REGS.events_end().as_ptr()));
-    start.tep().write_value(address(SWITCH.tasks_start().as_ptr()));
-    PPI.ch(PPI_SWITCH_ENABLE).eep().write_value(address(SWITCH.events_compare(0).as_ptr()));
+    start.eep().write_value(REGS.events_end().as_ptr().addr().strict_cast());
+    start.tep().write_value(SWITCH.tasks_start().as_ptr().addr().strict_cast());
+    PPI.ch(PPI_SWITCH_ENABLE).eep().write_value(SWITCH.events_compare(0).as_ptr().addr().strict_cast());
 }
 
 /// Sleeps until the turnaround enabled the radio again, and clears the

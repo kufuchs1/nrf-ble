@@ -1,11 +1,13 @@
 //! Connectable advertising and the advertising data writer.
 //!
 //! [`Data`] writes advertising and scan response data, AD structures of
-//! [`DATA_MAX`] octets at most: flags, the complete or shortened local name,
-//! the appearance, the complete list of 16-bit service UUIDs and the TX power
-//! level. A structure that does not fit is refused with [`Overflow`] and
-//! leaves the data as it was. [`Content`] builds both sets of a device from its
-//! name, appearance and services, which the device defines
+//! [`DATA_MAX`] octets at most (31, or with the feature
+//! `extended-advertising`, which has no scan response, 245 on the nRF52832 and
+//! 242 on the nRF51): flags, the complete or
+//! shortened local name, the appearance, the complete list of 16-bit service
+//! UUIDs and the TX power level. A structure that does not fit is refused with
+//! [`Overflow`] and leaves the data as it was. [`Content`] builds both sets of
+//! a device from its name, appearance and services, which the device defines
 //! ([`Content::new`]).
 //!
 //! # Modes
@@ -30,22 +32,50 @@
 //! With the feature `directed-advertising`, a phase in [`Mode::Reconnect`]
 //! may also be directed (`Phase::directed`): high duty cycle directed
 //! advertising, an `ADV_DIRECT_IND` to the bonded central every 3.75 ms for
-//! at most `DIRECTED_MAX`, connectable by that central only. Linux connects
+//! at most `DIRECTED_MAX`, connectable by that central only (with the
+//! feature `extended-advertising` low duty cycle directed advertising
+//! instead, see below). Linux connects
 //! to it as to an undirected advertisement from a device of its accept list
 //! with auto-connect (and only to it for a device `BlueZ` merely allows to
 //! connect), so a first directed phase makes a reconnection about 30 to 50 ms
-//! faster than one at 20 ms. The target is the central's identity address,
-//! which a central scanning from its identity address takes: Linux without
-//! host privacy, which sends no identity resolving key at pairing. A central
-//! that sent one scans from resolvable private addresses (Linux with
-//! `Privacy = device`) and would drop an advertisement directed to its
-//! identity, so its bond is not directed to. Where a directed phase cannot be
-//! directed, in pairing mode, for a bond with the central's key and for one
+//! faster than one at 20 ms. For a central that sent no identity resolving
+//! key at pairing, Linux with `Privacy = off` in `BlueZ`'s `main.conf`, the
+//! target is its identity address, which it scans from. A central that sent
+//! one scans and initiates from resolvable private addresses: Linux with any
+//! `Privacy` value but `off` (`device`, `network`, `on` and the others alike).
+//! The target is then a new resolvable private address made with its key
+//! each time the phase starts, as the link layer makes it
+//! ([`crate::link::Link::advertise`]). The central's controller has to
+//! resolve that address itself, with its own key in its resolving list (LL
+//! privacy, address resolution in the controller): the host cannot help, as
+//! a controller that initiates a connection only answers directed
+//! advertising to its own address or one it resolves (Core, Vol 6, Part B,
+//! 4.4.4.1 and 6.4). Linux uses LL privacy from kernel 6.14 where the
+//! controller supports it and `BlueZ` sets the device's address resolution
+//! flag; before, only with its experimental feature. A central without it
+//! ignores the directed phase and connects to the undirected advertising
+//! after it, so the bond remembers that ([`Bond::directed_works`]) and its
+//! later reconnections skip the directed phase (`Mode::skips`): they start
+//! with the undirected phase after it, which [`Schedule::total`] and
+//! [`Schedule::phase_at`] still count the directed phase before. The link
+//! layer tells which advertising a connection request answered
+//! ([`crate::link::Info::directed`]), so a central that answered the directed
+//! advertising just before the phase ended is not taken for one that did not.
+//! Where a directed phase cannot be directed, in pairing mode and for a bond
 //! whose central has no identity address, public or static random, as right
 //! after pairing with a central that sent none (`Mode::directs`), it
 //! advertises undirected at 20 ms instead, for the same time. It is the
 //! firmware's choice, opt-in through the feature and its reconnection
 //! schedule.
+//!
+//! With the feature `extended-advertising` as well, which replaces legacy
+//! advertising, a directed phase is low duty cycle directed advertising
+//! instead: an `AUX_ADV_IND` with the bonded central as its target at the
+//! phase's interval, 20 ms, connectable by that central only, for as long as
+//! the phase lasts. Extended advertising has no high duty cycle directed
+//! advertising, so the directed phase only helps a central that connects to
+//! directed advertising sooner than to undirected; the target and the
+//! adaptive skip are the same.
 //!
 //! [`Advertising::configure`] sets the link layer up for a mode once, while it
 //! does not advertise: our identity address
@@ -124,15 +154,21 @@
 //! reason 0x13, as [`crate::host::engine::Unclaimed`] says.
 
 use crate::{
-    advertiser::legacy::{self, Kind},
+    advertiser::{self, Kind},
     host::{bond::Bond, identity},
     link::{self, AdvParams, Link},
     pdu::Peer,
 };
+#[cfg(feature = "extended-advertising")]
+use crate::{chip, radio::Phy};
 use embassy_time::Duration;
 
 /// Largest advertising or scan response data.
-pub const DATA_MAX: usize = legacy::DATA_MAX;
+///
+/// 31 octets, or with the feature `extended-advertising` 245 octets of
+/// advertising data on the nRF52832 and 242 on the nRF51, whose radio sends
+/// a shorter payload, and no scan response.
+pub const DATA_MAX: usize = advertiser::DATA_MAX;
 /// AD type: flags.
 pub const AD_FLAGS: u8 = 0x01;
 /// AD type: the complete list of 16-bit service UUIDs.
@@ -147,14 +183,32 @@ pub const AD_TX_POWER: u8 = 0x0A;
 pub const AD_APPEARANCE: u8 = 0x19;
 /// The longest a directed phase lasts: the link layer ends high duty cycle
 /// directed advertising after 1.28 s.
+///
+/// The low duty cycle directed advertising of extended advertising has no
+/// such limit, and the phase keeps it.
 #[cfg(feature = "directed-advertising")]
 pub const DIRECTED_MAX: Duration = Duration::from_millis(1280);
 /// The interval of a directed phase where it cannot be directed: 20 ms.
 ///
 /// In units of 0.625 ms, for the undirected advertising that takes its place;
-/// the link layer keeps its own for directed advertising, 3.75 ms.
+/// the link layer keeps its own for high duty cycle directed advertising,
+/// 3.75 ms. With the feature `extended-advertising`, whose directed
+/// advertising is low duty cycle, the directed advertising takes this
+/// interval too.
 #[cfg(feature = "directed-advertising")]
 pub const DIRECTED_FALLBACK: u16 = 32;
+/// The advertising type of a directed phase: high duty cycle directed
+/// advertising, or with the feature `extended-advertising` low duty cycle
+/// directed advertising, an `AUX_ADV_IND` with the target, at the phase's
+/// interval.
+#[cfg(all(feature = "directed-advertising", not(feature = "extended-advertising")))]
+pub(crate) const DIRECTED: Kind = Kind::DirectedHighDuty;
+/// The advertising type of a directed phase: high duty cycle directed
+/// advertising, or with the feature `extended-advertising` low duty cycle
+/// directed advertising, an `AUX_ADV_IND` with the target, at the phase's
+/// interval.
+#[cfg(all(feature = "directed-advertising", feature = "extended-advertising"))]
+pub(crate) const DIRECTED: Kind = Kind::DirectedLowDuty;
 /// Flag: LE General Discoverable Mode.
 pub const LE_GENERAL_DISCOVERABLE: u8 = 0x02;
 /// Flag: BR/EDR not supported.
@@ -181,13 +235,17 @@ const NO_PEER: Peer = Peer::new([0; 6], false);
 /// scan response data.
 pub struct Advertising<'bond> {
     /// The advertising data.
-    data:     Data,
+    data:          Data,
     /// The mode.
-    mode:     Mode<'bond>,
+    mode:          Mode<'bond>,
     /// The scan response data.
-    scan:     Data,
+    #[cfg(not(feature = "extended-advertising"))]
+    scan:          Data,
     /// The phases and the security deadline.
-    schedule: &'static Schedule,
+    schedule:      &'static Schedule,
+    /// The PHY of the secondary channel.
+    #[cfg(feature = "extended-advertising")]
+    secondary_phy: Phy,
 }
 
 /// What a device advertises: its name, appearance, services and,
@@ -254,7 +312,9 @@ pub struct Phase {
     /// Whether it is high duty cycle directed advertising to the bonded
     /// central ([`Self::directed`]), which takes its interval from the link
     /// layer: `interval` is then that of the undirected advertising that
-    /// takes its place where it cannot be directed ([`Mode::directs`]).
+    /// takes its place where it cannot be directed ([`Mode::directs`]). With
+    /// the feature `extended-advertising` it is low duty cycle directed
+    /// advertising at `interval`.
     #[cfg(feature = "directed-advertising")]
     pub directed: bool,
     /// How long the phase lasts.
@@ -401,24 +461,60 @@ impl<'bond> Advertising<'bond> {
     /// [`Overflow`] if the content does not fit.
     #[inline]
     pub const fn new(mode: Mode<'bond>, schedule: &'static Schedule, content: &Content<'_>) -> Result<Self, Overflow> {
+        #[cfg(not(feature = "extended-advertising"))]
         let (data, scan) = content.data(mode.discoverable())?;
-        Ok(Self { data, mode, scan, schedule })
+        #[cfg(feature = "extended-advertising")]
+        let (data, _) = content.data(mode.discoverable())?;
+        Ok(Self {
+            data,
+            mode,
+            #[cfg(not(feature = "extended-advertising"))]
+            scan,
+            schedule,
+            #[cfg(feature = "extended-advertising")]
+            secondary_phy: Phy::M1,
+        })
     }
 
+    /// The link layer's parameters for `phase`: the mode's
+    /// ([`Mode::params`]), on the secondary channel's PHY.
+    #[cfg(feature = "extended-advertising")]
+    const fn params(&self, phase: &Phase) -> AdvParams { self.mode.params(phase).secondary_phy(self.secondary_phy) }
+
     /// The scan response data.
+    #[cfg(not(feature = "extended-advertising"))]
     #[inline]
     #[must_use = "the data is only read"]
     pub const fn scan(&self) -> &Data { &self.scan }
+
+    /// The scan response data: none with extended advertising.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the data is only read"]
+    pub const fn scan(&self) -> &Data {
+        /// No structures.
+        const NONE: Data = Data::new();
+        &NONE
+    }
 
     /// The phases and the security deadline.
     #[inline]
     #[must_use = "the schedule is only read"]
     pub const fn schedule(&self) -> &'static Schedule { self.schedule }
 
+    /// The PHY of the secondary channel.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the PHY is only read"]
+    pub const fn secondary_phy(&self) -> Phy { self.secondary_phy }
+
     /// Advertises with `phase`'s interval until a central connects, or
     /// until [`Link::stop_advertising`] or another call replaces it; a
-    /// directed phase ends by itself after 1.28 s. The mode is to be
-    /// [`Self::configure`]d first.
+    /// directed phase ends by itself after 1.28 s, as the link layer ends
+    /// high duty cycle directed advertising. With the feature
+    /// `extended-advertising` a directed phase is low duty cycle directed
+    /// advertising at `phase`'s interval, which runs until the next phase
+    /// replaces it. The mode is to be [`Self::configure`]d first.
     ///
     /// # Errors
     ///
@@ -429,8 +525,22 @@ impl<'bond> Advertising<'bond> {
     where
         C: Control,
     {
+        #[cfg(not(feature = "extended-advertising"))]
         let params = self.mode.params(phase);
-        Ok(control.call(Call::Advertise { adv: self.data.as_bytes(), params, scan: self.scan.as_bytes() })?)
+        #[cfg(feature = "extended-advertising")]
+        let params = self.params(phase);
+        Ok(control.call(Call::Advertise { adv: self.data.as_bytes(), params, scan: self.scan().as_bytes() })?)
+    }
+
+    /// With `phy` on the secondary channel, LE 1M by default: the
+    /// `AUX_ADV_IND`, the connection request and its answer, and the
+    /// connection's start. LE 2M halves their airtime, for centrals that
+    /// take it; the nRF51, which has LE 1M alone, keeps LE 1M.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the advertising is only built"]
+    pub const fn with_secondary_phy(self, phy: Phy) -> Self {
+        Self { secondary_phy: if chip::PHY_2M { phy } else { Phy::M1 }, ..self }
     }
 }
 
@@ -445,6 +555,13 @@ impl<'name> Content<'name> {
     /// name, so other devices do not list the device. The TX power level, if
     /// any, goes in the scan response.
     ///
+    /// With the feature `extended-advertising` there is no scan response: the
+    /// advertising data, up to [`DATA_MAX`] octets, holds the TX power level
+    /// after the appearance, and then the name, which is shortened only if it
+    /// does not fit there. Without `discoverable`, for a reconnection that
+    /// may be directed, the data takes six octets less: 239 on the nRF52832,
+    /// 236 on the nRF51.
+    ///
     /// # Errors
     ///
     /// [`Overflow`] if a structure does not fit, or not even one character
@@ -454,6 +571,33 @@ impl<'name> Content<'name> {
         let flags = if discoverable { LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED } else { BR_EDR_NOT_SUPPORTED };
         let mut adv = Data::new();
         adv.flags(flags)?.services(self.services)?.appearance(self.appearance)?;
+        self.name_and_power(adv, discoverable)
+    }
+
+    /// [`Self::data`] after the appearance in `adv`: with extended
+    /// advertising, the TX power level and the name in `adv`, and no scan
+    /// response.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    const fn name_and_power(&self, mut adv: Data, discoverable: bool) -> Result<(Data, Data), Overflow> {
+        if let Some(dbm) = self.tx_power {
+            adv.tx_power(dbm)?;
+        }
+        if discoverable {
+            adv.name_fitting(self.name)?;
+        }
+        if !discoverable && adv.len() > Kind::DirectedLowDuty.data_max() {
+            return Err(Overflow::TooLong);
+        }
+        Ok((adv, Data::new()))
+    }
+
+    /// [`Self::data`] after the appearance in `adv`: the name in `adv`,
+    /// complete in the scan response if shortened there, and the TX power
+    /// level in the scan response.
+    #[cfg(not(feature = "extended-advertising"))]
+    #[inline]
+    const fn name_and_power(&self, mut adv: Data, discoverable: bool) -> Result<(Data, Data), Overflow> {
         let mut scan = Data::new();
         if discoverable && adv.name_fitting(self.name)? {
             scan.name(self.name)?;
@@ -560,7 +704,8 @@ impl Data {
         let start = self.len();
         let end = start.saturating_add(data.len()).saturating_add(2);
         let target = self.bytes.get_mut(start..end).ok_or(Overflow::TooLong)?;
-        // Both fit an octet now: the structure fits the data's 31 octets.
+        // Both fit an octet now: the structure fits the data's DATA_MAX
+        // octets, at most 245.
         let length: u8 = data.len().saturating_add(1).saturating_cast();
         let (header, body) = target.split_at_mut(2);
         header.copy_from_slice(&[length, kind]);
@@ -643,20 +788,22 @@ impl Control for Link<'_> {
 
 impl Mode<'_> {
     /// Whether the mode advertises `phase` directed: a directed phase in
-    /// [`Self::Reconnect`] for a bond without the central's identity
-    /// resolving key, whose central therefore scans from its identity
-    /// address, and only if that is an identity address, public or static
-    /// random, which directed advertising can target. A central that sent its
-    /// key scans from resolvable private addresses and would drop an
-    /// advertisement directed to its identity. Elsewhere a directed phase
-    /// advertises undirected at its interval, 20 ms.
+    /// [`Self::Reconnect`], for a bond whose central has an identity address,
+    /// public or static random, which directed advertising can target, and
+    /// whose directed advertising has not gone unanswered
+    /// ([`Bond::directed_works`]). With the central's identity resolving key
+    /// in the bond, the link layer targets a resolvable private address made
+    /// with it (see the module documentation). [`crate::host::Host::advertise`]
+    /// skips a directed phase of a bond whose directed advertising went
+    /// unanswered (`Self::skips`); elsewhere a directed phase advertises
+    /// undirected at its interval, 20 ms.
     #[cfg(feature = "directed-advertising")]
     #[inline]
     #[must_use = "the property is only read"]
     pub const fn directs(&self, phase: &Phase) -> bool {
         match *self {
             Self::Pairing => false,
-            Self::Reconnect(bond) => phase.directed && bond.peer_irk.is_none() && is_identity(bond.peer),
+            Self::Reconnect(bond) => phase.directed && bond.directed_works && is_identity(bond.peer),
         }
     }
 
@@ -674,8 +821,12 @@ impl Mode<'_> {
     /// all three channels, from a resolvable private address, filtered on the
     /// filter accept list in [`Self::Reconnect`]; with the feature
     /// `directed-advertising`, for a phase the mode directs
-    /// (`Self::directs`), high duty cycle directed advertising to the bonded
-    /// central's identity, from the same private address.
+    /// (`Self::directs`), high duty cycle directed advertising (low duty
+    /// cycle at the phase's interval with the feature
+    /// `extended-advertising`) to the bonded central's identity, from the
+    /// same private address; the link layer
+    /// puts a resolvable private address of the central on air in its place
+    /// if the resolving list holds the central's key.
     #[inline]
     #[must_use = "the parameters are only built"]
     pub const fn params(&self, phase: &Phase) -> AdvParams {
@@ -691,16 +842,33 @@ impl Mode<'_> {
         if let Self::Reconnect(bond) = *self
             && self.directs(phase)
         {
-            return AdvParams { kind: Kind::DirectedHighDuty, peer: bond.peer, ..undirected };
+            return AdvParams { kind: DIRECTED, peer: bond.peer, ..undirected };
         }
         undirected
+    }
+
+    /// Whether [`crate::host::Host::advertise`] skips `phase`: a directed
+    /// phase in [`Self::Reconnect`] for a bond whose directed advertising
+    /// went unanswered ([`Bond::directed_works`] false), which would only
+    /// delay the central.
+    #[cfg(feature = "directed-advertising")]
+    #[inline]
+    #[must_use = "the property is only read"]
+    pub const fn skips(&self, phase: &Phase) -> bool {
+        match *self {
+            Self::Pairing => false,
+            Self::Reconnect(bond) => phase.directed && !bond.directed_works,
+        }
     }
 }
 
 impl Phase {
     /// A directed phase lasting `duration`, at most [`DIRECTED_MAX`]: high
     /// duty cycle directed advertising to the bonded central, for the start
-    /// of a reconnection schedule (see the module documentation).
+    /// of a reconnection schedule (see the module documentation). With the
+    /// feature `extended-advertising` low duty cycle directed advertising at
+    /// [`DIRECTED_FALLBACK`], 20 ms, which ends when the host starts the next
+    /// phase.
     #[cfg(feature = "directed-advertising")]
     #[inline]
     #[must_use = "the phase is only built"]

@@ -6,6 +6,25 @@ use crate::link::{Epoch, Link, ParamRange};
 /// The answer path against a central that follows the specification.
 mod central;
 
+/// The connection request of the tests' connections: CONNECT_IND
+/// parameters, window offset 0 and size 1.
+const REQUEST: ConnectInd = ConnectInd {
+    access_address:   0x9A32_8370,
+    channel_map:      [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
+    crc_init:         1,
+    csa2:             false,
+    hop:              5,
+    initiator:        [1; 6],
+    initiator_random: false,
+    interval:         12,
+    latency:          0,
+    sca:              0,
+    sca_ppm:          500,
+    timeout:          600,
+    win_offset:       0,
+    win_size:         1,
+};
+
 /// Fills the host's event queue.
 fn fill(shared: &Shared) { while shared.try_push_event(Event::PayloadTimeout) {} }
 
@@ -16,27 +35,7 @@ fn queued(shared: &Shared) -> usize { core::iter::from_fn(|| shared.take_event()
 /// changes the sleep clock all tests share holds meanwhile.
 fn connection() -> Connection { critical_section::with(|_| new_connection()) }
 
-fn new_connection() -> Connection {
-    Connection::new(
-        &ConnectInd {
-            access_address:   0x9A32_8370,
-            channel_map:      [0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
-            crc_init:         1,
-            csa2:             false,
-            hop:              5,
-            initiator:        [1; 6],
-            initiator_random: false,
-            interval:         12,
-            latency:          0,
-            sca:              0,
-            sca_ppm:          500,
-            timeout:          600,
-            win_offset:       0,
-            win_size:         1,
-        },
-        100,
-    )
-}
+fn new_connection() -> Connection { Connection::new(&REQUEST, 100, Setup::LEGACY) }
 
 /// The steps of `Connection::respond` that need no radio, as before the
 /// split: the room counted, the packet validated and taken, and the
@@ -72,6 +71,73 @@ impl Connection {
             }
         }
     }
+}
+
+#[test]
+fn the_transmit_window_and_the_phy_follow_the_setup() {
+    let window = |link: &Connection| match link.expect {
+        Expect::Window { start, size } => Some((start, size)),
+        Expect::Anchor => None,
+    };
+    let phys = |link: &Connection| [link.phy, link.tx_phy, link.next_tx_phy];
+    // After a CONNECT_IND: 1.25 ms after the end at 100 us, then the window
+    // offset 0; one unit of 1.25 ms wide; LE 1M.
+    let legacy = connection();
+    assert_eq!(window(&legacy), Some((1350, 1250)));
+    assert!(phys(&legacy) == [Phy::M1; 3]);
+    // Another delay, a window offset of 3 units and LE 2M.
+    let setup = Setup { phy: Phy::M2, window_delay_us: 2500 };
+    let request = ConnectInd { win_offset: 3, ..REQUEST };
+    let other = critical_section::with(|_| Connection::new(&request, 100, setup));
+    assert_eq!(window(&other), Some((6350, 1250)));
+    assert!(phys(&other) == [Phy::M2; 3]);
+}
+
+#[cfg(feature = "extended-advertising")]
+#[test]
+fn a_connection_from_an_aux_connect_req_starts_2_5_ms_later_with_csa2_on_the_secondary_phy() {
+    use crate::advertiser::extended::SECONDARY_PHYS;
+    // The request as it comes on air: AUX_CONNECT_REQ from a public central
+    // to a static random advertiser, ChSel 0 as it is reserved, window
+    // offset 3 and size 1, interval 12, hop 5.
+    let advertiser = crate::pdu::Peer::new([1, 2, 3, 4, 5, 0xC6], true);
+    let mut pdu = [0_u8; 36];
+    pdu[0] = 0x05 | 0x80;
+    pdu[1] = 34;
+    pdu[2..8].copy_from_slice(&[1; 6]);
+    pdu[8..14].copy_from_slice(&advertiser.address);
+    pdu[14..18].copy_from_slice(&0x9A32_8370_u32.to_le_bytes());
+    pdu[18] = 1;
+    pdu[21] = 1;
+    pdu[22..24].copy_from_slice(&3_u16.to_le_bytes());
+    pdu[24] = 12;
+    pdu[28..30].copy_from_slice(&600_u16.to_le_bytes());
+    pdu[30..35].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F]);
+    pdu[35] = 5;
+    let request = ConnectInd::parse_aux(&pdu, advertiser).unwrap();
+    assert!(request.csa2 && request.win_offset == 3);
+    for phy in SECONDARY_PHYS {
+        // The request ended at 100 us: the transmit window opens 2500 us
+        // later plus 3 units of 1250 us, one unit wide.
+        let link = critical_section::with(|_| Connection::new(&request, 100, Setup::aux(phy)));
+        assert!(matches!(link.expect, Expect::Window { start: 6350, size: 1250 }));
+        // Channel selection algorithm 2 from the access address, whatever
+        // ChSel said: the identifier is its two halves XORed, 0x9A32 ^ 0x8370.
+        assert!(matches!(link.hopping, Hopping::Csa2 { identifier: 0x1942 }));
+        // Both ways on the secondary channel's PHY.
+        assert!([link.phy, link.tx_phy, link.next_tx_phy] == [phy; 3]);
+    }
+    // A CONNECT_IND keeps the legacy setup: 1.25 ms, LE 1M.
+    assert!(Setup::LEGACY.window_delay_us == 1250 && Setup::LEGACY.phy == Phy::M1);
+    assert!(Setup::aux(Phy::M1).window_delay_us == 2500);
+}
+
+#[test]
+fn the_extended_advertising_feature_bit_follows_the_feature() {
+    // Bit 12 (Core, Vol 6, Part B, 4.6): LE Extended Advertising, octet 1.
+    assert_eq!(FEATURES[1] & 0x10 != 0, cfg!(feature = "extended-advertising"));
+    // The rest of octet 1: LE 2M where the radio has it, CSA #2.
+    assert_eq!(FEATURES[1] & !0x10, if cfg!(feature = "nrf51") { 0x40 } else { 0x41 });
 }
 
 #[test]

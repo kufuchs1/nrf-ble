@@ -183,6 +183,7 @@ fn at(millis: u64) -> Instant { Instant::from_millis(millis) }
 fn info(peer: Peer, local: Peer) -> Info {
     Info {
         central_accuracy: 0,
+        directed: false,
         epoch: Epoch::for_test(1),
         identity: None,
         local,

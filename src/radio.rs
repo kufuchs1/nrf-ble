@@ -320,14 +320,17 @@ impl<'peripherals> Radio<'peripherals> {
     /// # Safety
     ///
     /// `buffer` must point to RAM holding the whole PDU its header announces
-    /// for a transmission, and [`BUFFER_LEN`](crate::pdu::BUFFER_LEN)
-    /// writable bytes for a reception. It must stay valid, and the CPU must not
-    /// access it while the radio may, until the radio is disabled or given
+    /// for a transmission, and for a reception writable bytes for the
+    /// longest packet the packet layout admits:
+    /// [`BUFFER_LEN`](crate::pdu::BUFFER_LEN) on the data channels and with
+    /// legacy advertising, the header and `AUX_PAYLOAD_MAX` octets with
+    /// extended advertising. It must stay valid, and the CPU must not access it
+    /// while the radio may, until the radio is disabled or given
     /// another buffer.
     #[inline]
     pub unsafe fn set_buffer(&mut self, buffer: *mut u8) {
         compiler_fence(Ordering::SeqCst);
-        REGS.packetptr().write_value(u32::try_from(buffer.addr()).unwrap_or_default());
+        REGS.packetptr().write_value(buffer.addr().strict_cast());
     }
 
     /// Tunes to a BLE channel index and sets the matching whitening.
@@ -432,6 +435,23 @@ impl<'peripherals> Radio<'peripherals> {
     pub fn wait_end(&mut self) {
         Self::sleep_on(|w| w.set_end(true), || self.is_end());
         REGS.events_end().write_value(0);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Sleeps until the radio is disabled after the packet under way, by its
+    /// state rather than its disabled event, and clears the end and disabled
+    /// events.
+    ///
+    /// Unlike [`Self::wait_end`] and [`Self::wait_disabled`] it returns also
+    /// when that packet ended before and its events came and were cleared,
+    /// as [`Self::wait_switched`] clears the disabled event on the nRF52832:
+    /// an answer that has already gone out leaves the radio disabled, and no
+    /// event follows.
+    #[inline]
+    pub fn wait_stopped(&mut self) {
+        Self::sleep_on(|w| w.set_disabled(true), || REGS.state().read().state() == State::Disabled);
+        REGS.events_end().write_value(0);
+        REGS.events_disabled().write_value(0);
         compiler_fence(Ordering::SeqCst);
     }
 

@@ -28,6 +28,10 @@ use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 pub(crate) const CONFIG_LEN: usize = 33;
 /// Offset of the packet counter in a CCM configuration.
 const COUNTER_OFFSET: usize = 16;
+/// Octets of the packet counter in a CCM configuration: its 39 bits.
+const COUNTER_LEN: usize = 5;
+/// End of the packet counter in a CCM configuration.
+const COUNTER_END: usize = COUNTER_OFFSET.strict_add(COUNTER_LEN);
 /// Offset of the direction bit in a CCM configuration.
 const DIRECTION_OFFSET: usize = 24;
 /// Offset of the IV in a CCM configuration.
@@ -233,7 +237,7 @@ pub fn encrypt_block(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
 fn ecb(data: &mut [u8; 48]) -> bool {
     ECB.events_endecb().write_value(0);
     ECB.events_errorecb().write_value(0);
-    ECB.ecbdataptr().write_value(u32::try_from(data.as_mut_ptr().addr()).unwrap_or_default());
+    ECB.ecbdataptr().write_value(data.as_mut_ptr().addr().strict_cast());
     ECB.intenset().write(|w| {
         w.set_endecb(true);
         w.set_errorecb(true);
@@ -270,28 +274,28 @@ where
     key
 }
 
-/// Sets the packet counter of a configuration.
+/// Sets the packet counter of a configuration: its low five octets, least
+/// significant first. The array splits fix both ranges at compile time, so
+/// the per-packet path stores the octets with no bounds check.
 #[inline]
 #[must_use = "counter exhaustion must end the connection before a nonce is reused"]
-pub(crate) const fn set_counter(config: &mut [u8; CONFIG_LEN], counter: u64) -> bool {
+pub(crate) fn set_counter(config: &mut [u8; CONFIG_LEN], counter: u64) -> bool {
     if counter >= COUNTER_LIMIT {
         return false;
     }
-    if let Some(target) = config.get_mut(COUNTER_OFFSET..COUNTER_OFFSET.saturating_add(5))
-        && let Some(source) = counter.to_le_bytes().first_chunk::<5>()
-    {
-        target.copy_from_slice(source);
-    }
+    let (head, _) = config.split_array_mut::<COUNTER_END>();
+    let (_, target) = head.rsplit_array_mut::<COUNTER_LEN>();
+    *target = *counter.to_le_bytes().split_array_ref::<COUNTER_LEN>().0;
     true
 }
 
 /// Sets the configuration, data and scratch pointers.
 fn set_pointers(config: &[u8; CONFIG_LEN], input: *const u8, output: *mut u8, scratch: &mut [u8; SCRATCH_LEN]) {
     compiler_fence(Ordering::SeqCst);
-    CCM.cnfptr().write_value(u32::try_from(config.as_ptr().addr()).unwrap_or_default());
-    CCM.inptr().write_value(u32::try_from(input.addr()).unwrap_or_default());
-    CCM.outptr().write_value(u32::try_from(output.addr()).unwrap_or_default());
-    CCM.scratchptr().write_value(u32::try_from(scratch.as_mut_ptr().addr()).unwrap_or_default());
+    CCM.cnfptr().write_value(config.as_ptr().addr().strict_cast());
+    CCM.inptr().write_value(input.addr().strict_cast());
+    CCM.outptr().write_value(output.addr().strict_cast());
+    CCM.scratchptr().write_value(scratch.as_mut_ptr().addr().strict_cast());
 }
 
 /// Stops a decryption the radio started, for a packet that is not used.
@@ -328,17 +332,6 @@ pub(crate) fn wait_decrypted() -> Option<bool> {
     completed.then(|| CCM.micstatus().read().micstatus() == Micstatus::CheckPassed)
 }
 
-/// A resolvable private address for the identity resolving key `irk` and the
-/// random bytes `random`, both least significant octet first as on HCI
-/// (Core, Vol 6, Part B, 1.3.2.2). The two top bits of the random part mark
-/// the address as resolvable; random parts of all zeros or all ones are
-/// avoided as the specification requires.
-#[must_use = "the address is only computed"]
-#[inline]
-pub(crate) fn resolvable_address(irk: [u8; 16], random: [u8; 3]) -> [u8; 6] {
-    resolvable_address_with(irk, random, encrypt_block)
-}
-
 /// Whether `address`, least significant octet first, is a resolvable
 /// private address generated with the identity resolving key `irk`.
 #[inline]
@@ -346,7 +339,7 @@ pub(crate) fn resolvable_address(irk: [u8; 16], random: [u8; 3]) -> [u8; 6] {
 pub(crate) fn resolves(irk: [u8; 16], address: [u8; 6]) -> bool { resolves_with(irk, address, encrypt_block) }
 
 /// [`resolves`] using `encrypt` for AES-128.
-fn resolves_with<Encrypt>(
+pub(crate) fn resolves_with<Encrypt>(
     irk: [u8; 16],
     [hash0, hash1, hash2, prand0, prand1, prand2]: [u8; 6],
     encrypt: Encrypt,
@@ -357,8 +350,13 @@ where
     prand2 & 0xC0 == 0x40 && address_hash(irk, [prand0, prand1, prand2], encrypt) == [hash0, hash1, hash2]
 }
 
-/// [`resolvable_address`] using `encrypt` for AES-128.
-fn resolvable_address_with<Encrypt>(irk: [u8; 16], [low, mid, high]: [u8; 3], encrypt: Encrypt) -> [u8; 6]
+/// A resolvable private address for the identity resolving key `irk` and the
+/// random bytes `random`, both least significant octet first as on HCI
+/// (Core, Vol 6, Part B, 1.3.2.2), using `encrypt` for AES-128 (on the chip
+/// [`encrypt_block`]). The two top bits of the random part mark the address
+/// as resolvable; random parts of all zeros or all ones are avoided as the
+/// specification requires.
+pub(crate) fn resolvable_address_with<Encrypt>(irk: [u8; 16], [low, mid, high]: [u8; 3], encrypt: Encrypt) -> [u8; 6]
 where
     Encrypt: FnOnce([u8; 16], [u8; 16]) -> [u8; 16],
 {

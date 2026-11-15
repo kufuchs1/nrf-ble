@@ -4,8 +4,9 @@
 //! identity resolving key if it sent one, the long term key, whether the
 //! pairing was authenticated, the [`Variant`] of our own identity it was made
 //! under, the central's client characteristic configuration bits
-//! ([`crate::host::gatt::Subscriptions::bits`]) and, only for a table with the
-//! Service Changed characteristic, part of the table's layout hash.
+//! ([`crate::host::gatt::Subscriptions::bits`]), whether directed advertising
+//! reaches the central ([`Bond::directed_works`]) and, only for a table with
+//! the Service Changed characteristic, part of the table's layout hash.
 //!
 //! A table without the Service Changed characteristic makes bonds that keep
 //! no layout: [`Bond::new`] takes it from the table, and
@@ -21,13 +22,17 @@
 //! | Octets | Field |
 //! |---|---|
 //! | 0 | Version, [`BOND_VERSION`] |
-//! | 1 | Flags: bit 0 the central's identity address is random, bit 1 it sent an identity resolving key, bit 2 the pairing was authenticated, bit 3 a layout is kept; the others zero |
+//! | 1 | Flags: bit 0 the central's identity address is random, bit 1 it sent an identity resolving key, bit 2 the pairing was authenticated, bit 3 a layout is kept, bit 4 directed advertising went unanswered ([`Bond::directed_works`] false); the others zero |
 //! | 2 to 7 | The central's identity address, least significant octet first |
 //! | 8 to 23 | Its identity resolving key, least significant octet first, or zeros |
 //! | 24 to 39 | The long term key, least significant octet first |
 //! | 40, 41 | Our [`Variant`], least significant octet first |
 //! | 42 to 45 | The client characteristic configuration bits, least significant octet first |
 //! | 46 to 49 | The layout, the first four octets of the table's hash, or zeros |
+//!
+//! Bit 4 came after the first records of this version: they have it clear,
+//! which reads as directed advertising working, the state of a new bond. A
+//! record with it set is refused by a build from before it.
 //!
 //! Keys are kept least significant octet first, the order the security
 //! manager's PDUs carry them in and [`crate::link::Link::ltk_reply`] and
@@ -57,8 +62,11 @@ const FLAG_IRK: u8 = 0x02;
 const FLAG_AUTHENTICATED: u8 = 0x04;
 /// Flag: a layout is kept.
 const FLAG_LAYOUT: u8 = 0x08;
+/// Flag: directed advertising went unanswered, [`Bond::directed_works`] is
+/// false.
+const FLAG_UNDIRECTED: u8 = 0x10;
 /// Every flag.
-const FLAGS: u8 = FLAG_RANDOM | FLAG_IRK | FLAG_AUTHENTICATED | FLAG_LAYOUT;
+const FLAGS: u8 = FLAG_RANDOM | FLAG_IRK | FLAG_AUTHENTICATED | FLAG_LAYOUT | FLAG_UNDIRECTED;
 
 /// The bond with the central: see the module documentation. Its keys are
 /// overwritten when it is dropped.
@@ -67,23 +75,34 @@ const FLAGS: u8 = FLAG_RANDOM | FLAG_IRK | FLAG_AUTHENTICATED | FLAG_LAYOUT;
 pub struct Bond {
     /// Whether the pairing was authenticated, with protection against a man
     /// in the middle. Just Works pairing is not.
-    pub authenticated: bool,
+    pub authenticated:  bool,
     /// The client characteristic configuration bits, two for each
     /// descriptor, as [`Subscriptions::bits`] gives them.
-    pub cccd:          u32,
+    pub cccd:           u32,
+    /// Whether a reconnection may start with directed advertising
+    /// (`host::adv::Mode::directs`, feature `directed-advertising`): true for
+    /// a new bond, false once a directed phase went unanswered and the
+    /// central then connected, with this bond's key, to the undirected
+    /// advertising right after it ([`crate::link::Info::directed`] false). Such
+    /// a central does not resolve the resolvable private address directed
+    /// advertising targets, or is not listening for it, so the directed phase
+    /// only delays it; the host clears this and reports the bond to store
+    /// ([`crate::host::ConnEvent::BondUpdated`]), and only a new pairing, or
+    /// the firmware itself, sets it again.
+    pub directed_works: bool,
     /// The first four octets of the table's layout hash, least significant
     /// octet first, as the central last learned the table; only for a table
     /// with the Service Changed characteristic.
-    pub layout:        Option<u32>,
+    pub layout:         Option<u32>,
     /// Our identity's variant at the pairing.
-    pub local:         Variant,
+    pub local:          Variant,
     /// The long term key, least significant octet first.
-    pub ltk:           [u8; 16],
+    pub ltk:            [u8; 16],
     /// The central's identity address and its type.
-    pub peer:          Peer,
+    pub peer:           Peer,
     /// The central's identity resolving key, least significant octet first,
     /// if it sent one. `BlueZ` sends one only with host privacy on.
-    pub peer_irk:      Option<[u8; 16]>,
+    pub peer_irk:       Option<[u8; 16]>,
 }
 
 impl Bond {
@@ -123,6 +142,7 @@ impl Bond {
         Some(Self {
             authenticated: flags & FLAG_AUTHENTICATED != 0,
             cccd: u32::from_le_bytes(cccd),
+            directed_works: flags & FLAG_UNDIRECTED == 0,
             layout,
             local: Variant::from_bits(u16::from_le_bytes(local)),
             ltk,
@@ -143,7 +163,7 @@ impl Bond {
     #[inline]
     #[must_use = "the bond is only built"]
     pub fn new(peer: Peer, peer_irk: Option<[u8; 16]>, ltk: [u8; 16], local: Variant, db: &Db) -> Self {
-        Self { authenticated: false, cccd: 0, layout: layout(db), local, ltk, peer, peer_irk }
+        Self { authenticated: false, cccd: 0, directed_works: true, layout: layout(db), local, ltk, peer, peer_irk }
     }
 
     /// Records whether the pairing was authenticated.
@@ -171,6 +191,7 @@ impl Bond {
             (self.peer_irk.is_some(), FLAG_IRK),
             (self.authenticated, FLAG_AUTHENTICATED),
             (self.layout.is_some(), FLAG_LAYOUT),
+            (!self.directed_works, FLAG_UNDIRECTED),
         ] {
             if set {
                 flags |= flag;

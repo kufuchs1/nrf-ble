@@ -137,13 +137,27 @@ fn the_device_advertises_its_own_content() {
     let advertising = Advertising::new(Mode::Pairing, &PAIRING, &CONTENT).unwrap();
     let adv = advertising.data().as_bytes();
     assert_eq!(adv[..13], [2, 0x01, 0x06, 5, 0x03, 0x12, 0x18, 0x0F, 0x18, 3, 0x19, 0x80, 0x01]);
-    assert_eq!(adv[13..], *[&[17, AD_SHORT_NAME][..], &NAME[..16]].concat());
-    assert_eq!(advertising.scan().as_bytes(), [&[18, AD_NAME][..], NAME].concat());
+    if cfg!(feature = "extended-advertising") {
+        // The name complete in the advertising data, no scan response.
+        assert_eq!(adv[13..], *[&[18, AD_NAME][..], NAME].concat());
+        assert!(advertising.scan().is_empty());
+    } else {
+        assert_eq!(adv[13..], *[&[17, AD_SHORT_NAME][..], &NAME[..16]].concat());
+        assert_eq!(advertising.scan().as_bytes(), [&[18, AD_NAME][..], NAME].concat());
+    }
     assert!(advertising.schedule() == &PAIRING);
     assert_eq!(PAIRING.total(), Duration::from_secs(30));
     let with_power = CONTENT.with_tx_power(Some(-4));
     assert_eq!(with_power.tx_power, Some(-4));
-    assert_eq!(Content::new(&[b'x'; 30], APPEARANCE, &[]).data(true).err(), Some(Overflow::TooLong));
+    if cfg!(feature = "extended-advertising") {
+        // A long name is only shortened; refused only if not one character
+        // fits after the other structures.
+        assert!(Content::new(&[b'x'; 241], APPEARANCE, &[]).data(true).is_ok());
+        assert_eq!(Content::new(b"x", APPEARANCE, &[0x1800; 117]).data(true).err(), Some(Overflow::TooLong));
+    } else {
+        // The complete name has to fit the scan response.
+        assert_eq!(Content::new(&[b'x'; 30], APPEARANCE, &[]).data(true).err(), Some(Overflow::TooLong));
+    }
 }
 
 #[test]

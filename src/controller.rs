@@ -1,8 +1,10 @@
 //! The link layer task: advertises as the host configured it and runs the
 //! resulting connection.
 
+#[cfg(feature = "extended-advertising")]
+use crate::advertiser::Setup;
 use crate::{
-    advertiser::legacy::{self, Kind, Settings},
+    advertiser::{self, Accepted, Counters, Settings},
     clock::{Clock, SETUP_US},
     connection::{Connection, Ended},
     health,
@@ -30,7 +32,7 @@ const REASON_LOCAL_HOST: u8 = 0x16;
 /// when the advertising was enabled. Returns true if it ended.
 async fn check_limits(settings: &Settings, since: &mut Option<Instant>, shared: &Shared) -> bool {
     let started = *since.get_or_insert_with(Instant::now);
-    if settings.kind != Kind::DirectedHighDuty || started.elapsed() < HIGH_DUTY_DURATION {
+    if !settings.kind.is_high_duty() || started.elapsed() < HIGH_DUTY_DURATION {
         return false;
     }
     *since = None;
@@ -47,7 +49,7 @@ async fn check_limits(settings: &Settings, since: &mut Option<Instant>, shared: 
 /// Time until the next advertising event. The random delay comes from the
 /// RNG interrupt while other tasks run.
 async fn interval(settings: &Settings) -> u32 {
-    if settings.kind == Kind::DirectedHighDuty {
+    if settings.kind.is_high_duty() {
         return HIGH_DUTY_INTERVAL_US;
     }
     let mut jitter: [u8; 2] = [0; 2];
@@ -55,14 +57,13 @@ async fn interval(settings: &Settings) -> u32 {
     settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).strict_rem(ADV_DELAY_MAX_US))
 }
 
-/// Logs the scan requests the advertiser decided only after the radio had
-/// started sending the scan response, when there are more than `seen`.
-fn log_late_scans(seen: &mut u32) {
-    let late = legacy::late_scan_decisions();
-    if late != *seen {
-        *seen = late;
-        info!("advertising: {} scan requests decided late", late);
-    }
+/// Publishes the PHY of a link that starts after an `AUX_CONNECT_REQ`, the
+/// secondary channel's both ways, and logs how it starts. Call it after the
+/// link was recorded as connected, which resets the PHY to LE 1M.
+#[cfg(feature = "extended-advertising")]
+fn start_after_aux(setup: Setup, shared: &Shared) {
+    shared.set_phys(setup.phy.hci(), setup.phy.hci());
+    info!("connection from AUX_CONNECT_REQ: window +{} us, csa2, phy {}M", setup.window_delay_us, setup.phy.hci());
 }
 
 /// Runs the link layer forever.
@@ -70,7 +71,7 @@ fn log_late_scans(seen: &mut u32) {
 pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) -> ! {
     let mut rx: [u8; BUFFER_LEN] = [0; BUFFER_LEN];
     let mut since = None;
-    let mut late_scans = 0;
+    let mut counters = Counters::new();
     loop {
         health::checkpoint(15);
         maintenance::service(clock, radio).await;
@@ -81,7 +82,11 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             shared.complete_reset();
         }
         shared.refresh_private_address();
-        let Some(settings) = shared.advertising() else {
+        #[cfg(not(feature = "extended-advertising"))]
+        let current = shared.advertising();
+        #[cfg(feature = "extended-advertising")]
+        let current = shared.renewed_advertising().await;
+        let Some(settings) = current else {
             since = None;
             clock.pause();
             health::suspend();
@@ -92,11 +97,9 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             continue;
         }
         clock.resume_now().await;
-        let (primary, scan_response) = settings.pdus();
-        let started = clock.now();
-        let event = legacy::event(radio, clock, &settings, (&primary, &scan_response), &mut rx);
-        log_late_scans(&mut late_scans);
-        let Some((request, end)) = event else {
+        let (started, event) = advertiser::event(radio, clock, &settings, &mut counters, &mut rx);
+        counters.log();
+        let Some(Accepted { end, request, setup }) = event else {
             let next = started.wrapping_add(interval(&settings).await);
             // The sleep returns `SETUP_US` early, for a radio start the timer
             // triggers; advertising starts when it returns, so it sleeps that
@@ -104,7 +107,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             // directed advertising keeps the early start instead: its events
             // must be at most 3.75 ms apart, which the loop's own time would
             // otherwise exceed.
-            let wake = if settings.kind == Kind::DirectedHighDuty { next } else { next.wrapping_add(SETUP_US) };
+            let wake = if settings.kind.is_high_duty() { next } else { next.wrapping_add(SETUP_US) };
             if !clock.sleep_until(wake, shared.changed()).await {
                 since = None;
             }
@@ -113,15 +116,18 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         shared.set_connected(true);
         radio.set_access_address(request.access_address);
         radio.set_crc_init(request.crc_init);
-        let mut connection = Connection::new(&request, end);
+        let mut connection = Connection::new(&request, end, setup);
         connection.set_preferred_phys(shared.preferred_phys());
         connection.set_suggested_length(shared.suggested_length());
         let central = request.central();
         let mut shown = central.address;
         shown.reverse();
         info!("central {=[u8; 6]:02X} random {}", shown, central.random);
+        #[cfg(feature = "extended-advertising")]
+        start_after_aux(setup, shared);
         let params = ConnectionParams::new(request.interval, request.latency, request.timeout);
-        let epoch = shared.set_info((central, settings.resolve(central), settings.own), params, request.sca);
+        let answered = (request.sca, settings.kind.is_directed());
+        let epoch = shared.set_info((central, settings.resolve(central), settings.own), params, answered);
         connection.notify(Event::Connected(epoch), shared);
         since = None;
         let (ended, stats) = connection.run(radio, clock, &mut rx, shared).await;

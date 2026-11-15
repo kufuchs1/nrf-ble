@@ -1,10 +1,9 @@
-//! Legacy advertising: the five advertising types, scan responses, the
-//! advertising channel map and the filter accept list.
+//! Legacy advertising: the five advertising types, scan responses and their
+//! advertising event on the primary channels.
 
-use super::{CHANNELS, LISTEN_US};
+use super::{CHANNELS, LISTEN_US, Settings};
 use crate::{
     clock::Clock,
-    crypto,
     pdu::{
         ADV_ACCESS_ADDRESS,
         ADV_CRC_INIT,
@@ -23,15 +22,43 @@ use crate::{
 };
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Largest advertising or scan response data.
+/// Largest advertising data.
 pub const DATA_MAX: usize = 31;
-/// Entries of the filter accept list.
-pub const FILTER_LIST_SIZE: usize = 4;
-/// Peers in the resolving list.
-pub const RESOLVING_LIST_SIZE: usize = 2;
+/// Largest scan response data.
+pub const SCAN_DATA_MAX: usize = 31;
 /// Scan requests decided only after the radio had started sending the scan
 /// response. Only the link layer task writes it.
 static LATE_SCAN_DECISIONS: AtomicU32 = AtomicU32::new(0);
+
+/// The advertiser's counters as last logged.
+pub struct Counters {
+    /// Scan requests decided late, see [`late_scan_decisions`].
+    late_scans: u32,
+}
+
+impl Counters {
+    /// Logs the scan requests the advertiser decided only after the radio
+    /// had started sending the scan response, when there are more than at
+    /// the last call.
+    #[inline]
+    pub fn log(&mut self) {
+        let late = late_scan_decisions();
+        if late != self.late_scans {
+            self.late_scans = late;
+            info!("advertising: {} scan requests decided late", late);
+        }
+    }
+
+    /// No counts logged yet.
+    #[inline]
+    #[must_use = "the counters are only created"]
+    pub const fn new() -> Self { Self { late_scans: 0 } }
+}
+
+impl Default for Counters {
+    #[inline]
+    fn default() -> Self { Self::new() }
+}
 
 /// Advertising type.
 #[derive(Clone, Copy, Eq)]
@@ -51,6 +78,20 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The largest advertising data of the type: [`DATA_MAX`], whatever
+    /// the type.
+    #[inline]
+    #[must_use = "the length is only read"]
+    pub const fn data_max(self) -> usize {
+        match self {
+            Self::ConnectableUndirected
+            | Self::DirectedHighDuty
+            | Self::DirectedLowDuty
+            | Self::NonConnectable
+            | Self::Scannable => DATA_MAX,
+        }
+    }
+
     /// The type for an HCI advertising type value.
     #[inline]
     #[must_use = "the type is only decoded"]
@@ -76,301 +117,27 @@ impl Kind {
     #[inline]
     #[must_use = "the property is only read"]
     pub const fn is_directed(self) -> bool { matches!(self, Self::DirectedHighDuty | Self::DirectedLowDuty) }
+
+    /// Whether the advertising is high duty cycle directed, which runs its
+    /// events back to back for at most 1.28 s.
+    #[inline]
+    #[must_use = "the property is only read"]
+    pub const fn is_high_duty(self) -> bool { matches!(self, Self::DirectedHighDuty) }
 }
 
-/// The filter accept list.
-#[derive(Clone, Copy)]
-pub struct FilterList {
-    /// Entries.
-    entries: [Option<Peer>; FILTER_LIST_SIZE],
-}
-
-impl FilterList {
-    /// Adds a device. Returns false if the list is full.
-    #[inline]
-    pub fn add(&mut self, peer: Peer) -> bool {
-        if self.contains(peer) {
-            return true;
-        }
-        self.entries.iter_mut().find(|entry| entry.is_none()).is_some_and(|entry| {
-            *entry = Some(peer);
-            true
-        })
+/// Whether a scanner gets a scan response. With the filter accept list, a
+/// resolvable private address counts as the identity it resolves to. This
+/// runs within the interframe space: resolving takes one AES block of about
+/// 7 us per listed peer, and only for an address of the resolvable type that
+/// is not listed itself.
+fn accepts_scan(settings: &Settings, scanner: Peer) -> bool {
+    if settings.resolution_enabled && !settings.resolving.accepts_identity(scanner) {
+        return false;
     }
-
-    /// Removes all devices.
-    #[inline]
-    pub const fn clear(&mut self) { self.entries = [None; FILTER_LIST_SIZE]; }
-
-    /// Whether the list holds a device.
-    #[inline]
-    #[must_use = "the membership is only checked"]
-    pub fn contains(&self, peer: Peer) -> bool { self.entries.contains(&Some(peer)) }
-
-    /// An empty list.
-    #[inline]
-    #[must_use = "the list is only created"]
-    pub const fn new() -> Self { Self { entries: [None; FILTER_LIST_SIZE] } }
-
-    /// Removes a device.
-    #[inline]
-    pub fn remove(&mut self, peer: Peer) {
-        for entry in &mut self.entries {
-            if *entry == Some(peer) {
-                *entry = None;
-            }
-        }
-    }
-}
-
-impl Default for FilterList {
-    #[inline]
-    fn default() -> Self { Self::new() }
-}
-
-/// Privacy state belonging to one peer identity.
-#[derive(Clone, Copy)]
-struct ResolvingEntry {
-    /// Device privacy accepts identity addresses as well as RPAs.
-    device: bool,
-    /// Peer identity resolving key.
-    irk:    [u8; 16],
-    /// Local identity resolving key for this peer.
-    local:  [u8; 16],
-    /// Identity address.
-    peer:   Peer,
-}
-
-/// Peers whose resolvable private addresses are resolved to their identity
-/// address, with their identity resolving keys.
-#[derive(Clone, Copy)]
-pub struct ResolvingList {
-    /// Identity address and key of each peer.
-    entries: [Option<ResolvingEntry>; RESOLVING_LIST_SIZE],
-}
-
-impl ResolvingList {
-    /// Whether an identity address is acceptable under its privacy mode.
-    fn accepts_identity(&self, peer: Peer) -> bool {
-        self.entries
-            .iter()
-            .flatten()
-            .find(|entry| entry.peer == peer)
-            .is_none_or(|entry| entry.device || entry.irk == [0; 16])
-    }
-
-    /// Adds or replaces the key of `identity`. Returns false if the list is
-    /// full.
-    #[inline]
-    pub fn add(&mut self, identity: Peer, irk: [u8; 16]) -> bool { self.add_keys(identity, irk, [0; 16]) }
-
-    /// Stores both keys, preserving the per-peer privacy mode.
-    #[inline]
-    pub fn add_keys(&mut self, identity: Peer, irk: [u8; 16], local: [u8; 16]) -> bool {
-        self.remove(identity);
-        let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) else { return false };
-        *slot = Some(ResolvingEntry { peer: identity, irk, local, device: false });
-        true
-    }
-
-    /// Whether a new entry or a replacement fits without changing the list.
-    pub(crate) fn can_add(&self, peer: Peer) -> bool {
-        self.entries.iter().any(|entry| entry.is_none_or(|listed| listed.peer == peer))
-    }
-
-    /// Removes every peer, overwriting their keys.
-    #[inline]
-    pub fn clear(&mut self) {
-        for slot in &mut self.entries {
-            Self::forget(slot);
-        }
-    }
-
-    /// Overwrites the key in `slot` and empties it.
-    fn forget(slot: &mut Option<ResolvingEntry>) {
-        if let Some(entry) = slot.as_mut() {
-            crypto::wipe(&mut entry.irk);
-            crypto::wipe(&mut entry.local);
-        }
-        *slot = None;
-    }
-
-    /// The identity address of `address`: the identity whose key generated
-    /// it, if it is a resolvable private address of a listed peer.
-    fn identity(&self, address: Peer) -> Option<Peer> {
-        if !address.random {
-            return None;
-        }
-        self.entries
-            .iter()
-            .flatten()
-            .find(|entry| entry.irk != [0; 16] && crypto::resolves(entry.irk, address.address))
-            .map(|entry| entry.peer)
-    }
-
-    /// Whether no peer is listed.
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool { self.entries.iter().all(Option::is_none) }
-
-    /// Local key associated with the directed peer or first listed peer.
-    #[inline]
-    #[must_use = "the key is only read"]
-    pub fn local_key(&self, peer: Option<Peer>) -> Option<[u8; 16]> {
-        self.entries
-            .iter()
-            .flatten()
-            .find(|entry| peer.is_none_or(|target| target == entry.peer) && entry.local != [0; 16])
-            .map(|entry| entry.local)
-    }
-
-    /// An empty list.
-    #[inline]
-    #[must_use = "the list is only created"]
-    pub const fn new() -> Self { Self { entries: [None; RESOLVING_LIST_SIZE] } }
-
-    /// Removes `identity`.
-    #[inline]
-    pub fn remove(&mut self, identity: Peer) {
-        for slot in &mut self.entries {
-            if slot.is_some_and(|entry| entry.peer == identity) {
-                Self::forget(slot);
-            }
-        }
-    }
-
-    /// Changes the privacy mode of an existing identity.
-    #[inline]
-    pub fn set_mode(&mut self, peer: Peer, device: bool) -> bool {
-        let Some(entry) = self.entries.iter_mut().flatten().find(|entry| entry.peer == peer) else { return false };
-        entry.device = device;
-        true
-    }
-}
-
-impl Default for ResolvingList {
-    #[inline]
-    fn default() -> Self { Self::new() }
-}
-
-/// Advertising as the host configured it.
-#[derive(Clone, Copy)]
-#[non_exhaustive]
-pub struct Settings {
-    /// Own address as the host set it, the identity address with privacy.
-    pub address:            Peer,
-    /// Advertising channels, bit 0 for channel 37.
-    pub channel_map:        u8,
-    /// Advertising data.
-    pub data:               [u8; DATA_MAX],
-    /// Filter accept list.
-    pub filter:             FilterList,
-    /// Filter policy: bit 0 filters scan requests, bit 1 connection requests.
-    pub filter_policy:      u8,
-    /// Advertising interval in microseconds.
-    pub interval:           u32,
-    /// Advertising type.
-    pub kind:               Kind,
-    /// Length of [`Self::data`].
-    pub len:                u8,
-    /// Address on air: [`Self::address`], or a resolvable private address
-    /// generated when the advertising starts.
-    pub own:                Peer,
-    /// Target of directed advertising.
-    pub peer:               Peer,
-    /// The host asked for a resolvable private address.
-    pub private:            bool,
-    /// Whether address resolution is enabled by the host.
-    pub resolution_enabled: bool,
-    /// Peers whose private addresses the filter accept list resolves.
-    pub resolving:          ResolvingList,
-    /// Scan response data.
-    pub scan_data:          [u8; DATA_MAX],
-    /// Length of [`Self::scan_data`].
-    pub scan_len:           u8,
-}
-
-impl Settings {
-    /// Whether a central may connect. With the filter accept list, a
-    /// resolvable private address counts as the identity it resolves to.
-    fn accepts_connection(&self, central: Peer) -> bool {
-        if self.resolution_enabled && !self.resolving.accepts_identity(central) {
-            return false;
-        }
-        if self.kind.is_directed() {
-            // A central with privacy answers from a resolvable private
-            // address of the identity the advertising is directed to.
-            return central == self.peer || self.resolve(central) == Some(self.peer);
-        }
-        self.kind.is_connectable()
-            && (self.filter_policy & 0x02 == 0
-                || self.filter.contains(central)
-                || self.resolve(central).is_some_and(|identity| self.filter.contains(identity)))
-    }
-
-    /// Whether a scanner gets a scan response. With the filter accept list,
-    /// a resolvable private address counts as the identity it resolves to.
-    /// This runs within the interframe space: resolving takes one AES block
-    /// of about 7 us per listed peer, and only for an address of the
-    /// resolvable type that is not listed itself.
-    fn accepts_scan(&self, scanner: Peer) -> bool {
-        if self.resolution_enabled && !self.resolving.accepts_identity(scanner) {
-            return false;
-        }
-        matches!(self.kind, Kind::ConnectableUndirected | Kind::Scannable)
-            && (self.filter_policy & 0x01 == 0
-                || self.filter.contains(scanner)
-                || self.resolve(scanner).is_some_and(|identity| self.filter.contains(identity)))
-    }
-
-    /// The defaults after a reset.
-    #[inline]
-    #[must_use = "the settings are only created"]
-    pub const fn new() -> Self {
-        Self {
-            address:            Peer::new([0; 6], true),
-            channel_map:        0x07,
-            data:               [0; DATA_MAX],
-            filter:             FilterList::new(),
-            filter_policy:      0,
-            interval:           1_280_000,
-            kind:               Kind::ConnectableUndirected,
-            len:                0,
-            own:                Peer::new([0; 6], true),
-            peer:               Peer::new([0; 6], false),
-            private:            false,
-            resolving:          ResolvingList::new(),
-            resolution_enabled: false,
-            scan_data:          [0; DATA_MAX],
-            scan_len:           0,
-        }
-    }
-
-    /// The advertising PDU and the scan response.
-    #[inline]
-    #[must_use = "the PDUs are only built"]
-    pub fn pdus(&self) -> (LegacyAdvertisement, LegacyAdvertisement) {
-        let data = self.data.get(..usize::from(self.len)).unwrap_or_default();
-        let scan_data = self.scan_data.get(..usize::from(self.scan_len)).unwrap_or_default();
-        let primary = match self.kind {
-            Kind::ConnectableUndirected => LegacyAdvertisement::undirected(ADV_IND, self.own, data),
-            Kind::DirectedHighDuty | Kind::DirectedLowDuty => LegacyAdvertisement::directed(self.own, self.peer),
-            Kind::NonConnectable => LegacyAdvertisement::undirected(ADV_NONCONN_IND, self.own, data),
-            Kind::Scannable => LegacyAdvertisement::undirected(ADV_SCAN_IND, self.own, data),
-        };
-        (primary, LegacyAdvertisement::undirected(SCAN_RSP, self.own, scan_data))
-    }
-
-    /// Resolves a received private address only when resolution is enabled.
-    #[must_use = "the identity is only read"]
-    #[inline]
-    pub fn resolve(&self, peer: Peer) -> Option<Peer> {
-        self.resolution_enabled.then(|| self.resolving.identity(peer)).flatten()
-    }
-}
-
-impl Default for Settings {
-    #[inline]
-    fn default() -> Self { Self::new() }
+    matches!(settings.kind, Kind::ConnectableUndirected | Kind::Scannable)
+        && (settings.filter_policy & 0x01 == 0
+            || settings.filter.contains(scanner)
+            || settings.resolve(scanner).is_some_and(|identity| settings.filter.contains(identity)))
 }
 
 /// Runs one advertising event on the enabled channels. Returns a valid
@@ -449,7 +216,7 @@ fn on_channel(
     let end = clock.end_time();
     let valid = radio.crc_ok();
     if valid && is_scan_request(rx[0]) {
-        let answer = scan_request(rx, settings.own).is_some_and(|scanner| settings.accepts_scan(scanner));
+        let answer = scan_request(rx, settings.own).is_some_and(|scanner| accepts_scan(settings, scanner));
         if radio.tx_started() {
             LATE_SCAN_DECISIONS.store(late_scan_decisions().wrapping_add(1), Ordering::Relaxed);
         }
@@ -472,3 +239,47 @@ fn on_channel(
         .filter(|request| settings.accepts_connection(request.central()))
         .map(|request| (request, end))
 }
+
+/// The advertising PDU and the scan response of `settings`.
+#[inline]
+#[must_use = "the PDUs are only built"]
+pub fn pdus(settings: &Settings) -> (LegacyAdvertisement, LegacyAdvertisement) {
+    let data = settings.data.get(..usize::from(settings.len)).unwrap_or_default();
+    let scan_data = settings.scan_data.get(..usize::from(settings.scan_len)).unwrap_or_default();
+    let primary = match settings.kind {
+        Kind::ConnectableUndirected => LegacyAdvertisement::undirected(ADV_IND, settings.own, data),
+        Kind::DirectedHighDuty | Kind::DirectedLowDuty => {
+            LegacyAdvertisement::directed(settings.own, settings.target())
+        },
+        Kind::NonConnectable => LegacyAdvertisement::undirected(ADV_NONCONN_IND, settings.own, data),
+        Kind::Scannable => LegacyAdvertisement::undirected(ADV_SCAN_IND, settings.own, data),
+    };
+    (primary, LegacyAdvertisement::undirected(SCAN_RSP, settings.own, scan_data))
+}
+
+/// Sets the advertising data and the scan response data of `settings`.
+/// Returns false, changing neither, if one is longer than [`DATA_MAX`] or
+/// [`SCAN_DATA_MAX`].
+#[inline]
+#[must_use = "data that does not fit is refused"]
+pub fn set_data(settings: &mut Settings, adv: &[u8], scan: &[u8]) -> bool {
+    if adv.len() > DATA_MAX || scan.len() > SCAN_DATA_MAX {
+        return false;
+    }
+    for (target, len, source) in
+        [(&mut settings.data, &mut settings.len, adv), (&mut settings.scan_data, &mut settings.scan_len, scan)]
+    {
+        target.fill(0);
+        if let Some(destination) = target.get_mut(..source.len()) {
+            destination.copy_from_slice(source);
+        }
+        *len = source.len().saturating_cast();
+    }
+    true
+}
+
+/// Sets our address on air.
+#[inline]
+pub const fn set_own(settings: &mut Settings, own: Peer) { settings.own = own; }
+
+#[cfg(test)] mod tests;

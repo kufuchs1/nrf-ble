@@ -78,7 +78,7 @@ impl Control for Recorder {
                 response.bytes[..scan.len()].copy_from_slice(scan);
                 response.len = u8::try_from(scan.len()).unwrap();
                 assert_eq!(params.channel_map, 0x07);
-                if params.kind == Kind::DirectedHighDuty {
+                if params.kind.is_directed() {
                     Seen::Directed(params.peer, params.private)
                 } else {
                     assert!(params.kind == Kind::ConnectableUndirected);
@@ -129,18 +129,23 @@ fn structures_are_written_with_their_length_and_type() {
 #[test]
 fn a_structure_that_does_not_fit_is_refused_and_changes_nothing() {
     let mut data = Data::new();
-    // 29 octets of data fill the 31 exactly.
-    data.push(0xFF, &[7; 29]).unwrap();
+    // 29 octets of data fill the 31 exactly; with extended advertising 243
+    // the 245 of the nRF52832, 240 the 242 of the nRF51.
+    let extended = if cfg!(feature = "nrf51") { 242 } else { 245 };
+    assert_eq!(DATA_MAX, if cfg!(feature = "extended-advertising") { extended } else { 31 });
+    data.push(0xFF, &[7; DATA_MAX - 2]).unwrap();
     assert_eq!(data.len(), DATA_MAX);
     assert_eq!(data.flags(0x06).err(), Some(Overflow::TooLong));
     let mut data = Data::new();
     data.flags(0x06).unwrap();
     let before = data;
-    assert_eq!(data.push(0xFF, &[7; 27]).err(), Some(Overflow::TooLong));
+    assert_eq!(data.push(0xFF, &[7; DATA_MAX - 4]).err(), Some(Overflow::TooLong));
     assert!(data == before);
-    // Fourteen services fit an empty set, fifteen do not.
-    assert!(Data::new().services(&[0x1800; 14]).is_ok());
-    assert_eq!(Data::new().services(&[0x1800; 15]).err(), Some(Overflow::TooLong));
+    // Fourteen services fit an empty set, fifteen do not; 121 and 122 with
+    // extended advertising on the nRF52832, 120 and 121 on the nRF51.
+    let services = (DATA_MAX - 2) / 2;
+    assert!(Data::new().services(&[0x1800; 121][..services]).is_ok());
+    assert_eq!(Data::new().services(&[0x1800; 122][..=services]).err(), Some(Overflow::TooLong));
     assert_eq!(Data::new().push(0xFF, &[0; 300]).err(), Some(Overflow::TooLong));
 }
 
@@ -152,16 +157,17 @@ fn a_long_name_is_shortened_at_a_character_boundary() {
     // 27 octets of data leave room for a name of 2 octets: "a" and the
     // first octet of a two octet character would be cut before the latter.
     let mut data = Data::new();
-    data.push(0xFF, &[0; 25]).unwrap();
+    data.push(0xFF, &[0; DATA_MAX - 6]).unwrap();
     assert_eq!(data.name_fitting("a\u{e4}b".as_bytes()), Ok(true));
-    assert_eq!(data.as_bytes()[27..], [2, AD_SHORT_NAME, b'a']);
+    assert_eq!(data.as_bytes()[DATA_MAX - 4..], [2, AD_SHORT_NAME, b'a']);
     // No room for a single character.
     let mut data = Data::new();
-    data.push(0xFF, &[0; 26]).unwrap();
+    data.push(0xFF, &[0; DATA_MAX - 5]).unwrap();
     assert_eq!(data.name_fitting("\u{e4}\u{e4}".as_bytes()), Err(Overflow::TooLong));
-    assert_eq!(data.len(), 28);
+    assert_eq!(data.len(), DATA_MAX - 3);
 }
 
+#[cfg(not(feature = "extended-advertising"))]
 #[test]
 fn pairing_is_discoverable_with_the_name() {
     let advertising = example::advertising(Mode::Pairing, None).unwrap();
@@ -176,6 +182,7 @@ fn pairing_is_discoverable_with_the_name() {
     assert!(advertising.mode().pairable() && advertising.mode().discoverable());
 }
 
+#[cfg(not(feature = "extended-advertising"))]
 #[test]
 fn reconnection_is_without_name_or_discoverability() {
     let bond = bond(false);
@@ -186,6 +193,7 @@ fn reconnection_is_without_name_or_discoverability() {
     assert!(!advertising.mode().pairable() && !advertising.mode().discoverable());
 }
 
+#[cfg(not(feature = "extended-advertising"))]
 #[test]
 fn a_name_too_long_for_the_advertising_data_is_complete_in_the_scan_response() {
     let content = Content { name: b"A remote with a long name", ..example::CONTENT };
@@ -200,6 +208,70 @@ fn a_name_too_long_for_the_advertising_data_is_complete_in_the_scan_response() {
     assert_eq!(content.data(true).err(), Some(Overflow::TooLong));
     // Without discoverability the name does not matter.
     assert!(content.data(false).is_ok());
+}
+
+#[cfg(feature = "extended-advertising")]
+#[test]
+fn extended_pairing_data_holds_the_complete_name_and_there_is_no_scan_response() {
+    let advertising = example::advertising(Mode::Pairing, Some(-8)).unwrap();
+    let adv = advertising.data().as_bytes();
+    let head = [2, 0x01, 0x06, 5, 0x03, 0x12, 0x18, 0x0F, 0x18, 3, 0x19, 0xC1, 0x03];
+    assert_eq!(adv[..head.len()], head);
+    // The TX power level, then "Example HID Remote" complete.
+    assert_eq!(adv[head.len()..], *[&[2, AD_TX_POWER, 0xF8, 19, AD_NAME][..], b"Example HID Remote"].concat());
+    assert!(advertising.scan().is_empty());
+    assert!(advertising.mode().pairable() && advertising.mode().discoverable());
+    // A long name, too.
+    let content = Content { name: b"A remote with a long name", ..example::CONTENT };
+    let (adv, scan) = content.data(true).unwrap();
+    assert_eq!(adv.as_bytes()[13..15], [26, AD_NAME]);
+    assert!(scan.is_empty());
+}
+
+#[cfg(feature = "extended-advertising")]
+#[test]
+fn extended_reconnection_data_is_without_the_name_and_fits_directed_advertising() {
+    let bond = bond(false);
+    let advertising = example::advertising(Mode::Reconnect(&bond), Some(-8)).unwrap();
+    assert_eq!(advertising.data().as_bytes(), &[
+        2,
+        0x01,
+        0x04,
+        5,
+        0x03,
+        0x12,
+        0x18,
+        0x0F,
+        0x18,
+        3,
+        0x19,
+        0xC1,
+        0x03,
+        2,
+        AD_TX_POWER,
+        0xF8
+    ]);
+    assert!(advertising.scan().is_empty());
+    assert!(!advertising.mode().pairable() && !advertising.mode().discoverable());
+    // The flags, the services and the appearance take 9 + 2n octets. With
+    // the fewest services too many for directed advertising, 241 of its 239
+    // octets on the nRF52832 (116 services) and 237 of 236 on the nRF51
+    // (114), reconnection refuses them; pairing shortens the name to the
+    // octets left of 245, or 242 on the nRF51.
+    let directed = Kind::DirectedLowDuty.data_max();
+    assert_eq!((DATA_MAX, directed), if cfg!(feature = "nrf51") { (242, 236) } else { (245, 239) });
+    let services = (directed - 9) / 2 + 1;
+    assert_eq!(services, if cfg!(feature = "nrf51") { 114 } else { 116 });
+    let content = Content { services: &[0x1800; 116][..services], ..example::CONTENT };
+    assert_eq!(content.data(false).err(), Some(Overflow::TooLong));
+    let (adv, _) = content.data(true).unwrap();
+    assert_eq!(adv.len(), DATA_MAX);
+    let short = DATA_MAX - (9 + 2 * services) - 2;
+    let header = [u8::try_from(short + 1).unwrap(), AD_SHORT_NAME];
+    assert_eq!(adv.as_bytes()[9 + 2 * services..], *[&header[..], &b"Example"[..short]].concat());
+    let content = Content { services: &[0x1800; 116][..services - 1], ..example::CONTENT };
+    assert_eq!(content.data(false).unwrap().0.len(), 9 + 2 * (services - 1));
+    assert!(content.data(false).unwrap().0.len() <= directed);
 }
 
 #[test]
@@ -343,6 +415,35 @@ fn the_link_layer_refuses_to_start_while_a_central_is_connected() {
     assert!(shared.advertising().is_none());
 }
 
+#[cfg(feature = "extended-advertising")]
+#[test]
+fn the_secondary_phy_reaches_the_link_layer_where_the_chip_has_it() {
+    use crate::radio::Phy;
+    use core::cell::Cell;
+    /// A stand-in that keeps the parameters of the last advertising.
+    struct Params(Cell<Option<AdvParams>>);
+    impl Control for Params {
+        fn call(&self, call: Call<'_>) -> Result<(), link::Error> {
+            if let Call::Advertise { params, .. } = call {
+                self.0.set(Some(params));
+            }
+            Ok(())
+        }
+    }
+    let control = Params(Cell::new(None));
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    assert!(advertising.secondary_phy() == Phy::M1);
+    advertising.start(&control, &example::PHASES[0]).unwrap();
+    assert!(control.0.get().unwrap().secondary_phy == Phy::M1);
+    // LE 2M on the nRF52832; the nRF51, with LE 1M alone, keeps it.
+    let fast = advertising.with_secondary_phy(Phy::M2);
+    let expected = if cfg!(feature = "nrf51") { Phy::M1 } else { Phy::M2 };
+    assert!(fast.secondary_phy() == expected);
+    fast.start(&control, &example::PHASES[0]).unwrap();
+    let params = control.0.get().unwrap();
+    assert!(params.secondary_phy == expected && params.kind == Kind::ConnectableUndirected && params.private);
+}
+
 #[test]
 fn the_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() {
     let (adv, scan) = example::CONTENT.data(true).unwrap();
@@ -363,7 +464,7 @@ fn the_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() 
     if let Some(short) = field(adv.as_bytes(), AD_SHORT_NAME) {
         assert!(example::NAME.starts_with(&short));
     }
-    assert!(adv.as_bytes().len() <= 31 && scan.as_bytes().len() <= 31);
+    assert!(adv.as_bytes().len() <= DATA_MAX && scan.as_bytes().len() <= crate::advertiser::SCAN_DATA_MAX);
 }
 
 #[cfg(feature = "directed-advertising")]
@@ -385,7 +486,7 @@ fn a_directed_phase_targets_the_bonded_central_s_identity_only_when_reconnecting
     let reconnect = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     assert!(reconnect.mode().directs(&phase) && !reconnect.mode().directs(&example::PHASES[0]));
     let params = reconnect.mode().params(&phase);
-    assert!(params.kind == Kind::DirectedHighDuty && params.peer == CENTRAL && params.private);
+    assert!(params.kind == DIRECTED && params.peer == CENTRAL && params.private);
     reconnect.start(&recorder, &phase).unwrap();
     assert!(recorder.saw(&[Seen::Directed(CENTRAL, true)]));
     // Never in pairing mode, which has no central to direct it to: it
@@ -412,16 +513,33 @@ fn a_directed_phase_targets_the_bonded_central_s_identity_only_when_reconnecting
 
 #[cfg(feature = "directed-advertising")]
 #[test]
-fn a_central_that_sent_its_key_is_not_directed_to() {
-    // It scans from resolvable private addresses and would drop an
-    // advertisement directed to its identity: the phase advertises
-    // undirected at 20 ms, from the accept list only.
+fn a_central_that_sent_its_key_is_directed_to_until_it_goes_unanswered() {
+    // It scans from resolvable private addresses: the host directs to its
+    // identity, and the link layer targets a private address made with the
+    // key the resolving list holds for it.
     let phase = Phase::directed(DIRECTED_MAX);
-    let bond = bond(true);
+    let mut bond = bond(true);
+    assert!(Mode::Reconnect(&bond).directs(&phase));
+    let params = Mode::Reconnect(&bond).params(&phase);
+    assert!(params.kind == DIRECTED && params.peer == CENTRAL && params.private);
+    let recorder = Recorder::new();
+    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    advertising.configure(&recorder, &identity(1)).unwrap();
+    assert!(recorder.calls.borrow().0.contains(&Some(Seen::AddPeer(CENTRAL, CENTRAL_IRK, identity(1).irk()))));
+    assert!(!Mode::Reconnect(&bond).skips(&phase) && !Mode::Pairing.skips(&phase));
+    // Once directed advertising went unanswered, the host skips the phase,
+    // whether the central sent its key or not; started anyway, it
+    // advertises undirected at 20 ms, from the accept list only. Undirected
+    // phases are never skipped.
+    bond.directed_works = false;
+    assert!(Mode::Reconnect(&bond).skips(&phase));
+    assert!(!Mode::Reconnect(&bond).skips(&Phase::new(32, DIRECTED_MAX)));
     assert!(!Mode::Reconnect(&bond).directs(&phase));
     let params = Mode::Reconnect(&bond).params(&phase);
     assert!(params.kind == Kind::ConnectableUndirected && params.interval == 32 && params.filter_policy == 0x03);
     assert!(params.private);
+    bond.peer_irk = None;
+    assert!(!Mode::Reconnect(&bond).directs(&phase));
 }
 
 #[cfg(feature = "directed-advertising")]
@@ -443,17 +561,34 @@ fn the_link_layer_takes_a_directed_phase() {
     // undirected phases.
     link.advertise(&params.private(false), advertising.data().as_bytes(), advertising.scan().as_bytes()).unwrap();
     let settings = shared.advertising().unwrap();
-    assert!(settings.kind == Kind::DirectedHighDuty && settings.peer == CENTRAL);
+    assert!(settings.kind == DIRECTED && settings.peer == CENTRAL);
     assert!(settings.filter_policy == 0x03 && settings.own == identity.peer());
     assert_eq!(settings.resolving.local_key(Some(CENTRAL)), Some(identity.irk()));
-    let (primary, _) = settings.pdus();
-    let header = primary.as_bytes()[0];
-    assert_eq!(header & 0x0F, crate::pdu::ADV_DIRECT_IND);
+    // ADV_DIRECT_IND, or with extended advertising an AUX_ADV_IND with
+    // AdvA and TargetA after its extended header length and flags.
+    #[cfg(not(feature = "extended-advertising"))]
+    let (pdu, (kind, addresses)) = (advertiser::legacy::pdus(&settings).0, (crate::pdu::ADV_DIRECT_IND, 2));
+    #[cfg(feature = "extended-advertising")]
+    let (pdu, (kind, addresses)) = (advertiser::extended::auxiliary(&settings), (crate::pdu::ADV_EXT_IND, 4));
+    let header = pdu.as_bytes()[0];
+    assert_eq!(header & 0x0F, kind);
     // TxAdd: our address is random, as a private one is; RxAdd: the
     // central's identity is public, as BlueZ without host privacy scans
     // from it.
     assert!(identity.peer().random && header & 0x40 != 0);
     assert!(!CENTRAL.random && header & 0x80 == 0);
-    assert_eq!(primary.as_bytes()[2..8], identity.peer().address);
-    assert_eq!(primary.as_bytes()[8..14], CENTRAL.address);
+    assert_eq!(pdu.as_bytes()[addresses..addresses + 6], identity.peer().address);
+    assert_eq!(pdu.as_bytes()[addresses + 6..addresses + 12], CENTRAL.address);
+    // From the identity address the target stays the central's identity,
+    // also with its key in the resolving list.
+    assert!(settings.target == CENTRAL);
+    let keyed = super::tests::bond(true);
+    let advertising = example::advertising(Mode::Reconnect(&keyed), None).unwrap();
+    advertising.configure(&link, &identity).unwrap();
+    assert!(shared.advertising().is_none());
+    let params = advertising.mode().params(&Phase::directed(DIRECTED_MAX));
+    link.advertise(&params.private(false), advertising.data().as_bytes(), &[]).unwrap();
+    let settings = shared.advertising().unwrap();
+    assert_eq!(settings.resolving.peer_key(CENTRAL), Some(CENTRAL_IRK));
+    assert!(settings.target == CENTRAL && settings.peer == CENTRAL);
 }

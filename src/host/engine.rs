@@ -68,7 +68,11 @@
 //!   the encryption, which also keeps the link layer's buffers free for the
 //!   pairing's burst. Whatever the bonded central writes later goes into the
 //!   bond, and [`ConnEvent::BondUpdated`] hands it to the application to store
-//!   when it changed.
+//!   when it changed. With the feature `directed-advertising`, so does a link
+//!   that arrived right after a directed phase went unanswered, answering the
+//!   undirected advertising after it, once it is encrypted with the bond's key:
+//!   the bond no longer directs ([`Bond::directed_works`],
+//!   `Engine::directed_unanswered`).
 //! - It gives the security manager the identity the advertising was set up with
 //!   ([`Engine::advertise`]), so pairing distributes the identity our
 //!   resolvable private address was made from, and builds the bond from the
@@ -262,6 +266,10 @@ pub struct Engine {
     config:        Config,
     /// The table.
     db:            &'static Db,
+    /// The link that arrived right after a directed phase went unanswered
+    /// ([`Self::directed_unanswered`]), until the bond notes it.
+    #[cfg(feature = "directed-advertising")]
+    directed_unanswered: Option<Epoch> = None,
     /// The events for the application.
     events:        Events,
     /// The link, while one exists.
@@ -604,6 +612,22 @@ impl Engine {
         }
     }
 
+    /// Notes that the link `epoch` arrived in the phase right after a
+    /// directed phase ran to its end. If the link layer reports that its
+    /// connection request answered undirected advertising
+    /// ([`Info::directed`]), the directed advertising went unanswered: once
+    /// the link is encrypted with the bond's key, which proves it is the
+    /// bonded central, the bond's [`Bond::directed_works`] is cleared and
+    /// [`ConnEvent::BondUpdated`] hands the bond to the application to store.
+    /// A request that answered the directed advertising, made just before the
+    /// phase ended and handed over after it, changes nothing.
+    #[cfg(feature = "directed-advertising")]
+    #[inline]
+    pub const fn directed_unanswered(&mut self, epoch: Epoch) {
+        self.directed_unanswered = Some(epoch);
+        self.forget_directed();
+    }
+
     /// Forgets the link `epoch`, which ended for `reason`.
     fn disconnected(&mut self, epoch: Epoch, reason: u8) {
         if self.link.as_ref().is_none_or(|link| link.info.epoch != epoch) {
@@ -706,6 +730,32 @@ impl Engine {
     #[inline]
     #[must_use = "the link is only read"]
     pub const fn epoch(&self) -> Option<Epoch> { self.link.as_ref().map(const |link| link.info.epoch) }
+
+    /// Clears the bond's [`Bond::directed_works`] and reports the bond, if
+    /// the link arrived after an unanswered directed phase, answering
+    /// undirected advertising, and is encrypted with the bond's key. Not
+    /// inlined: [`Self::restore`]'s two callers and
+    /// [`Self::directed_unanswered`] share one copy.
+    #[cfg(feature = "directed-advertising")]
+    #[inline(never)]
+    const fn forget_directed(&mut self) {
+        let Some(link) = self.link.as_ref() else { return };
+        if self.directed_unanswered != Some(link.info.epoch)
+            || link.info.directed
+            || !link.encrypted
+            || link.key != Some(Key::Bond)
+        {
+            return;
+        }
+        self.directed_unanswered = None;
+        if let Some(bond) = self.bond.as_mut()
+            && bond.directed_works
+        {
+            bond.directed_works = false;
+            self.events.flags |= EV_BOND_UPDATED;
+            self.events.changed = true;
+        }
+    }
 
     /// Notes that the fragment [`Self::next_fragment`] gave was queued by the
     /// link layer, at `now`.
@@ -1190,8 +1240,12 @@ impl Engine {
     }
 
     /// Restores the bond's subscriptions, once the link is encrypted with
-    /// the bond's key.
+    /// the bond's key; with the feature `directed-advertising`, forgets
+    /// there that directed advertising works if it went unanswered
+    /// ([`Self::directed_unanswered`]).
     const fn restore(&mut self) {
+        #[cfg(feature = "directed-advertising")]
+        self.forget_directed();
         let Some(link) = self.link.as_mut() else { return };
         if link.discovery.restored || link.key != Some(Key::Bond) {
             return;

@@ -74,13 +74,17 @@
 //! anchor costs one interval, not the whole latency, and a supervision
 //! timeout shorter than a few latencies holds.
 
+#[cfg(feature = "extended-advertising")]
+use crate::{advertiser::extended::RENEWAL_LEN, radio::Phy};
 use crate::{
-    advertiser::legacy::{DATA_MAX, FILTER_LIST_SIZE, Kind, Settings as LegacySettings},
+    advertiser::{Kind, SCAN_DATA_MAX, Settings as AdvSettings, privacy::FILTER_LIST_SIZE},
     chip,
     crypto,
     pdu::{Llid, Peer, valid_connection_parameters},
     rng,
 };
+#[cfg(feature = "extended-advertising")]
+use core::ops::{AsyncFnMut, ControlFlow};
 use core::{
     cell::RefCell,
     mem,
@@ -175,7 +179,8 @@ pub enum Error {
 
 /// One connection. A request with the epoch of a link that has ended has
 /// no effect on the next one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq)]
+#[derive_const(PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Epoch(u32);
 
@@ -250,6 +255,10 @@ impl ParamRange {
 pub struct Info {
     /// The central's sleep clock accuracy as the connection request gave it.
     pub central_accuracy: u8,
+    /// Whether the connection request answered directed advertising
+    /// ([`Kind::is_directed`]), as the link layer sent it in that event,
+    /// rather than undirected advertising.
+    pub directed:         bool,
     /// The link.
     pub epoch:            Epoch,
     /// The central's identity address, if its address on the air is a
@@ -488,12 +497,20 @@ pub struct AdvParams {
     pub interval:      u16,
     /// Advertising type.
     pub kind:          Kind,
-    /// The peer of directed advertising, and whose local key gives the
-    /// resolvable private address.
+    /// The peer of directed advertising, its identity, and whose local key
+    /// gives the resolvable private address; with the feature
+    /// `directed-advertising` and its key in the resolving list, the target
+    /// on air is a resolvable private address of it ([`Link::advertise`]).
     pub peer:          Peer,
     /// Advertise from a resolvable private address made with the local key
     /// in the resolving list, rather than from the identity address.
     pub private:       bool,
+    /// PHY of the secondary channel: of the `AUX_ADV_IND`, the
+    /// `AUX_CONNECT_REQ` and `AUX_CONNECT_RSP`, and of the connection's
+    /// start. LE 1M, or LE 2M on the nRF52832, half the airtime for a
+    /// central that takes it; the nRF51 refuses LE 2M.
+    #[cfg(feature = "extended-advertising")]
+    pub secondary_phy: Phy,
 }
 
 impl AdvParams {
@@ -514,8 +531,11 @@ impl AdvParams {
 
     /// Whether the parameters are in range.
     const fn is_valid(&self) -> bool {
-        let interval_valid =
-            self.kind == Kind::DirectedHighDuty || (ADV_INTERVAL_MIN..=ADV_INTERVAL_MAX).contains(&self.interval);
+        let interval_valid = self.kind.is_high_duty() || (ADV_INTERVAL_MIN..=ADV_INTERVAL_MAX).contains(&self.interval);
+        #[cfg(feature = "extended-advertising")]
+        if !chip::PHY_2M && matches!(self.secondary_phy, Phy::M2) {
+            return false;
+        }
         interval_valid && (1..=0x07).contains(&self.channel_map) && self.filter_policy <= 3
     }
 
@@ -531,6 +551,8 @@ impl AdvParams {
             kind,
             peer: Peer::new([0; 6], false),
             private: false,
+            #[cfg(feature = "extended-advertising")]
+            secondary_phy: Phy::M1,
         }
     }
 
@@ -543,6 +565,12 @@ impl AdvParams {
     #[inline]
     #[must_use = "the parameters are only built"]
     pub const fn private(self, private: bool) -> Self { Self { private, ..self } }
+
+    /// With the PHY of the secondary channel.
+    #[cfg(feature = "extended-advertising")]
+    #[inline]
+    #[must_use = "the parameters are only built"]
+    pub const fn secondary_phy(self, secondary_phy: Phy) -> Self { Self { secondary_phy, ..self } }
 }
 
 /// The host's answer to a long term key request. Without [`Debug`] beyond
@@ -556,22 +584,34 @@ pub(crate) enum LtkAnswer {
     Missing,
 }
 
+/// The addresses advertising puts on air, made outside the critical
+/// section when it starts ([`Link::advertise`]).
+#[derive(Clone, Copy)]
+pub(crate) struct OnAir {
+    /// Our address: the identity, or a resolvable private address.
+    pub own:    Peer,
+    /// The target of directed advertising: the peer's identity, or a
+    /// resolvable private address of its key.
+    #[cfg(feature = "directed-advertising")]
+    pub target: Peer,
+}
+
 /// Host state kept by the link layer.
 struct HostState {
     /// Fragments of the link the central acknowledged.
     acked:            u32,
     /// Host query bits already accepted but not completed.
     active_queries:   u8,
+    /// Advertising parameters.
+    adv:              AdvSettings,
+    /// Whether the host enabled advertising.
+    adv_enabled:      bool,
     /// Whether a connection exists.
     connected:        bool,
     /// Changes at each link boundary so requests cannot cross links.
     epoch:            u32,
     /// What the host learns about the current link.
     info:             Option<Info>,
-    /// Legacy advertising parameters.
-    legacy:           LegacySettings,
-    /// Whether the host enabled legacy advertising.
-    legacy_enabled:   bool,
     /// An LTK request waits for the host's answer.
     ltk_pending:      bool,
     /// Connection updates the host asked for while it answered a central's
@@ -627,7 +667,7 @@ impl HostState {
     /// Overwrites every identity resolving key before it is dropped.
     fn forget_keys(&mut self) {
         self.forget_address();
-        self.legacy.resolving.clear();
+        self.adv.resolving.clear();
     }
 
     /// The state after power-on or a reset, in the generation `epoch`.
@@ -635,11 +675,11 @@ impl HostState {
         Self {
             acked: 0,
             active_queries: 0,
+            adv: AdvSettings::new(),
+            adv_enabled: false,
             connected: false,
             epoch,
             info: None,
-            legacy: LegacySettings::new(),
-            legacy_enabled: false,
             ltk_pending: false,
             merged_updates: 0,
             #[cfg(feature = "event-timing")]
@@ -733,11 +773,13 @@ impl Shared {
     pub(crate) fn acl_room(&self) -> usize { self.acl_in.free_capacity() }
 
     /// The advertising to run, if the host enabled it and no connection
-    /// exists.
-    pub(crate) fn advertising(&self) -> Option<LegacySettings> {
+    /// exists. With extended advertising the link layer task takes it
+    /// through [`Self::renewed_advertising`] instead.
+    #[cfg(any(test, not(feature = "extended-advertising")))]
+    pub(crate) fn advertising(&self) -> Option<AdvSettings> {
         self.state.lock(|cell| {
             let state = cell.borrow();
-            (!state.connected && state.legacy_enabled).then_some(state.legacy)
+            (!state.connected && state.adv_enabled).then_some(state.adv)
         })
     }
 
@@ -768,6 +810,43 @@ impl Shared {
         while self.events.try_receive().is_ok() {}
         while self.acl_in.try_receive().is_ok() {}
         self.reset_done.signal(());
+    }
+
+    /// The target on air of advertising of the kind `kind` to the peer
+    /// `peer`, from a private address if `private`: for directed advertising
+    /// from a private address to a peer whose identity resolving key the
+    /// resolving list holds, a resolvable private address made with that key
+    /// and new random bytes (Core, Vol 6, Part B, 6.2.2); otherwise the
+    /// peer's identity. On the chip, [`Self::directed_target_with`] with the
+    /// RNG and the ECB.
+    #[cfg(feature = "directed-advertising")]
+    fn directed_target(&self, settings: (bool, Kind, Peer)) -> Peer {
+        self.directed_target_with(settings, rng::fill, crypto::encrypt_block)
+    }
+
+    /// [`Self::directed_target`], with `fill` drawing the random part and
+    /// `encrypt` running AES-128. The key is read under the lock, and the
+    /// random bytes and the AES come outside it. The key's copy read here
+    /// is overwritten afterwards; the AES works on copies of its own, and the
+    /// resolving list keeps the key in memory anyway.
+    #[cfg(feature = "directed-advertising")]
+    fn directed_target_with<Fill, Encrypt>(
+        &self,
+        (private, kind, peer): (bool, Kind, Peer),
+        fill: Fill,
+        encrypt: Encrypt,
+    ) -> Peer
+    where
+        Fill: FnOnce(&mut [u8]),
+        Encrypt: FnOnce([u8; 16], [u8; 16]) -> [u8; 16],
+    {
+        let mut key = (private && kind.is_directed())
+            .then(|| self.state.lock(|cell| cell.borrow().adv.resolving.peer_key(peer)))
+            .flatten();
+        let Some(irk) = key.as_mut() else { return peer };
+        let target = new_private_address(*irk, fill, encrypt);
+        crypto::wipe(irk);
+        target
     }
 
     /// Ends a central's connection parameter request the host was asked
@@ -820,16 +899,14 @@ impl Shared {
     fn own_address(&self, private_key: Option<[u8; 16]>) -> Peer {
         let (fallback, lifetime) = self.state.lock(|cell| {
             let state = cell.borrow();
-            (state.legacy.address, state.private_timeout)
+            (state.adv.address, state.private_timeout)
         });
         let Some(key) = private_key else { return fallback };
         let now = Instant::now();
         if let Some(address) = self.state.lock(|cell| cell.borrow().cached_address(key, now)) {
             return address;
         }
-        let mut prand = [0; 3];
-        rng::fill(&mut prand);
-        let address = Peer::new(crypto::resolvable_address(key, prand), true);
+        let address = new_private_address(key, rng::fill, crypto::encrypt_block);
         self.state.lock(|cell| {
             cell.borrow_mut().private_address = Some((address, key, now.saturating_add(lifetime)));
         });
@@ -849,8 +926,8 @@ impl Shared {
     fn private_key(&self) -> Option<[u8; 16]> {
         self.state.lock(|cell| {
             let state = cell.borrow();
-            let legacy = &state.legacy;
-            legacy.resolving.local_key(legacy.kind.is_directed().then_some(legacy.peer)).filter(|_| legacy.private)
+            let adv = &state.adv;
+            adv.resolving.local_key(adv.kind.is_directed().then_some(adv.peer)).filter(|_| adv.private)
         })
     }
 
@@ -879,19 +956,60 @@ impl Shared {
 
     /// Moves running advertising to a new resolvable private address once
     /// the current one expired, so a device that advertises for long cannot
-    /// be followed by its address. Call it before each advertising event,
+    /// be followed by its address. The target of directed advertising stays
+    /// as [`Link::advertise`] made it. Call it before each advertising event,
     /// outside radio events.
     pub(crate) fn refresh_private_address(&self) {
-        let enabled = self.state.lock(|cell| cell.borrow().legacy_enabled);
+        let enabled = self.state.lock(|cell| cell.borrow().adv_enabled);
         let Some(key) = self.private_key().filter(|_| enabled) else { return };
         let address = self.own_address(Some(key));
         self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            if state.legacy_enabled && state.legacy.private && state.legacy.own != address {
-                state.legacy.own = address;
+            if state.adv_enabled && state.adv.private && state.adv.own != address {
+                state.adv.set_own(address);
                 info!("new private address");
             }
         });
+    }
+
+    /// [`Self::advertising`], once the advertising set is renewed.
+    ///
+    /// After a change of the data or our address it first draws a new
+    /// advertising data ID and secondary channel identifier, from the RNG
+    /// while other tasks run, and again if another change came meanwhile, so
+    /// that no event sends new data or a new address with the old ones. Call
+    /// it before each advertising event, outside radio events: the settings
+    /// it returns are taken as used ([`AdvSettings::last_used`]).
+    #[cfg(feature = "extended-advertising")]
+    pub(crate) async fn renewed_advertising(&self) -> Option<AdvSettings> {
+        self.renewed_advertising_with(rng::fill_async).await
+    }
+
+    /// [`Self::renewed_advertising`], with `fill` drawing the random octets.
+    #[cfg(feature = "extended-advertising")]
+    pub(crate) async fn renewed_advertising_with(&self, mut fill: impl AsyncFnMut(&mut [u8])) -> Option<AdvSettings> {
+        loop {
+            // No copy of the settings lives across the wait.
+            let step = self.state.lock(|cell| {
+                let mut state = cell.borrow_mut();
+                if state.connected || !state.adv_enabled {
+                    return ControlFlow::Break(None);
+                }
+                if state.adv.stale {
+                    return ControlFlow::Continue(());
+                }
+                // The event may send this DID: a renewal avoids it from now
+                // on, until another event takes a newer one.
+                state.adv.last_used = state.adv.adi;
+                ControlFlow::Break(Some(state.adv))
+            });
+            if let ControlFlow::Break(current) = step {
+                return current;
+            }
+            let mut random = [0; RENEWAL_LEN];
+            fill(&mut random).await;
+            self.state.lock(|cell| cell.borrow_mut().adv.renew(random));
+        }
     }
 
     /// Queues a key request and authorizes one answer of the host. Returns
@@ -949,7 +1067,7 @@ impl Shared {
             }
             state.connected = connected;
             if connected {
-                state.legacy_enabled = false;
+                state.adv_enabled = false;
             }
             changed
         });
@@ -973,18 +1091,19 @@ impl Shared {
     }
 
     /// Records what the host learns about the link that just started, from
-    /// the central's address on the air, our own, the parameters and the
-    /// central's clock accuracy. Returns the link's epoch.
+    /// the central's address on the air, our own, the parameters, the
+    /// central's clock accuracy and whether the request answered directed
+    /// advertising. Returns the link's epoch.
     pub(crate) fn set_info(
         &self,
         (peer, identity, local): (Peer, Option<Peer>, Peer),
         params: ConnectionParams,
-        central_accuracy: u8,
+        (central_accuracy, directed): (u8, bool),
     ) -> Epoch {
         self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             let epoch = Epoch(state.epoch);
-            state.info = Some(Info { central_accuracy, epoch, identity, local, params, peer });
+            state.info = Some(Info { central_accuracy, directed, epoch, identity, local, params, peer });
             epoch
         })
     }
@@ -1024,7 +1143,7 @@ impl Shared {
     }
 
     /// Ends advertising that ran out of time.
-    pub(crate) fn stop_advertising(&self) { self.state.lock(|cell| cell.borrow_mut().legacy_enabled = false); }
+    pub(crate) fn stop_advertising(&self) { self.state.lock(|cell| cell.borrow_mut().adv_enabled = false); }
 
     /// Data length new links start with: payload octets and time.
     pub(crate) fn suggested_length(&self) -> [u16; 2] { self.state.lock(|cell| cell.borrow().suggested_length) }
@@ -1115,7 +1234,7 @@ impl<'shared> Link<'shared> {
     /// [`Error::Full`] if it holds [`FILTER_LIST_SIZE`] devices.
     #[inline]
     pub fn accept_list_add(&self, peer: Peer) -> Result<(), Error> {
-        self.with_filter_list(|legacy| if legacy.filter.add(peer) { Ok(()) } else { Err(Error::Full) })
+        self.with_filter_list(|settings| if settings.filter.add(peer) { Ok(()) } else { Err(Error::Full) })
     }
 
     /// Empties the filter accept list.
@@ -1125,8 +1244,8 @@ impl<'shared> Link<'shared> {
     /// [`Error::Disallowed`] while advertising filters on the list.
     #[inline]
     pub fn accept_list_clear(&self) -> Result<(), Error> {
-        self.with_filter_list(|legacy| {
-            legacy.filter.clear();
+        self.with_filter_list(|settings| {
+            settings.filter.clear();
             Ok(())
         })
     }
@@ -1138,8 +1257,8 @@ impl<'shared> Link<'shared> {
     /// [`Error::Disallowed`] while advertising filters on the list.
     #[inline]
     pub fn accept_list_remove(&self, peer: Peer) -> Result<(), Error> {
-        self.with_filter_list(|legacy| {
-            legacy.filter.remove(peer);
+        self.with_filter_list(|settings| {
+            settings.filter.remove(peer);
             Ok(())
         })
     }
@@ -1163,13 +1282,13 @@ impl<'shared> Link<'shared> {
     #[inline]
     pub fn add_peer(&self, identity: Peer, peer_irk: [u8; 16], local_irk: [u8; 16]) -> Result<(), Error> {
         self.check_resolving_change()?;
-        if !self.shared.state.lock(|cell| cell.borrow().legacy.resolving.can_add(identity)) {
+        if !self.shared.state.lock(|cell| cell.borrow().adv.resolving.can_add(identity)) {
             return Err(Error::Full);
         }
         let needs_address = local_irk != [0; 16]
             && self.shared.state.lock(|cell| {
                 let state = cell.borrow();
-                state.legacy_enabled && state.legacy.private && state.legacy.own == state.legacy.address
+                state.adv_enabled && state.adv.private && state.adv.own == state.adv.address
             });
         let own = needs_address.then(|| self.shared.own_address(Some(local_irk)));
         let added = self.shared.state.lock(|cell| {
@@ -1177,9 +1296,9 @@ impl<'shared> Link<'shared> {
             // Advertising that started before the key arrived moves to a
             // private address now.
             if let Some(address) = own {
-                state.legacy.own = address;
+                state.adv.set_own(address);
             }
-            state.legacy.resolving.add_keys(identity, peer_irk, local_irk)
+            state.adv.resolving.add_keys(identity, peer_irk, local_irk)
         });
         if added { Ok(()) } else { Err(Error::Full) }
     }
@@ -1189,22 +1308,58 @@ impl<'shared> Link<'shared> {
     /// [`Self::stop_advertising`]. Replaces advertising that runs. The own
     /// address is the identity of [`Self::set_identity`], or with
     /// [`AdvParams::private`] a resolvable private address made with the
-    /// local key in the resolving list.
+    /// local key in the resolving list. With the feature
+    /// `directed-advertising`, directed advertising from a private address
+    /// to a peer whose identity resolving key the resolving list holds
+    /// targets a new resolvable private address made with that key (Core,
+    /// Vol 6, Part B, 6.2.2), which only a central that resolves addresses
+    /// in its controller recognizes; a connection request is still checked
+    /// against the peer's identity, and its own private addresses resolve to
+    /// it. The target is made here and kept while the advertising runs: our
+    /// own private address moves on when the private address timeout expires,
+    /// the target does not (Core, Vol 6, Part B, 6.1 asks for both). The
+    /// host's directed phases last at most 1.28 s and each makes a new one;
+    /// a caller that directs for longer than the timeout calls this again to
+    /// renew it.
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for parameters out of range, data longer than 31
-    /// octets or without an identity address, [`Error::Disallowed`] while a
-    /// connection exists.
+    /// [`Error::Invalid`] for parameters out of range, advertising data
+    /// longer than the type takes ([`Kind::data_max`]: 31 octets, or with
+    /// extended advertising 245 and 239 when directed, 242 and 236 on the
+    /// nRF51), scan response data longer than 31 octets or any with extended
+    /// advertising, or without an identity address, [`Error::Disallowed`]
+    /// while a connection exists.
     #[inline]
     pub fn advertise(&self, params: &AdvParams, adv: &[u8], scan: &[u8]) -> Result<(), Error> {
-        let max = DATA_MAX;
-        if !params.is_valid() || adv.len() > max || scan.len() > max {
+        self.advertise_with(params, adv, scan, |key| OnAir {
+            own: self.shared.own_address(key),
+            #[cfg(feature = "directed-advertising")]
+            target: self.shared.directed_target((params.private, params.kind, params.peer)),
+        })
+    }
+
+    /// [`Self::advertise`] with the addresses on air from `on_air`, given
+    /// the local key of the private address the parameters ask for, if any.
+    /// `on_air` runs outside the critical section, once the parameters were
+    /// checked.
+    #[inline]
+    pub(crate) fn advertise_with<Addresses>(
+        self,
+        params: &AdvParams,
+        adv: &[u8],
+        scan: &[u8],
+        on_air: Addresses,
+    ) -> Result<(), Error>
+    where
+        Addresses: FnOnce(Option<[u8; 16]>) -> OnAir,
+    {
+        if !params.is_valid() || adv.len() > params.kind.data_max() || scan.len() > SCAN_DATA_MAX {
             return Err(Error::Invalid);
         }
         let (address, connected) = self.shared.state.lock(|cell| {
             let state = cell.borrow();
-            (state.legacy.address, state.connected)
+            (state.adv.address, state.connected)
         });
         if address.address == [0; 6] {
             return Err(Error::Invalid);
@@ -1217,32 +1372,30 @@ impl<'shared> Link<'shared> {
         let key = params.private.then(|| {
             self.shared
                 .state
-                .lock(|cell| cell.borrow().legacy.resolving.local_key(params.kind.is_directed().then_some(params.peer)))
+                .lock(|cell| cell.borrow().adv.resolving.local_key(params.kind.is_directed().then_some(params.peer)))
         });
-        let own = self.shared.own_address(key.flatten());
+        let addresses = on_air(key.flatten());
         let result = self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             if state.connected {
                 return Err(Error::Disallowed);
             }
-            let legacy = &mut state.legacy;
-            legacy.kind = params.kind;
-            legacy.private = params.private;
-            legacy.interval = u32::from(params.interval).saturating_mul(625);
-            legacy.peer = params.peer;
-            legacy.channel_map = params.channel_map;
-            legacy.filter_policy = params.filter_policy;
-            for (target, len, source) in
-                [(&mut legacy.data, &mut legacy.len, adv), (&mut legacy.scan_data, &mut legacy.scan_len, scan)]
-            {
-                target.fill(0);
-                if let Some(destination) = target.get_mut(..source.len()) {
-                    destination.copy_from_slice(source);
-                }
-                *len = source.len().saturating_cast();
+            let settings = &mut state.adv;
+            if !settings.set_data(adv, scan) {
+                return Err(Error::Invalid);
             }
-            legacy.own = own;
-            state.legacy_enabled = true;
+            settings.kind = params.kind;
+            settings.private = params.private;
+            settings.interval = u32::from(params.interval).saturating_mul(625);
+            settings.peer = params.peer;
+            #[cfg(feature = "directed-advertising")]
+            settings.target.clone_from(&addresses.target);
+            settings.channel_map = params.channel_map;
+            settings.filter_policy = params.filter_policy;
+            #[cfg(feature = "extended-advertising")]
+            settings.secondary_phy.clone_from(&params.secondary_phy);
+            settings.own = addresses.own;
+            state.adv_enabled = true;
             Ok(())
         });
         if result.is_ok() {
@@ -1252,11 +1405,33 @@ impl<'shared> Link<'shared> {
         result
     }
 
+    /// [`Self::advertise`] with `fill` and `encrypt` in place of the RNG
+    /// and the ECB, for the host tests: our private address is a new one
+    /// each call, not kept for its lifetime, which needs the clock.
+    #[cfg(all(test, feature = "directed-advertising"))]
+    pub(crate) fn advertise_drawn<Fill, Encrypt>(
+        &self,
+        params: &AdvParams,
+        (adv, scan): (&[u8], &[u8]),
+        mut fill: Fill,
+        encrypt: Encrypt,
+    ) -> Result<(), Error>
+    where
+        Fill: FnMut(&mut [u8]),
+        Encrypt: Fn([u8; 16], [u8; 16]) -> [u8; 16] + Copy,
+    {
+        let identity = self.shared.state.lock(|cell| cell.borrow().adv.address);
+        self.advertise_with(params, adv, scan, |key| OnAir {
+            own:    key.map_or(identity, |key| new_private_address(key, &mut fill, encrypt)),
+            target: self.shared.directed_target_with((params.private, params.kind, params.peer), &mut fill, encrypt),
+        })
+    }
+
     /// Refuses resolving list changes while advertising resolves addresses.
     fn check_resolving_change(self) -> Result<(), Error> {
         let busy = self.shared.state.lock(|cell| {
             let state = cell.borrow();
-            state.legacy_enabled && state.legacy.resolution_enabled
+            state.adv_enabled && state.adv.resolution_enabled
         });
         if busy { Err(Error::Disallowed) } else { Ok(()) }
     }
@@ -1472,7 +1647,7 @@ impl<'shared> Link<'shared> {
         self.check_resolving_change()?;
         self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            state.legacy.resolving.remove(identity);
+            state.adv.resolving.remove(identity);
             state.forget_address();
         });
         Ok(())
@@ -1599,8 +1774,8 @@ impl<'shared> Link<'shared> {
     /// [`Error::Disallowed`] while advertising runs.
     #[inline]
     pub fn set_address_resolution(&self, enable: bool) -> Result<(), Error> {
-        self.with_idle_advertising(|legacy| {
-            legacy.resolution_enabled = enable;
+        self.with_idle_advertising(|settings| {
+            settings.resolution_enabled = enable;
             Ok(())
         })
     }
@@ -1651,9 +1826,9 @@ impl<'shared> Link<'shared> {
     /// [`Error::Disallowed`] while advertising runs.
     #[inline]
     pub fn set_identity(&self, address: [u8; 6]) -> Result<(), Error> {
-        self.with_idle_advertising(|legacy| {
-            legacy.address = Peer::new(address, true);
-            legacy.own = legacy.address;
+        self.with_idle_advertising(|settings| {
+            settings.address = Peer::new(address, true);
+            settings.own = settings.address;
             Ok(())
         })
     }
@@ -1710,8 +1885,8 @@ impl<'shared> Link<'shared> {
     /// the peer is not listed.
     #[inline]
     pub fn set_privacy_mode(&self, identity: Peer, device: bool) -> Result<(), Error> {
-        self.with_idle_advertising(|legacy| {
-            if legacy.resolving.set_mode(identity, device) { Ok(()) } else { Err(Error::Invalid) }
+        self.with_idle_advertising(|settings| {
+            if settings.resolving.set_mode(identity, device) { Ok(()) } else { Err(Error::Invalid) }
         })
     }
 
@@ -1746,7 +1921,7 @@ impl<'shared> Link<'shared> {
     /// Ends advertising.
     #[inline]
     pub fn stop_advertising(&self) {
-        let was = self.shared.state.lock(|cell| mem::take(&mut cell.borrow_mut().legacy_enabled));
+        let was = self.shared.state.lock(|cell| mem::take(&mut cell.borrow_mut().adv_enabled));
         if was {
             self.shared.changed.signal(());
             info!("advertising stopped");
@@ -1806,24 +1981,24 @@ impl<'shared> Link<'shared> {
 
     /// Runs `change` on the advertising settings unless advertising filters
     /// on the accept list.
-    fn with_filter_list(self, change: impl FnOnce(&mut LegacySettings) -> Result<(), Error>) -> Result<(), Error> {
+    fn with_filter_list(self, change: impl FnOnce(&mut AdvSettings) -> Result<(), Error>) -> Result<(), Error> {
         self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            if state.legacy_enabled && state.legacy.filter_policy != 0 {
+            if state.adv_enabled && state.adv.filter_policy != 0 {
                 return Err(Error::Disallowed);
             }
-            change(&mut state.legacy)
+            change(&mut state.adv)
         })
     }
 
     /// Runs `change` on the advertising settings unless advertising runs.
-    fn with_idle_advertising(self, change: impl FnOnce(&mut LegacySettings) -> Result<(), Error>) -> Result<(), Error> {
+    fn with_idle_advertising(self, change: impl FnOnce(&mut AdvSettings) -> Result<(), Error>) -> Result<(), Error> {
         self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            if state.legacy_enabled {
+            if state.adv_enabled {
                 return Err(Error::Disallowed);
             }
-            change(&mut state.legacy)
+            change(&mut state.adv)
         })
     }
 }
@@ -1851,6 +2026,22 @@ fn phy_preferences(tx: Option<u8>, rx: Option<u8>) -> Result<[u8; 2], Error> {
         Some(bits) => Ok(bits),
     };
     Ok([check(tx)?, check(rx)?])
+}
+
+/// A new resolvable private address of the identity resolving key `key`
+/// (Core, Vol 6, Part B, 1.3.2.2), its random part drawn with `fill` and its
+/// hash made with `encrypt` running AES-128. Not inlined: our own address
+/// and, with the feature `directed-advertising`, the target of directed
+/// advertising share one copy of the RNG and ECB code.
+#[inline(never)]
+fn new_private_address<Fill, Encrypt>(key: [u8; 16], fill: Fill, encrypt: Encrypt) -> Peer
+where
+    Fill: FnOnce(&mut [u8]),
+    Encrypt: FnOnce([u8; 16], [u8; 16]) -> [u8; 16],
+{
+    let mut prand = [0; 3];
+    fill(&mut prand);
+    Peer::new(crypto::resolvable_address_with(key, prand, encrypt), true)
 }
 
 #[cfg(test)] mod tests;

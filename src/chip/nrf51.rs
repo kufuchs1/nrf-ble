@@ -45,7 +45,18 @@ pub const CRYSTAL_LEAD_US: u32 = 1500;
 /// the nRF52832's.
 pub const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 2500);
 /// Largest advertising channel payload: 37 octets, a legacy advertising PDU.
+#[cfg(not(feature = "extended-advertising"))]
 pub const ADV_MAXLEN: u8 = 37;
+/// Largest advertising channel payload with extended advertising: 252
+/// octets, the longest `AUX_ADV_IND` the radio sends from RAM
+/// ([`PACKET_RAM_MAX`] less S0 and the length).
+///
+/// MAXLEN cuts a packet sent as well as one received, and it is written
+/// only with the packet layout, while the radio is disabled. So it admits
+/// that `AUX_ADV_IND` for the whole advertising event, and the listen for a
+/// request right after it receives into a buffer of the same size.
+#[cfg(feature = "extended-advertising")]
+pub const ADV_MAXLEN: u8 = PACKET_RAM_MAX.strict_sub(2).strict_cast();
 /// Largest data channel payload: 27 octets and the four-byte MIC, as far as
 /// the 5-bit length field reaches.
 const DATA_MAXLEN: u8 = 31;
@@ -77,9 +88,17 @@ pub const PREPARE_AFTER_RESTART: bool = false;
 /// prepare time of the 10 s report): it prepares between events only, and
 /// sends one new PDU per event.
 pub const PREPARE_IN_EVENT: bool = false;
-/// Largest payload the radio accepts on any channel, for the size of the
-/// packet buffers: an advertising payload, as a data payload with its MIC
-/// takes 31 octets at most.
+/// The most octets of a packet in RAM: S0, length, S1 and payload together
+/// cannot exceed 254 bytes, whatever MAXLEN holds (nRF51 Series Reference
+/// Manual v3.0, 17.1.3). With the advertising channels' one-octet S0 and
+/// length and no S1, a payload of 252 octets at most.
+pub const PACKET_RAM_MAX: usize = 254;
+/// Largest payload the radio accepts into a packet buffer
+/// (`pdu::BUFFER_LEN`), on the data channels and with legacy advertising: a
+/// legacy advertising payload, as a data payload with its MIC takes 31
+/// octets at most. With `extended-advertising` the advertising channels
+/// take up to [`ADV_MAXLEN`] octets, into the advertiser's own buffer
+/// (`advertiser::extended::AUX_BUFFER_LEN`) instead.
 pub const PAYLOAD_MAX: usize = 37;
 /// Programmable PPI channels above a channel that its stand-in for FORK
 /// uses: the nRF51 has 16 programmable channels and no FORK.
@@ -220,7 +239,7 @@ pub fn self_disabling(channel: usize, group: usize) {
     let fork = fork_channel(channel);
     let stand_in = PPI.ch(fork);
     stand_in.eep().write_value(PPI.ch(channel).eep().read());
-    stand_in.tep().write_value(address(PPI.tasks_chg(group).dis().as_ptr()));
+    stand_in.tep().write_value(PPI.tasks_chg(group).dis().as_ptr().addr().strict_cast());
     PPI.chg(group).write(|w| {
         w.set_ch(channel, true);
         w.set_ch(fork, true);
@@ -299,9 +318,6 @@ const fn xtalfreq(high_frequency: HighFrequency) -> Xtalfreq {
         HighFrequency::Mhz32 => Xtalfreq::_32mHz,
     }
 }
-
-/// The address of a register for a PPI endpoint.
-fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
 
 #[cfg(test)]
 mod tests {
