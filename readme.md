@@ -48,7 +48,9 @@ What is done so far:
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
   phases, an optional directed first phase of a reconnection with the feature `directed-advertising`, high duty cycle,
   or low duty cycle with `extended-advertising`, and their setup of the link layer's accept list, resolving list and
-  privacy) and the bond (`host::bond`: the record of the one central with its fixed 50 octet stored form).
+  privacy) and the bond (`host::bond`: the record of the one central with its fixed 50 octet stored form; bits 5 to 7
+  of its flags hold the central's Client Supported Features bits 0 to 2, which an nrf-ble from before them refuses, so
+  going back to one means pairing again).
 - The engine (`host::engine::Engine`): all of the host's protocol state for one link, without futures. It takes the
   link layer's events and fragments, the time and the results of the P-256 jobs, and gives the fragments to send (pulled
   one at a time, the connection parameter request leaving one place of the link layer's queue free), the calls of the
