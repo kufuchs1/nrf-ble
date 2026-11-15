@@ -241,8 +241,8 @@ advertising event). The other features cost nothing when off.
   twice the longest run of events (the latency plus one) is left of the time, and at once for a time too short for
   that. It then listens at every event until the response arrives, and the host learns when the whole time passes. A
   central that leaves the ping unanswered for 40 s ends the link with an LL response timeout, as any other procedure
-  does. A key reply for a link that ended before the host answered
-  returns `Error::Gone` and has no effect on the next link.
+  does. A key reply for a link that ended before the host answered returns `Error::Gone` and has no effect on the
+  next link.
 - **Connection parameter requests from the host** run one at a time: `Link::request_params` returns
   `Error::Disallowed` until the previous one reported its `Event::ParamsUpdated`, and `Error::UnsupportedRemote` for a
   central without the connection parameters request procedure, for which the host sends the L2CAP request.
@@ -300,8 +300,10 @@ advertising event). The other features cost nothing when off.
   instant; data from the host ends the skipping at the next connection event. It is also held off, so that every
   connection event is listened to: during the first second of a link, for 200 ms or 8 connection events, whichever is
   longer, after any PDU with a payload in either direction other than LE Ping's, and while the host asks for it with
-  `Link::hold_latency`. LE Ping is followed by nothing but its response, so a ping of either side on a resting link
-  costs one listened event, not 200 ms of them (about 14 events at 15 ms, 28 at 7.5 ms, every 22.5 s).
+  `Link::hold_latency`. LE Ping is followed by nothing but its response, so on a resting link our ping costs one
+  listened event besides the one it rides on (the response), and the central's two (our response, and its
+  acknowledgement, which the link layer waits for as for any PDU of ours), not 200 ms of them (about 14 events at
+  15 ms, 28 at 7.5 ms, every 22.5 s).
   Linux reconnects with the latency it stored from the very first event, so without the hold each ATT round trip of a
   reconnection could wait up to the whole latency. After an event in which it heard nothing from the central (no
   packet with a valid CRC), the link layer listens at every following event until it hears it again, and the latency

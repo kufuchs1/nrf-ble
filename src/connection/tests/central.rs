@@ -639,28 +639,29 @@ fn resting(latency: u16, timeout: u16) -> Sim {
 impl Sim {
     /// Runs `events` connection events as the run loop does, one at a time:
     /// the procedures at the loop top, then the event skipped while the
-    /// latency allows, or listened at. Returns the events listened at.
-    fn rest(&mut self, events: u32) -> u32 {
-        let start = self.time;
-        let mut heard = 0;
-        for event in 0..events {
-            self.time = start.wrapping_add(event * self.link.interval);
+    /// latency allows, or listened at. Returns whether each was listened
+    /// at; the next call goes on with the event after the last.
+    fn rest(&mut self, events: u32) -> Vec<bool> {
+        let mut trace = Vec::new();
+        for _ in 0..events {
             if self.link.hold_until.is_some_and(|until| reached(self.time, until)) {
                 self.link.hold_until = None;
             }
             self.link.start_procedures(self.time, &self.shared);
             assert_eq!(self.link.abort, None);
             self.link.apply_instants(&self.shared);
-            if self.link.skips(self.time, &self.shared) {
+            let skips = self.link.skips(self.time, &self.shared);
+            if skips {
                 self.link.skip_to(self.link.counter.wrapping_add(1), &self.shared);
-                continue;
+            } else {
+                let before = self.link.listening();
+                self.event();
+                self.link.listened(before);
             }
-            let before = self.link.listening();
-            self.event();
-            self.link.listened(before);
-            heard += 1;
+            trace.push(!skips);
+            self.time = self.time.wrapping_add(self.link.interval);
         }
-        heard
+        trace
     }
 
     /// How often the central received `pdu` from us.
@@ -673,44 +674,63 @@ impl Sim {
     }
 }
 
+/// The distances between the events listened at in `trace`, in events.
+fn gaps(trace: &[bool]) -> Vec<usize> {
+    let at: Vec<usize> = trace.iter().enumerate().filter_map(|(event, &listened)| listened.then_some(event)).collect();
+    at.windows(2).map(|pair| pair[1] - pair[0]).collect()
+}
+
+/// Checks that a resting link with the latency 30 listened at every 31st
+/// event, as it must, and besides only at `extra` events right after one
+/// listened at: what LE Ping costs.
+fn assert_latency_kept(trace: &[bool], extra: usize) {
+    let gaps = gaps(trace);
+    assert!(gaps.iter().all(|&gap| gap == 31 || gap == 1), "a run of skipped events broken: {gaps:?}");
+    assert_eq!(gaps.iter().filter(|&&gap| gap == 1).count(), extra, "{gaps:?}");
+}
+
 #[test]
-fn le_ping_on_a_resting_link_costs_one_event_and_keeps_the_latency() {
+fn le_ping_on_a_resting_link_keeps_the_latency() {
     // 60 s at 15 ms and a latency of 30, as a keyboard: two pings at the
     // default timeout of 30 s.
     let events = 4000;
     let mut quiet = resting(30, 3000);
     quiet.link.payload_timer = None;
-    let base = quiet.rest(events);
+    assert_latency_kept(&quiet.rest(events), 0);
+    // Our ping rides on an event listened at anyway; only the event after
+    // it, which brings the response, is listened at besides. Holding the
+    // latency off for 200 ms after each PDU cost 13 more per ping.
     let mut pinged = resting(30, 3000);
-    let heard = pinged.rest(events);
+    let trace = pinged.rest(events);
     assert_eq!(pinged.sent(&[OP_PING_REQ]), 2);
     assert!(!pinged.timed_out());
-    // The ping rides on an event listened at anyway; the event after it
-    // brings the response.
-    assert!(heard <= base + 2, "{heard} events listened at with LE Ping, {base} without");
+    assert_latency_kept(&trace, 2);
 
-    // The central's ping is answered at the next event, and the latency
-    // goes on after it.
+    // The central's ping: our response goes out at the next event and its
+    // acknowledgement comes at the one after, as for any PDU of ours; then
+    // the latency goes on.
     let mut answered = resting(30, 3000);
     answered.link.payload_timer = None;
-    answered.rest(100);
+    let mut trace = answered.rest(100);
     answered.central.outbox.push_back((Llid::Control, vec![OP_PING_REQ]));
-    let heard = answered.rest(events - 100);
+    trace.extend(answered.rest(events - 100));
     assert_eq!(answered.sent(&[OP_PING_RSP]), 1);
-    let mut quiet = resting(30, 3000);
-    quiet.link.payload_timer = None;
-    quiet.rest(100);
-    let base = quiet.rest(events - 100);
-    assert!(heard <= base + 1, "{heard} events listened at with the central's ping, {base} without");
+    assert_latency_kept(&trace, 2);
 }
 
 #[test]
-fn the_shortest_authenticated_payload_timeout_never_runs_out() {
-    // 470 ms, just over the interval times one plus the latency, which the
-    // specification allows as the shortest: the ping cannot wait for an
-    // event listened at anyway.
-    let mut sim = resting(30, 47);
-    sim.rest(2000);
-    assert!(sim.sent(&[OP_PING_REQ]) >= 60);
-    assert!(!sim.timed_out());
+fn the_authenticated_payload_timeout_never_runs_out_on_a_resting_link() {
+    // At 15 ms. 470 ms with the latency 30 is just over the interval times
+    // one plus the latency, the shortest the specification allows: the ping
+    // cannot wait for an event listened at anyway. From 3.72 s on, the
+    // latest time for the ping lies after three quarters of the timeout:
+    // with 3.8 and 4 s it may lie before the next event listened at anyway.
+    for (latency, timeout, pings) in
+        [(30, 47, 60), (60, 92, 30), (0, 10, 300), (4, 8, 300), (30, 380, 5), (30, 400, 5), (60, 400, 5), (30, 3000, 1)]
+    {
+        let mut sim = resting(latency, timeout);
+        sim.rest(2000);
+        assert!(sim.sent(&[OP_PING_REQ]) >= pings, "latency {latency}, timeout {timeout}");
+        assert!(!sim.timed_out(), "latency {latency}, timeout {timeout}");
+    }
 }
