@@ -14,13 +14,42 @@
 //! rejects it; any other response, and any command with identifier 0 or a
 //! length field that does not match the PDU, is dropped, as Linux drops them.
 //! The LE signalling channel carries one command per PDU.
+//!
+//! With the feature `eatt`, the commands of the credit based channels go to
+//! `host::ecfc` (`Action::Ecfc`): the Credit Based Connection and
+//! Reconfigure Requests, the Flow Control Credit Indication, a Disconnection
+//! Request whose destination is one of our bearers' CIDs, a Disconnection
+//! Response, and a Command Reject other than of our pending parameter request,
+//! which may reject one of our Disconnection Requests. The identifiers of all
+//! our requests then come from one counter (`Signalling::next_identifier`),
+//! and the parameter request's own is kept, so that only its response matches
+//! it.
 
+#[cfg(feature = "eatt")] use crate::host::ecfc;
 use crate::{link::ParamRange, pdu::concat_into};
 
 /// Code of a Command Reject.
 pub const COMMAND_REJECT: u8 = 0x01;
 /// Code of a Disconnection Request.
 pub const DISCONNECTION_REQUEST: u8 = 0x06;
+/// Code of a Disconnection Response.
+#[cfg(feature = "eatt")]
+pub const DISCONNECTION_RESPONSE: u8 = 0x07;
+/// Code of a Flow Control Credit Indication.
+#[cfg(feature = "eatt")]
+pub const FLOW_CONTROL_CREDIT_IND: u8 = 0x16;
+/// Code of a Credit Based Connection Request.
+#[cfg(feature = "eatt")]
+pub const CREDIT_BASED_CONNECTION_REQUEST: u8 = 0x17;
+/// Code of a Credit Based Connection Response.
+#[cfg(feature = "eatt")]
+pub const CREDIT_BASED_CONNECTION_RESPONSE: u8 = 0x18;
+/// Code of a Credit Based Reconfigure Request.
+#[cfg(feature = "eatt")]
+pub const CREDIT_BASED_RECONFIGURE_REQUEST: u8 = 0x19;
+/// Code of a Credit Based Reconfigure Response.
+#[cfg(feature = "eatt")]
+pub const CREDIT_BASED_RECONFIGURE_RESPONSE: u8 = 0x1A;
 /// Code of a Connection Parameter Update Request.
 pub const CONNECTION_PARAMETER_UPDATE_REQUEST: u8 = 0x12;
 /// Code of a Connection Parameter Update Response.
@@ -30,7 +59,7 @@ pub const REJECT_NOT_UNDERSTOOD: u16 = 0x0000;
 /// Command Reject reason: invalid CID in the request.
 pub const REJECT_INVALID_CID: u16 = 0x0002;
 /// Length of a command header: code, identifier and data length.
-const HEADER_LEN: usize = 4;
+pub const HEADER_LEN: usize = 4;
 /// Codes of the responses of the signalling channels: Command Reject,
 /// Connection, Configuration, Disconnection, Echo and Information Response,
 /// Connection Parameter Update Response, LE Credit Based Connection
@@ -43,6 +72,15 @@ const COMMAND_MAX: usize = HEADER_LEN.strict_add(8);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Action {
+    /// A command of the credit based channels, for
+    /// [`crate::host::ecfc::Ecfc::command`] with the data after the header.
+    #[cfg(feature = "eatt")]
+    Ecfc {
+        /// The command's code.
+        code:       u8,
+        /// The command's identifier.
+        identifier: u8,
+    },
     /// The outcome of our Connection Parameter Update Request.
     Outcome(Outcome),
     /// Send this command in answer.
@@ -75,6 +113,9 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Signalling {
+    /// The identifier of our last Connection Parameter Update Request.
+    #[cfg(feature = "eatt")]
+    asked:      u8,
     /// The identifier of the last request sent.
     identifier: u8,
     /// Whether our request waits for its response.
@@ -96,23 +137,90 @@ impl Command {
         Self { data, len: HEADER_LEN.saturating_add(len).saturating_cast() }
     }
 
+    /// A Credit Based Reconfigure Response to the request with `identifier`,
+    /// with `result`.
+    #[cfg(feature = "eatt")]
+    #[inline]
+    #[must_use = "the command is only built"]
+    pub fn reconfigure_response(identifier: u8, result: u16) -> Self {
+        Self::new(CREDIT_BASED_RECONFIGURE_RESPONSE, identifier, &[&result.to_le_bytes()])
+    }
+
     /// A Command Reject of the request with `identifier` for `reason`, with
     /// `data`.
     fn reject(identifier: u8, reason: u16, data: &[u8]) -> Self {
         Self::new(COMMAND_REJECT, identifier, &[&reason.to_le_bytes(), data])
     }
+
+    /// A Command Reject, invalid CID, of the Disconnection Request with
+    /// `identifier` for the channel of `dcid` and `scid`.
+    #[cfg(feature = "eatt")]
+    #[inline]
+    #[must_use = "the command is only built"]
+    pub fn reject_cid(identifier: u8, dcid: u16, scid: u16) -> Self {
+        let [dcid0, dcid1] = dcid.to_le_bytes();
+        let [scid0, scid1] = scid.to_le_bytes();
+        Self::reject(identifier, REJECT_INVALID_CID, &[dcid0, dcid1, scid0, scid1])
+    }
 }
 
 impl Signalling {
+    /// The identifier of our last Connection Parameter Update Request.
+    #[cfg(feature = "eatt")]
+    const fn asked(self) -> u8 { self.asked }
+
+    /// The identifier of our last Connection Parameter Update Request: that
+    /// of our last request.
+    #[cfg(not(feature = "eatt"))]
+    const fn asked(self) -> u8 { self.identifier }
+
     /// Gives up waiting for the response to our request, as after its 30 s
     /// timeout; a late response is then dropped.
     #[inline]
     pub const fn cancel(&mut self) { self.pending = false; }
 
+    /// Whether the command with `code`, `identifier` and `data` is one of
+    /// the credit based channels.
+    #[cfg(feature = "eatt")]
+    const fn is_ecfc(self, code: u8, identifier: u8, data: &[u8]) -> bool {
+        match (code, data) {
+            (
+                DISCONNECTION_RESPONSE
+                | FLOW_CONTROL_CREDIT_IND
+                | CREDIT_BASED_CONNECTION_REQUEST
+                | CREDIT_BASED_RECONFIGURE_REQUEST,
+                _,
+            ) => true,
+            (DISCONNECTION_REQUEST, &[dcid0, dcid1, _, _]) => {
+                ecfc::bearer(u16::from_le_bytes([dcid0, dcid1])).is_some()
+            },
+            (COMMAND_REJECT, _) => !self.pending || identifier != self.asked(),
+            _ => false,
+        }
+    }
+
     /// A link without signalling so far.
     #[inline]
     #[must_use = "the channel is only built"]
-    pub const fn new() -> Self { Self { identifier: 0, pending: false } }
+    pub const fn new() -> Self {
+        Self {
+            #[cfg(feature = "eatt")]
+            asked: 0,
+            identifier: 0,
+            pending: false,
+        }
+    }
+
+    /// The identifier for our next command of the credit based channels, a
+    /// Disconnection Request or a Flow Control Credit Indication: one more
+    /// than the last of any request, from 1 to 255, as 0 is never valid.
+    #[cfg(feature = "eatt")]
+    #[inline]
+    #[must_use = "the identifier is to be sent"]
+    pub const fn next_identifier(&mut self) -> u8 {
+        self.identifier = self.identifier.checked_add(1).unwrap_or(1);
+        self.identifier
+    }
 
     /// Whether our request waits for its response.
     #[inline]
@@ -127,6 +235,10 @@ impl Signalling {
         let (&[code, identifier, len0, len1], data) = pdu.split_first_chunk::<HEADER_LEN>()?;
         if identifier == 0 || usize::from(u16::from_le_bytes([len0, len1])) != data.len() {
             return None;
+        }
+        #[cfg(feature = "eatt")]
+        if self.is_ecfc(code, identifier, data) {
+            return Some(Action::Ecfc { code, identifier });
         }
         if RESPONSES.contains(&code) {
             return self.response(code, identifier, data).map(Action::Outcome);
@@ -151,7 +263,16 @@ impl Signalling {
         // Identifiers run from 1 to 255: 0 is never valid.
         self.identifier = self.identifier.checked_add(1).unwrap_or(1);
         self.pending = true;
-        Some(Command::new(CONNECTION_PARAMETER_UPDATE_REQUEST, self.identifier, &[
+        // With `eatt` our Disconnection Requests advance the identifier too,
+        // so the request's own is kept for its response.
+        #[cfg(feature = "eatt")]
+        let identifier = {
+            self.asked = self.identifier;
+            self.asked
+        };
+        #[cfg(not(feature = "eatt"))]
+        let identifier = self.identifier;
+        Some(Command::new(CONNECTION_PARAMETER_UPDATE_REQUEST, identifier, &[
             &range.interval_min.to_le_bytes(),
             &range.interval_max.to_le_bytes(),
             &range.latency.to_le_bytes(),
@@ -161,7 +282,7 @@ impl Signalling {
 
     /// The outcome a response gives our request, if it answers it.
     const fn response(&mut self, code: u8, identifier: u8, data: &[u8]) -> Option<Outcome> {
-        if !self.pending || identifier != self.identifier {
+        if !self.pending || identifier != self.asked() {
             return None;
         }
         let outcome = match (code, data) {

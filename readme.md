@@ -171,22 +171,24 @@ release build keeps its size to the byte):
   (keyboard) and 512 B (presenter) of flash with extended advertising, 252 B, 452 B and 320 B with legacy advertising.
   `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Not yet tried on hardware.
 - **`eatt`** (implies `att-mtu`): Enhanced ATT as responder, being built in steps. So far it adds the GATT server's
-  part, on the fixed channel; the L2CAP credit based channels that carry the enhanced bearers are still to come, so no
-  enhanced bearer opens yet, though the Server Supported Features already say EATT. The table declares the Client
-  Supported Features (0x2B29, read and write) and the Server Supported Features (0x2B3A, read) in its GATT service,
-  each without encryption, with `gatt::Value::ClientFeatures` and `gatt::Value::ServerFeatures`; `Host::new` refuses a
-  table without them, and a table that declares them without the feature does not build. A firmware lists them under
-  `#[cfg(feature = "eatt")]` (the `gatt!` macro takes one `#[cfg]` on a `char` without descriptors), which changes the
-  table's hash, so BlueZ discovers it again once. The client's features (bits 0 to 2 of the octet it writes) are kept
-  for the link and in the bond, flags bits 5 to 7: a client may add bits but never clear one (Value Not Allowed,
-  0x13), a reconnection adds the bond's bits to those written before the encryption, and only a change makes a
-  `ConnEvent::BondUpdated`, so BlueZ's write on every connection costs no flash write. The server serves Read Multiple
-  Variable Length (0x20), Prepare and Execute Write for one value of up to 22 octets (`att::PREPARE_MAX`; anything else
-  gets Prepare Queue Full, 0x09), and `Conn::notify_multiple` sends a Multiple Handle Value Notification (0x23) of two
-  values or more in one PDU of 23 octets to a client that set bit 2 of its features (`NotifyError::Unsupported`
-  otherwise). Robust Caching (bit 0) is stored, not acted on: the server never answers Database Out Of Sync (0x12).
-  That is enough for a table without Service Changed; a table with both Service Changed and the Database Hash would
-  have to serve Robust Caching (GATT 2.5.2.1), which the host does not do.
+  part, on the fixed channel, and the L2CAP credit based channels that are to carry the enhanced bearers (`host::ecfc`:
+  the connection requests and their answers, credits, SDUs in K-frames, reconfiguration and disconnection), which the
+  engine does not use yet, so no enhanced bearer opens, though the Server Supported Features already say EATT. A link
+  has 1 enhanced bearer, or up to 2 to 5 with `eatt-bearers-2` to `eatt-bearers-5` (`ecfc::BEARERS`, the highest one
+  enabled). The table declares the Client Supported Features (0x2B29, read and write) and the Server Supported Features
+  (0x2B3A, read) in its GATT service, each without encryption, with `gatt::Value::ClientFeatures` and
+  `gatt::Value::ServerFeatures`; `Host::new` refuses a table without them, and a table that declares them without the
+  feature does not build. A firmware lists them under `#[cfg(feature = "eatt")]` (the `gatt!` macro takes one `#[cfg]`
+  on a `char` without descriptors), which changes the table's hash, so BlueZ discovers it again once. The client's
+  features (bits 0 to 2 of the octet it writes) are kept for the link and in the bond, flags bits 5 to 7: a client may
+  add bits but never clear one (Value Not Allowed, 0x13), a reconnection adds the bond's bits to those written before
+  the encryption, and only a change makes a `ConnEvent::BondUpdated`, so BlueZ's write on every connection costs no
+  flash write. The server serves Read Multiple Variable Length (0x20), Prepare and Execute Write for one value of up to
+  22 octets (`att::PREPARE_MAX`; anything else gets Prepare Queue Full, 0x09), and `Conn::notify_multiple` sends a
+  Multiple Handle Value Notification (0x23) of two values or more in one PDU of 23 octets to a client that set bit 2 of
+  its features (`NotifyError::Unsupported` otherwise). Robust Caching (bit 0) is stored, not acted on: the server never
+  answers Database Out Of Sync (0x12). That is enough for a table without Service Changed; a table with both Service
+  Changed and the Database Hash would have to serve Robust Caching (GATT 2.5.2.1), which the host does not do.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
@@ -861,7 +863,7 @@ target again, so `cargo test` runs on the PC.
 cargo test                                         # host tests, also with --features data-length, event-timing,
                                                    # directed-advertising, param-requests,key-missing,passkey,
                                                    # extended-advertising (with and without directed-advertising),
-                                                   # att-mtu, eatt
+                                                   # att-mtu, eatt, eatt-bearers-5
 cargo test --no-default-features --features nrf51  # host tests for the nRF51
 cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt and data-length
 cargo clippy --target thumbv6m-none-eabi --no-default-features --features nrf51   # also with defmt

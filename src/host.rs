@@ -352,6 +352,9 @@ pub mod adv;
 pub mod att;
 /// The bond with the one central and its stored form.
 pub mod bond;
+/// The credit based channels that carry Enhanced ATT.
+#[cfg(feature = "eatt")]
+pub mod ecfc;
 /// The protocol engine, without input or output of its own.
 pub mod engine;
 /// The GATT server's attribute table.

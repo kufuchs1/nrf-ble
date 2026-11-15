@@ -1109,8 +1109,16 @@ impl Engine {
                         }
                     }
                 },
+                // The credit based channels are not wired yet: their
+                // commands are dropped.
+                #[cfg(feature = "eatt")]
+                Some(Action::Ecfc { code: _, identifier: _ }) | None => {},
+                #[cfg(not(feature = "eatt"))]
                 None => {},
             },
+            // No enhanced bearer opens yet.
+            #[cfg(feature = "eatt")]
+            Channel::Eatt(_) => {},
         }
         wipe(&mut buffer);
     }
