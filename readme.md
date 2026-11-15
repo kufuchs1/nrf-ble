@@ -184,7 +184,9 @@ release build keeps its size to the byte):
   Variable Length (0x20), Prepare and Execute Write for one value of up to 22 octets (`att::PREPARE_MAX`; anything else
   gets Prepare Queue Full, 0x09), and `Conn::notify_multiple` sends a Multiple Handle Value Notification (0x23) of two
   values or more in one PDU of 23 octets to a client that set bit 2 of its features (`NotifyError::Unsupported`
-  otherwise). Robust Caching (bit 0) is stored, not acted on: a table without Service Changed needs nothing more.
+  otherwise). Robust Caching (bit 0) is stored, not acted on: the server never answers Database Out Of Sync (0x12).
+  That is enough for a table without Service Changed; a table with both Service Changed and the Database Hash would
+  have to serve Robust Caching (GATT 2.5.2.1), which the host does not do.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride

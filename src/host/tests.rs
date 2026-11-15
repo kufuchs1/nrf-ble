@@ -2061,6 +2061,44 @@ fn several_values_go_out_in_one_multiple_notification() {
     assert_eq!(multiplications.get(), 0);
 }
 
+/// With `eatt` an Execute Write that leaves every input report's
+/// configuration written counts as the Write Request that does: discovery is
+/// over 100 ms after the central has its response.
+#[cfg(feature = "eatt")]
+#[test]
+fn an_execute_write_of_the_last_input_configuration_ends_discovery() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    for characteristic in [example::KEYBOARD, example::CONSUMER] {
+        assert_eq!(request(link, &mut tasks, &enable(characteristic)), [0x13]);
+    }
+    // The mouse's configuration as a long write in two parts.
+    let [handle0, handle1] = (example::MOUSE.handle() + 1).to_le_bytes();
+    for (offset, part) in [(0x00, 0x01), (0x01, 0x00)] {
+        let prepare = [0x16, handle0, handle1, offset, 0x00, part];
+        let mut response = prepare.to_vec();
+        response[0] = 0x17;
+        assert_eq!(request(link, &mut tasks, &prepare), response);
+    }
+    link.send(CID_ATT, &[0x18, 0x01], true);
+    tasks.step();
+    assert_eq!(link.transmit().len(), 1);
+    let ConnEvent::BondUpdated(updated) = next!(conn) else { panic!("no update") };
+    assert_eq!(updated.cccd, 0b0101_0101);
+    // The latency goes once the central has the Execute Write Response and
+    // ATT has been idle for 100 ms, not after the fallback of 1 s.
+    link.advance(200);
+    tasks.step();
+    assert!(link.calls().is_empty());
+    link.ack();
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Hold(false)]);
+    assert_eq!(next!(conn), ConnEvent::Ready);
+    assert_eq!(multiplications.get(), 0);
+}
+
 #[test]
 fn signalling_requests_get_a_command_reject() {
     let host = host(Unclaimed::Keep);

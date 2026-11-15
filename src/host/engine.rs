@@ -38,12 +38,13 @@
 //!   over, then reports [`ConnEvent::Ready`] and lets the latency go. Linux
 //!   reconnects with the latency it stored, and every ATT round trip would
 //!   otherwise wait for it. Discovery is over on an encrypted link once the
-//!   central acknowledged our Write Response to the write that left every input
-//!   report's client characteristic configuration written on this link, and ATT
-//!   has been idle for [`INPUTS_IDLE`] since: `BlueZ` creates its input device
-//!   only once it received that response, and drops the reports before it.
-//!   Without such a write, as with a table without input reports, ATT is to be
-//!   idle for [`READY_IDLE`] on the encrypted link.
+//!   central acknowledged our Write Response (with the feature `eatt`, or
+//!   Execute Write Response) to the write that left every input report's client
+//!   characteristic configuration written on this link, and ATT has been idle
+//!   for [`INPUTS_IDLE`] since: `BlueZ` creates its input device only once it
+//!   received that response, and drops the reports before it. Without such a
+//!   write, as with a table without input reports, ATT is to be idle for
+//!   [`READY_IDLE`] on the encrypted link.
 //! - Once ATT has been idle for [`PARAMS_IDLE`], it asks for the connection
 //!   parameters of its [`Config`] with the L2CAP request, once per link and
 //!   only if the link has others: the same constant as the Peripheral Preferred
@@ -118,7 +119,7 @@ use crate::host::PasskeyError;
 #[cfg(feature = "param-requests")]
 use crate::host::RequestError;
 #[cfg(feature = "eatt")]
-use crate::host::att::EXECUTE_WRITE_REQUEST;
+use crate::host::att::{EXECUTE_WRITE_REQUEST, EXECUTE_WRITE_RESPONSE};
 use crate::{
     crypto::wipe,
     host::{
@@ -531,8 +532,16 @@ impl Engine {
         if let Some(len) = self.att.handle(pdu, level, app, &mut out) {
             if self.response.is_none() {
                 self.response = Some(Slot { bytes: out, len: len.saturating_cast() });
-                if pdu.first() == Some(&WRITE_REQUEST)
-                    && out.first() == Some(&WRITE_RESPONSE)
+                #[cfg(not(feature = "eatt"))]
+                let written = pdu.first() == Some(&WRITE_REQUEST) && out.first() == Some(&WRITE_RESPONSE);
+                // An Execute Write Response answers a write too.
+                #[cfg(feature = "eatt")]
+                let written = matches!(
+                    (pdu.first(), out.first()),
+                    (Some(&WRITE_REQUEST), Some(&WRITE_RESPONSE))
+                        | (Some(&EXECUTE_WRITE_REQUEST), Some(&EXECUTE_WRITE_RESPONSE))
+                );
+                if written
                     && self.inputs_written()
                     && let Some(answering) = self.link.as_mut()
                     && answering.inputs == Inputs::Open
