@@ -1,11 +1,16 @@
 //! Tests of the attribute server: the whole `BlueZ` first connection as golden
 //! PDUs against the example table, and the error cases.
+//!
+//! The example table gains the Client and Server Supported Features with the
+//! feature `eatt`, which moves its later handles; these tests run on its
+//! layout without them ([`DB`]), so that their PDUs hold in every build, and
+//! test the requests of `eatt` on a table of their own.
 
 extern crate alloc;
 
 use super::*;
 use crate::host::{
-    example::{self, BATTERY_LEVEL_VALUE, DB, PARAMS, REPORT_MAP},
+    example::{self, BATTERY_LEVEL_VALUE, PARAMS, REPORT_MAP},
     gatt::{Value, ValueId, ppcp},
 };
 use alloc::vec::Vec;
@@ -51,6 +56,69 @@ impl Handler for App {
     }
 }
 
+crate::gatt! {
+    /// The example table without the Client and Server Supported Features:
+    /// [`example::DB`] in a build without the feature `eatt`.
+    const DB;
+    service 0x1800 {
+        char 0x2A00 [read] = Value::Const(example::NAME);
+        char 0x2A01 [read] = Value::Const(&example::APPEARANCE);
+        char 0x2A04 [read] = Value::Const(&ppcp(PARAMS));
+    }
+    service 0x1801 {
+        char 0x2B2A [read] = Value::Hash;
+    }
+    service 0x180F {
+        /// The Battery Level.
+        char BATTERY_LEVEL: 0x2A19 [read, notify] = Value::Dynamic(BATTERY_LEVEL_VALUE);
+        ccc;
+    }
+    service 0x180A {
+        char 0x2A50 [read] = Value::Const(&example::PNP_ID);
+    }
+    service 0x1812 {
+        char 0x2A4A [read] = Value::Const(&example::HID_INFORMATION);
+        char 0x2A4B [read] = Value::Const(&REPORT_MAP);
+        char 0x2A4C [write_without_response] = Value::Sink;
+        /// The keyboard input report.
+        char KEYBOARD: 0x2A4D [read, notify; encrypted] = Value::Zeros(example::KEYBOARD_REPORT_LEN);
+        ccc;
+        desc 0x2908 [read] = Value::Const(&[example::KEYBOARD_REPORT_ID, example::INPUT_REPORT]);
+        /// The consumer control input report.
+        char CONSUMER: 0x2A4D [read, notify; encrypted] = Value::Zeros(example::CONSUMER_REPORT_LEN);
+        ccc;
+        desc 0x2908 [read] = Value::Const(&[example::CONSUMER_REPORT_ID, example::INPUT_REPORT]);
+        /// The mouse input report.
+        char MOUSE: 0x2A4D [read, notify; encrypted] = Value::Zeros(example::MOUSE_REPORT_LEN);
+        ccc;
+        desc 0x2908 [read] = Value::Const(&[example::MOUSE_REPORT_ID, example::INPUT_REPORT]);
+    }
+}
+
+#[test]
+fn the_table_is_the_example_s_without_the_features() {
+    let full = example::DB.attrs();
+    let shift = usize::from(example::EATT_SHIFT);
+    assert_eq!(DB.attrs().len() + shift, full.len());
+    // The same attributes, but for the four after the Database Hash, handle
+    // 10.
+    for (index, attr) in DB.attrs().iter().enumerate() {
+        let other = &full[if index < 10 { index } else { index + shift }];
+        assert_eq!((attr.kind(), attr.uuid(), attr.value_source()), (other.kind(), other.uuid(), other.value_source()));
+    }
+    assert_eq!(
+        (BATTERY_LEVEL.handle() + example::EATT_SHIFT, BATTERY_LEVEL.cccd()),
+        (example::BATTERY_LEVEL.handle(), example::BATTERY_LEVEL.cccd())
+    );
+    for (ours, theirs) in [(KEYBOARD, example::KEYBOARD), (CONSUMER, example::CONSUMER), (MOUSE, example::MOUSE)] {
+        assert_eq!(ours.handle() + example::EATT_SHIFT, theirs.handle());
+        assert_eq!((ours.cccd(), ours.props(), ours.sec()), (theirs.cccd(), theirs.props(), theirs.sec()));
+    }
+    if !cfg!(feature = "eatt") {
+        assert_eq!(DB.hash(), example::DB.hash());
+    }
+}
+
 /// An octet a slot holds where no response was written.
 const UNWRITTEN: u8 = 0xA5;
 
@@ -72,6 +140,15 @@ fn exchange(server: &mut Server, app: &App, request: &[u8], level: Sec) -> Optio
     assert_eq!(twin.is_indicating(), server.is_indicating(), "request {request:02X?}");
     #[cfg(feature = "att-mtu")]
     assert_eq!(twin.mtu, server.mtu, "request {request:02X?}");
+    #[cfg(feature = "eatt")]
+    {
+        assert_eq!(twin.client_features, server.client_features, "request {request:02X?}");
+        assert_eq!(
+            (twin.prepared.handle, twin.prepared.offset, twin.prepared.value()),
+            (server.prepared.handle, server.prepared.offset, server.prepared.value()),
+            "request {request:02X?}"
+        );
+    }
     let len = len?;
     assert_eq!(long[..len], out[..len], "request {request:02X?}");
     Some(out[..len].to_vec())
@@ -242,13 +319,13 @@ fn the_bluez_first_connection_gets_these_answers() {
     // Every input report and the battery now notify.
     let mut out = [0_u8; MTU];
     let report = [0, 0, 0x4B, 0, 0, 0, 0, 0];
-    let len = s.notify(example::KEYBOARD, &report, Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(KEYBOARD, &report, Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &*<[&[u8]]>::concat(&[&[0x1B, 0x1A, 0x00], &report]));
-    let len = s.notify(example::CONSUMER, &[0xE9, 0x00], Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(CONSUMER, &[0xE9, 0x00], Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &[0x1B, 0x1E, 0x00, 0xE9, 0x00]);
-    let len = s.notify(example::MOUSE, &[0, 1, 0, 0xFF, 0xFF], Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(MOUSE, &[0, 1, 0, 0xFF, 0xFF], Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &[0x1B, 0x22, 0x00, 0, 1, 0, 0xFF, 0xFF]);
-    let len = s.notify(example::BATTERY_LEVEL, &[89], Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(BATTERY_LEVEL, &[89], Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &[0x1B, 0x0D, 0x00, 89]);
     assert_eq!(s.subscriptions().bits(), 0b0101_0101);
     assert_eq!(BATTERY_LEVEL_VALUE.index(), 0);
@@ -358,10 +435,10 @@ fn the_bluez_first_connection_at_mtu_65_gets_these_answers() {
     // Notifications still carry at most 20 octets.
     let mut out = [0_u8; MTU];
     let report = [0, 0, 0x4B, 0, 0, 0, 0, 0];
-    let len = s.notify(example::KEYBOARD, &report, Sec::Encrypted, &mut out).unwrap();
+    let len = s.notify(KEYBOARD, &report, Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &*<[&[u8]]>::concat(&[&[0x1B, 0x1A, 0x00], &report]));
-    assert!(s.notify(example::KEYBOARD, &[0; 20], Sec::Encrypted, &mut out).is_ok());
-    assert_eq!(s.notify(example::KEYBOARD, &[0; 21], Sec::Encrypted, &mut out), Err(NotifyError::TooLong));
+    assert!(s.notify(KEYBOARD, &[0; 20], Sec::Encrypted, &mut out).is_ok());
+    assert_eq!(s.notify(KEYBOARD, &[0; 21], Sec::Encrypted, &mut out), Err(NotifyError::TooLong));
 }
 
 /// With `att-mtu`, Exchange MTU always answers 65, and the fixed channel's
@@ -506,8 +583,8 @@ fn an_unencrypted_request_for_a_report_gets_insufficient_encryption() {
     // A notification needs the encryption too.
     let mut out = [0_u8; MTU];
     server.restore(crate::host::gatt::Subscriptions::from_bits(0b0101_0101));
-    assert_eq!(server.notify(example::KEYBOARD, &[0; 8], Sec::Open, &mut out), Err(NotifyError::Insecure));
-    assert!(server.notify(example::BATTERY_LEVEL, &[1], Sec::Open, &mut out).is_ok());
+    assert_eq!(server.notify(KEYBOARD, &[0; 8], Sec::Open, &mut out), Err(NotifyError::Insecure));
+    assert!(server.notify(BATTERY_LEVEL, &[1], Sec::Open, &mut out).is_ok());
 }
 
 #[test]
@@ -589,15 +666,13 @@ fn read_blob_at_mtu_65_gives_up_to_64_octets() {
 fn requests_the_server_does_not_serve_get_request_not_supported() {
     let app = App::new();
     let mut server = Server::new(&DB);
-    // Prepare Write, Execute Write, Read Multiple, Read Multiple Variable
-    // and an unknown request.
-    for request in [
-        &[0x16, 0x16, 0x00, 0x00, 0x00, 0x01][..],
-        &[0x18, 0x01],
-        &[0x0E, 0x03, 0x00, 0x05, 0x00],
-        &[0x20, 0x03, 0x00, 0x05, 0x00],
-        &[0x3F],
-    ] {
+    // Read Multiple and an unknown request; without `eatt`, Prepare Write,
+    // Execute Write and Read Multiple Variable too.
+    let mut requests = Vec::from([&[0x0E, 0x03, 0x00, 0x05, 0x00][..], &[0x3F]]);
+    if !cfg!(feature = "eatt") {
+        requests.extend([&[0x16, 0x16, 0x00, 0x00, 0x00, 0x01][..], &[0x18, 0x01], &[0x20, 0x03, 0x00, 0x05, 0x00]]);
+    }
+    for request in requests {
         let response = exchange(&mut server, &app, request, Sec::Encrypted).unwrap();
         assert_eq!(*response, [0x01, request[0], 0x00, 0x00, 0x06]);
     }
@@ -714,13 +789,13 @@ fn notifications_need_a_subscription_and_fit_the_mtu() {
     let app = App::new();
     let mut server = Server::new(&DB);
     let mut out = [0_u8; MTU];
-    assert_eq!(server.notify(example::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
+    assert_eq!(server.notify(KEYBOARD, &[0; 8], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
     golden(&mut server, &app, &[0x12, 0x1B, 0x00, 0x01, 0x00], &[0x13]);
-    assert!(server.notify(example::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out).is_ok());
-    assert!(server.notify(example::KEYBOARD, &[0; 20], Sec::Encrypted, &mut out).is_ok());
-    assert_eq!(server.notify(example::KEYBOARD, &[0; 21], Sec::Encrypted, &mut out), Err(NotifyError::TooLong));
+    assert!(server.notify(KEYBOARD, &[0; 8], Sec::Encrypted, &mut out).is_ok());
+    assert!(server.notify(KEYBOARD, &[0; 20], Sec::Encrypted, &mut out).is_ok());
+    assert_eq!(server.notify(KEYBOARD, &[0; 21], Sec::Encrypted, &mut out), Err(NotifyError::TooLong));
     // Only notifications were enabled.
-    assert_eq!(server.indicate(example::KEYBOARD, &[0; 8], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
+    assert_eq!(server.indicate(KEYBOARD, &[0; 8], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
     assert_eq!(server.service_changed(Sec::Encrypted, &mut out), None);
 }
 
@@ -892,3 +967,7 @@ fn notify_and_indicate_only_values_keep_their_security() {
     let response = exchange(&mut server, &app, &[0x12, 0x07, 0x00, 0x02, 0x00], Sec::Open).unwrap();
     assert_eq!(*response, [0x01, 0x12, 0x07, 0x00, 0x0F]);
 }
+
+/// The requests and notifications of the feature `eatt`.
+#[cfg(feature = "eatt")]
+mod eatt;

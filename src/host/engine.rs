@@ -68,11 +68,13 @@
 //!   the encryption, which also keeps the link layer's buffers free for the
 //!   pairing's burst. Whatever the bonded central writes later goes into the
 //!   bond, and [`ConnEvent::BondUpdated`] hands it to the application to store
-//!   when it changed. With the feature `directed-advertising`, so does a link
-//!   that arrived right after a directed phase went unanswered, answering the
-//!   undirected advertising after it, once it is encrypted with the bond's key:
-//!   the bond no longer directs ([`Bond::directed_works`],
-//!   `Engine::directed_unanswered`).
+//!   when it changed. With the feature `eatt` the Client Supported Features go
+//!   the same way, except that the bond's are added to those the client wrote
+//!   before the encryption, as a client never clears one. With the feature
+//!   `directed-advertising`, so does a link that arrived right after a directed
+//!   phase went unanswered, answering the undirected advertising after it, once
+//!   it is encrypted with the bond's key: the bond no longer directs
+//!   ([`Bond::directed_works`], `Engine::directed_unanswered`).
 //! - It gives the security manager the identity the advertising was set up with
 //!   ([`Engine::advertise`]), so pairing distributes the identity our
 //!   resolvable private address was made from, and builds the bond from the
@@ -115,6 +117,8 @@
 use crate::host::PasskeyError;
 #[cfg(feature = "param-requests")]
 use crate::host::RequestError;
+#[cfg(feature = "eatt")]
+use crate::host::att::EXECUTE_WRITE_REQUEST;
 use crate::{
     crypto::wipe,
     host::{
@@ -540,7 +544,11 @@ impl Engine {
                 warn!("att: a request before the response to the previous one");
             }
         }
-        if matches!(pdu.first(), Some(&(WRITE_REQUEST | WRITE_COMMAND))) {
+        #[cfg(not(feature = "eatt"))]
+        let write = matches!(pdu.first(), Some(&(WRITE_REQUEST | WRITE_COMMAND)));
+        #[cfg(feature = "eatt")]
+        let write = matches!(pdu.first(), Some(&(WRITE_REQUEST | WRITE_COMMAND | EXECUTE_WRITE_REQUEST)));
+        if write {
             self.update_bond();
         }
     }
@@ -1008,6 +1016,38 @@ impl Engine {
         Segmenter::new(Channel::Att, len).and_then(|segmenter| segmenter.fragment(bytes)).ok_or(NotifyError::TooLong)
     }
 
+    /// The Multiple Handle Value Notification of `values`, each a
+    /// characteristic and its value, on the link `epoch`, as the one fragment
+    /// it fits ([`Server::notify_multiple`]), as [`Self::notification`] gives
+    /// a notification.
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be sent, as for [`Self::notification`]; also
+    /// [`NotifyError::Unsupported`] unless the client set bit 2 of its Client
+    /// Supported Features, or for fewer than two values.
+    #[cfg(feature = "eatt")]
+    #[inline]
+    pub fn notification_multiple(&self, epoch: Epoch, values: &[(Char, &[u8])]) -> Result<Fragment, NotifyError> {
+        let link = self
+            .link
+            .as_ref()
+            .filter(|link| link.info.epoch == epoch && !link.fate.closing && link.ending.is_none())
+            .ok_or(NotifyError::Disconnected)?;
+        let encryption = if link.encrypted { Sec::Encrypted } else { Sec::Open };
+        #[cfg(feature = "passkey")]
+        let level = self.raised(encryption);
+        #[cfg(not(feature = "passkey"))]
+        let level = encryption;
+        let mut out: [u8; MTU] = [0; MTU];
+        let len = self.att.notify_multiple(values, level, &mut out).map_err(NotifyError::from)?;
+        if self.sending.is_some_and(|(_, segmenter)| segmenter.is_mid_pdu()) {
+            return Err(NotifyError::Busy);
+        }
+        let bytes = out.get(..len).ok_or(NotifyError::TooLong)?;
+        Segmenter::new(Channel::Att, len).and_then(|segmenter| segmenter.fragment(bytes)).ok_or(NotifyError::TooLong)
+    }
+
     /// How many fragments of the link may be in flight for a notification to
     /// go out ([`Config::notify_depth`]), at least one.
     #[inline]
@@ -1161,6 +1201,9 @@ impl Engine {
                 // Reported once the central has our identity: see
                 // `take_command`.
                 link.discovery.bonding = true;
+                // The Client Supported Features the client wrote so far.
+                #[cfg(feature = "eatt")]
+                self.update_bond();
             },
             Outcome::Failed { by_central, reason } => {
                 self.events.flags |= EV_PAIRING_FAILED;
@@ -1253,7 +1296,9 @@ impl Engine {
     /// Restores the bond's subscriptions, once the link is encrypted with
     /// the bond's key; with the feature `directed-advertising`, forgets
     /// there that directed advertising works if it went unanswered
-    /// ([`Self::directed_unanswered`]).
+    /// ([`Self::directed_unanswered`]). With the feature `eatt`, adds the
+    /// bond's Client Supported Features to those the client wrote before the
+    /// encryption, and puts the sum into the bond if it is more.
     const fn restore(&mut self) {
         #[cfg(feature = "directed-advertising")]
         self.forget_directed();
@@ -1264,7 +1309,11 @@ impl Engine {
         link.discovery.restored = true;
         if let Some(bond) = self.bond.as_ref() {
             self.att.restore(bond.subscriptions(self.db));
+            #[cfg(feature = "eatt")]
+            self.att.restore_client_features(bond.client_features);
         }
+        #[cfg(feature = "eatt")]
+        self.update_bond();
     }
 
     /// The security of the link `epoch`: encrypted once it is with a key the
@@ -1422,18 +1471,34 @@ impl Engine {
     }
 
     /// Puts the live subscriptions into the bond, if the link is encrypted
-    /// with its key and they changed. A bond not yet reported carries them
-    /// in [`ConnEvent::Bonded`].
+    /// with its key and they changed; with the feature `eatt`, the Client
+    /// Supported Features too, and only once the bond's were restored: the
+    /// live ones are the bond's and the written ones together, so a write
+    /// before that would drop the bond's. A bond not yet reported carries
+    /// them in [`ConnEvent::Bonded`].
     const fn update_bond(&mut self) {
         let Some(link) = self.link.as_ref().filter(const |link| link.key == Some(Key::Bond)) else { return };
+        #[cfg(feature = "eatt")]
+        if !link.discovery.restored {
+            return;
+        }
         let bits = self.att.subscriptions().bits();
-        if let Some(bond) = self.bond.as_mut()
-            && bond.cccd != bits
-        {
+        #[cfg(not(feature = "eatt"))]
+        let changed = self.bond.as_ref().is_some_and(const |bond| bond.cccd != bits);
+        #[cfg(feature = "eatt")]
+        let features = self.att.client_features();
+        #[cfg(feature = "eatt")]
+        let changed =
+            self.bond.as_ref().is_some_and(const |bond| bond.cccd != bits || bond.client_features != features);
+        if changed && let Some(bond) = self.bond.as_mut() {
             bond.cccd = bits;
             if !link.discovery.bonding {
                 self.events.flags |= EV_BOND_UPDATED;
                 self.events.changed = true;
+            }
+            #[cfg(feature = "eatt")]
+            {
+                bond.client_features = features;
             }
         }
     }

@@ -105,6 +105,10 @@ impl Lanes {
             Value::Hash => self.byte(5),
             Value::Sink => self.byte(6),
             Value::Zeros(len) => self.byte(7).byte(len),
+            #[cfg(feature = "eatt")]
+            Value::ClientFeatures => self.byte(8),
+            #[cfg(feature = "eatt")]
+            Value::ServerFeatures => self.byte(9),
         }
     }
 }

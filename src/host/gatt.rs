@@ -13,7 +13,10 @@
 //! application reads and writes through [`Handler`] ([`Value::Dynamic`]),
 //! client characteristic configuration bits ([`Value::Cccd`]), which the host
 //! keeps for each link in [`Subscriptions`] and restores from the bond, or the
-//! table's own hash ([`Value::Hash`]).
+//! table's own hash ([`Value::Hash`]). With the feature `eatt` a value may
+//! also be the client's Client Supported Features, which the host keeps for
+//! each link and in the bond (`Value::ClientFeatures`), or the Server
+//! Supported Features (`Value::ServerFeatures`).
 //!
 //! The Service Changed characteristic (0x2A05) is optional, and a table that
 //! never changes its layout needs none. Where it is present, the server builds
@@ -74,10 +77,39 @@
 //! characteristic configuration descriptor of the characteristic before it,
 //! with that characteristic's security, and `desc` adds another descriptor
 //! with its permissions (`read`, `write`) and security. A UUID is a 16-bit
-//! literal or, in parentheses, an expression of type [`Uuid`]. The table is
-//! checked while it is compiled: every characteristic that notifies or
-//! indicates has exactly one client characteristic configuration descriptor
-//! and no other has one. A table without it does not build:
+//! literal or, in parentheses, an expression of type [`Uuid`].
+//!
+//! A `char` takes documentation, which goes to its constant, and one
+//! `#[cfg(..)]` attribute: the characteristic and its constant are then in
+//! the table only where the condition holds, and the handles after it count
+//! accordingly. Such a characteristic takes no `ccc;` and no `desc`, which
+//! where the condition fails would belong to the characteristic before it;
+//! the macro refuses them. A firmware lists the Client and Server Supported
+//! Features this way, under its own feature that enables nrf-ble's `eatt`:
+//!
+//! ```
+//! # use nrf_ble::host::gatt::Value;
+//! nrf_ble::gatt! {
+//!     const DB;
+//!     service 0x1801 {
+//!         char 0x2B2A [read] = Value::Hash;
+//!         #[cfg(feature = "eatt")]
+//!         char 0x2B29 [read, write] = Value::ClientFeatures;
+//!         #[cfg(feature = "eatt")]
+//!         char 0x2B3A [read] = Value::ServerFeatures;
+//!     }
+//!     service 0x180F {
+//!         char 0x2A19 [read] = Value::Const(&[50]);
+//!     }
+//! }
+//!
+//! assert_eq!(DB.last_handle(), if cfg!(feature = "eatt") { 10 } else { 6 });
+//! ```
+//!
+//! The table is checked while it is compiled: every characteristic that
+//! notifies or indicates has exactly one client characteristic
+//! configuration descriptor and no other has one. A table without it does
+//! not build:
 //!
 //! ```compile_fail
 //! use nrf_ble::host::gatt::Value;
@@ -121,6 +153,123 @@
 //! static HOST: Host<Link<'static>> =
 //!     Host::new(Link::new(&SHARED), &DB, Config::new(None, Unclaimed::Keep));
 //! ```
+//!
+//! The Client (0x2B29) and Server (0x2B3A) Supported Features belong to the
+//! feature `eatt`: each may be declared once, in the GATT service (0x1801),
+//! read and written (the client's) or read (the server's) without
+//! encryption, with `Value::ClientFeatures` and `Value::ServerFeatures`. With
+//! the feature, a host's table must declare both (`Host::new`), as the
+//! specification asks of a server that serves Enhanced ATT; without it,
+//! neither may be declared, as the server would offer what the host does
+//! not serve.
+#![cfg_attr(
+    feature = "eatt",
+    doc = "
+With `eatt`, a host whose table lacks the Server Supported Features does not
+build:
+
+```compile_fail
+use nrf_ble::{
+    host::{
+        Host,
+        engine::{Config, Unclaimed},
+        gatt::Value,
+    },
+    link::{Link, Shared},
+};
+
+nrf_ble::gatt! {
+    const DB;
+    service 0x1801 {
+        char 0x2B2A [read] = Value::Hash;
+        char 0x2B29 [read, write] = Value::ClientFeatures;
+    }
+}
+
+static SHARED: Shared = Shared::new();
+static HOST: Host<Link<'static>> =
+    Host::new(Link::new(&SHARED), &DB, Config::new(None, Unclaimed::Keep));
+```
+
+Nor does a table with them outside the GATT service:
+
+```compile_fail
+use nrf_ble::host::gatt::Value;
+
+nrf_ble::gatt! {
+    const DB;
+    service 0x180F {
+        char 0x2B29 [read, write] = Value::ClientFeatures;
+        char 0x2B3A [read] = Value::ServerFeatures;
+    }
+}
+
+const CCCDS: u8 = DB.cccds();
+```
+
+With both in the GATT service it builds:
+
+```
+use nrf_ble::{
+    host::{
+        Host,
+        engine::{Config, Unclaimed},
+        gatt::Value,
+    },
+    link::{Link, Shared},
+};
+
+nrf_ble::gatt! {
+    const DB;
+    service 0x1801 {
+        char 0x2B2A [read] = Value::Hash;
+        char 0x2B29 [read, write] = Value::ClientFeatures;
+        char 0x2B3A [read] = Value::ServerFeatures;
+    }
+}
+
+static SHARED: Shared = Shared::new();
+static HOST: Host<Link<'static>> =
+    Host::new(Link::new(&SHARED), &DB, Config::new(None, Unclaimed::Keep));
+```
+"
+)]
+#![cfg_attr(
+    not(feature = "eatt"),
+    doc = "
+Without `eatt`, a table that declares the Server Supported Features does not
+build:
+
+```compile_fail
+use nrf_ble::host::gatt::Value;
+
+nrf_ble::gatt! {
+    const DB;
+    service 0x1801 {
+        char 0x2B2A [read] = Value::Hash;
+        char 0x2B3A [read] = Value::Const(&[0x01]);
+    }
+}
+
+const CCCDS: u8 = DB.cccds();
+```
+"
+)]
+//! A characteristic under `#[cfg]` with a descriptor after it does not
+//! build either:
+//!
+//! ```compile_fail
+//! use nrf_ble::host::gatt::Value;
+//!
+//! nrf_ble::gatt! {
+//!     const DB;
+//!     service 0x180F {
+//!         #[cfg(any())]
+//!         char 0x2A19 [read, notify] = Value::Const(&[50]);
+//!         ccc;
+//!     }
+//! }
+//! ```
 
 /// The constant hash of the table's layout.
 pub mod hash;
@@ -140,7 +289,51 @@ macro_rules! gatt {
             $($body)* $($rest)*);
     };
     (@munch {[$($db_meta:tt)*] $vis:vis $db:ident} [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr)
-        ($sec:expr) $(#[$meta:meta])* char $name:ident : $uuid:tt [$($prop:ident),+ $(; $level:ident)?] = $value:expr;
+        ($sec:expr) $(#[doc = $doc:expr])* #[cfg($cfg:meta)] $(#[doc = $after:expr])*
+        char $name:ident : $uuid:tt [$($prop:ident),+ $(; $level:ident)?] = $value:expr;
+        $($rest:tt)*
+    ) => {
+        $crate::gatt!(@cfg_end {[$($db_meta)*] $vis $db}
+            [$($attrs)*
+                #[cfg($cfg)]
+                $crate::host::gatt::Attr::characteristic($crate::gatt!(@uuid $uuid), 0 $(| $crate::gatt!(@prop $prop))+),
+                #[cfg($cfg)]
+                $crate::host::gatt::Attr::value(
+                    $crate::gatt!(@uuid $uuid),
+                    0 $(| $crate::gatt!(@prop $prop))+,
+                    $crate::gatt!(@sec $($level)?),
+                    $value,
+                ),
+            ]
+            [$($items)* $(#[doc = $doc])* $(#[doc = $after])* #[cfg($cfg)]
+                $vis const $name: $crate::host::gatt::Char = $db.characteristic($handle);]
+            (::core::primitive::u16::strict_add($handle, if cfg!($cfg) { 2 } else { 0 })) ($ccc)
+            ($crate::gatt!(@sec $($level)?))
+            $($rest)*);
+    };
+    (@munch $head:tt [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr) ($sec:expr)
+        $(#[doc = $doc:expr])* #[cfg($cfg:meta)] $(#[doc = $after:expr])*
+        char $uuid:tt [$($prop:ident),+ $(; $level:ident)?] = $value:expr;
+        $($rest:tt)*
+    ) => {
+        $crate::gatt!(@cfg_end $head
+            [$($attrs)*
+                #[cfg($cfg)]
+                $crate::host::gatt::Attr::characteristic($crate::gatt!(@uuid $uuid), 0 $(| $crate::gatt!(@prop $prop))+),
+                #[cfg($cfg)]
+                $crate::host::gatt::Attr::value(
+                    $crate::gatt!(@uuid $uuid),
+                    0 $(| $crate::gatt!(@prop $prop))+,
+                    $crate::gatt!(@sec $($level)?),
+                    $value,
+                ),
+            ]
+            [$($items)*] (::core::primitive::u16::strict_add($handle, if cfg!($cfg) { 2 } else { 0 })) ($ccc)
+            ($crate::gatt!(@sec $($level)?))
+            $($rest)*);
+    };
+    (@munch {[$($db_meta:tt)*] $vis:vis $db:ident} [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr)
+        ($sec:expr) $(#[doc = $doc:expr])* char $name:ident : $uuid:tt [$($prop:ident),+ $(; $level:ident)?] = $value:expr;
         $($rest:tt)*
     ) => {
         $crate::gatt!(@munch {[$($db_meta)*] $vis $db}
@@ -153,12 +346,12 @@ macro_rules! gatt {
                     $value,
                 ),
             ]
-            [$($items)* $(#[$meta])* $vis const $name: $crate::host::gatt::Char = $db.characteristic($handle);]
+            [$($items)* $(#[doc = $doc])* $vis const $name: $crate::host::gatt::Char = $db.characteristic($handle);]
             (::core::primitive::u16::strict_add($handle, 2)) ($ccc) ($crate::gatt!(@sec $($level)?))
             $($rest)*);
     };
     (@munch $head:tt [$($attrs:tt)*] [$($items:tt)*] ($handle:expr) ($ccc:expr) ($sec:expr)
-        $(#[$meta:meta])* char $uuid:tt [$($prop:ident),+ $(; $level:ident)?] = $value:expr;
+        $(#[doc = $doc:expr])* char $uuid:tt [$($prop:ident),+ $(; $level:ident)?] = $value:expr;
         $($rest:tt)*
     ) => {
         $crate::gatt!(@munch $head
@@ -205,6 +398,15 @@ macro_rules! gatt {
         $vis const $db: $crate::host::gatt::Db = $crate::host::gatt::Db::new(&[$($attrs)*]);
         $($items)*
     };
+    // After a characteristic under `#[cfg]`: where the condition fails, a
+    // descriptor would belong to the characteristic before it.
+    (@cfg_end $head:tt $attrs:tt $items:tt $handle:tt $ccc:tt $sec:tt ccc; $($rest:tt)*) => {
+        ::core::compile_error!("a characteristic under #[cfg] takes no descriptors: no `ccc;` after it");
+    };
+    (@cfg_end $head:tt $attrs:tt $items:tt $handle:tt $ccc:tt $sec:tt desc $($rest:tt)*) => {
+        ::core::compile_error!("a characteristic under #[cfg] takes no descriptors: no `desc` after it");
+    };
+    (@cfg_end $($state:tt)*) => { $crate::gatt!(@munch $($state)*); };
     (@uuid ($uuid:expr)) => { $uuid };
     (@uuid $uuid:literal) => { $crate::host::gatt::Uuid::U16($uuid) };
     (@prop read) => { $crate::host::gatt::PROP_READ };
@@ -245,6 +447,13 @@ pub const CLIENT_CONFIGURATION: u16 = 0x2902;
 pub const SERVICE_CHANGED: u16 = 0x2A05;
 /// UUID of the Database Hash characteristic.
 pub const DATABASE_HASH: u16 = 0x2B2A;
+/// UUID of the GATT service, which holds the Database Hash and the Client
+/// and Server Supported Features.
+pub const GATT_SERVICE: u16 = 0x1801;
+/// UUID of the Client Supported Features characteristic.
+pub const CLIENT_SUPPORTED_FEATURES: u16 = 0x2B29;
+/// UUID of the Server Supported Features characteristic.
+pub const SERVER_SUPPORTED_FEATURES: u16 = 0x2B3A;
 /// Client characteristic configuration bit: notifications.
 pub const CCC_NOTIFY: u16 = 0x0001;
 /// Client characteristic configuration bit: indications.
@@ -364,6 +573,18 @@ pub struct Subscriptions {
     written: u16,
 }
 
+/// The Client and Server Supported Features characteristics a table
+/// declares, as [`check`] finds them, and where it is.
+#[cfg(feature = "eatt")]
+struct Features {
+    /// The Client Supported Features (0x2B29).
+    client:  bool,
+    /// Whether the attributes are in the GATT service.
+    in_gatt: bool,
+    /// The Server Supported Features (0x2B3A).
+    server:  bool,
+}
+
 /// The UUID of a service, a characteristic or a descriptor type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -381,6 +602,11 @@ pub enum Value {
     /// Client characteristic configuration bits with this index, kept for
     /// each link.
     Cccd(u8),
+    /// The Client Supported Features the client wrote on this link, one
+    /// octet: the value of the GATT service's characteristic 0x2B29, with the
+    /// feature `eatt`.
+    #[cfg(feature = "eatt")]
+    ClientFeatures,
     /// Constant bytes in flash, of any length: Read Blob serves the rest.
     Const(&'static [u8]),
     /// A value the application reads and writes through [`Handler`].
@@ -389,6 +615,11 @@ pub enum Value {
     Empty,
     /// The table's layout hash: the Database Hash characteristic.
     Hash,
+    /// The Server Supported Features, one octet with bit 0 (EATT Supported)
+    /// set: the value of the GATT service's characteristic 0x2B3A, with the
+    /// feature `eatt`.
+    #[cfg(feature = "eatt")]
+    ServerFeatures,
     /// Takes writes and ignores them, as for the HID Control Point.
     Sink,
     /// This many zeros, as for an input report read before any was sent.
@@ -546,6 +777,9 @@ impl AttError {
     pub const INVALID_OFFSET: Self = Self(0x07);
     /// The PDU is malformed.
     pub const INVALID_PDU: Self = Self(0x04);
+    /// The prepare queue holds no more: another attribute's value, a part
+    /// that does not follow the queued ones, or more octets than it takes.
+    pub const PREPARE_QUEUE_FULL: Self = Self(0x09);
     /// The attribute cannot be read.
     pub const READ_NOT_PERMITTED: Self = Self(0x02);
     /// The server does not serve the request.
@@ -646,6 +880,25 @@ impl Db {
         end
     }
 
+    /// Whether the table declares the Client and Server Supported Features
+    /// characteristics, which [`Self::new`] allows only in the GATT service,
+    /// once each, as the server serves them.
+    #[cfg(feature = "eatt")]
+    #[inline]
+    #[must_use = "the answer is only computed"]
+    pub const fn has_features(&self) -> bool {
+        let mut found = Features { client: false, in_gatt: false, server: false };
+        let mut rest = self.attrs;
+        while let Some((attr, tail)) = rest.split_first() {
+            if let Kind::Characteristic(_) = attr.kind {
+                found.client |= matches!(attr.uuid, Uuid::U16(CLIENT_SUPPORTED_FEATURES));
+                found.server |= matches!(attr.uuid, Uuid::U16(SERVER_SUPPORTED_FEATURES));
+            }
+            rest = tail;
+        }
+        found.client && found.server
+    }
+
     /// The layout hash, the value of the Database Hash characteristic.
     #[inline]
     #[must_use = "the hash is only read"]
@@ -685,7 +938,9 @@ impl Db {
     /// lacks its client characteristic configuration descriptor, if
     /// another has one, if the descriptor indices do not count up from 0,
     /// if an attribute needs authentication ([`Sec::Authenticated`])
-    /// without the feature `passkey`, or if the table is too large.
+    /// without the feature `passkey`, if the Client or Server Supported
+    /// Features are declared against the rules of the [module
+    /// documentation](crate::host::gatt), or if the table is too large.
     ///
     /// Without the feature `passkey` the host pairs with Just Works only,
     /// so no link is ever authenticated: an attribute that needs it would
@@ -875,6 +1130,8 @@ const fn check(attrs: &[Attr]) -> u8 {
     let mut cccds: u8 = 0;
     let mut props: u8 = 0;
     let mut has_cccd = false;
+    #[cfg(feature = "eatt")]
+    let mut features = Features { client: false, in_gatt: false, server: false };
     let mut rest = attrs;
     while let Some((attr, tail)) = rest.split_first() {
         #[cfg(not(feature = "passkey"))]
@@ -882,8 +1139,16 @@ const fn check(attrs: &[Attr]) -> u8 {
             !needs_authentication(attr.kind),
             "no attribute may need authentication: the host pairs with Just Works"
         );
+        #[cfg(feature = "eatt")]
+        check_features(attr, &mut features);
         match (attr.kind, attr.value) {
             (Kind::Characteristic(next), _) => {
+                #[cfg(not(feature = "eatt"))]
+                assert!(
+                    !matches!(attr.uuid, Uuid::U16(CLIENT_SUPPORTED_FEATURES | SERVER_SUPPORTED_FEATURES)),
+                    "the Client and Server Supported Features characteristics need the feature eatt: the server \
+                     would offer what the host does not serve"
+                );
                 check_cccd(props, has_cccd);
                 props = next;
                 has_cccd = false;
@@ -907,6 +1172,49 @@ const fn check(attrs: &[Attr]) -> u8 {
     }
     check_cccd(props, has_cccd);
     cccds
+}
+
+/// Checks an attribute of the table, `attr`, against the rules of the Client
+/// and Server Supported Features characteristics, and notes in `found` their
+/// declarations and whether the attributes are in the GATT service: each may be
+/// declared once, in the GATT service, with the properties and value the
+/// server serves, readable (and the client's writable) without encryption,
+/// as a client writes its features before it encrypts. That both are there
+/// is for `Host::new` to check ([`Db::has_features`]): the server serves a
+/// table without them.
+#[cfg(feature = "eatt")]
+const fn check_features(attr: &Attr, found: &mut Features) {
+    let client = matches!(attr.uuid, Uuid::U16(CLIENT_SUPPORTED_FEATURES));
+    let server = matches!(attr.uuid, Uuid::U16(SERVER_SUPPORTED_FEATURES));
+    match attr.kind {
+        Kind::Service => found.in_gatt = matches!(attr.uuid, Uuid::U16(GATT_SERVICE)),
+        Kind::Characteristic(props) if client => {
+            assert!(
+                found.in_gatt && props == PROP_READ | PROP_WRITE && !found.client,
+                "the Client Supported Features are declared once, in the GATT service, with read and write"
+            );
+            found.client = true;
+        },
+        Kind::Characteristic(props) if server => {
+            assert!(
+                found.in_gatt && props == PROP_READ && !found.server,
+                "the Server Supported Features are declared once, in the GATT service, with read only"
+            );
+            found.server = true;
+        },
+        Kind::Value(access, sec) if client || server => assert!(
+            matches!(
+                (client, access, sec, attr.value),
+                (true, Access { read: Some(Sec::Open), write: Some(Sec::Open) }, Sec::Open, Value::ClientFeatures)
+                    | (false, Access { read: Some(Sec::Open), write: None }, Sec::Open, Value::ServerFeatures)
+            ),
+            "the Client and Server Supported Features are open, with their own values"
+        ),
+        Kind::Characteristic(_) | Kind::Descriptor(_) | Kind::Value(..) => assert!(
+            !matches!(attr.value, Value::ClientFeatures | Value::ServerFeatures),
+            "the feature values belong to their own characteristics"
+        ),
+    }
 }
 
 /// Checks that a characteristic with the properties `props` has a client

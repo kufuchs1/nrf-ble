@@ -73,6 +73,18 @@ fn receive_as(engine: &mut Engine, device: &mut Device, cid: u16, payload: &[u8]
 
 extern crate std;
 
+/// The Write Request that enables the battery level's notifications.
+fn enable_battery() -> [u8; 5] {
+    let [handle0, handle1] = (example::BATTERY_LEVEL.handle() + 1).to_le_bytes();
+    [0x12, handle0, handle1, 0x01, 0x00]
+}
+
+/// The battery level's notification of 50 %, as its one fragment.
+fn battery_50() -> [u8; 8] {
+    let [handle0, handle1] = example::BATTERY_LEVEL.handle().to_le_bytes();
+    [4, 0, 4, 0, 0x1B, handle0, handle1, 50]
+}
+
 /// Queues every fragment the engine has, with room for `room`, and
 /// returns them.
 fn drain(engine: &mut Engine, room: usize, now: Instant) -> std::vec::Vec<Fragment> {
@@ -94,7 +106,7 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_public_key() {
     engine.job_done(&mut device, result, at(0));
     engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
     // The battery's notifications are open: enabled before any pairing.
-    receive(&mut engine, &mut device, 4, &[0x12, 0x0E, 0x00, 0x01, 0x00], at(0));
+    receive(&mut engine, &mut device, 4, &enable_battery(), at(0));
     assert_eq!(drain(&mut engine, 4, at(0)).len(), 1);
     let epoch = engine.epoch().unwrap();
     assert!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]).is_ok());
@@ -116,7 +128,7 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_public_key() {
         (true, 21)
     ]);
     let fragment = engine.notification(epoch, example::BATTERY_LEVEL, &[50]).unwrap();
-    assert_eq!(fragment.bytes(), [4, 0, 4, 0, 0x1B, 0x0D, 0x00, 50]);
+    assert_eq!(fragment.bytes(), battery_50());
     // The input reports need the encryption the link lacks.
     assert_eq!(engine.notification(epoch, example::KEYBOARD, &[0; 8]), Err(NotifyError::NotSubscribed));
 }
@@ -130,7 +142,7 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_long_response() {
     let mut engine = Engine::new(&example::DB, example::CONFIG);
     let mut device = Device(5);
     engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
-    receive(&mut engine, &mut device, 4, &[0x12, 0x0E, 0x00, 0x01, 0x00], at(0));
+    receive(&mut engine, &mut device, 4, &enable_battery(), at(0));
     assert_eq!(drain(&mut engine, 4, at(0)).len(), 1);
     let epoch = engine.epoch().unwrap();
     receive(&mut engine, &mut device, 4, &[0x02, 0x05, 0x02], at(1));
@@ -157,7 +169,7 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_long_response() {
         [(true, 27), (false, 27), (false, 12)]
     );
     let fragment = engine.notification(epoch, example::BATTERY_LEVEL, &[50]).unwrap();
-    assert_eq!(fragment.bytes(), [4, 0, 4, 0, 0x1B, 0x0D, 0x00, 50]);
+    assert_eq!(fragment.bytes(), battery_50());
 }
 
 #[test]
@@ -308,4 +320,133 @@ fn the_input_reports_are_the_notifying_hid_reports() {
     // The keyboard's, the consumer control's and the mouse's
     // configuration, not the battery's.
     assert_eq!(example::DB.input_reports(), 0b1110);
+}
+
+/// A Write Request of `features` to the Client Supported Features.
+#[cfg(feature = "eatt")]
+fn write_features(features: &[u8]) -> std::vec::Vec<u8> {
+    let [handle0, handle1] = example::CLIENT_FEATURES.to_le_bytes();
+    [&[0x12, handle0, handle1][..], features].concat()
+}
+
+/// The ATT PDUs among `fragments`, each a fragment of its own.
+#[cfg(feature = "eatt")]
+fn att_pdus(fragments: &[Fragment]) -> std::vec::Vec<std::vec::Vec<u8>> {
+    fragments
+        .iter()
+        .filter(|fragment| fragment.bytes()[2..4] == [4, 0])
+        .map(|fragment| fragment.bytes()[4..].to_vec())
+        .collect()
+}
+
+/// A reconnection of the bonded central of `bond`, up to the long term key
+/// request answered with its key; returns the engine and the link's epoch.
+#[cfg(feature = "eatt")]
+fn reconnect(bond: Bond) -> (Engine, Epoch) {
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    engine.advertise(false, &identity(), Some(bond), Duration::from_secs(20));
+    engine.connected(&info(Peer::new([3; 6], true), Some(Peer::new(CENTRAL_IDENTITY, false))), at(0));
+    let epoch = engine.epoch().unwrap();
+    engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, at(0));
+    assert_eq!(engine.take_command(0, at(0)), Some(Command::HoldLatency(true)));
+    assert_eq!(engine.take_command(0, at(0)), Some(Command::LtkReply { epoch, key: Some([0x77; 16]) }));
+    (engine, epoch)
+}
+
+/// The bond of [`reconnect`], with the Client Supported Features
+/// `features`.
+#[cfg(feature = "eatt")]
+fn bond_with_features(features: u8) -> Bond {
+    let mut bond = Bond::new(Peer::new(CENTRAL_IDENTITY, false), None, [0x77; 16], identity().variant(), &example::DB);
+    bond.client_features = features;
+    bond
+}
+
+/// The Client Supported Features a client writes during pairing go into
+/// the bond, before or after it is made.
+#[cfg(feature = "eatt")]
+#[test]
+fn the_bond_takes_the_client_features_written_while_pairing() {
+    for before in [true, false] {
+        let mut engine = Engine::new(&example::DB, example::CONFIG);
+        let mut device = Device(9);
+        let identity = identity();
+        let (epoch, _) = pair(&mut engine, &mut device, &identity, Peer::new(CENTRAL_ADDRESS, false), false);
+        if before {
+            // Before encryption, as BlueZ writes them once the MTU is
+            // agreed: open, so taken.
+            receive(&mut engine, &mut device, 4, &write_features(&[0x05]), at(0));
+        }
+        let fragments = drain(&mut engine, 4, at(0));
+        if !before {
+            receive_as(&mut engine, &mut device, 4, &write_features(&[0x07]), true, at(0));
+        }
+        let fragments = [fragments, drain(&mut engine, 4, at(0))].concat();
+        assert_eq!(att_pdus(&fragments), [[0x13]]);
+        assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: false }));
+        assert_eq!(engine.take_command(0, at(0)), None);
+        let Some(ConnEvent::Bonded(bond)) = engine.take_event(epoch) else { panic!("no bond") };
+        assert_eq!(bond.client_features, if before { 0x05 } else { 0x07 });
+        assert_eq!(engine.take_event(epoch), None, "no update besides the bond");
+        assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond.clone()));
+    }
+}
+
+/// On a reconnection the bond's features join those written before the
+/// encryption, and only a change updates the bond.
+#[cfg(feature = "eatt")]
+#[test]
+fn a_reconnection_adds_the_bond_s_client_features_and_stores_only_changes() {
+    let mut device = Device(9);
+    // The bond has Robust Caching; before the encryption the client writes
+    // Multiple Handle Value Notifications, which is taken.
+    let (mut engine, epoch) = reconnect(bond_with_features(0x01));
+    receive(&mut engine, &mut device, 4, &write_features(&[0x04]), at(5));
+    assert_eq!(att_pdus(&drain(&mut engine, 4, at(5))), [[0x13]]);
+    assert_eq!(engine.take_event(epoch), None, "nothing stored before the encryption");
+    engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, at(10));
+    assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: true }));
+    let Some(ConnEvent::BondUpdated(bond)) = engine.take_event(epoch) else { panic!("no update") };
+    assert_eq!(bond.client_features, 0x05);
+    assert_eq!(engine.take_event(epoch), None);
+    let [handle0, handle1] = example::CLIENT_FEATURES.to_le_bytes();
+    receive_as(&mut engine, &mut device, 4, &[0x0A, handle0, handle1], true, at(20));
+    assert_eq!(att_pdus(&drain(&mut engine, 4, at(20))), [[0x0B, 0x05]]);
+    // The same value again changes nothing to store.
+    receive_as(&mut engine, &mut device, 4, &write_features(&[0x05]), true, at(30));
+    assert_eq!(att_pdus(&drain(&mut engine, 4, at(30))), [[0x13]]);
+    assert_eq!(engine.take_event(epoch), None);
+    // Clearing a bit is refused, and stores nothing either.
+    receive_as(&mut engine, &mut device, 4, &write_features(&[0x04]), true, at(40));
+    assert_eq!(att_pdus(&drain(&mut engine, 4, at(40))), [[0x01, 0x12, handle0, handle1, 0x13]]);
+    assert_eq!(engine.take_event(epoch), None);
+    // A new bit is stored.
+    receive_as(&mut engine, &mut device, 4, &write_features(&[0x07]), true, at(50));
+    assert_eq!(att_pdus(&drain(&mut engine, 4, at(50))), [[0x13]]);
+    let Some(ConnEvent::BondUpdated(bond)) = engine.take_event(epoch) else { panic!("no update") };
+    assert_eq!(bond.client_features, 0x07);
+    assert_eq!(engine.bond().map(|bond| bond.client_features), Some(0x07));
+}
+
+/// BlueZ writes its features on every connection, after the encryption on
+/// a bonded reconnection: the bond's value again stores nothing, and a
+/// value with fewer bits, after BlueZ went back to one channel, is refused.
+#[cfg(feature = "eatt")]
+#[test]
+fn bluez_writing_the_bond_s_client_features_again_stores_nothing() {
+    for (bond_features, written, answer) in [(0x05, 0x05, &[0x13][..]), (0x07, 0x05, &[0x01, 0x12, 0, 0, 0x13][..])] {
+        let mut device = Device(9);
+        let (mut engine, epoch) = reconnect(bond_with_features(bond_features));
+        engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, at(10));
+        assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: true }));
+        assert_eq!(engine.take_event(epoch), None, "the restored features are the bond's");
+        receive_as(&mut engine, &mut device, 4, &write_features(&[written]), true, at(20));
+        let mut expected = answer.to_vec();
+        if expected.len() > 1 {
+            expected[2..4].copy_from_slice(&example::CLIENT_FEATURES.to_le_bytes());
+        }
+        assert_eq!(att_pdus(&drain(&mut engine, 4, at(20))), [expected]);
+        assert_eq!(engine.take_event(epoch), None);
+        assert_eq!(engine.bond().map(|bond| bond.client_features), Some(bond_features));
+    }
 }

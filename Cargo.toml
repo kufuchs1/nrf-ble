@@ -84,6 +84,17 @@ extended-advertising = []
 # of 23); flash +0.3 to 0.5 KB in the release builds of the three firmwares
 # (readme).
 att-mtu = []
+# `eatt`: Enhanced ATT (Core 5.2) as responder, being built in steps; so far
+# the GATT server's part of it, on the fixed channel only. The table declares
+# the Client and Server Supported Features in its GATT service
+# (`gatt::Value::ClientFeatures`, `gatt::Value::ServerFeatures`, checked by
+# `host::Host::new`); the client's features are kept in the bond. The server
+# serves Read Multiple Variable Length, Prepare and Execute Write (one value
+# of up to 22 octets) and Multiple Handle Value Notifications
+# (`host::Conn::notify_multiple`). The credit based channels that carry the
+# enhanced bearers are not there yet, so no enhanced bearer opens, though the
+# Server Supported Features already say EATT. Implies `att-mtu`.
+eatt = ["att-mtu"]
 
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main): the crate's own dependencies name their git

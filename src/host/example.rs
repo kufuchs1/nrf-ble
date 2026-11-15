@@ -22,6 +22,11 @@
 //! | 29 to 32 | Consumer input report 0x2A4D (ID 2, 2 octets): the same |
 //! | 33 to 36 | Mouse input report 0x2A4D (ID 3, 5 octets): the same |
 //!
+//! With the feature `eatt` the GATT service also holds the Client Supported
+//! Features 0x2B29 (handles 11 and 12, read and write) and the Server
+//! Supported Features 0x2B3A (13 and 14, read), and every handle after them
+//! is 4 higher ([`EATT_SHIFT`]).
+//!
 //! The input reports need an encrypted link to be read, configured or
 //! notified, and read as zeros. There is no Service Changed characteristic,
 //! no Protocol Mode and no boot report.
@@ -67,7 +72,7 @@ pub const CONSUMER_REPORT_LEN: u8 = 2;
 /// signed values.
 pub const MOUSE_REPORT_LEN: u8 = 5;
 /// Report type of an input report in a Report Reference.
-const INPUT_REPORT: u8 = 1;
+pub const INPUT_REPORT: u8 = 1;
 /// The battery level, which the application's handler reads.
 pub const BATTERY_LEVEL_VALUE: ValueId = ValueId::new(0);
 /// The Peripheral Preferred Connection Parameters value of [`PARAMS`].
@@ -158,6 +163,10 @@ crate::gatt! {
     }
     service 0x1801 {
         char 0x2B2A [read] = Value::Hash;
+        #[cfg(feature = "eatt")]
+        char 0x2B29 [read, write] = Value::ClientFeatures;
+        #[cfg(feature = "eatt")]
+        char 0x2B3A [read] = Value::ServerFeatures;
     }
     service 0x180F {
         /// The Battery Level, which the application notifies.
@@ -185,6 +194,16 @@ crate::gatt! {
         desc 0x2908 [read] = Value::Const(&[MOUSE_REPORT_ID, INPUT_REPORT]);
     }
 }
+
+/// How much higher the handles after the Database Hash are with the feature
+/// `eatt`, whose Client and Server Supported Features come before them.
+pub const EATT_SHIFT: u16 = if cfg!(feature = "eatt") { 4 } else { 0 };
+/// The handle of the Client Supported Features, with the feature `eatt`.
+#[cfg(feature = "eatt")]
+pub const CLIENT_FEATURES: u16 = 12;
+/// The handle of the Server Supported Features, with the feature `eatt`.
+#[cfg(feature = "eatt")]
+pub const SERVER_FEATURES: u16 = 14;
 
 /// The advertising phases: 20 ms for 3 s, 50 ms for 12 s, 400 ms for 45 s.
 pub const PHASES: [Phase; 3] = [
