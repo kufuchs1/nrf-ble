@@ -115,10 +115,10 @@
 //! Connection Request on a link not yet encrypted with a key the host gave
 //! (unless the request itself arrived encrypted) is held until the
 //! encryption, which answers it, or refused for security once the encryption
-//! failed, or `ecfc::HOLD_MAX` (2 s) after it arrived, unless the
-//! key went to the link layer or a pairing runs by then. An ATT PDU or a
-//! command that arrived encrypted proves the encryption for the held
-//! requests, as it does for ATT. Each complete SDU of an open bearer is an
+//! failed, or `ecfc::HOLD_MAX` (2 s) after the first held request
+//! arrived, unless the key went to the link layer or a pairing runs by then. An
+//! ATT PDU or a command that arrived encrypted proves the encryption for the
+//! held requests, as it does for ATT. Each complete SDU of an open bearer is an
 //! ATT request of that bearer, answered with its ATT MTU; one request is
 //! outstanding on each bearer, as on the fixed channel. A Write Response that
 //! completes the input reports' configuration counts on any bearer. A bearer

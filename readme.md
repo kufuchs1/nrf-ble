@@ -180,12 +180,12 @@ release build keeps its size to the byte):
   goes on as before, Exchange MTU included (an enhanced bearer answers it with Request Not Supported). A Credit Based
   Connection Request that arrives before the link is encrypted with the host's key, as BlueZ sends it on every
   reconnection, waits for the encryption; it is refused for security (Insufficient Encryption to the bonded central,
-  Insufficient Authentication to another) if the encryption fails, or 2 s after it arrived while neither a key went to
-  the link layer nor a pairing runs. Linux then encrypts, or pairs, and asks again; the answer is never sent on an
-  encrypted link, where Linux would ask for a pairing with protection against a man in the middle. A request of two or
-  more source CIDs not in ascending order gets Insufficient Resources with every destination CID 0: Linux 7.3 sends its
-  CIDs in that order, newest first, and binds the destination CIDs of the answer to its channels shifted by one, so
-  any bearer it opened would be crossed. With BlueZ's `[GATT] Channels`:
+  Insufficient Authentication to another) if the encryption fails, or 2 s after the first waiting request arrived
+  while neither a key went to the link layer nor a pairing runs. Linux then encrypts, or pairs, and asks again; this
+  refusal is never sent on an encrypted link, where Linux would ask for a pairing with protection against a man in the
+  middle. A request of two or more source CIDs not in ascending order gets Insufficient Resources with every
+  destination CID 0: Linux 7.3 sends its CIDs in that order, newest first, and binds the destination CIDs of the answer
+  to its channels shifted by one, so any bearer it opened would be crossed. With BlueZ's `[GATT] Channels`:
 
   | Channels | Request | Bearers |
   |---|---|---|

@@ -145,10 +145,129 @@ fn a_hold_waits_for_an_encryption_under_way() {
     sim.advance(HOLD_MAX.as_millis() + 500);
     assert_eq!(answers(&sim), []);
     sim.engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, sim.at());
+    assert!(sim.engine.has_output(), "the answer waits for room in the link layer's queue");
     sim.kernel.encrypted();
     sim.pump();
     assert_eq!(answers(&sim), [(0x0000, vec![0x0040])]);
     assert!(sim.kernel.settled() && !sim.kernel.escalated);
+}
+
+/// A pairing under way keeps the hold past its 2 s too: the request is not
+/// refused while the central pairs.
+#[test]
+fn a_hold_waits_for_a_pairing_under_way() {
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(9);
+    engine.advertise(true, &identity(), None, Duration::from_secs(60));
+    let job = engine.take_job().unwrap();
+    let result = job.run(&mut device.clone(), || ());
+    engine.job_done(&mut device, result, at(0));
+    engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
+    let epoch = engine.epoch().unwrap();
+    let mut sim = Sim { device, engine, epoch, kernel: Kernel::linux(), now: 0 };
+    sim.kernel.connect_eatt(2);
+    sim.pump();
+    let central = Central::new(linux_request(false, true), local_rpa());
+    let now = sim.at();
+    receive(&mut sim.engine, &mut sim.device, 6, &central.request, now);
+    assert!(sim.engine.smp.is_pairing());
+    sim.advance(HOLD_MAX.as_millis() + 500);
+    assert_eq!(answers(&sim), []);
+    assert_eq!(sim.engine.ecfc.deadline(), None);
+}
+
+/// A request that itself arrives encrypted, once the bond's key went to the
+/// link layer and before the encryption event, proves the encryption and is
+/// answered at once; one that arrives marked encrypted before any key went
+/// is no proof and is held.
+#[test]
+fn an_encrypted_request_with_the_host_s_key_is_not_held() {
+    for key in [true, false] {
+        let mut sim = Sim::reconnection(bond_with_features(0x07), Kernel::linux());
+        if key {
+            let now = sim.at();
+            sim.engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, now);
+            assert!(matches!(sim.engine.take_command(0, now), Some(Command::LtkReply { epoch: _, key: Some(_) })));
+        }
+        sim.kernel.encrypted = true;
+        sim.kernel.connect_eatt(2);
+        sim.pump();
+        if key {
+            assert_eq!(answers(&sim), [(0x0000, vec![0x0040])]);
+            assert_eq!(sim.bound(), [(0x0040, 0x0040)]);
+            assert_eq!(sim.engine.ecfc.deadline(), None);
+        } else {
+            assert_eq!(answers(&sim), []);
+            assert_eq!(sim.engine.ecfc.deadline(), Some(at(HOLD_MAX.as_millis())));
+        }
+        assert!(events(&mut sim).is_empty(), "no encryption event yet");
+    }
+}
+
+/// A held request is answered by the first ATT PDU that arrives encrypted
+/// with the bond's key, before the encryption event.
+#[test]
+fn an_encrypted_att_pdu_answers_the_held_request() {
+    let mut sim = Sim::reconnection(bond_with_features(0x07), Kernel::linux());
+    sim.kernel.connect_eatt(2);
+    sim.pump();
+    assert_eq!(answers(&sim), []);
+    let now = sim.at();
+    sim.engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, now);
+    assert!(matches!(sim.engine.take_command(0, now), Some(Command::LtkReply { epoch: _, key: Some(_) })));
+    sim.kernel.encrypted();
+    sim.kernel.request_on(On::Fixed, &read_features());
+    sim.pump();
+    assert_eq!(answers(&sim), [(0x0000, vec![0x0040])]);
+    assert!(sim.kernel.settled() && !sim.kernel.escalated);
+    assert_eq!(sim.engine.ecfc.deadline(), None);
+    assert!(events(&mut sim).is_empty(), "no encryption event yet");
+    serve_on_every_bearer(&mut sim);
+}
+
+/// The central closes a bearer whose response waits for a credit: the
+/// response is dropped, the input reports' configuration it completed
+/// counts as open again, and a new channel on the same CID gets nothing of
+/// it. The configuration written again on CID 4 then makes the link ready
+/// after [`INPUTS_IDLE`].
+#[test]
+fn a_close_drops_a_response_waiting_for_credits() {
+    let mut sim = Sim::paired(Kernel::linux());
+    sim.kernel.credits = 1;
+    sim.kernel.hold_credits = true;
+    sim.kernel.connect_eatt(2);
+    sim.pump();
+    sim.kernel.request_on(On::Chan(0x0040), &enable(example::KEYBOARD));
+    sim.kernel.request_on(On::Fixed, &enable(example::CONSUMER));
+    sim.pump();
+    assert_eq!(sim.kernel.responses.len(), 2);
+    // The bearer has no credit left for the response that completes the
+    // configuration.
+    sim.kernel.request_on(On::Chan(0x0040), &enable(example::MOUSE));
+    sim.pump();
+    assert!(sim.engine.response[1].is_some());
+    assert_eq!(sim.engine.link.as_ref().map(|link| link.inputs), Some(Inputs::Answering(1)));
+    sim.kernel.close(0x0040);
+    sim.pump();
+    assert!(sim.engine.response.iter().all(Option::is_none));
+    assert_eq!(sim.engine.link.as_ref().map(|link| link.inputs), Some(Inputs::Open));
+    assert!(sim.kernel.chans.is_empty() && !sim.engine.has_output());
+    // A new channel on the same CID, with credits: no stale response.
+    sim.kernel.credits = 3;
+    sim.kernel.hold_credits = false;
+    sim.kernel.connect_eatt(2);
+    sim.pump();
+    assert_eq!(sim.bound(), [(0x0040, 0x0040)]);
+    assert_eq!(sim.kernel.responses.len(), 2);
+    sim.kernel.request_on(On::Fixed, &enable(example::MOUSE));
+    sim.pump();
+    assert_eq!(
+        sim.kernel.responses.last().map(|(on, _, response)| (*on, response.clone())),
+        Some((On::Fixed, vec![0x13]))
+    );
+    sim.advance(INPUTS_IDLE.as_millis() + 10);
+    assert!(events(&mut sim).contains(&ConnEvent::Ready));
+    serve_on_every_bearer(&mut sim);
 }
 
 /// `Channels` = 3 to 6 on a reconnection: Linux's request names 2 to 5
