@@ -51,10 +51,27 @@ impl Handler for App {
     }
 }
 
+/// An octet a slot holds where no response was written.
+const UNWRITTEN: u8 = 0xA5;
+
 /// Sends `request` at `level` and returns the response, if any.
+///
+/// A copy of the server takes the same request through
+/// [`Server::handle_on`] on the fixed channel, into a slot twice as long as
+/// [`MTU`]: it must give the same answer and end in the same state, and
+/// leave the octets after the first [`MTU`] as they were.
 fn exchange(server: &mut Server, app: &App, request: &[u8], level: Sec) -> Option<Vec<u8>> {
+    let mut twin = *server;
+    let mut long = [UNWRITTEN; 2 * MTU];
+    let twin_len = twin.handle_on(Bearer::Fixed, request, level, app, &mut long);
+    assert!(long[MTU..].iter().all(|&octet| octet == UNWRITTEN), "request {request:02X?}");
     let mut out = [0_u8; MTU];
-    let len = server.handle(request, level, app, &mut out)?;
+    let len = server.handle(request, level, app, &mut out);
+    assert_eq!(twin_len, len, "request {request:02X?}");
+    assert_eq!(twin.subscriptions(), server.subscriptions(), "request {request:02X?}");
+    assert_eq!(twin.is_indicating(), server.is_indicating(), "request {request:02X?}");
+    let len = len?;
+    assert_eq!(long[..len], out[..len], "request {request:02X?}");
     Some(out[..len].to_vec())
 }
 
@@ -255,6 +272,45 @@ fn an_unencrypted_request_for_a_report_gets_insufficient_encryption() {
     server.restore(crate::host::gatt::Subscriptions::from_bits(0b0101_0101));
     assert_eq!(server.notify(example::KEYBOARD, &[0; 8], Sec::Open, &mut out), Err(NotifyError::Insecure));
     assert!(server.notify(example::BATTERY_LEVEL, &[1], Sec::Open, &mut out).is_ok());
+}
+
+#[test]
+fn the_fixed_channel_answers_within_its_mtu_whatever_the_slot() {
+    let app = App::new();
+    let mut server = Server::new(&DB);
+    let read = [0x0A, 0x16, 0x00];
+    // The Report Map is longer than a response: a Read on the fixed
+    // channel gives its first 22 octets, in a slot of any length.
+    let mut slot = [UNWRITTEN; 64];
+    assert_eq!(server.handle_on(Bearer::Fixed, &read, Sec::Encrypted, &app, &mut slot), Some(MTU));
+    assert_eq!(slot[..MTU], *<[&[u8]]>::concat(&[&[0x0B], &REPORT_MAP[..MTU - 1]]));
+    assert!(slot[MTU..].iter().all(|&octet| octet == UNWRITTEN));
+    // So does every discovery response: Find Information over the whole
+    // table stops at the fifth entry of 16-bit UUIDs, 2 + 5 * 4 = 22
+    // octets, and Read By Type of the characteristics at the third of
+    // length 7, 2 + 3 * 7 = 23.
+    let mut slot = [UNWRITTEN; 64];
+    let len = server.handle_on(Bearer::Fixed, &[0x04, 0x01, 0x00, 0xFF, 0xFF], Sec::Encrypted, &app, &mut slot);
+    assert_eq!(len, Some(22));
+    assert!(slot[22..].iter().all(|&octet| octet == UNWRITTEN));
+    let mut slot = [UNWRITTEN; 64];
+    let request = [0x08, 0x01, 0x00, 0xFF, 0xFF, 0x03, 0x28];
+    assert_eq!(server.handle_on(Bearer::Fixed, &request, Sec::Encrypted, &app, &mut slot), Some(MTU));
+    assert!(slot[MTU..].iter().all(|&octet| octet == UNWRITTEN));
+
+    // A slot shorter than the bearer's MTU is the caller's mistake: the PDU
+    // is ignored, nothing is written into the slot, and a write is not
+    // taken.
+    let mut short = [UNWRITTEN; MTU - 1];
+    assert_eq!(server.handle_on(Bearer::Fixed, &read, Sec::Encrypted, &app, &mut short), None);
+    let write = [0x12, 0x1B, 0x00, 0x01, 0x00];
+    assert_eq!(server.handle_on(Bearer::Fixed, &write, Sec::Encrypted, &app, &mut short), None);
+    assert_eq!(server.handle_on(Bearer::Fixed, &[0x52, 0x1B, 0x00, 0x01, 0x00], Sec::Encrypted, &app, &mut []), None);
+    assert!(short.iter().all(|&octet| octet == UNWRITTEN));
+    assert_eq!(server.subscriptions(), Subscriptions::new());
+    // The same write through a slot of the MTU is taken.
+    golden(&mut server, &app, &write, &[0x13]);
+    assert_ne!(server.subscriptions(), Subscriptions::new());
 }
 
 #[test]
