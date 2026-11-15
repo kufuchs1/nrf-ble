@@ -1,4 +1,4 @@
-//! The L2CAP fixed channels of a low energy link.
+//! The L2CAP channels of a low energy link.
 //!
 //! [`Reassembly`] joins received fragments into one PDU in a single buffer of
 //! [`RX_MAX`] (72) octets, the size of the largest PDU the host takes: an SMP
@@ -6,8 +6,9 @@
 //! drops an incomplete one. A continuation without a start, a PDU longer than
 //! the buffer and a PDU with more octets than its header announces are
 //! dropped. A complete PDU goes to its channel by CID: 4 (ATT), 5 (LE
-//! signalling) or 6 (security manager), and with the feature `eatt` 0x0040 and
-//! up for the enhanced bearers (`Channel::Eatt`); any other CID is dropped.
+//! signalling) or 6 (security manager), and with the feature `eatt` 0x0040 to
+//! 0x0040 + `ecfc::BEARERS` − 1 for the enhanced bearers (`Channel::Eatt`);
+//! any other CID is dropped.
 //! The PDU is encrypted only if each of its fragments was received encrypted.
 //! With `eatt`, a PDU too long for the buffer on a bearer's CID is reported
 //! (`Reassembly::take_overlong`): it is a K-frame longer than the bearer's
@@ -56,7 +57,8 @@ const END_CID: u16 = FIRST_CID.strict_add(BEARERS.saturating_cast());
 #[cfg(feature = "eatt")]
 const SDU_LEN_LEN: usize = 2;
 
-/// A fixed channel the host serves.
+/// A channel the host serves: a fixed one, or with the feature `eatt` an
+/// enhanced bearer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]

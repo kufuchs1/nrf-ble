@@ -98,7 +98,8 @@
 //! - Disconnection Request for one of our CIDs: on an open or closing bearer
 //!   with the peer's CID as source, the bearer is released and answered; with
 //!   another source CID it is dropped (Core, Vol 3, Part A, 4.6); on a bearer
-//!   that is not open, a Command Reject, invalid CID.
+//!   already released, whose answer is still to be sent, it is dropped too; on
+//!   a bearer that is free or not yet answered, a Command Reject, invalid CID.
 //! - Our Disconnection Request ([`Ecfc::close`]) takes the next identifier of
 //!   the signalling channel. Data on the bearer is dropped from then on. A
 //!   Disconnection Response with its identifier and CIDs, or a Command Reject
@@ -518,7 +519,7 @@ impl Ecfc {
     pub fn deadline(&self) -> Option<Instant> { [self.hold_until, self.close_until].into_iter().flatten().min() }
 
     /// Takes a Disconnection Request for one of our CIDs; returns a Command
-    /// Reject for a bearer that is not open.
+    /// Reject for a bearer that is free, held or not yet answered.
     fn disconnection_request(&mut self, identifier: u8, data: &[u8]) -> Option<Command> {
         let &[dcid0, dcid1, scid0, scid1] = data else { return None };
         let dcid = u16::from_le_bytes([dcid0, dcid1]);

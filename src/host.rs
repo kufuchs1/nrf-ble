@@ -361,7 +361,8 @@ pub mod engine;
 pub mod gatt;
 /// The device's own identity address and identity resolving key.
 pub mod identity;
-/// The L2CAP fixed channels: demultiplexing, reassembly and fragmenting.
+/// The L2CAP channels: demultiplexing, reassembly and fragmenting, and with
+/// `eatt` the K-frames of the enhanced bearers.
 pub mod l2cap;
 /// The L2CAP signalling channel.
 pub mod signal;

@@ -412,6 +412,9 @@ fn the_central_closes_a_bearer_with_its_cids_and_is_rejected_for_one_not_open() 
     assert_eq!(fixture.send_all(), Vec::<Vec<u8>>::new());
     assert_eq!(fixture.command(0x06, 3, &[0x40, 0x00, 0x50, 0x00], true), None);
     assert!(!fixture.ecfc.is_open(0));
+    // The same request again, before our response went: dropped, not
+    // rejected, and answered once.
+    assert_eq!(fixture.command(0x06, 3, &[0x40, 0x00, 0x50, 0x00], true), None);
     // It stays taken until our response went.
     assert_eq!(fixture.ecfc.next_signal(), Some(Signal::Released(0)));
     fixture.connect(4, &[0x0051], true);
