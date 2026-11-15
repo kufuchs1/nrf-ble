@@ -566,6 +566,25 @@ fn read_blob_past_the_end_gets_invalid_offset_never_attribute_not_long() {
     golden(&mut server, &app, &[0x0C, 0x0D, 0x00, 0x02, 0x00], &[0x01, 0x0C, 0x0D, 0x00, 0x07]);
 }
 
+/// With `att-mtu` at an MTU of 65, Read Blob gives up to 64 octets: a full
+/// 64 where that many are left, so the client reads on, then the rest, an
+/// empty response at the end and Invalid Offset past it.
+#[cfg(feature = "att-mtu")]
+#[test]
+fn read_blob_at_mtu_65_gives_up_to_64_octets() {
+    let app = App::new();
+    let mut server = Server::new(&DB);
+    golden(&mut server, &app, &[0x02, 0x05, 0x02], &[0x03, 0x41, 0x00]);
+    let blob = |offset: usize| <[&[u8]]>::concat(&[&[0x0D], &REPORT_MAP[offset..]]);
+    golden(&mut server, &app, &[0x0C, 0x16, 0x00, 0x00, 0x00], &blob(0)[..65]);
+    golden(&mut server, &app, &[0x0C, 0x16, 0x00, 61, 0x00], &blob(61)[..65]);
+    golden(&mut server, &app, &[0x0C, 0x16, 0x00, 62, 0x00], &blob(62));
+    assert_eq!(blob(62).len(), 65);
+    golden(&mut server, &app, &[0x0C, 0x16, 0x00, 63, 0x00], &blob(63));
+    golden(&mut server, &app, &[0x0C, 0x16, 0x00, 126, 0x00], &[0x0D]);
+    golden(&mut server, &app, &[0x0C, 0x16, 0x00, 127, 0x00], &[0x01, 0x0C, 0x16, 0x00, 0x07]);
+}
+
 #[test]
 fn requests_the_server_does_not_serve_get_request_not_supported() {
     let app = App::new();

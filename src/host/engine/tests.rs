@@ -121,6 +121,45 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_public_key() {
     assert_eq!(engine.notification(epoch, example::KEYBOARD, &[0; 8]), Err(NotifyError::NotSubscribed));
 }
 
+/// With `att-mtu` an ATT response of more than 23 octets takes several
+/// fragments, and a notification waits for the last of them as it does for
+/// a public key.
+#[cfg(feature = "att-mtu")]
+#[test]
+fn a_notification_never_interleaves_with_the_fragments_of_a_long_response() {
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(5);
+    engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
+    receive(&mut engine, &mut device, 4, &[0x12, 0x0E, 0x00, 0x01, 0x00], at(0));
+    assert_eq!(drain(&mut engine, 4, at(0)).len(), 1);
+    let epoch = engine.epoch().unwrap();
+    receive(&mut engine, &mut device, 4, &[0x02, 0x05, 0x02], at(1));
+    let answer = drain(&mut engine, 4, at(1));
+    assert_eq!(answer.iter().map(Fragment::bytes).collect::<std::vec::Vec<_>>(), [[3, 0, 4, 0, 0x03, 0x41, 0x00]]);
+    // Find Information over the whole table: 15 entries, 62 octets, in
+    // three fragments.
+    receive(&mut engine, &mut device, 4, &[0x04, 0x01, 0x00, 0xFF, 0xFF], at(2));
+    let first = engine.next_fragment(4).unwrap();
+    assert!(first.start());
+    assert_eq!(first.bytes()[..6], [62, 0, 4, 0, 0x05, 0x01]);
+    engine.fragment_sent(at(2));
+    assert_eq!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]), Err(NotifyError::Busy));
+    let second = engine.next_fragment(4).unwrap();
+    engine.fragment_sent(at(2));
+    assert_eq!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]), Err(NotifyError::Busy));
+    let rest = drain(&mut engine, 4, at(2));
+    assert_eq!(
+        [&first, &second]
+            .into_iter()
+            .chain(&rest)
+            .map(|fragment| (fragment.start(), fragment.bytes().len()))
+            .collect::<std::vec::Vec<_>>(),
+        [(true, 27), (false, 27), (false, 12)]
+    );
+    let fragment = engine.notification(epoch, example::BATTERY_LEVEL, &[50]).unwrap();
+    assert_eq!(fragment.bytes(), [4, 0, 4, 0, 0x1B, 0x0D, 0x00, 50]);
+}
+
 #[test]
 fn the_parameter_request_leaves_the_last_place_to_responses() {
     let identity = identity();
