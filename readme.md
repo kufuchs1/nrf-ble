@@ -41,9 +41,9 @@ What is done so far:
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
   feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
 - L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer, fragmenting on demand), LE signalling
-  (`host::signal`: the connection parameter update request and command rejects), the ATT server at MTU 23
-  (`host::att`) and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state and a constant table hash; the
-  table itself is the device's).
+  (`host::signal`: the connection parameter update request and command rejects), the ATT server at MTU 23, or up to
+  65 with the feature `att-mtu` (`host::att`), and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD
+  state and a constant table hash; the table itself is the device's).
 - Our identity (`host::identity`: the address and identity resolving key derived from the device secret the way the MX
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
   phases, an optional directed first phase of a reconnection with the feature `directed-advertising`, high duty cycle,
@@ -159,6 +159,16 @@ release build keeps its size to the byte):
   more flash than legacy advertising on the nRF52832 and 2.5 KB on the nRF51, and about 0.4 KB more static RAM, most
   of it the longer advertising data the link layer and the host keep (see [Flash cost](#flash-cost)). Not yet tried on
   hardware.
+- **`att-mtu`**: the ATT server answers an Exchange MTU Request with 65 instead of 23 (`att::ATT_MAX`), and the fixed
+  channel's ATT MTU becomes the smaller of the client's and 65, at least 23, from the next request on. BlueZ offers
+  517, so in its first discovery after pairing a Read or Read Blob Response carries up to 64 octets of a value, a Find
+  Information Response up to 15 entries of 16-bit UUIDs and a Read By Type Response up to 9 characteristic declarations,
+  each in up to three link layer fragments: a Report Map of 167 octets takes 3 reads instead of 8. A reconnection with
+  a cached table reads little and gains little. Notifications and indications stay within 20 octets and one fragment,
+  and a dynamic value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets,
+  and the engine by 40 bytes of static RAM; the release builds of the three firmwares grow by 260 B (mouse), 452 B
+  (keyboard) and 512 B (presenter) of flash with extended advertising, 252 B, 452 B and 320 B with legacy advertising.
+  `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Not yet tried on hardware.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
@@ -832,7 +842,8 @@ target again, so `cargo test` runs on the PC.
 ```sh
 cargo test                                         # host tests, also with --features data-length, event-timing,
                                                    # directed-advertising, param-requests,key-missing,passkey,
-                                                   # extended-advertising (with and without directed-advertising)
+                                                   # extended-advertising (with and without directed-advertising),
+                                                   # att-mtu
 cargo test --no-default-features --features nrf51  # host tests for the nRF51
 cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt and data-length
 cargo clippy --target thumbv6m-none-eabi --no-default-features --features nrf51   # also with defmt

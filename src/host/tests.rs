@@ -554,16 +554,43 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond.clone()));
     assert!(poll(pin!(conn.next())).is_pending());
 
-    // Discovery as BlueZ runs it, encrypted.
+    // Discovery as BlueZ runs it, encrypted. With `att-mtu` the ATT MTU
+    // becomes 65.
+    #[cfg(not(feature = "att-mtu"))]
     assert_eq!(request(link, &mut tasks, &[0x02, 0x05, 0x02]), [0x03, 0x17, 0x00]);
+    #[cfg(feature = "att-mtu")]
+    assert_eq!(request(link, &mut tasks, &[0x02, 0x05, 0x02]), [0x03, 0x41, 0x00]);
     assert_eq!(request(link, &mut tasks, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B]), [0x01, 0x08, 0x01, 0x00, 0x0A]);
+    #[cfg(not(feature = "att-mtu"))]
     assert_eq!(request(link, &mut tasks, &[0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), [
         0x11, 0x06, 0x01, 0x00, 0x07, 0x00, 0x00, 0x18, 0x08, 0x00, 0x0A, 0x00, 0x01, 0x18, 0x0B, 0x00, 0x0E, 0x00,
         0x0F, 0x18
     ]);
+    // All five primary services, in two fragments.
+    #[cfg(feature = "att-mtu")]
+    assert_eq!(request(link, &mut tasks, &[0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), [
+        0x11, 0x06, 0x01, 0x00, 0x07, 0x00, 0x00, 0x18, 0x08, 0x00, 0x0A, 0x00, 0x01, 0x18, 0x0B, 0x00, 0x0E, 0x00,
+        0x0F, 0x18, 0x0F, 0x00, 0x11, 0x00, 0x0A, 0x18, 0x12, 0x00, 0x24, 0x00, 0x12, 0x18
+    ]);
     assert_eq!(request(link, &mut tasks, &[0x0A, 0x0D, 0x00]), [0x0B, 90]);
-    let report_map = request(link, &mut tasks, &[0x0A, 0x16, 0x00]);
-    assert_eq!(&report_map[1..], &example::REPORT_MAP[..22]);
+    #[cfg(not(feature = "att-mtu"))]
+    {
+        let report_map = request(link, &mut tasks, &[0x0A, 0x16, 0x00]);
+        assert_eq!(&report_map[1..], &example::REPORT_MAP[..22]);
+    }
+    // With `att-mtu` the Read Response holds 64 octets of the Report Map:
+    // with the L2CAP header, three fragments of 27, 27 and 15 octets.
+    #[cfg(feature = "att-mtu")]
+    {
+        link.send(CID_ATT, &[0x0A, 0x16, 0x00], true);
+        tasks.step();
+        let fragments = link.transmit();
+        link.ack();
+        let lengths: Vec<_> = fragments.iter().map(|(start, fragment)| (*start, fragment.len())).collect();
+        assert_eq!(lengths, [(true, 27), (false, 27), (false, 15)]);
+        let pdu: Vec<u8> = fragments.into_iter().flat_map(|(_, fragment)| fragment).collect();
+        assert_eq!(pdu, [&[65, 0x00, 0x04, 0x00, 0x0B][..], &example::REPORT_MAP[..64]].concat());
+    }
     // The input reports need the encryption, which the request had.
     assert_eq!(request(link, &mut tasks, &[0x0A, 0x1A, 0x00]), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
     // The configuration of the battery and of the three reports: the bond

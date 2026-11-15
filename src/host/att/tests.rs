@@ -58,18 +58,20 @@ const UNWRITTEN: u8 = 0xA5;
 ///
 /// A copy of the server takes the same request through
 /// [`Server::handle_on`] on the fixed channel, into a slot twice as long as
-/// [`MTU`]: it must give the same answer and end in the same state, and
-/// leave the octets after the first [`MTU`] as they were.
+/// [`ATT_MAX`]: it must give the same answer and end in the same state, and
+/// leave the octets after its answer as they were.
 fn exchange(server: &mut Server, app: &App, request: &[u8], level: Sec) -> Option<Vec<u8>> {
     let mut twin = *server;
-    let mut long = [UNWRITTEN; 2 * MTU];
+    let mut long = [UNWRITTEN; 2 * ATT_MAX];
     let twin_len = twin.handle_on(Bearer::Fixed, request, level, app, &mut long);
-    assert!(long[MTU..].iter().all(|&octet| octet == UNWRITTEN), "request {request:02X?}");
-    let mut out = [0_u8; MTU];
+    assert!(long[twin_len.unwrap_or(0)..].iter().all(|&octet| octet == UNWRITTEN), "request {request:02X?}");
+    let mut out = [0_u8; ATT_MAX];
     let len = server.handle(request, level, app, &mut out);
     assert_eq!(twin_len, len, "request {request:02X?}");
     assert_eq!(twin.subscriptions(), server.subscriptions(), "request {request:02X?}");
     assert_eq!(twin.is_indicating(), server.is_indicating(), "request {request:02X?}");
+    #[cfg(feature = "att-mtu")]
+    assert_eq!(twin.mtu, server.mtu, "request {request:02X?}");
     let len = len?;
     assert_eq!(long[..len], out[..len], "request {request:02X?}");
     Some(out[..len].to_vec())
@@ -82,10 +84,23 @@ fn golden(server: &mut Server, app: &App, request: &[u8], expected: &[u8]) {
     assert_eq!(response.as_deref(), Some(expected), "request {request:02X?}");
 }
 
+/// The answer to `BlueZ`'s Exchange MTU Request, which offers 517: 23, or
+/// with `att-mtu` 65.
+#[cfg(not(feature = "att-mtu"))]
+const MTU_517: [u8; 3] = [0x03, 0x17, 0x00];
+/// The answer to `BlueZ`'s Exchange MTU Request, which offers 517: 23, or
+/// with `att-mtu` 65.
+#[cfg(feature = "att-mtu")]
+const MTU_517: [u8; 3] = [0x03, 0x41, 0x00];
+
 /// The whole first connection of `BlueZ` (research-bluez.md, section 1.1),
 /// after pairing: MTU, server features, primary, secondary and include
 /// discovery, characteristics, descriptors, the hash, then the profiles'
 /// reads and configuration writes. Every response is checked octet by octet.
+///
+/// With `att-mtu` the client offers 23 here, as one without a larger MTU
+/// does, and every answer is the same; `BlueZ`'s connection at 65 is
+/// [`the_bluez_first_connection_at_mtu_65_gets_these_answers`].
 #[test]
 fn the_bluez_first_connection_gets_these_answers() {
     let app = App::new();
@@ -93,7 +108,14 @@ fn the_bluez_first_connection_gets_these_answers() {
     let s = &mut server;
 
     // Exchange MTU with 517: the answer is 23.
-    golden(s, &app, &[0x02, 0x05, 0x02], &[0x03, 0x17, 0x00]);
+    #[cfg(not(feature = "att-mtu"))]
+    golden(s, &app, &[0x02, 0x05, 0x02], &MTU_517);
+    // With `att-mtu`: Exchange MTU with 23, the answer is 65, and the MTU
+    // stays 23.
+    #[cfg(feature = "att-mtu")]
+    golden(s, &app, &[0x02, 0x17, 0x00], &MTU_517);
+    #[cfg(feature = "att-mtu")]
+    assert_eq!(s.mtu, 23);
     // Server Supported Features: none.
     golden(s, &app, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B], &[0x01, 0x08, 0x01, 0x00, 0x0A]);
 
@@ -232,6 +254,220 @@ fn the_bluez_first_connection_gets_these_answers() {
     assert_eq!(BATTERY_LEVEL_VALUE.index(), 0);
 }
 
+/// `BlueZ`'s first connection as
+/// [`the_bluez_first_connection_gets_these_answers`] has it, with `att-mtu`:
+/// Exchange MTU agrees on 65, so the primary services and the HID service's
+/// characteristics each fit one response, the Report Map takes a Read and one
+/// Read Blob, and notifications stay within 20 octets.
+#[cfg(feature = "att-mtu")]
+#[test]
+fn the_bluez_first_connection_at_mtu_65_gets_these_answers() {
+    let app = App::new();
+    let mut server = Server::new(&DB);
+    let s = &mut server;
+
+    // Exchange MTU with 517: the answer is 65, and so is the MTU.
+    golden(s, &app, &[0x02, 0x05, 0x02], &[0x03, 0x41, 0x00]);
+    assert_eq!(s.mtu, 65);
+    golden(s, &app, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B], &[0x01, 0x08, 0x01, 0x00, 0x0A]);
+
+    // All five primary services in one response.
+    golden(s, &app, &[0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28], &[
+        0x11, 0x06, //
+        0x01, 0x00, 0x07, 0x00, 0x00, 0x18, //
+        0x08, 0x00, 0x0A, 0x00, 0x01, 0x18, //
+        0x0B, 0x00, 0x0E, 0x00, 0x0F, 0x18, //
+        0x0F, 0x00, 0x11, 0x00, 0x0A, 0x18, //
+        0x12, 0x00, 0x24, 0x00, 0x12, 0x18,
+    ]);
+    golden(s, &app, &[0x10, 0x25, 0x00, 0xFF, 0xFF, 0x00, 0x28], &[0x01, 0x10, 0x25, 0x00, 0x0A]);
+    golden(s, &app, &[0x10, 0x01, 0x00, 0xFF, 0xFF, 0x01, 0x28], &[0x01, 0x10, 0x01, 0x00, 0x0A]);
+    for (start, end) in [(0x01_u8, 0x07_u8), (0x08, 0x0A), (0x0B, 0x0E), (0x0F, 0x11), (0x12, 0x24)] {
+        golden(s, &app, &[0x08, start, 0x00, end, 0x00, 0x02, 0x28], &[0x01, 0x08, start, 0x00, 0x0A]);
+    }
+
+    // Characteristics: the services before HID as at 23, then all six of
+    // HID's in one response.
+    golden(s, &app, &[0x08, 0x01, 0x00, 0x07, 0x00, 0x03, 0x28], &[
+        0x09, 0x07, //
+        0x02, 0x00, 0x02, 0x03, 0x00, 0x00, 0x2A, //
+        0x04, 0x00, 0x02, 0x05, 0x00, 0x01, 0x2A, //
+        0x06, 0x00, 0x02, 0x07, 0x00, 0x04, 0x2A,
+    ]);
+    golden(s, &app, &[0x08, 0x07, 0x00, 0x07, 0x00, 0x03, 0x28], &[0x01, 0x08, 0x07, 0x00, 0x0A]);
+    golden(s, &app, &[0x08, 0x08, 0x00, 0x0A, 0x00, 0x03, 0x28], &[
+        0x09, 0x07, //
+        0x09, 0x00, 0x02, 0x0A, 0x00, 0x2A, 0x2B,
+    ]);
+    golden(s, &app, &[0x08, 0x0A, 0x00, 0x0A, 0x00, 0x03, 0x28], &[0x01, 0x08, 0x0A, 0x00, 0x0A]);
+    golden(s, &app, &[0x08, 0x0B, 0x00, 0x0E, 0x00, 0x03, 0x28], &[
+        0x09, 0x07, //
+        0x0C, 0x00, 0x12, 0x0D, 0x00, 0x19, 0x2A,
+    ]);
+    golden(s, &app, &[0x08, 0x0D, 0x00, 0x0E, 0x00, 0x03, 0x28], &[0x01, 0x08, 0x0D, 0x00, 0x0A]);
+    golden(s, &app, &[0x08, 0x0F, 0x00, 0x11, 0x00, 0x03, 0x28], &[
+        0x09, 0x07, //
+        0x10, 0x00, 0x02, 0x11, 0x00, 0x50, 0x2A,
+    ]);
+    golden(s, &app, &[0x08, 0x11, 0x00, 0x11, 0x00, 0x03, 0x28], &[0x01, 0x08, 0x11, 0x00, 0x0A]);
+    golden(s, &app, &[0x08, 0x12, 0x00, 0x24, 0x00, 0x03, 0x28], &[
+        0x09, 0x07, //
+        0x13, 0x00, 0x02, 0x14, 0x00, 0x4A, 0x2A, //
+        0x15, 0x00, 0x02, 0x16, 0x00, 0x4B, 0x2A, //
+        0x17, 0x00, 0x04, 0x18, 0x00, 0x4C, 0x2A, //
+        0x19, 0x00, 0x12, 0x1A, 0x00, 0x4D, 0x2A, //
+        0x1D, 0x00, 0x12, 0x1E, 0x00, 0x4D, 0x2A, //
+        0x21, 0x00, 0x12, 0x22, 0x00, 0x4D, 0x2A,
+    ]);
+    golden(s, &app, &[0x08, 0x22, 0x00, 0x24, 0x00, 0x03, 0x28], &[0x01, 0x08, 0x22, 0x00, 0x0A]);
+    for (start, end) in [(0x1B_u8, 0x1C_u8), (0x1F, 0x20), (0x23, 0x24)] {
+        golden(s, &app, &[0x04, start, 0x00, end, 0x00], &[
+            0x05, 0x01, //
+            start, 0x00, 0x02, 0x29, //
+            end, 0x00, 0x08, 0x29,
+        ]);
+    }
+    golden(
+        s,
+        &app,
+        &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x2A, 0x2B],
+        &<[&[u8]]>::concat(&[&[0x09, 0x12, 0x0A, 0x00], &DB.hash()]),
+    );
+
+    // The profiles' reads as at 23.
+    golden(s, &app, &[0x0A, 0x03, 0x00], &<[&[u8]]>::concat(&[&[0x0B], example::NAME]));
+    golden(s, &app, &[0x0A, 0x05, 0x00], &[0x0B, 0xC1, 0x03]);
+    golden(s, &app, &[0x0A, 0x07, 0x00], &<[&[u8]]>::concat(&[&[0x0B], &ppcp(PARAMS)]));
+    golden(s, &app, &[0x0A, 0x11, 0x00], &[0x0B, 0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01]);
+    golden(s, &app, &[0x0A, 0x0D, 0x00], &[0x0B, 90]);
+    golden(s, &app, &[0x12, 0x0E, 0x00, 0x01, 0x00], &[0x13]);
+
+    // The Report Map: a Read gives a full 64 octets, so BlueZ asks for the
+    // rest with Read Blob, which gives the last 62, fewer than 64, and ends
+    // the read.
+    golden(s, &app, &[0x0A, 0x16, 0x00], &<[&[u8]]>::concat(&[&[0x0B], &REPORT_MAP[..64]]));
+    golden(s, &app, &[0x0C, 0x16, 0x00, 64, 0x00], &<[&[u8]]>::concat(&[&[0x0D], &REPORT_MAP[64..]]));
+    golden(s, &app, &[0x0A, 0x14, 0x00], &[0x0B, 0x11, 0x01, 0x00, 0x03]);
+    for (value, length, id) in [(0x1A_u8, 8, 1_u8), (0x1E, 2, 2), (0x22, 5, 3)] {
+        golden(s, &app, &[0x0A, value, 0x00], &<[&[u8]]>::concat(&[&[0x0B], &[0; 8][..length]]));
+        golden(s, &app, &[0x0A, value + 2, 0x00], &[0x0B, id, 0x01]);
+        golden(s, &app, &[0x0A, value + 1, 0x00], &[0x0B, 0x00, 0x00]);
+        golden(s, &app, &[0x12, value + 1, 0x00, 0x01, 0x00], &[0x13]);
+    }
+
+    // Notifications still carry at most 20 octets.
+    let mut out = [0_u8; MTU];
+    let report = [0, 0, 0x4B, 0, 0, 0, 0, 0];
+    let len = s.notify(example::KEYBOARD, &report, Sec::Encrypted, &mut out).unwrap();
+    assert_eq!(&out[..len], &*<[&[u8]]>::concat(&[&[0x1B, 0x1A, 0x00], &report]));
+    assert!(s.notify(example::KEYBOARD, &[0; 20], Sec::Encrypted, &mut out).is_ok());
+    assert_eq!(s.notify(example::KEYBOARD, &[0; 21], Sec::Encrypted, &mut out), Err(NotifyError::TooLong));
+}
+
+/// With `att-mtu`, Exchange MTU always answers 65, and the fixed channel's
+/// ATT MTU becomes the smaller of the client's and 65, at least 23, from
+/// the next request on.
+#[cfg(feature = "att-mtu")]
+#[test]
+fn exchange_mtu_agrees_on_the_smaller_mtu_at_least_23() {
+    let app = App::new();
+    let mut server = Server::new(&DB);
+    let read = [0x0A, 0x16, 0x00];
+    let report_map = |len: usize| <[&[u8]]>::concat(&[&[0x0B], &REPORT_MAP[..len]]);
+    // 23 before any exchange.
+    golden(&mut server, &app, &read, &report_map(22));
+    // A malformed request changes nothing.
+    golden(&mut server, &app, &[0x02, 0x1E], &[0x01, 0x02, 0x00, 0x00, 0x04]);
+    golden(&mut server, &app, &[0x02, 0x1E, 0x00, 0x00], &[0x01, 0x02, 0x00, 0x00, 0x04]);
+    golden(&mut server, &app, &read, &report_map(22));
+    // The client's 30.
+    golden(&mut server, &app, &[0x02, 0x1E, 0x00], &[0x03, 0x41, 0x00]);
+    assert_eq!(server.mtu, 30);
+    golden(&mut server, &app, &read, &report_map(29));
+    // Less than 23 counts as 23.
+    for client in [[0x16, 0x00], [0x00, 0x00]] {
+        golden(&mut server, &app, &[0x02, client[0], client[1]], &[0x03, 0x41, 0x00]);
+        assert_eq!(server.mtu, 23);
+        golden(&mut server, &app, &read, &report_map(22));
+    }
+    // More than 65 counts as 65; exactly 65 too.
+    for client in [[0x05, 0x02], [0xFF, 0xFF], [0x41, 0x00]] {
+        golden(&mut server, &app, &[0x02, client[0], client[1]], &[0x03, 0x41, 0x00]);
+        assert_eq!(server.mtu, 65);
+        golden(&mut server, &app, &read, &report_map(64));
+    }
+    // A slot of 23 octets is now too short: the request is ignored.
+    let mut short = [UNWRITTEN; MTU];
+    assert_eq!(server.handle_on(Bearer::Fixed, &read, Sec::Encrypted, &app, &mut short), None);
+    assert!(short.iter().all(|&octet| octet == UNWRITTEN));
+    // A new link starts at 23 again.
+    let mut server = Server::new(&DB);
+    golden(&mut server, &app, &read, &report_map(22));
+}
+
+/// With `att-mtu` at an MTU of 65, one Find Information Response holds 15
+/// entries of 16-bit UUIDs, 2 + 15 * 4 = 62 octets, and one Read By Type
+/// Response 9 characteristic declarations, 2 + 9 * 7 = 65.
+#[cfg(feature = "att-mtu")]
+#[test]
+fn discovery_at_mtu_65_fills_each_response() {
+    let app = App::new();
+    let mut server = Server::new(&DB);
+    golden(&mut server, &app, &[0x02, 0x05, 0x02], &[0x03, 0x41, 0x00]);
+    golden(&mut server, &app, &[0x04, 0x01, 0x00, 0xFF, 0xFF], &[
+        0x05, 0x01, //
+        0x01, 0x00, 0x00, 0x28, //
+        0x02, 0x00, 0x03, 0x28, //
+        0x03, 0x00, 0x00, 0x2A, //
+        0x04, 0x00, 0x03, 0x28, //
+        0x05, 0x00, 0x01, 0x2A, //
+        0x06, 0x00, 0x03, 0x28, //
+        0x07, 0x00, 0x04, 0x2A, //
+        0x08, 0x00, 0x00, 0x28, //
+        0x09, 0x00, 0x03, 0x28, //
+        0x0A, 0x00, 0x2A, 0x2B, //
+        0x0B, 0x00, 0x00, 0x28, //
+        0x0C, 0x00, 0x03, 0x28, //
+        0x0D, 0x00, 0x19, 0x2A, //
+        0x0E, 0x00, 0x02, 0x29, //
+        0x0F, 0x00, 0x00, 0x28,
+    ]);
+    golden(&mut server, &app, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x03, 0x28], &[
+        0x09, 0x07, //
+        0x02, 0x00, 0x02, 0x03, 0x00, 0x00, 0x2A, //
+        0x04, 0x00, 0x02, 0x05, 0x00, 0x01, 0x2A, //
+        0x06, 0x00, 0x02, 0x07, 0x00, 0x04, 0x2A, //
+        0x09, 0x00, 0x02, 0x0A, 0x00, 0x2A, 0x2B, //
+        0x0C, 0x00, 0x12, 0x0D, 0x00, 0x19, 0x2A, //
+        0x10, 0x00, 0x02, 0x11, 0x00, 0x50, 0x2A, //
+        0x13, 0x00, 0x02, 0x14, 0x00, 0x4A, 0x2A, //
+        0x15, 0x00, 0x02, 0x16, 0x00, 0x4B, 0x2A, //
+        0x17, 0x00, 0x04, 0x18, 0x00, 0x4C, 0x2A,
+    ]);
+    golden(&mut server, &app, &[0x08, 0x18, 0x00, 0xFF, 0xFF, 0x03, 0x28], &[
+        0x09, 0x07, //
+        0x19, 0x00, 0x12, 0x1A, 0x00, 0x4D, 0x2A, //
+        0x1D, 0x00, 0x12, 0x1E, 0x00, 0x4D, 0x2A, //
+        0x21, 0x00, 0x12, 0x22, 0x00, 0x4D, 0x2A,
+    ]);
+}
+
+/// Read By Type cuts a value longer than an entry holds to the ATT MTU less
+/// 4 octets: 19 octets of the Report Map at 23, and with `att-mtu` 61 at
+/// 65.
+#[test]
+fn read_by_type_cuts_a_long_value_to_the_mtu_less_4() {
+    let app = App::new();
+    let mut server = Server::new(&DB);
+    let request = [0x08, 0x12, 0x00, 0x24, 0x00, 0x4B, 0x2A];
+    golden(&mut server, &app, &request, &<[&[u8]]>::concat(&[&[0x09, 0x15, 0x16, 0x00], &REPORT_MAP[..19]]));
+    #[cfg(feature = "att-mtu")]
+    {
+        golden(&mut server, &app, &[0x02, 0x05, 0x02], &[0x03, 0x41, 0x00]);
+        golden(&mut server, &app, &request, &<[&[u8]]>::concat(&[&[0x09, 0x3F, 0x16, 0x00], &REPORT_MAP[..61]]));
+    }
+}
+
 /// The reconnection of a bonded central with a cached table: the hash
 /// matches, so no discovery follows.
 #[test]
@@ -239,7 +475,7 @@ fn a_reconnection_reads_the_hash_and_restores_nothing_it_did_not_write() {
     let app = App::new();
     let mut server = Server::new(&DB);
     server.restore(crate::host::gatt::Subscriptions::from_bits(0b0101_0101));
-    golden(&mut server, &app, &[0x02, 0x05, 0x02], &[0x03, 0x17, 0x00]);
+    golden(&mut server, &app, &[0x02, 0x05, 0x02], &MTU_517);
     golden(
         &mut server,
         &app,

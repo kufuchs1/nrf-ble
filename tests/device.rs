@@ -18,7 +18,7 @@ use nrf_ble::{
             Phase,
             Schedule,
         },
-        att::{MTU, Server},
+        att::{ATT_MAX, Server},
         engine::{Config, Unclaimed},
         gatt::{AttError, Handler, PROP_NOTIFY, PROP_READ, Sec, Uuid, Value, ValueId, ppcp},
     },
@@ -95,7 +95,7 @@ impl Handler for App {
 /// Sends `request` to a server of [`DB`] on a link of security `level`.
 fn exchange(request: &[u8], level: Sec) -> Vec<u8> {
     let mut server = Server::new(&DB);
-    let mut out = [0; MTU];
+    let mut out = [0; ATT_MAX];
     let len = server.handle(request, level, &App, &mut out).unwrap();
     out[..len].to_vec()
 }

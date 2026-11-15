@@ -73,6 +73,17 @@ directed-advertising = []
 # flash than legacy advertising on the nRF52832, 2.5 KB on the nRF51, and
 # 0.4 KB more static RAM. Not yet tried on hardware.
 extended-advertising = []
+# `att-mtu`: the ATT server answers Exchange MTU with 65 instead of 23, so the
+# fixed channel's ATT MTU becomes the smaller of the client's and 65, at least
+# 23 (`host::att::ATT_MAX`). A Read or Read Blob Response then carries up to
+# 64 octets of a value, Find Information up to 15 entries of 16-bit UUIDs and
+# Read By Type up to 9 characteristic declarations of 16-bit UUIDs, which
+# shortens a first discovery. A response of more than 23 octets goes out in
+# 2 or 3 link layer fragments; notifications stay at 20 octets and one
+# fragment. Static RAM +40 B (the engine's response slot of 65 octets instead
+# of 23); flash +0.3 to 0.5 KB in the release builds of the three firmwares
+# (readme).
+att-mtu = []
 
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main): the crate's own dependencies name their git

@@ -1,17 +1,24 @@
-//! The attribute protocol, as a server with the default MTU of 23 octets.
+//! The attribute protocol, as a server.
+//!
+//! Its ATT MTU is the default of 23 octets, or with the feature `att-mtu` one
+//! of up to 65 that the client agrees to.
 //!
 //! [`Server`] decodes the requests `BlueZ` sends, answers them from the GATT
 //! table ([`crate::host::gatt::Db`]) with the error codes of the Core
 //! specification, and encodes notifications and indications. A request
 //! arrives on a [`Bearer`], whose ATT MTU bounds its response; the only one
 //! is the fixed channel. One request is outstanding at a time, so the engine
-//! keeps one response slot of [`MTU`] octets. One indication waits for its
-//! confirmation; the 30 s limit on that wait is for the engine to time, which
-//! does not send indications yet.
+//! keeps one response slot of [`ATT_MAX`] octets. One indication waits for
+//! its confirmation; the 30 s limit on that wait is for the engine to time,
+//! which does not send indications yet.
 //!
 //! It serves exactly these requests:
 //!
-//! - Exchange MTU: the answer is always 23.
+//! - Exchange MTU: the answer is [`ATT_MAX`], 23 or with `att-mtu` 65. With
+//!   `att-mtu` the fixed channel's ATT MTU then becomes the smaller of the
+//!   client's and 65, at least 23, from the next PDU on; the response itself
+//!   still fits the ATT MTU before it. Notifications and indications still
+//!   carry at most [`NOTIFY_MAX`] (20) octets of a value, in a PDU of 23.
 //! - Find Information.
 //! - Find By Type Value, for primary services (0x2800) only.
 //! - Read By Type, for any attribute type: characteristic declarations (0x2803)
@@ -69,8 +76,17 @@ use crate::host::gatt::{
     Value,
 };
 
-/// The ATT MTU: the default, which the server never raises.
+/// The default ATT MTU.
+///
+/// The least any bearer has, and the fixed channel's until an Exchange MTU
+/// raises it (with the feature `att-mtu`).
 pub const MTU: usize = 23;
+/// The largest ATT MTU the server takes: 65 with the feature `att-mtu`,
+/// otherwise [`MTU`].
+///
+/// The server answers an Exchange MTU Request with it, and a response slot
+/// is this long.
+pub const ATT_MAX: usize = if cfg!(feature = "att-mtu") { 65 } else { MTU };
 /// Longest value a notification or indication carries.
 pub const NOTIFY_MAX: usize = MTU.strict_sub(3);
 /// Opcode of an Error Response.
@@ -153,7 +169,8 @@ pub enum NotifyError {
 #[non_exhaustive]
 pub enum Bearer {
     /// The fixed channel of the attribute protocol, CID 0x0004, whose
-    /// ATT MTU is [`MTU`].
+    /// ATT MTU is [`MTU`] until an Exchange MTU raises it, with the feature
+    /// `att-mtu`.
     Fixed,
 }
 
@@ -167,6 +184,9 @@ pub struct Server {
     db:            &'static Db,
     /// Whether an indication waits for its confirmation.
     indicating:    bool,
+    /// The fixed channel's ATT MTU: [`MTU`] until an Exchange MTU.
+    #[cfg(feature = "att-mtu")]
+    mtu:           u16,
     /// The link's client characteristic configuration.
     subscriptions: Subscriptions,
 }
@@ -203,17 +223,28 @@ struct Writer<'out> {
 }
 
 impl Server {
+    /// Takes the client's ATT MTU of an Exchange MTU Request, `params`:
+    /// the fixed channel's becomes the smaller of it and [`ATT_MAX`], at
+    /// least [`MTU`]. A request of the wrong length changes nothing.
+    #[cfg(feature = "att-mtu")]
+    const fn agree_mtu(&mut self, params: &[u8]) {
+        if let &[client0, client1] = params {
+            self.mtu = u16::from_le_bytes([client0, client1])
+                .clamp(MTU.saturating_cast::<u16>(), ATT_MAX.saturating_cast::<u16>());
+        }
+    }
+
     /// Forgets the indication waiting for its confirmation, after its 30 s
     /// timeout ended the link.
     #[inline]
     pub const fn cancel_indication(&mut self) { self.indicating = false; }
 
-    /// Answers an Exchange MTU Request: always the default MTU.
+    /// Answers an Exchange MTU Request: always [`ATT_MAX`].
     const fn exchange_mtu(params: &[u8], out: &mut [u8]) -> Answer {
         if params.len() != 2 {
             return Err((0, AttError::INVALID_PDU));
         }
-        let [low, high] = MTU.saturating_cast::<u16>().to_le_bytes();
+        let [low, high] = ATT_MAX.saturating_cast::<u16>().to_le_bytes();
         let mut writer = Writer::new(out, EXCHANGE_MTU_RESPONSE);
         writer.push(&[low, high]);
         Ok(writer.finish())
@@ -271,9 +302,10 @@ impl Server {
 
     /// Answers a request, `pdu`, received on the fixed channel
     /// ([`Bearer::Fixed`]) at the security `level`, as
-    /// [`Self::handle_on`] does.
+    /// [`Self::handle_on`] does, into a slot of [`ATT_MAX`] octets, which
+    /// any ATT MTU of the channel fits.
     #[inline]
-    pub fn handle(&mut self, pdu: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Option<usize> {
+    pub fn handle(&mut self, pdu: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; ATT_MAX]) -> Option<usize> {
         self.handle_on(Bearer::Fixed, pdu, level, app, out)
     }
 
@@ -295,12 +327,20 @@ impl Server {
         slot: &mut [u8],
     ) -> Option<usize> {
         let mtu = match bearer {
+            #[cfg(feature = "att-mtu")]
+            Bearer::Fixed => usize::from(self.mtu),
+            #[cfg(not(feature = "att-mtu"))]
             Bearer::Fixed => MTU,
         };
         let out = slot.get_mut(..mtu)?;
         let (&opcode, params) = pdu.split_first()?;
         let answer = match opcode {
-            EXCHANGE_MTU_REQUEST => Self::exchange_mtu(params, out),
+            EXCHANGE_MTU_REQUEST => {
+                // The response goes out within the ATT MTU before it.
+                #[cfg(feature = "att-mtu")]
+                self.agree_mtu(params);
+                Self::exchange_mtu(params, out)
+            },
             FIND_INFORMATION_REQUEST => self.find_information(params, out),
             FIND_BY_TYPE_VALUE_REQUEST => self.find_by_type_value(params, out),
             READ_BY_TYPE_REQUEST => self.read_by_type(params, level, app, out),
@@ -358,7 +398,15 @@ impl Server {
     /// The server of a new link over the table `db`, with no subscriptions.
     #[inline]
     #[must_use = "the server is only built"]
-    pub const fn new(db: &'static Db) -> Self { Self { db, indicating: false, subscriptions: Subscriptions::new() } }
+    pub const fn new(db: &'static Db) -> Self {
+        Self {
+            db,
+            indicating: false,
+            #[cfg(feature = "att-mtu")]
+            mtu: MTU.saturating_cast(),
+            subscriptions: Subscriptions::new(),
+        }
+    }
 
     /// A Handle Value Notification of `data` for `characteristic` on a link
     /// of security `level`, written into `out`; returns its length.
@@ -456,9 +504,12 @@ impl Server {
     }
 
     /// Answers a Read By Type Request: the values of the attributes of the
-    /// type, as long as they have the length of the first and may be read.
+    /// type, as long as they have the length of the first and may be read,
+    /// each cut to the ATT MTU less 4 octets.
     fn read_by_type(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8]) -> Answer {
         let (start, end, wanted) = typed_range(params)?;
+        // The opcode, the entries' length and the handle come before it.
+        let value_max = out.len().saturating_sub(4);
         let mut writer = Writer::new(out, READ_BY_TYPE_RESPONSE);
         let mut pair_len = None;
         for (handle, attr) in self.within(start, end) {
@@ -474,8 +525,8 @@ impl Server {
                 Err(error) if pair_len.is_none() => return Err((handle, error)),
                 Err(_) => break,
             };
-            let mut value: [u8; MTU.strict_sub(4)] = [0; MTU.strict_sub(4)];
-            let len = source.copy(0, &mut value).unwrap_or_default();
+            let mut value: [u8; ATT_MAX.strict_sub(4)] = [0; ATT_MAX.strict_sub(4)];
+            let len = source.copy(0, value.get_mut(..value_max).unwrap_or_default()).unwrap_or_default();
             let entry_len = len.saturating_add(2);
             if *pair_len.get_or_insert(entry_len) != entry_len {
                 break;

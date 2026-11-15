@@ -108,8 +108,8 @@
 //!
 //! Not served: indications, with the Service Changed indication, its ordering
 //! after the Write Response and its 30 s confirmation timer (for a table
-//! with Service Changed); the LE credit based channels; and an MTU
-//! above 23.
+//! with Service Changed); the LE credit based channels; and, without the
+//! feature `att-mtu`, an ATT MTU above 23.
 
 #[cfg(feature = "passkey")]
 use crate::host::PasskeyError;
@@ -121,11 +121,11 @@ use crate::{
         Aes,
         ConnEvent,
         NotifyError,
-        att::{MTU, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
+        att::{ATT_MAX, MTU, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
         bond::Bond,
         gatt::{CCCD_MAX, Char, Db, Handler, Sec},
         identity::{self, Variant},
-        l2cap::{Channel, Fragment, RX_MAX, Reassembly, Segmenter},
+        l2cap::{Channel, Fragment, HEADER_LEN, RX_MAX, Reassembly, Segmenter},
         signal::{self, Action, Signalling},
         smp::{self, Job, JobResult, Outcome, Random, Reason, Responder},
     },
@@ -411,10 +411,17 @@ struct Payload {
 #[derive(Clone, Copy)]
 struct Slot {
     /// The octets.
-    bytes: [u8; MTU],
+    bytes: [u8; ATT_MAX],
     /// Their number.
     len:   u8,
 }
+
+// A response of the largest ATT MTU fits a slot's length, and a payload to
+// render; a request of it fits the reassembly buffer.
+const _: () = assert!(
+    ATT_MAX <= usize::from(u8::MAX) && ATT_MAX <= smp::PDU_MAX && HEADER_LEN.strict_add(ATT_MAX) <= RX_MAX,
+    "the ATT MTU fits the slot, the payload and the reassembly buffer"
+);
 
 /// Where the PDU being sent comes from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -516,7 +523,7 @@ impl Engine {
         let level = self.raised(received);
         #[cfg(not(feature = "passkey"))]
         let level = received;
-        let mut out: [u8; MTU] = [0; MTU];
+        let mut out: [u8; ATT_MAX] = [0; ATT_MAX];
         if let Some(len) = self.att.handle(pdu, level, app, &mut out) {
             if self.response.is_none() {
                 self.response = Some(Slot { bytes: out, len: len.saturating_cast() });
@@ -1186,8 +1193,9 @@ impl Engine {
             Source::Att => self.response.map(|slot| (slot.bytes, usize::from(slot.len))),
             Source::Reply | Source::Request => {
                 let command = if source == Source::Reply { self.sig_reply } else { self.sig_req }?;
-                let mut bytes: [u8; MTU] = [0; MTU];
-                let len = command.bytes().len().min(MTU);
+                // The array of the slot's type, though a command is shorter.
+                let mut bytes: [u8; ATT_MAX] = [0; ATT_MAX];
+                let len = command.bytes().len().min(ATT_MAX);
                 bytes.get_mut(..len)?.copy_from_slice(command.bytes().get(..len)?);
                 Some((bytes, len))
             },
