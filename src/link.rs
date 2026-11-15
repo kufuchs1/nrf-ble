@@ -584,6 +584,18 @@ pub(crate) enum LtkAnswer {
     Missing,
 }
 
+/// The addresses advertising puts on air, made outside the critical
+/// section when it starts ([`Link::advertise`]).
+#[derive(Clone, Copy)]
+pub(crate) struct OnAir {
+    /// Our address: the identity, or a resolvable private address.
+    pub own:    Peer,
+    /// The target of directed advertising: the peer's identity, or a
+    /// resolvable private address of its key.
+    #[cfg(feature = "directed-advertising")]
+    pub target: Peer,
+}
+
 /// Host state kept by the link layer.
 struct HostState {
     /// Fragments of the link the central acknowledged.
@@ -975,7 +987,7 @@ impl Shared {
 
     /// [`Self::renewed_advertising`], with `fill` drawing the random octets.
     #[cfg(feature = "extended-advertising")]
-    async fn renewed_advertising_with(&self, mut fill: impl AsyncFnMut(&mut [u8])) -> Option<AdvSettings> {
+    pub(crate) async fn renewed_advertising_with(&self, mut fill: impl AsyncFnMut(&mut [u8])) -> Option<AdvSettings> {
         loop {
             // No copy of the settings lives across the wait.
             let step = self.state.lock(|cell| {
@@ -1320,6 +1332,28 @@ impl<'shared> Link<'shared> {
     /// while a connection exists.
     #[inline]
     pub fn advertise(&self, params: &AdvParams, adv: &[u8], scan: &[u8]) -> Result<(), Error> {
+        self.advertise_with(params, adv, scan, |key| OnAir {
+            own: self.shared.own_address(key),
+            #[cfg(feature = "directed-advertising")]
+            target: self.shared.directed_target((params.private, params.kind, params.peer)),
+        })
+    }
+
+    /// [`Self::advertise`] with the addresses on air from `on_air`, given
+    /// the local key of the private address the parameters ask for, if any.
+    /// `on_air` runs outside the critical section, once the parameters were
+    /// checked.
+    #[inline]
+    pub(crate) fn advertise_with<Addresses>(
+        self,
+        params: &AdvParams,
+        adv: &[u8],
+        scan: &[u8],
+        on_air: Addresses,
+    ) -> Result<(), Error>
+    where
+        Addresses: FnOnce(Option<[u8; 16]>) -> OnAir,
+    {
         if !params.is_valid() || adv.len() > params.kind.data_max() || scan.len() > SCAN_DATA_MAX {
             return Err(Error::Invalid);
         }
@@ -1340,9 +1374,7 @@ impl<'shared> Link<'shared> {
                 .state
                 .lock(|cell| cell.borrow().adv.resolving.local_key(params.kind.is_directed().then_some(params.peer)))
         });
-        let own = self.shared.own_address(key.flatten());
-        #[cfg(feature = "directed-advertising")]
-        let on_air_target = self.shared.directed_target((params.private, params.kind, params.peer));
+        let addresses = on_air(key.flatten());
         let result = self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             if state.connected {
@@ -1357,12 +1389,12 @@ impl<'shared> Link<'shared> {
             settings.interval = u32::from(params.interval).saturating_mul(625);
             settings.peer = params.peer;
             #[cfg(feature = "directed-advertising")]
-            settings.target.clone_from(&on_air_target);
+            settings.target.clone_from(&addresses.target);
             settings.channel_map = params.channel_map;
             settings.filter_policy = params.filter_policy;
             #[cfg(feature = "extended-advertising")]
             settings.secondary_phy.clone_from(&params.secondary_phy);
-            settings.own = own;
+            settings.own = addresses.own;
             state.adv_enabled = true;
             Ok(())
         });
@@ -1371,6 +1403,28 @@ impl<'shared> Link<'shared> {
             info!("advertising");
         }
         result
+    }
+
+    /// [`Self::advertise`] with `fill` and `encrypt` in place of the RNG
+    /// and the ECB, for the host tests: our private address is a new one
+    /// each call, not kept for its lifetime, which needs the clock.
+    #[cfg(all(test, feature = "directed-advertising"))]
+    pub(crate) fn advertise_drawn<Fill, Encrypt>(
+        &self,
+        params: &AdvParams,
+        (adv, scan): (&[u8], &[u8]),
+        mut fill: Fill,
+        encrypt: Encrypt,
+    ) -> Result<(), Error>
+    where
+        Fill: FnMut(&mut [u8]),
+        Encrypt: Fn([u8; 16], [u8; 16]) -> [u8; 16] + Copy,
+    {
+        let identity = self.shared.state.lock(|cell| cell.borrow().adv.address);
+        self.advertise_with(params, adv, scan, |key| OnAir {
+            own:    key.map_or(identity, |key| new_private_address(key, &mut fill, encrypt)),
+            target: self.shared.directed_target_with((params.private, params.kind, params.peer), &mut fill, encrypt),
+        })
     }
 
     /// Refuses resolving list changes while advertising resolves addresses.

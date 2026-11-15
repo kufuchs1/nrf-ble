@@ -44,9 +44,9 @@ What is done so far:
   table itself is the device's).
 - Our identity (`host::identity`: the address and identity resolving key derived from the device secret the way the MX
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
-  phases, an optional high duty cycle directed first phase of a reconnection with the feature `directed-advertising`,
-  and their setup of the link layer's accept list, resolving list and privacy) and the bond (`host::bond`: the record
-  of the one central with its fixed 50 octet stored form).
+  phases, an optional directed first phase of a reconnection with the feature `directed-advertising`, high duty cycle,
+  or low duty cycle with `extended-advertising`, and their setup of the link layer's accept list, resolving list and
+  privacy) and the bond (`host::bond`: the record of the one central with its fixed 50 octet stored form).
 - The engine (`host::engine::Engine`): all of the host's protocol state for one link, without futures. It takes the
   link layer's events and fragments, the time and the results of the P-256 jobs, and gives the fragments to send (pulled
   one at a time, the connection parameter request leaving one place of the link layer's queue free), the calls of the
@@ -129,8 +129,10 @@ release build keeps its size to the byte):
   data of f4, f5, f6 and g2.
 - **`directed-advertising`**: a reconnection schedule may start with `Phase::directed(adv::DIRECTED_MAX)`, high duty
   cycle directed advertising to the bonded central, to a resolvable private address made with its key if it sent one
-  (see [A device](#a-device)). About 1.2 KB of flash on the nRF52832 and 1.4 KB on the nRF51 (measured in a keyboard
-  and a presenter firmware), and one AES block each time a directed phase starts.
+  (see [A device](#a-device)), or with `extended-advertising` low duty cycle directed advertising every 20 ms. About
+  1.2 KB of flash on the nRF52832 and 1.3 KB on the nRF51 with legacy advertising, 1.3 KB and 0.7 KB with
+  `extended-advertising`, 24 bytes of static RAM, and one AES block each time a directed phase starts (see
+  [Flash cost](#flash-cost)).
 - **`extended-advertising`**: Bluetooth 5 extended advertising in place of legacy advertising, for centrals that scan
   with the extended commands (Linux with a Bluetooth 5 adapter). An `ADV_EXT_IND` on each primary channel points to
   one `AUX_ADV_IND` on a secondary channel, which holds up to 245 octets of advertising data (239 when directed; 242
@@ -149,8 +151,10 @@ release build keeps its size to the byte):
   request's `InitA` also for a central in device privacy mode that sends its identity address, against a
   recommendation of the specification, as initiators take no other. With the feature the link layer sets bit 12 (LE
   Extended Advertising) of its features. No legacy advertising is compiled in. With `directed-advertising`, a directed
-  phase is low duty cycle directed advertising, an `AUX_ADV_IND` with the target at the phase's interval. Not yet
-  tried on hardware.
+  phase is low duty cycle directed advertising, an `AUX_ADV_IND` with the target at the phase's interval. About 2.8 KB
+  more flash than legacy advertising on the nRF52832 and 2.5 KB on the nRF51, and about 0.4 KB more static RAM, most
+  of it the longer advertising data the link layer and the host keep (see [Flash cost](#flash-cost)). Not yet tried on
+  hardware.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
@@ -159,6 +163,23 @@ release build keeps its size to the byte):
 
 A firmware enables the features it needs: a mouse, for example, `param-requests` and `key-missing`, a keyboard also
 `passkey`.
+
+### Flash cost
+
+The advertising features, measured in the release builds of three firmwares with this crate as a path dependency
+(`llvm-size`; flash is text and data, static RAM data and bss; the stack is not counted), each against the same
+firmware with legacy advertising and neither feature:
+
+| Firmware (chip) | `directed-advertising` | `extended-advertising` | both | flash of `directed-advertising` on top of `extended-advertising` |
+|---|---|---|---|---|
+| MX Keys S keyboard (nRF52832) | +1208 B flash, +24 B RAM | +2776 B flash, +416 B RAM | +4088 B flash, +440 B RAM | +1312 B |
+| MX Master 3S mouse (nRF52832) | +1160 B flash, +24 B RAM | +2744 B flash, +408 B RAM | +3996 B flash, +432 B RAM | +1252 B |
+| Spotlight presenter (nRF51) | +1332 B flash, +24 B RAM | +2484 B flash, +448 B RAM | +3164 B flash, +472 B RAM | +680 B |
+
+The extended advertising event replaces legacy advertising's, and is larger; its static RAM is mostly the
+advertising data of up to 245 octets in the link layer's settings and the host's `Advertising`, in place of 31. Each
+copy of the link layer's settings on the stack grows by the same amount (one in the link layer task, one during an
+advertising event). The other features cost nothing when off.
 
 ## The typed link API
 
@@ -704,7 +725,12 @@ Everything that makes a device what it is lives in the device's own crate, typic
   reconnections skip that phase (`Mode::skips`); a new pairing directs again. The all-zero key that a central without
   one may send with its identity address counts as none, and its bond is stored. In pairing mode, and for a bond
   whose central has no identity address, a directed phase advertises undirected at 20 ms instead, for the same time
-  (`Mode::directs`).
+  (`Mode::directs`). With `extended-advertising` as well, which has no high duty cycle directed advertising, the
+  directed phase is low duty cycle directed advertising instead: an `AUX_ADV_IND` with `TargetA` (the central's
+  identity, or the resolvable private address made with its key, `RxAdd` set) every 20 ms plus the random advDelay,
+  connectable only by that central (its identity, or an `InitA` that resolves to it with the bond's key), for the
+  phase's time, at most 1.28 s. It is no faster than undirected advertising at 20 ms, so it only helps a central that
+  connects to directed advertising sooner than to undirected; the target, the bond's bit and the skip are the same.
 
 ```rust
 use embassy_time::Duration;

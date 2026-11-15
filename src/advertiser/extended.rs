@@ -373,7 +373,17 @@ impl Kind {
 #[inline]
 #[must_use = "the request is only checked"]
 pub fn accepted_request(settings: &Settings, pdu: &[u8]) -> Option<ConnectInd> {
-    ConnectInd::parse_aux(pdu, settings.own).filter(|request| settings.accepts_connection(request.central()))
+    accepted_request_with(settings, pdu, |central| settings.accepts_connection(central))
+}
+
+/// [`accepted_request`], with `accepts` deciding whether the settings
+/// accept the central: in the host tests, with the AES in software.
+#[inline]
+pub(crate) fn accepted_request_with<Accepts>(settings: &Settings, pdu: &[u8], accepts: Accepts) -> Option<ConnectInd>
+where
+    Accepts: FnOnce(Peer) -> bool,
+{
+    ConnectInd::parse_aux(pdu, settings.own).filter(|request| accepts(request.central()))
 }
 
 /// Arms the radio's start at `at`, with at least [`MIN_LEAD_US`] to go.

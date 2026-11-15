@@ -139,7 +139,7 @@ impl Settings {
 
     /// [`Self::accepts_connection`], with `resolves` deciding whether an
     /// address resolves with a key.
-    fn accepts_connection_with<Resolves>(&self, central: Peer, resolves: Resolves) -> bool
+    pub(crate) fn accepts_connection_with<Resolves>(&self, central: Peer, resolves: Resolves) -> bool
     where
         Resolves: Fn([u8; 16], [u8; 6]) -> bool + Copy,
     {
