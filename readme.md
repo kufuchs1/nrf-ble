@@ -34,7 +34,9 @@ What is done so far:
   `p256` crate behind the crate nrf-ble-p256 of this repository (`p256/`; see
   [Cryptography of pairing](#cryptography-of-pairing)).
 - The security manager (`host::smp::Responder`): LE Secure Connections Just Works pairing as responder, with bonding and
-  the identity keys both ways, as a state machine without input or output of its own. The P-256 multiplications are
+  the identity keys both ways, as a state machine without input or output of its own. A pairing on a link that is
+  already encrypted (a central that pairs again, or one that replaces a Just Works key with Passkey Entry) ends with
+  the key refresh to the pairing's key as a first pairing ends with the encryption. The P-256 multiplications are
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
   feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
@@ -234,9 +236,12 @@ advertising event). The other features cost nothing when off.
   of a link, are overwritten once they are no longer needed.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
   the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
-  or as long as the host sets: after three quarters of that time without one, the link layer pings the central, and
-  the host learns when the whole time passes. A central that leaves the ping unanswered for 40 s ends the link with
-  an LL response timeout, as any other procedure does. A key reply for a link that ended before the host answered
+  or as long as the host sets: after three quarters of that time without one, the link layer pings the central at
+  the next connection event it listens to anyway, so the ping breaks no run of skipped events; at the latest when
+  twice the longest run of events (the latency plus one) is left of the time, and at once for a time too short for
+  that. It then listens at every event until the response arrives, and the host learns when the whole time passes. A
+  central that leaves the ping unanswered for 40 s ends the link with an LL response timeout, as any other procedure
+  does. A key reply for a link that ended before the host answered
   returns `Error::Gone` and has no effect on the next link.
 - **Connection parameter requests from the host** run one at a time: `Link::request_params` returns
   `Error::Disallowed` until the previous one reported its `Event::ParamsUpdated`, and `Error::UnsupportedRemote` for a
@@ -294,7 +299,9 @@ advertising event). The other features cost nothing when off.
 - **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
   instant; data from the host ends the skipping at the next connection event. It is also held off, so that every
   connection event is listened to: during the first second of a link, for 200 ms or 8 connection events, whichever is
-  longer, after any PDU with a payload in either direction, and while the host asks for it with `Link::hold_latency`.
+  longer, after any PDU with a payload in either direction other than LE Ping's, and while the host asks for it with
+  `Link::hold_latency`. LE Ping is followed by nothing but its response, so a ping of either side on a resting link
+  costs one listened event, not 200 ms of them (about 14 events at 15 ms, 28 at 7.5 ms, every 22.5 s).
   Linux reconnects with the latency it stored from the very first event, so without the hold each ATT round trip of a
   reconnection could wait up to the whole latency. After an event in which it heard nothing from the central (no
   packet with a valid CRC), the link layer listens at every following event until it hears it again, and the latency

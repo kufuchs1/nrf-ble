@@ -1130,6 +1130,89 @@ fn a_bond_is_reported_only_once_the_central_has_our_identity() {
     assert_eq!(multiplications.get(), 4);
 }
 
+/// Runs a Just Works pairing of a Linux central that sends its identity,
+/// its PDUs `encrypted` or not, up to our DHKey check, and returns the
+/// long term key, least significant octet first.
+fn pair_just_works<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, encrypted: bool) -> [u8; 16] {
+    let mut central = Central::new(linux_request(true, true), local_rpa());
+    assert_eq!(smp(link, tasks, &central.request, encrypted).len(), 1);
+    let answer = smp(link, tasks, &central.public_key(), encrypted);
+    assert_eq!(answer.len(), 2);
+    central.take_public_key(&answer[0]);
+    central.take_confirm(&answer[1]);
+    let random = smp(link, tasks, &central.random(), encrypted);
+    central.take_random(&random[0]);
+    let check = central.check();
+    assert_eq!(smp(link, tasks, &check, encrypted), [central.expected_check().to_vec()]);
+    let mut ltk = central.ltk;
+    ltk.reverse();
+    ltk
+}
+
+/// Takes our identity keys and sends the central's, as the end of
+/// [`pair_just_works`]'s pairing once the link is encrypted with its key.
+fn exchange_identities<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, identity: &identity::Local) {
+    let mut info = vec![0x08];
+    info.extend_from_slice(&identity.irk());
+    let mut address = vec![0x09, 0x01];
+    address.extend_from_slice(&identity.address());
+    assert_eq!(link.deliver(), [(Channel::SecurityManager, info), (Channel::SecurityManager, address)]);
+    assert!(smp(link, tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true).is_empty());
+    let mut central_identity = [0x09, 0x00, 0, 0, 0, 0, 0, 0];
+    central_identity[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    assert!(smp(link, tasks, &central_identity, true).is_empty());
+}
+
+#[test]
+fn a_pairing_on_a_link_encrypted_with_the_bond_s_key_completes_with_the_key_refresh() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+
+    // The first pairing, on the plain link, makes the bond.
+    let first = pair_just_works(link, &mut tasks, false);
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
+    exchange_identities(link, &mut tasks, &identity);
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
+    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
+    assert_eq!(bond.ltk, first);
+
+    // The central pairs again on the link, still encrypted with the bond's
+    // key. The link layer pauses the encryption and starts it again with
+    // the new key: a key refresh, which ends the pairing as a first
+    // encryption does.
+    let second = pair_just_works(link, &mut tasks, true);
+    assert_ne!(second, first);
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: true, status: 0 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(Some(second))]);
+    exchange_identities(link, &mut tasks, &identity);
+    // The link stayed encrypted: no second Encrypted, only the new bond.
+    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no second bond") };
+    assert_eq!(bond.ltk, second);
+    assert!(poll(pin!(conn.next())).is_pending());
+
+    // The pairing is over: its timer does not end the link.
+    link.advance(30_000);
+    tasks.step();
+    assert!(!link.calls().iter().any(|call| matches!(call, Seen::Disconnect(_))));
+    assert_eq!(multiplications.get(), 4, "a key pair and a Diffie-Hellman key per pairing");
+}
+
 #[test]
 fn a_call_waits_for_a_link_the_run_task_has_not_taken_yet() {
     let host = host(Unclaimed::Keep);

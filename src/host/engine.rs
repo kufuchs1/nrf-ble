@@ -656,9 +656,12 @@ impl Engine {
         self.commands.hold = Some(false);
     }
 
-    /// Takes the encryption of the link, as the link layer reports it.
+    /// Takes the encryption of the link, as the link layer reports it. A key
+    /// refresh goes to the security manager too: a pairing on a link already
+    /// encrypted ends with one, the encryption paused and started again with
+    /// the pairing's key. Outside a pairing it ignores the event.
     fn encryption(&mut self, on: bool, refresh: bool, now: Instant) {
-        let outcome = if refresh { None } else { self.smp.encryption_changed(on) };
+        let outcome = self.smp.encryption_changed(on);
         if let Some(link) = self.link.as_mut()
             && let Some(key) = link.key
         {

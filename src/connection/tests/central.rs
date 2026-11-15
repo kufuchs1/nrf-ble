@@ -1,7 +1,9 @@
 //! The answer within the interframe space against a central that follows
 //! the acknowledgement rules of the Core specification (Vol 6, Part B,
 //! 4.5.9), as `BlueZ`'s controller does at the start of a link: the feature
-//! exchange, the version exchange, then data both ways.
+//! exchange, the version exchange, then data both ways. And a link at rest
+//! with the peripheral latency, event by event as the run loop skips or
+//! listens, for the cost of LE Ping.
 //!
 //! The radio is modelled as the nRF51 latches its packet pointer: the
 //! connection points it at the PDU on the air at the access address, and an
@@ -90,6 +92,9 @@ struct Central {
     last_count: Option<u32>,
     /// Whether the link is encrypted both ways.
     encrypted:  bool,
+    /// Answers it sends from the next event on, as a controller that
+    /// processes a control PDU after the event.
+    deferred:   Vec<(Llid, Vec<u8>)>,
 }
 
 impl Central {
@@ -104,6 +109,7 @@ impl Central {
             counter: 0,
             last_count: None,
             encrypted,
+            deferred: Vec::new(),
         }
     }
 
@@ -165,6 +171,7 @@ impl Central {
         match payload[0] {
             OP_FEATURE_RSP => self.outbox.push_back((Llid::Control, CENTRAL_VERSION.to_vec())),
             OP_VERSION_IND => self.outbox.push_back((Llid::Start, CENTRAL_DATA.to_vec())),
+            OP_PING_REQ => self.deferred.push((Llid::Control, vec![OP_PING_RSP])),
             _ => {},
         }
     }
@@ -186,6 +193,8 @@ struct Sim {
     /// The host's packets that wait for room in the link layer's queue.
     host_tx: VecDeque<Vec<u8>>,
     rx:      [u8; BUFFER_LEN],
+    /// The time of the central's packets in the event, in microseconds.
+    time:    u32,
 }
 
 /// What the host sends once the central's request came: three packets,
@@ -215,6 +224,7 @@ impl Sim {
             replied: false,
             host_tx: VecDeque::new(),
             rx: [0; BUFFER_LEN],
+            time: 1000,
         }
     }
 
@@ -233,6 +243,7 @@ impl Sim {
 
     /// One connection event.
     fn event(&mut self) {
+        self.central.outbox.extend(self.central.deferred.drain(..));
         // Before the event, as `run_events` does.
         self.link.prepare_next(&self.shared);
         self.link.prepare_room(&self.shared);
@@ -260,7 +271,7 @@ impl Sim {
             let latched = *self.link.current_mut().on_air();
             let crc_ok = !self.random.chance(self.faults.corrupted);
             let packet = crc_ok.then_some((header, self.rx[1], true));
-            let decision = self.link.decide(packet, 1000, true, &self.shared).expect("the link goes on");
+            let decision = self.link.decide(packet, self.time, true, &self.shared).expect("the link goes on");
             let buffer = self.link.answer_buffer(decision.follow.md);
             let on_air = |link: &mut Connection, slot: bool| *link.slot_mut(slot).on_air();
             // Within the interframe space, only the header of the buffer
@@ -301,7 +312,7 @@ impl Sim {
             }
         }
         if heard {
-            self.link.exchanged(1000);
+            self.link.exchanged(self.time);
         }
         self.link.process(&self.rx, encrypted, &self.shared);
         assert_eq!(self.link.abort, None);
@@ -601,4 +612,105 @@ fn host_data_queued_during_the_sleep_goes_out_at_that_event() {
         late.prepare_next(&shared);
         assert!(late.next_ready);
     }
+}
+
+/// A link at rest: encrypted, the procedures of its start done, with the
+/// peripheral latency `latency` at 15 ms and the authenticated payload
+/// timeout `timeout` in units of 10 ms, against a central with nothing to
+/// send.
+fn resting(latency: u16, timeout: u16) -> Sim {
+    let mut sim = Sim::new(1, Faults::NONE, Late::Latched, true);
+    sim.central.outbox.clear();
+    sim.shared.set_payload_timeout_for_test(timeout);
+    let link = &mut sim.link;
+    link.latency = latency;
+    link.expect = Expect::Anchor;
+    link.establishment_deadline = None;
+    link.hold_until = None;
+    link.features_request = Request::Done;
+    link.phy_request = Request::Done;
+    link.length_request = Request::Done;
+    link.version_request = Request::Done;
+    link.last_valid = sim.time;
+    link.payload_timer = Some((sim.time, false));
+    sim
+}
+
+impl Sim {
+    /// Runs `events` connection events as the run loop does, one at a time:
+    /// the procedures at the loop top, then the event skipped while the
+    /// latency allows, or listened at. Returns the events listened at.
+    fn rest(&mut self, events: u32) -> u32 {
+        let start = self.time;
+        let mut heard = 0;
+        for event in 0..events {
+            self.time = start.wrapping_add(event * self.link.interval);
+            if self.link.hold_until.is_some_and(|until| reached(self.time, until)) {
+                self.link.hold_until = None;
+            }
+            self.link.start_procedures(self.time, &self.shared);
+            assert_eq!(self.link.abort, None);
+            self.link.apply_instants(&self.shared);
+            if self.link.skips(self.time, &self.shared) {
+                self.link.skip_to(self.link.counter.wrapping_add(1), &self.shared);
+                continue;
+            }
+            let before = self.link.listening();
+            self.event();
+            self.link.listened(before);
+            heard += 1;
+        }
+        heard
+    }
+
+    /// How often the central received `pdu` from us.
+    fn sent(&self, pdu: &[u8]) -> usize { self.central.received.iter().filter(|(_, payload)| payload == pdu).count() }
+
+    /// Whether the authenticated payload timeout ran out at some point.
+    fn timed_out(&self) -> bool {
+        self.link.notifications.contains(&Some(Event::PayloadTimeout))
+            || core::iter::from_fn(|| self.shared.take_event()).any(|event| event == Event::PayloadTimeout)
+    }
+}
+
+#[test]
+fn le_ping_on_a_resting_link_costs_one_event_and_keeps_the_latency() {
+    // 60 s at 15 ms and a latency of 30, as a keyboard: two pings at the
+    // default timeout of 30 s.
+    let events = 4000;
+    let mut quiet = resting(30, 3000);
+    quiet.link.payload_timer = None;
+    let base = quiet.rest(events);
+    let mut pinged = resting(30, 3000);
+    let heard = pinged.rest(events);
+    assert_eq!(pinged.sent(&[OP_PING_REQ]), 2);
+    assert!(!pinged.timed_out());
+    // The ping rides on an event listened at anyway; the event after it
+    // brings the response.
+    assert!(heard <= base + 2, "{heard} events listened at with LE Ping, {base} without");
+
+    // The central's ping is answered at the next event, and the latency
+    // goes on after it.
+    let mut answered = resting(30, 3000);
+    answered.link.payload_timer = None;
+    answered.rest(100);
+    answered.central.outbox.push_back((Llid::Control, vec![OP_PING_REQ]));
+    let heard = answered.rest(events - 100);
+    assert_eq!(answered.sent(&[OP_PING_RSP]), 1);
+    let mut quiet = resting(30, 3000);
+    quiet.link.payload_timer = None;
+    quiet.rest(100);
+    let base = quiet.rest(events - 100);
+    assert!(heard <= base + 1, "{heard} events listened at with the central's ping, {base} without");
+}
+
+#[test]
+fn the_shortest_authenticated_payload_timeout_never_runs_out() {
+    // 470 ms, just over the interval times one plus the latency, which the
+    // specification allows as the shortest: the ping cannot wait for an
+    // event listened at anyway.
+    let mut sim = resting(30, 47);
+    sim.rest(2000);
+    assert!(sim.sent(&[OP_PING_REQ]) >= 60);
+    assert!(!sim.timed_out());
 }
