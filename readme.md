@@ -41,9 +41,10 @@ What is done so far:
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
   feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
 - L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer, fragmenting on demand), LE signalling
-  (`host::signal`: the connection parameter update request and command rejects), the ATT server at MTU 23, or up to
-  65 with the feature `att-mtu` (`host::att`; with `eatt` also Read Multiple Variable Length, Prepare and Execute Write
-  and Multiple Handle Value Notifications), and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state
+  (`host::signal`: the connection parameter update request and command rejects), with the feature `eatt` the credit
+  based channels of the enhanced ATT bearers (`host::ecfc`), the ATT server at MTU 23, or up to 65 with the feature
+  `att-mtu` (`host::att`; with `eatt` also Read Multiple Variable Length, Prepare and Execute Write and Multiple Handle
+  Value Notifications, on the fixed channel and each enhanced bearer), and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state
   and a constant table hash; the table itself is the device's).
 - Our identity (`host::identity`: the address and identity resolving key derived from the device secret the way the MX
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
@@ -170,12 +171,34 @@ release build keeps its size to the byte):
   and the engine by 40 bytes of static RAM; the release builds of the three firmwares grow by 260 B (mouse), 452 B
   (keyboard) and 512 B (presenter) of flash with extended advertising, 252 B, 452 B and 320 B with legacy advertising.
   `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Not yet tried on hardware.
-- **`eatt`** (implies `att-mtu`): Enhanced ATT as responder, being built in steps. So far it adds the GATT server's
-  part, on the fixed channel, and the L2CAP credit based channels that are to carry the enhanced bearers (`host::ecfc`:
-  the connection requests and their answers, credits, SDUs in K-frames, reconfiguration and disconnection), which the
-  engine does not use yet, so no enhanced bearer opens, though the Server Supported Features already say EATT. A link
-  has 1 enhanced bearer, or up to 2 to 5 with `eatt-bearers-2` to `eatt-bearers-5` (`ecfc::BEARERS`, the highest one
-  enabled). The table declares the Client Supported Features (0x2B29, read and write) and the Server Supported Features
+- **`eatt`** (implies `att-mtu`): Enhanced ATT as responder. A central opens enhanced bearers with L2CAP's Enhanced
+  Credit Based Flow Control mode on SPSM 0x0027 (`host::ecfc`): our CIDs from 0x0040, MTU 65, MPS 67 and 256 credits,
+  topped up once 128 are used. A link has 1 enhanced bearer, or up to 2 to 5 with `eatt-bearers-2` to
+  `eatt-bearers-5` (`ecfc::BEARERS`, the highest one enabled). Each bearer answers ATT requests, one at a time, with its
+  ATT MTU (the smaller of 65 and the central's MTU) and in K-frames that each take one of the central's credits;
+  between two K-frames other PDUs may go, and the bearers take turns. Notifications stay on the fixed channel, which
+  goes on as before, Exchange MTU included (an enhanced bearer answers it with Request Not Supported). A Credit Based
+  Connection Request that arrives before the link is encrypted with the host's key, as BlueZ sends it on every
+  reconnection, waits for the encryption; it is refused for security (Insufficient Encryption to the bonded central,
+  Insufficient Authentication to another) if the encryption fails, or 2 s after it arrived while neither a key went to
+  the link layer nor a pairing runs. Linux then encrypts, or pairs, and asks again; the answer is never sent on an
+  encrypted link, where Linux would ask for a pairing with protection against a man in the middle. A request of two or
+  more source CIDs not in ascending order gets Insufficient Resources with every destination CID 0: Linux 7.3 sends its
+  CIDs in that order, newest first, and binds the destination CIDs of the answer to its channels shifted by one, so
+  any bearer it opened would be crossed. With BlueZ's `[GATT] Channels`:
+
+  | Channels | Request | Bearers |
+  |---|---|---|
+  | 1 | none | none |
+  | 2 | 1 source CID | 1, after the encryption on a reconnection |
+  | 3 to 6 | 2 to 5 source CIDs, not ascending | none: Insufficient Resources, and every channel is gone at once (no 40 s wait); the fixed channel serves on |
+
+  The exception: a request with nothing leading to the encryption within 2 s, as on a plain `connect` without `pair`,
+  is refused for security, and after the encryption Linux sends one request for each channel, all at once, which open
+  as many bearers as the build has, each correctly bound, and refuse the rest with Insufficient Resources. A central
+  that names its source CIDs in ascending order, as Zephyr and Android do, gets as many bearers as the build has in one
+  request. The setting is global: it also offers EATT to other devices of the computer. Static RAM: the engine grows by
+  296 bytes with one bearer over a build without `att-mtu`, and by 80 bytes for each further bearer. The table declares the Client Supported Features (0x2B29, read and write) and the Server Supported Features
   (0x2B3A, read) in its GATT service, each without encryption, with `gatt::Value::ClientFeatures` and
   `gatt::Value::ServerFeatures`; `Host::new` refuses a table without them, and a table that declares them without the
   feature does not build. A firmware lists them under `#[cfg(feature = "eatt")]` (the `gatt!` macro takes one `#[cfg]`

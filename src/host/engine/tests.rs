@@ -228,11 +228,20 @@ fn pair(
     engine.job_done(device, result, at(0));
     engine.connected(&info(peer, None), at(0));
     let epoch = engine.epoch().unwrap();
+    assert_eq!(engine.take_command(0, at(0)), Some(Command::HoldLatency(true)));
+    (epoch, pair_link(engine, device, central_id, at(0)))
+}
+
+/// Pairs the link of `engine` with a Linux central that is to send its
+/// identity keys if `central_id`, at `now`, up to the encryption; returns the
+/// key.
+fn pair_link(engine: &mut Engine, device: &mut Device, central_id: bool, now: Instant) -> [u8; 16] {
+    let epoch = engine.epoch().unwrap();
     let mut central = Central::new(linux_request(central_id, true), local_rpa());
-    receive(engine, device, 6, &central.request, at(0));
-    drain(engine, 4, at(0));
-    receive(engine, device, 6, &central.public_key(), at(0));
-    let fragments = drain(engine, 4, at(0));
+    receive(engine, device, 6, &central.request, now);
+    drain(engine, 4, now);
+    receive(engine, device, 6, &central.public_key(), now);
+    let fragments = drain(engine, 4, now);
     let mut reassembly = Reassembly::new();
     let pdus: std::vec::Vec<std::vec::Vec<u8>> = fragments
         .iter()
@@ -244,19 +253,18 @@ fn pair(
     central.take_confirm(&pdus[1]);
     let job = engine.take_job().unwrap();
     let result = job.run(&mut device.clone(), || ());
-    engine.job_done(device, result, at(0));
-    receive(engine, device, 6, &central.random(), at(0));
-    let random = drain(engine, 4, at(0));
+    engine.job_done(device, result, now);
+    receive(engine, device, 6, &central.random(), now);
+    let random = drain(engine, 4, now);
     central.take_random(&random[0].bytes()[4..]);
-    receive(engine, device, 6, &central.check(), at(0));
-    drain(engine, 4, at(0));
-    engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, at(0));
+    receive(engine, device, 6, &central.check(), now);
+    drain(engine, 4, now);
+    engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, now);
     let mut ltk = central.ltk;
     ltk.reverse();
-    assert_eq!(engine.take_command(0, at(0)), Some(Command::HoldLatency(true)));
-    assert_eq!(engine.take_command(0, at(0)), Some(Command::LtkReply { epoch, key: Some(ltk) }));
-    engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, at(0));
-    (epoch, ltk)
+    assert_eq!(engine.take_command(0, now), Some(Command::LtkReply { epoch, key: Some(ltk) }));
+    engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, now);
+    ltk
 }
 
 #[test]
@@ -450,3 +458,6 @@ fn bluez_writing_the_bond_s_client_features_again_stores_nothing() {
         assert_eq!(engine.bond().map(|bond| bond.client_features), Some(bond_features));
     }
 }
+
+#[cfg(feature = "eatt")] mod bearers;
+#[cfg(feature = "eatt")] mod sim;

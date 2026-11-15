@@ -6,9 +6,12 @@
 //! [`Server`] decodes the requests `BlueZ` sends, answers them from the GATT
 //! table ([`crate::host::gatt::Db`]) with the error codes of the Core
 //! specification, and encodes notifications and indications. A request
-//! arrives on a [`Bearer`], whose ATT MTU bounds its response; the only one
-//! is the fixed channel. One request is outstanding at a time, so the engine
-//! keeps one response slot of [`ATT_MAX`] octets. One indication waits for
+//! arrives on a [`Bearer`], whose ATT MTU bounds its response: the fixed
+//! channel, or with the feature `eatt` an enhanced bearer, which serves every
+//! request but the Exchange MTU (Request Not Supported, 0x06) and ignores a
+//! Handle Value Confirmation. One request is outstanding on each bearer at a
+//! time, so the engine keeps one response slot of [`ATT_MAX`] octets for
+//! each. One indication waits for
 //! its confirmation; the 30 s limit on that wait is for the engine to time,
 //! which does not send indications yet.
 //!
@@ -234,6 +237,16 @@ pub enum NotifyError {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Bearer {
+    /// An enhanced bearer of Enhanced ATT (`crate::host::ecfc`), with the
+    /// feature `eatt`: its ATT MTU is fixed when the channel opens, the
+    /// smaller of its MTU and the peer's, at least [`MTU`] and at most
+    /// [`ATT_MAX`]. It serves no Exchange MTU and takes no Handle Value
+    /// Confirmation, as indications go on the fixed channel only.
+    #[cfg(feature = "eatt")]
+    Enhanced {
+        /// The ATT MTU.
+        mtu: usize,
+    },
     /// The fixed channel of the attribute protocol, CID 0x0004, whose
     /// ATT MTU is [`MTU`] until an Exchange MTU raises it, with the feature
     /// `att-mtu`.
@@ -446,9 +459,18 @@ impl Server {
             Bearer::Fixed => usize::from(self.mtu),
             #[cfg(not(feature = "att-mtu"))]
             Bearer::Fixed => MTU,
+            #[cfg(feature = "eatt")]
+            Bearer::Enhanced { mtu } => mtu.clamp(MTU, ATT_MAX),
         };
         let out = slot.get_mut(..mtu)?;
         let (&opcode, params) = pdu.split_first()?;
+        #[cfg(feature = "eatt")]
+        if bearer != Bearer::Fixed && matches!(opcode, EXCHANGE_MTU_REQUEST | CONFIRMATION) {
+            // The ATT MTU of an enhanced bearer is the channel's, and the
+            // server sends no indication there.
+            return (opcode == EXCHANGE_MTU_REQUEST)
+                .then(|| error_response(out, opcode, 0, AttError::REQUEST_NOT_SUPPORTED));
+        }
         let answer = match opcode {
             EXCHANGE_MTU_REQUEST => {
                 // The response goes out within the ATT MTU before it.
