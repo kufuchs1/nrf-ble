@@ -18,7 +18,7 @@ use nrf_ble::{
             Phase,
             Schedule,
         },
-        att::{MTU, Server},
+        att::{ATT_MAX, Server},
         engine::{Config, Unclaimed},
         gatt::{AttError, Handler, PROP_NOTIFY, PROP_READ, Sec, Uuid, Value, ValueId, ppcp},
     },
@@ -52,6 +52,12 @@ nrf_ble::gatt! {
     }
     service 0x1801 {
         char 0x2B2A [read] = Value::Hash;
+        // With the feature `eatt`, as a firmware lists them under a feature
+        // of its own that enables nrf-ble's.
+        #[cfg(feature = "eatt")]
+        char 0x2B29 [read, write] = Value::ClientFeatures;
+        #[cfg(feature = "eatt")]
+        char 0x2B3A [read] = Value::ServerFeatures;
     }
     service 0x180F {
         /// The battery level.
@@ -92,23 +98,30 @@ impl Handler for App {
     }
 }
 
+/// How much higher the handles after the GATT service are with the feature
+/// `eatt`: its two feature characteristics.
+const SHIFT: u16 = if cfg!(feature = "eatt") { 4 } else { 0 };
+
+/// A Read Request for `handle`.
+fn read(handle: u16) -> Vec<u8> { [&[0x0A][..], &handle.to_le_bytes()].concat() }
+
 /// Sends `request` to a server of [`DB`] on a link of security `level`.
 fn exchange(request: &[u8], level: Sec) -> Vec<u8> {
     let mut server = Server::new(&DB);
-    let mut out = [0; MTU];
+    let mut out = [0; ATT_MAX];
     let len = server.handle(request, level, &App, &mut out).unwrap();
     out[..len].to_vec()
 }
 
 #[test]
 fn the_table_has_its_handles() {
-    assert_eq!(DB.last_handle(), 18);
+    assert_eq!(DB.last_handle(), 18 + SHIFT);
     assert_eq!(DB.cccds(), 2);
     assert_eq!(DB.service_changed(), None);
-    assert_eq!(BATTERY.handle(), 13);
+    assert_eq!(BATTERY.handle(), 13 + SHIFT);
     assert_eq!(BATTERY.cccd(), Some(0));
     assert_eq!(BATTERY.props(), PROP_READ | PROP_NOTIFY);
-    assert_eq!(STATUS.handle(), 17);
+    assert_eq!(STATUS.handle(), 17 + SHIFT);
     assert_eq!(STATUS.cccd(), Some(1));
     assert_eq!(STATUS.sec(), Sec::Encrypted);
 }
@@ -121,15 +134,23 @@ fn the_server_serves_the_table() {
     assert_eq!(exchange(&[0x0A, 0x05, 0x00], Sec::Open), [0x0B, 0x80, 0x01]);
     assert_eq!(exchange(&[0x0A, 0x07, 0x00], Sec::Open), [&[0x0B][..], &PPCP].concat());
     assert_eq!(exchange(&[0x0A, 0x0A, 0x00], Sec::Open), [&[0x0B][..], &DB.hash()].concat());
-    assert_eq!(exchange(&[0x0A, 0x0D, 0x00], Sec::Open), [0x0B, 42]);
+    assert_eq!(exchange(&read(BATTERY.handle()), Sec::Open), [0x0B, 42]);
     // The vendor status needs encryption.
-    assert_eq!(exchange(&[0x0A, 0x11, 0x00], Sec::Open), [0x01, 0x0A, 0x11, 0x00, 0x0F]);
-    assert_eq!(exchange(&[0x0A, 0x11, 0x00], Sec::Encrypted), [0x0B, 0, 0, 0, 0]);
+    let [status0, status1] = STATUS.handle().to_le_bytes();
+    assert_eq!(exchange(&read(STATUS.handle()), Sec::Open), [0x01, 0x0A, status0, status1, 0x0F]);
+    assert_eq!(exchange(&read(STATUS.handle()), Sec::Encrypted), [0x0B, 0, 0, 0, 0]);
     // The vendor service, with its real end handle.
+    let [start0, start1] = (15 + SHIFT).to_le_bytes();
+    let [end0, end1] = DB.last_handle().to_le_bytes();
     assert_eq!(
-        exchange(&[0x10, 0x0F, 0x00, 0xFF, 0xFF, 0x00, 0x28], Sec::Open),
-        [&[0x11, 20, 0x0F, 0x00, 0x12, 0x00][..], &VENDOR].concat()
+        exchange(&[0x10, start0, start1, 0xFF, 0xFF, 0x00, 0x28], Sec::Open),
+        [&[0x11, 20, start0, start1, end0, end1][..], &VENDOR].concat()
     );
+    // With `eatt`, the features, readable without encryption.
+    if cfg!(feature = "eatt") {
+        assert_eq!(exchange(&read(12), Sec::Open), [0x0B, 0x00]);
+        assert_eq!(exchange(&read(14), Sec::Open), [0x0B, 0x01]);
+    }
 }
 
 #[test]

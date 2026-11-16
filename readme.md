@@ -34,19 +34,25 @@ What is done so far:
   `p256` crate behind the crate nrf-ble-p256 of this repository (`p256/`; see
   [Cryptography of pairing](#cryptography-of-pairing)).
 - The security manager (`host::smp::Responder`): LE Secure Connections Just Works pairing as responder, with bonding and
-  the identity keys both ways, as a state machine without input or output of its own. The P-256 multiplications are
+  the identity keys both ways, as a state machine without input or output of its own. A pairing on a link that is
+  already encrypted (a central that pairs again, or one that replaces a Just Works key with Passkey Entry) ends with
+  the key refresh to the pairing's key as a first pairing ends with the encryption. The P-256 multiplications are
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
   feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
 - L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer, fragmenting on demand), LE signalling
-  (`host::signal`: the connection parameter update request and command rejects), the ATT server at MTU 23
-  (`host::att`) and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state and a constant table hash; the
-  table itself is the device's).
+  (`host::signal`: the connection parameter update request and command rejects), with the feature `eatt` the credit
+  based channels of the enhanced ATT bearers (`host::ecfc`), the ATT server at MTU 23, or up to 65 with the feature
+  `att-mtu` (`host::att`; with `eatt` also Read Multiple Variable Length, Prepare and Execute Write and Multiple Handle
+  Value Notifications, on the fixed channel and each enhanced bearer), and the GATT table (`host::gatt`: the `gatt!`
+  macro, per-link CCCD state and a constant table hash; the table itself is the device's).
 - Our identity (`host::identity`: the address and identity resolving key derived from the device secret the way the MX
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
   phases, an optional directed first phase of a reconnection with the feature `directed-advertising`, high duty cycle,
   or low duty cycle with `extended-advertising`, and their setup of the link layer's accept list, resolving list and
-  privacy) and the bond (`host::bond`: the record of the one central with its fixed 50 octet stored form).
+  privacy) and the bond (`host::bond`: the record of the one central with its fixed 50 octet stored form; bits 5 to 7
+  of its flags hold the central's Client Supported Features bits 0 to 2, which an nrf-ble from before them refuses, so
+  going back to one means pairing again).
 - The engine (`host::engine::Engine`): all of the host's protocol state for one link, without futures. It takes the
   link layer's events and fragments, the time and the results of the P-256 jobs, and gives the fragments to send (pulled
   one at a time, the connection parameter request leaving one place of the link layer's queue free), the calls of the
@@ -155,6 +161,58 @@ release build keeps its size to the byte):
   more flash than legacy advertising on the nRF52832 and 2.5 KB on the nRF51, and about 0.4 KB more static RAM, most
   of it the longer advertising data the link layer and the host keep (see [Flash cost](#flash-cost)). Not yet tried on
   hardware.
+- **`att-mtu`**: the ATT server answers an Exchange MTU Request with 65 instead of 23 (`att::ATT_MAX`), and the fixed
+  channel's ATT MTU becomes the smaller of the client's and 65, at least 23, from the next request on. BlueZ offers
+  517, so in its first discovery after pairing a Read or Read Blob Response carries up to 64 octets of a value, a Find
+  Information Response up to 15 entries of 16-bit UUIDs and a Read By Type Response up to 9 characteristic declarations,
+  each in up to three link layer fragments: a Report Map of 167 octets takes 3 reads instead of 8. A reconnection with
+  a cached table reads little and gains little. Notifications and indications stay within 20 octets and one fragment,
+  and a dynamic value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets,
+  and the engine by 40 bytes of static RAM; the release builds of the three firmwares grow by 260 B (mouse), 452 B
+  (keyboard) and 512 B (presenter) of flash with extended advertising, 252 B, 452 B and 320 B with legacy advertising.
+  `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Not yet tried on hardware.
+- **`eatt`** (implies `att-mtu`): Enhanced ATT as responder. A central opens enhanced bearers with L2CAP's Enhanced
+  Credit Based Flow Control mode on SPSM 0x0027 (`host::ecfc`): our CIDs from 0x0040, MTU 65, MPS 67 and 256 credits,
+  topped up once 128 are used. A link has 1 enhanced bearer, or up to 2 to 5 with `eatt-bearers-2` to
+  `eatt-bearers-5` (`ecfc::BEARERS`, the highest one enabled). Each bearer answers ATT requests, one at a time, with its
+  ATT MTU (the smaller of 65 and the central's MTU) and in K-frames that each take one of the central's credits;
+  between two K-frames other PDUs may go, and the bearers take turns. Notifications stay on the fixed channel, which
+  goes on as before, Exchange MTU included (an enhanced bearer answers it with Request Not Supported). A Credit Based
+  Connection Request that arrives before the link is encrypted with the host's key, as BlueZ sends it on every
+  reconnection, waits for the encryption; it is refused for security (Insufficient Encryption to the bonded central,
+  Insufficient Authentication to another) if the encryption fails, or 2 s after the first waiting request arrived
+  while neither a key went to the link layer nor a pairing runs. Linux then encrypts, or pairs, and asks again; this
+  refusal is never sent on an encrypted link, where Linux would ask for a pairing with protection against a man in the
+  middle. A request of two or more source CIDs not in ascending order gets Insufficient Resources with every
+  destination CID 0: Linux 7.3 sends its CIDs in that order, newest first, and binds the destination CIDs of the answer
+  to its channels shifted by one, so any bearer it opened would be crossed. With BlueZ's `[GATT] Channels`:
+
+  | Channels | Request | Bearers |
+  |---|---|---|
+  | 1 | none | none |
+  | 2 | 1 source CID | 1, after the encryption on a reconnection |
+  | 3 to 6 | 2 to 5 source CIDs, not ascending | none: Insufficient Resources, and every channel is gone at once (no 40 s wait); the fixed channel serves on |
+
+  The exception: a request with nothing leading to the encryption within 2 s, as on a plain `connect` without `pair`, is
+  refused for security, and after the encryption Linux sends one request for each channel, all at once, which open as
+  many bearers as the build has, each correctly bound, and refuse the rest with Insufficient Resources. A central that
+  names its source CIDs in ascending order, as Zephyr and Android do, gets as many bearers as the build has in one
+  request. The setting is global: it also offers EATT to other devices of the computer. Static RAM: the engine grows by
+  296 bytes with one bearer over a build without `att-mtu`, and by 80 bytes for each further bearer. The table declares
+  the Client Supported Features (0x2B29, read and write) and the Server Supported Features (0x2B3A, read) in its GATT
+  service, each without encryption, with `gatt::Value::ClientFeatures` and `gatt::Value::ServerFeatures`; `Host::new`
+  refuses a table without them, and a table that declares them without the feature does not build. A firmware lists them
+  under `#[cfg(feature = "eatt")]` (the `gatt!` macro takes one `#[cfg]` on a `char` without descriptors), which changes
+  the table's hash, so BlueZ discovers it again once. The client's features (bits 0 to 2 of the octet it writes) are
+  kept for the link and in the bond, flags bits 5 to 7: a client may add bits but never clear one (Value Not Allowed,
+  0x13), a reconnection adds the bond's bits to those written before the encryption, and only a change makes a
+  `ConnEvent::BondUpdated`, so BlueZ's write on every connection costs no flash write. The server serves Read Multiple
+  Variable Length (0x20), Prepare and Execute Write for one value of up to 22 octets (`att::PREPARE_MAX`; anything else
+  gets Prepare Queue Full, 0x09), and `Conn::notify_multiple` sends a Multiple Handle Value Notification (0x23) of two
+  values or more in one PDU of 23 octets to a client that set bit 2 of its features (`NotifyError::Unsupported`
+  otherwise). Robust Caching (bit 0) is stored, not acted on: the server never answers Database Out Of Sync (0x12). That
+  is enough for a table without Service Changed; a table with both Service Changed and the Database Hash would have to
+  serve Robust Caching (GATT 2.5.2.1), which the host does not do.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
@@ -234,10 +292,13 @@ advertising event). The other features cost nothing when off.
   of a link, are overwritten once they are no longer needed.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
   the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
-  or as long as the host sets: after three quarters of that time without one, the link layer pings the central, and
-  the host learns when the whole time passes. A central that leaves the ping unanswered for 40 s ends the link with
-  an LL response timeout, as any other procedure does. A key reply for a link that ended before the host answered
-  returns `Error::Gone` and has no effect on the next link.
+  or as long as the host sets: after three quarters of that time without one, the link layer pings the central at
+  the next connection event it listens to anyway, so the ping breaks no run of skipped events; at the latest when
+  twice the longest run of events (the latency plus one) is left of the time, and at once for a time too short for
+  that. It then listens at every event until the response arrives, and the host learns when the whole time passes. A
+  central that leaves the ping unanswered for 40 s ends the link with an LL response timeout, as any other procedure
+  does. A key reply for a link that ended before the host answered returns `Error::Gone` and has no effect on the
+  next link.
 - **Connection parameter requests from the host** run one at a time: `Link::request_params` returns
   `Error::Disallowed` until the previous one reported its `Event::ParamsUpdated`, and `Error::UnsupportedRemote` for a
   central without the connection parameters request procedure, for which the host sends the L2CAP request.
@@ -294,7 +355,11 @@ advertising event). The other features cost nothing when off.
 - **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
   instant; data from the host ends the skipping at the next connection event. It is also held off, so that every
   connection event is listened to: during the first second of a link, for 200 ms or 8 connection events, whichever is
-  longer, after any PDU with a payload in either direction, and while the host asks for it with `Link::hold_latency`.
+  longer, after any PDU with a payload in either direction other than LE Ping's, and while the host asks for it with
+  `Link::hold_latency`. LE Ping is followed by nothing but its response, so on a resting link our ping costs one
+  listened event besides the one it rides on (the response), and the central's two (our response, and its
+  acknowledgement, which the link layer waits for as for any PDU of ours), not 200 ms of them (about 14 events at
+  15 ms, 28 at 7.5 ms, every 22.5 s).
   Linux reconnects with the latency it stored from the very first event, so without the hold each ATT round trip of a
   reconnection could wait up to the whole latency. After an event in which it heard nothing from the central (no
   packet with a valid CRC), the link layer listens at every following event until it hears it again, and the latency
@@ -821,7 +886,8 @@ target again, so `cargo test` runs on the PC.
 ```sh
 cargo test                                         # host tests, also with --features data-length, event-timing,
                                                    # directed-advertising, param-requests,key-missing,passkey,
-                                                   # extended-advertising (with and without directed-advertising)
+                                                   # extended-advertising (with and without directed-advertising),
+                                                   # att-mtu, eatt, eatt-bearers-5
 cargo test --no-default-features --features nrf51  # host tests for the nRF51
 cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt and data-length
 cargo clippy --target thumbv6m-none-eabi --no-default-features --features nrf51   # also with defmt

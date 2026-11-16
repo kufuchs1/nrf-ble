@@ -66,13 +66,15 @@
 //! The link layer skips connection events as the peripheral latency allows
 //! only while the link is quiet: never during the first second of a link,
 //! never within [`LATENCY_HOLD_US`] or [`LATENCY_HOLD_EVENTS`] events,
-//! whichever is longer, after a PDU with a payload in either direction, and
-//! never while the host holds it with [`Link::hold_latency`]. A request of
-//! the central is then answered at the next event, not up to the latency
-//! later. After an event in which it heard nothing from the central, it
-//! listens at every event until it hears it again, as Zephyr does, so a lost
-//! anchor costs one interval, not the whole latency, and a supervision
-//! timeout shorter than a few latencies holds.
+//! whichever is longer, after a PDU with a payload in either direction other
+//! than LE Ping's, and never while the host holds it with
+//! [`Link::hold_latency`]. A request of the central is then answered at the
+//! next event, not up to the latency later. LE Ping is followed by nothing
+//! but its response: the link layer's own ping waits for an event it listens
+//! at anyway, and only the response is listened for at once. After an event in
+//! which it heard nothing from the central, it listens at every event until it
+//! hears it again, as Zephyr does, so a lost anchor costs one interval, not the
+//! whole latency, and a supervision timeout shorter than a few latencies holds.
 
 #[cfg(feature = "extended-advertising")]
 use crate::{advertiser::extended::RENEWAL_LEN, radio::Phy};
@@ -114,10 +116,10 @@ pub const ACL_IN_BUFFERS: usize = 2;
 /// Events the link layer queues for the host.
 pub const EVENT_QUEUE: usize = 6;
 /// Shortest time without a skipped connection event after a PDU with a
-/// payload in either direction, in microseconds.
+/// payload in either direction, other than LE Ping's, in microseconds.
 pub const LATENCY_HOLD_US: u32 = 200_000;
 /// Fewest connection events without a skipped one after a PDU with a
-/// payload in either direction.
+/// payload in either direction, other than LE Ping's.
 pub const LATENCY_HOLD_EVENTS: u32 = 8;
 /// Time from the start of a link during which no connection event is
 /// skipped, in microseconds.
@@ -916,6 +918,13 @@ impl Shared {
     /// The authenticated payload timeout in microseconds.
     pub(crate) fn payload_timeout(&self) -> u32 {
         self.state.lock(|cell| u32::from(cell.borrow().payload_timeout).saturating_mul(10_000))
+    }
+
+    /// Sets the authenticated payload timeout in units of 10 ms, as
+    /// [`Link::set_payload_timeout`] does for a link.
+    #[cfg(test)]
+    pub(crate) fn set_payload_timeout_for_test(&self, timeout: u16) {
+        self.state.lock(|cell| cell.borrow_mut().payload_timeout = timeout);
     }
 
     /// Default PHY preference for new connections.
@@ -1834,6 +1843,9 @@ impl<'shared> Link<'shared> {
     }
 
     /// Sets the authenticated payload timeout of the link in units of 10 ms.
+    /// The link layer pings the central from three quarters of it on, at an
+    /// event it listens at anyway, and at the latest when twice the
+    /// interval times one plus the latency is left.
     ///
     /// # Errors
     ///

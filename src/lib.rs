@@ -42,6 +42,9 @@
 )]
 // Rustdoc marks each item behind a Cargo feature with the feature it needs.
 #![cfg_attr(doc, feature(doc_cfg))]
+// The fuzz test of the credit based channels checks that it runs with overflow
+// checks (`cfg!(overflow_checks)`).
+#![cfg_attr(all(test, feature = "eatt"), feature(cfg_overflow_checks))]
 
 #[cfg(all(feature = "nrf52832", feature = "nrf51"))]
 compile_error!(

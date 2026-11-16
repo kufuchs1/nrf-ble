@@ -19,7 +19,7 @@ use super::{
     bond::Bond,
     engine::{Config, Unclaimed},
     example,
-    gatt::{AttError, Handler, ValueId},
+    gatt::{AttError, Char, Handler, ValueId},
     identity::{self, DeviceSecret, Variant},
     l2cap::{CID_ATT, CID_SECURITY_MANAGER, CID_SIGNALLING, Channel, Reassembly},
     smp::tests::{CENTRAL_ADDRESS, CENTRAL_IDENTITY, CENTRAL_IRK, Central, Device, linux_request, local_rpa, pdu},
@@ -452,6 +452,19 @@ fn request<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, p
     response
 }
 
+/// A Read Request for `handle`.
+fn read(handle: u16) -> [u8; 3] {
+    let [handle0, handle1] = handle.to_le_bytes();
+    [0x0A, handle0, handle1]
+}
+
+/// The Write Request that enables the notifications of `characteristic`,
+/// whose configuration descriptor follows its value.
+fn enable(characteristic: Char) -> [u8; 5] {
+    let [handle0, handle1] = (characteristic.handle() + 1).to_le_bytes();
+    [0x12, handle0, handle1, 0x01, 0x00]
+}
+
 /// One PDU of the security manager from the central, and ours in answer.
 fn smp<R: Future, K: Future>(
     link: &MockLink,
@@ -554,26 +567,62 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond.clone()));
     assert!(poll(pin!(conn.next())).is_pending());
 
-    // Discovery as BlueZ runs it, encrypted.
+    // Discovery as BlueZ runs it, encrypted. With `att-mtu` the ATT MTU
+    // becomes 65.
+    #[cfg(not(feature = "att-mtu"))]
     assert_eq!(request(link, &mut tasks, &[0x02, 0x05, 0x02]), [0x03, 0x17, 0x00]);
+    #[cfg(feature = "att-mtu")]
+    assert_eq!(request(link, &mut tasks, &[0x02, 0x05, 0x02]), [0x03, 0x41, 0x00]);
+    // The Server Supported Features: none, or with `eatt` EATT at handle
+    // 14.
+    #[cfg(not(feature = "eatt"))]
     assert_eq!(request(link, &mut tasks, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B]), [0x01, 0x08, 0x01, 0x00, 0x0A]);
-    assert_eq!(request(link, &mut tasks, &[0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), [
-        0x11, 0x06, 0x01, 0x00, 0x07, 0x00, 0x00, 0x18, 0x08, 0x00, 0x0A, 0x00, 0x01, 0x18, 0x0B, 0x00, 0x0E, 0x00,
-        0x0F, 0x18
-    ]);
-    assert_eq!(request(link, &mut tasks, &[0x0A, 0x0D, 0x00]), [0x0B, 90]);
-    let report_map = request(link, &mut tasks, &[0x0A, 0x16, 0x00]);
-    assert_eq!(&report_map[1..], &example::REPORT_MAP[..22]);
+    #[cfg(feature = "eatt")]
+    assert_eq!(request(link, &mut tasks, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B]), [0x09, 0x03, 0x0E, 0x00, 0x01]);
+    // The primary services: three, or with `att-mtu` all five, in two
+    // fragments.
+    let mut services = vec![0x11, 0x06];
+    let shift = example::EATT_SHIFT;
+    let groups = [
+        (1, 7, 0x1800_u16),
+        (8, 10 + shift, 0x1801),
+        (11 + shift, 14 + shift, 0x180F),
+        (15 + shift, 17 + shift, 0x180A),
+        (18 + shift, 36 + shift, 0x1812),
+    ];
+    for (start, end, uuid) in &groups[..if cfg!(feature = "att-mtu") { 5 } else { 3 }] {
+        services.extend([start.to_le_bytes(), end.to_le_bytes(), uuid.to_le_bytes()].concat());
+    }
+    assert_eq!(request(link, &mut tasks, &[0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), services);
+    assert_eq!(request(link, &mut tasks, &read(example::BATTERY_LEVEL.handle())), [0x0B, 90]);
+    #[cfg(not(feature = "att-mtu"))]
+    {
+        let report_map = request(link, &mut tasks, &read(22 + shift));
+        assert_eq!(&report_map[1..], &example::REPORT_MAP[..22]);
+    }
+    // With `att-mtu` the Read Response holds 64 octets of the Report Map:
+    // with the L2CAP header, three fragments of 27, 27 and 15 octets.
+    #[cfg(feature = "att-mtu")]
+    {
+        link.send(CID_ATT, &read(22 + shift), true);
+        tasks.step();
+        let fragments = link.transmit();
+        link.ack();
+        let lengths: Vec<_> = fragments.iter().map(|(start, fragment)| (*start, fragment.len())).collect();
+        assert_eq!(lengths, [(true, 27), (false, 27), (false, 15)]);
+        let pdu: Vec<u8> = fragments.into_iter().flat_map(|(_, fragment)| fragment).collect();
+        assert_eq!(pdu, [&[65, 0x00, 0x04, 0x00, 0x0B][..], &example::REPORT_MAP[..64]].concat());
+    }
     // The input reports need the encryption, which the request had.
-    assert_eq!(request(link, &mut tasks, &[0x0A, 0x1A, 0x00]), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(request(link, &mut tasks, &read(example::KEYBOARD.handle())), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
     // The configuration of the battery and of the three reports: the bond
     // takes it.
-    for cccd in [0x0E_u8, 0x1B, 0x1F] {
-        assert_eq!(request(link, &mut tasks, &[0x12, cccd, 0x00, 0x01, 0x00]), [0x13]);
+    for characteristic in [example::BATTERY_LEVEL, example::KEYBOARD, example::CONSUMER] {
+        assert_eq!(request(link, &mut tasks, &enable(characteristic)), [0x13]);
     }
     // The last input report's: its Write Response goes on the air, and
     // the central does not acknowledge it yet.
-    link.send(CID_ATT, &[0x12, 0x23, 0x00, 0x01, 0x00], true);
+    link.send(CID_ATT, &enable(example::MOUSE), true);
     tasks.step();
     assert_eq!(link.transmit().len(), 1);
     let ConnEvent::BondUpdated(updated) = next!(conn) else { panic!("no update") };
@@ -610,7 +659,8 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     // A report goes out as one fragment.
     let report = [0, 0, 0x4B, 0, 0, 0, 0, 0];
     assert_eq!(ready(pin!(conn.notify(example::KEYBOARD, &report))), Ok(()));
-    let mut notification = vec![0x1B, 0x1A, 0x00];
+    let mut notification = vec![0x1B];
+    notification.extend_from_slice(&example::KEYBOARD.handle().to_le_bytes());
     notification.extend_from_slice(&report);
     assert_eq!(link.deliver(), [(Channel::Att, notification)]);
 
@@ -695,8 +745,8 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
 
     // An encrypted request that overtakes the encryption event is served
     // as encrypted, with the bond's subscriptions restored.
-    assert_eq!(request(link, &mut tasks, &[0x0A, 0x1B, 0x00]), [0x0B, 0x01, 0x00]);
-    assert_eq!(request(link, &mut tasks, &[0x0A, 0x0E, 0x00]), [0x0B, 0x01, 0x00]);
+    assert_eq!(request(link, &mut tasks, &read(example::KEYBOARD.handle() + 1)), [0x0B, 0x01, 0x00]);
+    assert_eq!(request(link, &mut tasks, &read(example::BATTERY_LEVEL.handle() + 1)), [0x0B, 0x01, 0x00]);
     assert!(conn.is_subscribed(example::KEYBOARD));
     assert!(!conn.is_subscribed(example::MOUSE));
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
@@ -705,8 +755,8 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
 
     // BlueZ writes the same configuration again: the bond keeps it, and the
     // application has nothing to store.
-    for cccd in [0x0E_u8, 0x1B] {
-        assert_eq!(request(link, &mut tasks, &[0x12, cccd, 0x00, 0x01, 0x00]), [0x13]);
+    for characteristic in [example::BATTERY_LEVEL, example::KEYBOARD] {
+        assert_eq!(request(link, &mut tasks, &enable(characteristic)), [0x13]);
     }
     assert!(poll(pin!(conn.next())).is_pending());
     // A report on the restored subscription.
@@ -735,7 +785,14 @@ fn only_the_bonded_central_gets_the_bond_s_key() {
     assert_eq!(link.calls(), [Seen::Hold(true), Seen::Ltk(None)]);
     // Its encrypted requests are not served as encrypted, as no key of
     // ours made them.
-    assert_eq!(request(link, &mut tasks, &[0x0A, 0x1A, 0x00]), [0x01, 0x0A, 0x1A, 0x00, 0x0F]);
+    let keyboard = example::KEYBOARD.handle().to_le_bytes();
+    assert_eq!(request(link, &mut tasks, &read(example::KEYBOARD.handle())), [
+        0x01,
+        0x0A,
+        keyboard[0],
+        keyboard[1],
+        0x0F
+    ]);
     // The bonded central, connected from its identity address in device
     // privacy, does get it.
     link.disconnect_link(0x13);
@@ -1128,6 +1185,89 @@ fn a_bond_is_reported_only_once_the_central_has_our_identity() {
         link.calls();
     }
     assert_eq!(multiplications.get(), 4);
+}
+
+/// Runs a Just Works pairing of a Linux central that sends its identity,
+/// its PDUs `encrypted` or not, up to our DHKey check, and returns the
+/// long term key, least significant octet first.
+fn pair_just_works<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, encrypted: bool) -> [u8; 16] {
+    let mut central = Central::new(linux_request(true, true), local_rpa());
+    assert_eq!(smp(link, tasks, &central.request, encrypted).len(), 1);
+    let answer = smp(link, tasks, &central.public_key(), encrypted);
+    assert_eq!(answer.len(), 2);
+    central.take_public_key(&answer[0]);
+    central.take_confirm(&answer[1]);
+    let random = smp(link, tasks, &central.random(), encrypted);
+    central.take_random(&random[0]);
+    let check = central.check();
+    assert_eq!(smp(link, tasks, &check, encrypted), [central.expected_check().to_vec()]);
+    let mut ltk = central.ltk;
+    ltk.reverse();
+    ltk
+}
+
+/// Takes our identity keys and sends the central's, as the end of
+/// [`pair_just_works`]'s pairing once the link is encrypted with its key.
+fn exchange_identities<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, identity: &identity::Local) {
+    let mut info = vec![0x08];
+    info.extend_from_slice(&identity.irk());
+    let mut address = vec![0x09, 0x01];
+    address.extend_from_slice(&identity.address());
+    assert_eq!(link.deliver(), [(Channel::SecurityManager, info), (Channel::SecurityManager, address)]);
+    assert!(smp(link, tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true).is_empty());
+    let mut central_identity = [0x09, 0x00, 0, 0, 0, 0, 0, 0];
+    central_identity[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    assert!(smp(link, tasks, &central_identity, true).is_empty());
+}
+
+#[test]
+fn a_pairing_on_a_link_encrypted_with_the_bond_s_key_completes_with_the_key_refresh() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+
+    // The first pairing, on the plain link, makes the bond.
+    let first = pair_just_works(link, &mut tasks, false);
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
+    exchange_identities(link, &mut tasks, &identity);
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
+    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
+    assert_eq!(bond.ltk, first);
+
+    // The central pairs again on the link, still encrypted with the bond's
+    // key. The link layer pauses the encryption and starts it again with
+    // the new key: a key refresh, which ends the pairing as a first
+    // encryption does.
+    let second = pair_just_works(link, &mut tasks, true);
+    assert_ne!(second, first);
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: true, status: 0 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(Some(second))]);
+    exchange_identities(link, &mut tasks, &identity);
+    // The link stayed encrypted: no second Encrypted, only the new bond.
+    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no second bond") };
+    assert_eq!(bond.ltk, second);
+    assert!(poll(pin!(conn.next())).is_pending());
+
+    // The pairing is over: its timer does not end the link.
+    link.advance(30_000);
+    tasks.step();
+    assert!(!link.calls().iter().any(|call| matches!(call, Seen::Disconnect(_))));
+    assert_eq!(multiplications.get(), 4, "a key pair and a Diffie-Hellman key per pairing");
 }
 
 #[test]
@@ -1884,8 +2024,78 @@ fn the_battery_level_is_notified_when_it_changes() {
     assert_eq!(ready(pin!(battery.update(&conn, 90))), Ok(()));
     assert!(link.deliver().is_empty());
     assert_eq!(ready(pin!(battery.update(&conn, 89))), Ok(()));
-    assert_eq!(link.deliver(), [(Channel::Att, vec![0x1B, 0x0D, 0x00, 89])]);
+    let [handle0, handle1] = example::BATTERY_LEVEL.handle().to_le_bytes();
+    assert_eq!(link.deliver(), [(Channel::Att, vec![0x1B, handle0, handle1, 89])]);
     assert_eq!(battery.level(), 89);
+    assert_eq!(multiplications.get(), 0);
+}
+
+/// With `eatt` several values go out in one Multiple Handle Value
+/// Notification, once the client said it takes them.
+#[cfg(feature = "eatt")]
+#[test]
+fn several_values_go_out_in_one_multiple_notification() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    let values: [(Char, &[u8]); 2] = [(example::BATTERY_LEVEL, &[80]), (example::KEYBOARD, &[0; 8])];
+    assert_eq!(ready(pin!(conn.notify_multiple(&values))), Err(NotifyError::Unsupported));
+    assert_eq!(conn.try_notify(example::BATTERY_LEVEL, &[80]), Ok(()));
+    assert_eq!(link.deliver().len(), 1);
+    let [handle0, handle1] = example::CLIENT_FEATURES.to_le_bytes();
+    assert_eq!(request(link, &mut tasks, &[0x12, handle0, handle1, 0x04]), [0x13]);
+    let ConnEvent::BondUpdated(bond) = next!(conn) else { panic!("no update") };
+    assert_eq!(bond.client_features, 0x04);
+    assert_eq!(ready(pin!(conn.notify_multiple(&values))), Ok(()));
+    let mut expected = vec![0x23];
+    expected.extend_from_slice(&example::BATTERY_LEVEL.handle().to_le_bytes());
+    expected.extend_from_slice(&[0x01, 0x00, 80]);
+    expected.extend_from_slice(&example::KEYBOARD.handle().to_le_bytes());
+    expected.extend_from_slice(&[0x08, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(link.deliver(), [(Channel::Att, expected)]);
+    // The mouse's notifications are off.
+    let values: [(Char, &[u8]); 2] = [(example::BATTERY_LEVEL, &[80]), (example::MOUSE, &[0; 5])];
+    assert_eq!(ready(pin!(conn.notify_multiple(&values))), Err(NotifyError::NotSubscribed));
+    assert!(link.deliver().is_empty());
+    assert_eq!(multiplications.get(), 0);
+}
+
+/// With `eatt` an Execute Write that leaves every input report's
+/// configuration written counts as the Write Request that does: discovery is
+/// over 100 ms after the central has its response.
+#[cfg(feature = "eatt")]
+#[test]
+fn an_execute_write_of_the_last_input_configuration_ends_discovery() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    reconnected!(host, link, tasks, conn);
+    for characteristic in [example::KEYBOARD, example::CONSUMER] {
+        assert_eq!(request(link, &mut tasks, &enable(characteristic)), [0x13]);
+    }
+    // The mouse's configuration as a long write in two parts.
+    let [handle0, handle1] = (example::MOUSE.handle() + 1).to_le_bytes();
+    for (offset, part) in [(0x00, 0x01), (0x01, 0x00)] {
+        let prepare = [0x16, handle0, handle1, offset, 0x00, part];
+        let mut response = prepare.to_vec();
+        response[0] = 0x17;
+        assert_eq!(request(link, &mut tasks, &prepare), response);
+    }
+    link.send(CID_ATT, &[0x18, 0x01], true);
+    tasks.step();
+    assert_eq!(link.transmit().len(), 1);
+    let ConnEvent::BondUpdated(updated) = next!(conn) else { panic!("no update") };
+    assert_eq!(updated.cccd, 0b0101_0101);
+    // The latency goes once the central has the Execute Write Response and
+    // ATT has been idle for 100 ms, not after the fallback of 1 s.
+    link.advance(200);
+    tasks.step();
+    assert!(link.calls().is_empty());
+    link.ack();
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Hold(false)]);
+    assert_eq!(next!(conn), ConnEvent::Ready);
     assert_eq!(multiplications.get(), 0);
 }
 
@@ -2108,6 +2318,7 @@ fn a_pairable_link_without_a_key_waits_for_a_pairing() {
 mod keyboard {
     use crate::host::gatt::Value;
 
+    #[cfg(not(feature = "eatt"))]
     crate::gatt! {
         /// The table.
         pub const DB;
@@ -2115,6 +2326,23 @@ mod keyboard {
             /// The keyboard input report.
             char KEYS: 0x2A4D [read, notify; authenticated] = Value::Zeros(8);
             ccc;
+        }
+    }
+
+    // With `eatt` the host needs the feature characteristics too: after the
+    // report, so that its handles stay.
+    #[cfg(feature = "eatt")]
+    crate::gatt! {
+        /// The table.
+        pub const DB;
+        service 0x1812 {
+            /// The keyboard input report.
+            char KEYS: 0x2A4D [read, notify; authenticated] = Value::Zeros(8);
+            ccc;
+        }
+        service 0x1801 {
+            char 0x2B29 [read, write] = Value::ClientFeatures;
+            char 0x2B3A [read] = Value::ServerFeatures;
         }
     }
 }

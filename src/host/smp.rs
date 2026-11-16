@@ -784,7 +784,9 @@ impl Responder {
 
     /// Takes the encryption of the link, after the long term key went to
     /// the link layer: `on` once it is encrypted, not `on` if encryption
-    /// failed, which fails the pairing.
+    /// failed, which fails the pairing. A first encryption and a key refresh
+    /// alike: a pairing on a link already encrypted ends with a refresh to
+    /// its key. Outside the pairing's encryption step it changes nothing.
     #[inline]
     pub fn encryption_changed(&mut self, on: bool) -> Option<Outcome> {
         if self.state != State::Encryption {

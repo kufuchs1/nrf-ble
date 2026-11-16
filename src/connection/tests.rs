@@ -461,6 +461,13 @@ fn peripheral_latency_is_used_only_without_pending_work() {
     assert!(link.can_skip(now, &shared));
     link.phy_update = Some((Phy::M2, 10));
     assert!(!link.can_skip(now, &shared));
+    link.phy_update = None;
+    // Our ping waits for its response, which a central may send an event
+    // after its acknowledgement.
+    link.ping_request = Some(now + 40_000_000);
+    assert!(!link.can_skip(now, &shared));
+    link.ping_request = None;
+    assert!(link.can_skip(now, &shared));
 }
 
 #[test]
@@ -1727,8 +1734,14 @@ fn a_ping_point_or_a_reply_deadline_ends_a_batch_early() {
     link.timeout = 32_000_000;
     let now = link.anchor;
     link.payload_timer = Some((now, false));
+    // Not the ping's due point, which an event listened at anyway takes,
+    // but its latest: twice 31 events of 15 ms before the timeout.
     let timeout = shared.payload_timeout();
-    assert_eq!(link.next_deadline(now, &shared), now.wrapping_add(timeout - timeout / 4));
+    assert_eq!(link.ping_window(timeout), (timeout - timeout / 4, timeout - 2 * 31 * 15_000));
+    assert_eq!(link.next_deadline(now, &shared), now.wrapping_add(timeout - 930_000));
+    // A timeout too short for that: the due point.
+    shared.set_payload_timeout_for_test(100);
+    assert_eq!(link.next_deadline(now, &shared), now.wrapping_add(750_000));
     link.payload_timer = Some((now, true));
     link.features_request = Request::Requested(now.wrapping_add(1234));
     assert_eq!(link.next_deadline(now, &shared), now.wrapping_add(1234));

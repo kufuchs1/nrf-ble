@@ -73,6 +73,41 @@ directed-advertising = []
 # flash than legacy advertising on the nRF52832, 2.5 KB on the nRF51, and
 # 0.4 KB more static RAM. Not yet tried on hardware.
 extended-advertising = []
+# `att-mtu`: the ATT server answers Exchange MTU with 65 instead of 23, so the
+# fixed channel's ATT MTU becomes the smaller of the client's and 65, at least
+# 23 (`host::att::ATT_MAX`). A Read or Read Blob Response then carries up to
+# 64 octets of a value, Find Information up to 15 entries of 16-bit UUIDs and
+# Read By Type up to 9 characteristic declarations of 16-bit UUIDs, which
+# shortens a first discovery. A response of more than 23 octets goes out in
+# 2 or 3 link layer fragments; notifications stay at 20 octets and one
+# fragment. Static RAM +40 B (the engine's response slot of 65 octets instead
+# of 23); flash +0.3 to 0.5 KB in the release builds of the three firmwares
+# (readme).
+att-mtu = []
+# `eatt`: Enhanced ATT (Core 5.2) as responder. A central opens enhanced bearers
+# with L2CAP's Enhanced Credit Based Flow Control mode on SPSM 0x0027
+# (`host::ecfc`: MTU 65, MPS 67, 256 credits); each answers ATT requests in
+# K-frames beside the fixed channel, which carries every notification. A request
+# that arrives before the encryption waits for it, and is refused for security
+# if it fails or nothing leads to it within 2 s; two or more source CIDs not in
+# ascending order, as Linux 7.3 sends them and would cross the answer, are
+# refused: with BlueZ, `[GATT] Channels = 2` opens one bearer (readme). Static
+# RAM +296 B over a build without `att-mtu` (the engine with one bearer,
+# `att-mtu`'s 40 included). The table declares the Client and Server Supported
+# Features in its GATT service (`gatt::Value::ClientFeatures`,
+# `gatt::Value::ServerFeatures`, checked by `host::Host::new`); the client's
+# features are kept in the bond. The server serves Read Multiple Variable
+# Length, Prepare and Execute Write (one value of up to 22 octets) and Multiple
+# Handle Value Notifications (`host::Conn::notify_multiple`). Implies `att-mtu`.
+eatt = ["att-mtu"]
+# `eatt-bearers-2` to `eatt-bearers-5`: up to 2, 3, 4 or 5 enhanced bearers on
+# a link instead of 1 (`host::ecfc::BEARERS`, the highest one enabled), each
+# 16 bytes of `host::ecfc::Ecfc` and a response slot of 67 in the engine,
+# static RAM +80 B per bearer. Imply `eatt`.
+eatt-bearers-2 = ["eatt"]
+eatt-bearers-3 = ["eatt"]
+eatt-bearers-4 = ["eatt"]
+eatt-bearers-5 = ["eatt"]
 
 # Every dependency follows the main branch of its repository (the default
 # branch where it has no main): the crate's own dependencies name their git

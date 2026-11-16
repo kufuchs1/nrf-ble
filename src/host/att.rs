@@ -1,23 +1,34 @@
-//! The attribute protocol, as a server with the default MTU of 23 octets.
+//! The attribute protocol, as a server.
+//!
+//! Its ATT MTU is the default of 23 octets, or with the feature `att-mtu` one
+//! of up to 65 that the client agrees to.
 //!
 //! [`Server`] decodes the requests `BlueZ` sends, answers them from the GATT
 //! table ([`crate::host::gatt::Db`]) with the error codes of the Core
-//! specification, and encodes notifications and indications. One request is
-//! outstanding at a time, so the engine keeps one response slot of
-//! [`MTU`] octets. One indication waits for its confirmation; the 30 s limit
-//! on that wait is for the engine to time, which does not send indications
-//! yet.
+//! specification, and encodes notifications and indications. A request arrives
+//! on a [`Bearer`], whose ATT MTU bounds its response: the fixed channel, or
+//! with the feature `eatt` an enhanced bearer, which serves every request but
+//! the Exchange MTU (Request Not Supported, 0x06) and ignores a Handle Value
+//! Confirmation. One request is outstanding on each bearer at a time, so the
+//! engine keeps one response slot of [`ATT_MAX`] octets for each. One
+//! indication waits for its confirmation; the 30 s limit on that wait is for
+//! the engine to time, which does not send indications yet.
 //!
 //! It serves exactly these requests:
 //!
-//! - Exchange MTU: the answer is always 23.
+//! - Exchange MTU: the answer is [`ATT_MAX`], 23 or with `att-mtu` 65. With
+//!   `att-mtu` the fixed channel's ATT MTU then becomes the smaller of the
+//!   client's and 65, at least 23, from the next PDU on; the response itself
+//!   still fits the ATT MTU before it. Notifications and indications still
+//!   carry at most [`NOTIFY_MAX`] (20) octets of a value, in a PDU of 23.
 //! - Find Information.
 //! - Find By Type Value, for primary services (0x2800) only.
 //! - Read By Type, for any attribute type: characteristic declarations (0x2803)
 //!   are grouped by the size of their UUID, so one response holds entries of
-//!   length 7 or 21 only. Includes (0x2802) and Server Supported Features
-//!   (0x2B3A) are not in the table and give Attribute Not Found (0x0A); the
-//!   Database Hash (0x2B2A) gives the table's hash.
+//!   length 7 or 21 only. Includes (0x2802) are not in the table and give
+//!   Attribute Not Found (0x0A), as do the Server Supported Features (0x2B3A)
+//!   without the feature `eatt`; the Database Hash (0x2B2A) gives the table's
+//!   hash.
 //! - Read, and Read Blob: an offset equal to the value's length gives an empty
 //!   response, a larger one Invalid Offset (0x07), never Attribute Not Long
 //!   (0x0B), which would fail `BlueZ`'s whole read.
@@ -25,6 +36,28 @@
 //!   last service; secondary services (0x2801) give 0x0A, any other type
 //!   Unsupported Group Type (0x10).
 //! - Write Request and Write Command; Handle Value Confirmation.
+//! - With the feature `eatt`, the requests Enhanced ATT makes mandatory:
+//!   - Read Multiple Variable Length, for two handles or more. An error names
+//!     the first handle with the most important error, in the specification's
+//!     order: Insufficient Authentication (0x05), Insufficient Encryption
+//!     (0x0F), Invalid Handle (0x01), Read Not Permitted (0x02); then an error
+//!     of the application's read. The response is cut after the ATT MTU less 1
+//!     octets, or before a length field that would not fit whole.
+//!   - Prepare Write and Execute Write, for one value of up to `PREPARE_MAX`
+//!     octets: the parts are checked for the write's permission as they come
+//!     and queued, each part following the one before it in the same attribute,
+//!     and anything else gets Prepare Queue Full (0x09). The Execute Write
+//!     writes the value as a Write Request does, or cancels; a queue that does
+//!     not start at offset 0 gets Invalid Offset (0x07), as only whole values
+//!     are written. The queue is emptied after each Execute Write, and with the
+//!     link.
+//!   - Writes of the Client Supported Features: octet 0 is kept, bits 0 to 2 of
+//!     it, and further octets are ignored; a write that would clear a bit the
+//!     client set gets Value Not Allowed (0x13). Reads give one octet, and the
+//!     Server Supported Features read `0x01`, EATT Supported.
+//!
+//!   Multiple Handle Value Notifications (`Server::notify_multiple`) go out
+//!   only to a client that set bit 2 of its Client Supported Features.
 //!
 //! Any other request gets Request Not Supported (0x06); a command (opcode bit
 //! 6) is never answered, not even when it fails, and an unexpected response
@@ -67,9 +100,19 @@ use crate::host::gatt::{
     Uuid,
     Value,
 };
+#[cfg(feature = "eatt")] use core::mem;
 
-/// The ATT MTU: the default, which the server never raises.
+/// The default ATT MTU.
+///
+/// The least any bearer has, and the fixed channel's until an Exchange MTU
+/// raises it (with the feature `att-mtu`).
 pub const MTU: usize = 23;
+/// The largest ATT MTU the server takes: 65 with the feature `att-mtu`,
+/// otherwise [`MTU`].
+///
+/// The server answers an Exchange MTU Request with it, and a response slot
+/// is this long.
+pub const ATT_MAX: usize = if cfg!(feature = "att-mtu") { 65 } else { MTU };
 /// Longest value a notification or indication carries.
 pub const NOTIFY_MAX: usize = MTU.strict_sub(3);
 /// Opcode of an Error Response.
@@ -114,6 +157,42 @@ pub const INDICATION: u8 = 0x1D;
 pub const CONFIRMATION: u8 = 0x1E;
 /// Opcode of a Write Command.
 pub const WRITE_COMMAND: u8 = 0x52;
+/// Opcode of a Prepare Write Request.
+#[cfg(feature = "eatt")]
+pub const PREPARE_WRITE_REQUEST: u8 = 0x16;
+/// Opcode of a Prepare Write Response.
+#[cfg(feature = "eatt")]
+pub const PREPARE_WRITE_RESPONSE: u8 = 0x17;
+/// Opcode of an Execute Write Request.
+#[cfg(feature = "eatt")]
+pub const EXECUTE_WRITE_REQUEST: u8 = 0x18;
+/// Opcode of an Execute Write Response.
+#[cfg(feature = "eatt")]
+pub const EXECUTE_WRITE_RESPONSE: u8 = 0x19;
+/// Opcode of a Read Multiple Variable Length Request.
+#[cfg(feature = "eatt")]
+pub const READ_MULTIPLE_VARIABLE_REQUEST: u8 = 0x20;
+/// Opcode of a Read Multiple Variable Length Response.
+#[cfg(feature = "eatt")]
+pub const READ_MULTIPLE_VARIABLE_RESPONSE: u8 = 0x21;
+/// Opcode of a Multiple Handle Value Notification.
+#[cfg(feature = "eatt")]
+pub const MULTIPLE_NOTIFICATION: u8 = 0x23;
+/// The Client Supported Features bits the specification defines: Robust
+/// Caching (0), Enhanced ATT Bearer (1) and Multiple Handle Value
+/// Notifications (2).
+#[cfg(feature = "eatt")]
+pub const CLIENT_FEATURES: u8 = 0x07;
+/// Client Supported Features bit 2: the client takes Multiple Handle Value
+/// Notifications.
+#[cfg(feature = "eatt")]
+pub const MULTIPLE_NOTIFICATIONS: u8 = 0x04;
+/// The Server Supported Features: bit 0, EATT Supported.
+#[cfg(feature = "eatt")]
+pub const SERVER_FEATURES: u8 = 0x01;
+/// The longest value the prepare queue takes.
+#[cfg(feature = "eatt")]
+pub const PREPARE_MAX: usize = 22;
 /// Opcode bit of a command, which is never answered.
 const COMMAND_FLAG: u8 = 0x40;
 /// Opcodes a client sends only as a server, or never: responses,
@@ -141,8 +220,52 @@ pub enum NotifyError {
     NotSubscribed,
     /// An indication still waits for its confirmation.
     Pending,
-    /// The value is longer than [`NOTIFY_MAX`].
+    /// The value is longer than [`NOTIFY_MAX`]; for a Multiple Handle Value
+    /// Notification, the values do not fit one PDU of [`MTU`] octets.
     TooLong,
+    /// A Multiple Handle Value Notification for a client that has not set
+    /// bit 2 of its Client Supported Features ([`MULTIPLE_NOTIFICATIONS`]),
+    /// or of fewer than two values.
+    #[cfg(feature = "eatt")]
+    Unsupported,
+}
+
+/// The ATT bearer a request arrives on, which sets the ATT MTU of its
+/// response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum Bearer {
+    /// An enhanced bearer of Enhanced ATT (`crate::host::ecfc`), with the
+    /// feature `eatt`: its ATT MTU is fixed when the channel opens, the
+    /// smaller of its MTU and the peer's, at least [`MTU`] and at most
+    /// [`ATT_MAX`]. It serves no Exchange MTU and takes no Handle Value
+    /// Confirmation, as indications go on the fixed channel only.
+    #[cfg(feature = "eatt")]
+    Enhanced {
+        /// The ATT MTU.
+        mtu: usize,
+    },
+    /// The fixed channel of the attribute protocol, CID 0x0004, whose
+    /// ATT MTU is [`MTU`] until an Exchange MTU raises it, with the feature
+    /// `att-mtu`.
+    Fixed,
+}
+
+/// The values of Prepare Write Requests that wait for the Execute Write
+/// Request: consecutive parts of one attribute's value, one queue for each
+/// client.
+#[cfg(feature = "eatt")]
+#[derive(Clone, Copy, Debug)]
+struct Prepared {
+    /// The queued octets, of which the first `len` count.
+    bytes:  [u8; PREPARE_MAX],
+    /// The attribute's handle, 0 while nothing is queued.
+    handle: u16,
+    /// The number of octets queued.
+    len:    u8,
+    /// The offset in the value of the first octet queued.
+    offset: u16,
 }
 
 /// The attribute server of one link: the table, the link's client
@@ -151,12 +274,21 @@ pub enum NotifyError {
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Server {
+    /// The client's Client Supported Features, bits 0 to 2.
+    #[cfg(feature = "eatt")]
+    client_features: u8,
     /// The table.
-    db:            &'static Db,
+    db:              &'static Db,
     /// Whether an indication waits for its confirmation.
-    indicating:    bool,
+    indicating:      bool,
+    /// The fixed channel's ATT MTU: [`MTU`] until an Exchange MTU.
+    #[cfg(feature = "att-mtu")]
+    mtu:             u16,
+    /// The prepare queue.
+    #[cfg(feature = "eatt")]
+    prepared:        Prepared,
     /// The link's client characteristic configuration.
-    subscriptions: Subscriptions,
+    subscriptions:   Subscriptions,
 }
 
 /// An Error Response to give: the handle it names and its code.
@@ -184,32 +316,70 @@ enum Source {
 
 /// Writes a response into the slot, refusing what does not fit.
 struct Writer<'out> {
-    /// The response slot.
-    buf: &'out mut [u8; MTU],
+    /// The response slot, as long as the bearer's ATT MTU.
+    buf: &'out mut [u8],
     /// Octets written.
     len: usize,
 }
 
 impl Server {
+    /// Takes the client's ATT MTU of an Exchange MTU Request, `params`:
+    /// the fixed channel's becomes the smaller of it and [`ATT_MAX`], at
+    /// least [`MTU`]. A request of the wrong length changes nothing.
+    #[cfg(feature = "att-mtu")]
+    const fn agree_mtu(&mut self, params: &[u8]) {
+        if let &[client0, client1] = params {
+            self.mtu = u16::from_le_bytes([client0, client1])
+                .clamp(MTU.saturating_cast::<u16>(), ATT_MAX.saturating_cast::<u16>());
+        }
+    }
+
     /// Forgets the indication waiting for its confirmation, after its 30 s
     /// timeout ended the link.
     #[inline]
     pub const fn cancel_indication(&mut self) { self.indicating = false; }
 
-    /// Answers an Exchange MTU Request: always the default MTU.
-    const fn exchange_mtu(params: &[u8], out: &mut [u8; MTU]) -> Answer {
+    /// The client's Client Supported Features, bits 0 to 2: written on this
+    /// link, or restored from the bond ([`Self::restore_client_features`]).
+    #[cfg(feature = "eatt")]
+    #[inline]
+    #[must_use = "the features are only read"]
+    pub const fn client_features(&self) -> u8 { self.client_features }
+
+    /// Answers an Exchange MTU Request: always [`ATT_MAX`].
+    const fn exchange_mtu(params: &[u8], out: &mut [u8]) -> Answer {
         if params.len() != 2 {
             return Err((0, AttError::INVALID_PDU));
         }
-        let [low, high] = MTU.saturating_cast::<u16>().to_le_bytes();
+        let [low, high] = ATT_MAX.saturating_cast::<u16>().to_le_bytes();
         let mut writer = Writer::new(out, EXCHANGE_MTU_RESPONSE);
         writer.push(&[low, high]);
         Ok(writer.finish())
     }
 
+    /// Answers an Execute Write Request: writes the queued value, with flags
+    /// 1, as a Write Request does, or cancels it, with flags 0. Either empties
+    /// the queue.
+    #[cfg(feature = "eatt")]
+    fn execute_write(&mut self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8]) -> Answer {
+        let &[flags] = params else { return Err((0, AttError::INVALID_PDU)) };
+        if flags > 1 {
+            return Err((0, AttError::INVALID_PDU));
+        }
+        let prepared = mem::replace(&mut self.prepared, Prepared::new());
+        if flags == 1 && prepared.handle != 0 {
+            if prepared.offset != 0 {
+                // Only whole values are written.
+                return Err((prepared.handle, AttError::INVALID_OFFSET));
+            }
+            self.write_value(prepared.handle, prepared.value(), level, app, true)?;
+        }
+        Ok(Writer::new(out, EXECUTE_WRITE_RESPONSE).finish())
+    }
+
     /// Answers a Find By Type Value Request: primary services with the
     /// given UUID, with their end handles.
-    fn find_by_type_value(&self, params: &[u8], out: &mut [u8; MTU]) -> Answer {
+    fn find_by_type_value(&self, params: &[u8], out: &mut [u8]) -> Answer {
         let Some((&[start0, start1, end0, end1, type0, type1], value)) = params.split_first_chunk::<6>() else {
             return Err((0, AttError::INVALID_PDU));
         };
@@ -232,7 +402,7 @@ impl Server {
 
     /// Answers a Find Information Request: the handles and types in the
     /// range, all with UUIDs of the size of the first.
-    fn find_information(&self, params: &[u8], out: &mut [u8; MTU]) -> Answer {
+    fn find_information(&self, params: &[u8], out: &mut [u8]) -> Answer {
         let &[start0, start1, end0, end1] = params else { return Err((0, AttError::INVALID_PDU)) };
         let (start, end) = range([start0, start1], [end0, end1])?;
         let mut writer = Writer::new(out, FIND_INFORMATION_RESPONSE);
@@ -257,16 +427,56 @@ impl Server {
         writer.found(start)
     }
 
-    /// Answers a request, `pdu`, whose security is `level`: open unless it
-    /// was received encrypted on a link whose key the host handed to the
-    /// link layer itself. Writes the response into `out` and returns its
-    /// length, `None` for a PDU that gets no response: a command, a
-    /// confirmation or a response.
+    /// Answers a request, `pdu`, received on the fixed channel
+    /// ([`Bearer::Fixed`]) at the security `level`, as
+    /// [`Self::handle_on`] does, into a slot of [`ATT_MAX`] octets, which
+    /// any ATT MTU of the channel fits.
     #[inline]
-    pub fn handle(&mut self, pdu: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Option<usize> {
+    pub fn handle(&mut self, pdu: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; ATT_MAX]) -> Option<usize> {
+        self.handle_on(Bearer::Fixed, pdu, level, app, out)
+    }
+
+    /// Answers a request, `pdu`, received on `bearer` at the security
+    /// `level`: open unless it was received encrypted on a link whose key the
+    /// host handed to the link layer itself. Writes the response into the
+    /// first octets of `slot`, at most the bearer's ATT MTU of them, and
+    /// returns its length; `None` for a PDU that gets no response: a
+    /// command, a confirmation or a response. A `slot` shorter than the
+    /// bearer's ATT MTU is a mistake of the caller: the PDU is then ignored,
+    /// and `None` returned.
+    #[inline]
+    pub fn handle_on(
+        &mut self,
+        bearer: Bearer,
+        pdu: &[u8],
+        level: Sec,
+        app: &dyn Handler,
+        slot: &mut [u8],
+    ) -> Option<usize> {
+        let mtu = match bearer {
+            #[cfg(feature = "att-mtu")]
+            Bearer::Fixed => usize::from(self.mtu),
+            #[cfg(not(feature = "att-mtu"))]
+            Bearer::Fixed => MTU,
+            #[cfg(feature = "eatt")]
+            Bearer::Enhanced { mtu } => mtu.clamp(MTU, ATT_MAX),
+        };
+        let out = slot.get_mut(..mtu)?;
         let (&opcode, params) = pdu.split_first()?;
+        #[cfg(feature = "eatt")]
+        if bearer != Bearer::Fixed && matches!(opcode, EXCHANGE_MTU_REQUEST | CONFIRMATION) {
+            // The ATT MTU of an enhanced bearer is the channel's, and the
+            // server sends no indication there.
+            return (opcode == EXCHANGE_MTU_REQUEST)
+                .then(|| error_response(out, opcode, 0, AttError::REQUEST_NOT_SUPPORTED));
+        }
         let answer = match opcode {
-            EXCHANGE_MTU_REQUEST => Self::exchange_mtu(params, out),
+            EXCHANGE_MTU_REQUEST => {
+                // The response goes out within the ATT MTU before it.
+                #[cfg(feature = "att-mtu")]
+                self.agree_mtu(params);
+                Self::exchange_mtu(params, out)
+            },
             FIND_INFORMATION_REQUEST => self.find_information(params, out),
             FIND_BY_TYPE_VALUE_REQUEST => self.find_by_type_value(params, out),
             READ_BY_TYPE_REQUEST => self.read_by_type(params, level, app, out),
@@ -274,6 +484,12 @@ impl Server {
             READ_BLOB_REQUEST => self.read_blob(params, level, app, out),
             READ_BY_GROUP_TYPE_REQUEST => self.read_by_group_type(params, out),
             WRITE_REQUEST => self.write(params, level, app, true).map(|()| Writer::new(out, WRITE_RESPONSE).finish()),
+            #[cfg(feature = "eatt")]
+            PREPARE_WRITE_REQUEST => self.prepare_write(params, level, out),
+            #[cfg(feature = "eatt")]
+            EXECUTE_WRITE_REQUEST => self.execute_write(params, level, app, out),
+            #[cfg(feature = "eatt")]
+            READ_MULTIPLE_VARIABLE_REQUEST => self.read_multiple(params, level, app, out),
             WRITE_COMMAND => {
                 // A command is never answered, not even with an error.
                 let _ignored: Result<(), Failure> = self.write(params, level, app, false);
@@ -324,7 +540,19 @@ impl Server {
     /// The server of a new link over the table `db`, with no subscriptions.
     #[inline]
     #[must_use = "the server is only built"]
-    pub const fn new(db: &'static Db) -> Self { Self { db, indicating: false, subscriptions: Subscriptions::new() } }
+    pub const fn new(db: &'static Db) -> Self {
+        Self {
+            #[cfg(feature = "eatt")]
+            client_features: 0,
+            db,
+            indicating: false,
+            #[cfg(feature = "att-mtu")]
+            mtu: MTU.saturating_cast(),
+            #[cfg(feature = "eatt")]
+            prepared: Prepared::new(),
+            subscriptions: Subscriptions::new(),
+        }
+    }
 
     /// A Handle Value Notification of `data` for `characteristic` on a link
     /// of security `level`, written into `out`; returns its length.
@@ -345,6 +573,43 @@ impl Server {
         Ok(handle_value(out, NOTIFICATION, characteristic.handle(), data))
     }
 
+    /// A Multiple Handle Value Notification of `values`, each a
+    /// characteristic and its value, on a link of security `level`, written
+    /// into `out`; returns its length. Each value is checked as
+    /// [`Self::notify`] checks it, and all of them go into the one PDU, never
+    /// cut.
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be sent: [`NotifyError::Unsupported`] unless the client
+    /// set bit 2 of its Client Supported Features, or for fewer than two
+    /// values; [`NotifyError::TooLong`] if they do not fit [`MTU`] octets.
+    #[cfg(feature = "eatt")]
+    #[inline]
+    pub const fn notify_multiple(
+        &self,
+        values: &[(Char, &[u8])],
+        level: Sec,
+        out: &mut [u8; MTU],
+    ) -> Result<usize, NotifyError> {
+        if self.client_features & MULTIPLE_NOTIFICATIONS == 0 || values.len() < 2 {
+            return Err(NotifyError::Unsupported);
+        }
+        let mut writer = Writer::new(out, MULTIPLE_NOTIFICATION);
+        let mut rest = values;
+        while let Some((&(characteristic, data), tail)) = rest.split_first() {
+            let subscribed = characteristic.cccd().is_some_and(const |index| self.subscriptions.notifying(index));
+            check_notify(characteristic, PROP_NOTIFY, subscribed, data, level)?;
+            let [handle0, handle1] = characteristic.handle().to_le_bytes();
+            let [len0, len1] = data.len().saturating_cast::<u16>().to_le_bytes();
+            if !writer.push(&[handle0, handle1, len0, len1]) || !writer.push(data) {
+                return Err(NotifyError::TooLong);
+            }
+            rest = tail;
+        }
+        Ok(writer.finish())
+    }
+
     /// The characteristic properties of the characteristic that owns the
     /// descriptor at `handle`.
     const fn owner_props(&self, handle: u16) -> u8 {
@@ -358,33 +623,57 @@ impl Server {
         0
     }
 
-    /// Answers a Read Request.
-    fn read(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Answer {
-        let &[handle0, handle1] = params else { return Err((0, AttError::INVALID_PDU)) };
-        self.read_at(u16::from_le_bytes([handle0, handle1]), 0, level, app, Writer::new(out, READ_RESPONSE))
+    /// Answers a Prepare Write Request: queues its part of a value if the
+    /// link may write the attribute and the part follows the queued ones, and
+    /// echoes the request.
+    #[cfg(feature = "eatt")]
+    fn prepare_write(&mut self, params: &[u8], level: Sec, out: &mut [u8]) -> Answer {
+        // The response repeats the request, which has to fit the ATT MTU.
+        let Some((&[handle0, handle1, offset0, offset1], part)) = params.split_first_chunk::<4>() else {
+            return Err((0, AttError::INVALID_PDU));
+        };
+        if params.len() >= out.len() {
+            return Err((0, AttError::INVALID_PDU));
+        }
+        let handle = u16::from_le_bytes([handle0, handle1]);
+        let attr = self.db.attr(handle).ok_or((handle, AttError::INVALID_HANDLE))?;
+        permit(attr.access().write, level, AttError::WRITE_NOT_PERMITTED).map_err(|error| (handle, error))?;
+        if !self.prepared.push(handle, u16::from_le_bytes([offset0, offset1]), part) {
+            return Err((handle, AttError::PREPARE_QUEUE_FULL));
+        }
+        let mut writer = Writer::new(out, PREPARE_WRITE_RESPONSE);
+        writer.push(params);
+        Ok(writer.finish())
     }
 
-    /// Answers a read of the attribute at `handle` from `offset` with the
-    /// response `writer` started.
-    fn read_at(&self, handle: u16, offset: usize, level: Sec, app: &dyn Handler, mut writer: Writer<'_>) -> Answer {
+    /// Answers a Read Request.
+    fn read(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8]) -> Answer {
+        let &[handle0, handle1] = params else { return Err((0, AttError::INVALID_PDU)) };
+        self.read_at(u16::from_le_bytes([handle0, handle1]), 0, level, app, out, READ_RESPONSE)
+    }
+
+    /// Answers a read of the attribute at `handle` from `offset` with a
+    /// response `opcode` in `out`.
+    fn read_at(&self, handle: u16, offset: usize, level: Sec, app: &dyn Handler, out: &mut [u8], opcode: u8) -> Answer {
         let attr = self.db.attr(handle).ok_or((handle, AttError::INVALID_HANDLE))?;
         permit(attr.access().read, level, AttError::READ_NOT_PERMITTED).map_err(|error| (handle, error))?;
         let source = self.value(handle, attr, app).map_err(|error| (handle, error))?;
+        let mut writer = Writer::new(out, opcode);
         let len = source.copy(offset, writer.rest()).map_err(|error| (handle, error))?;
         writer.len = writer.len.saturating_add(len);
         Ok(writer.finish())
     }
 
     /// Answers a Read Blob Request.
-    fn read_blob(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Answer {
+    fn read_blob(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8]) -> Answer {
         let &[handle0, handle1, offset0, offset1] = params else { return Err((0, AttError::INVALID_PDU)) };
         let handle = u16::from_le_bytes([handle0, handle1]);
         let offset = usize::from(u16::from_le_bytes([offset0, offset1]));
-        self.read_at(handle, offset, level, app, Writer::new(out, READ_BLOB_RESPONSE))
+        self.read_at(handle, offset, level, app, out, READ_BLOB_RESPONSE)
     }
 
     /// Answers a Read By Group Type Request: primary services only.
-    fn read_by_group_type(&self, params: &[u8], out: &mut [u8; MTU]) -> Answer {
+    fn read_by_group_type(&self, params: &[u8], out: &mut [u8]) -> Answer {
         let (start, end, group) = typed_range(params)?;
         if !Uuid::U16(PRIMARY_SERVICE).matches(group) {
             let error = if Uuid::U16(SECONDARY_SERVICE).matches(group) {
@@ -421,9 +710,12 @@ impl Server {
     }
 
     /// Answers a Read By Type Request: the values of the attributes of the
-    /// type, as long as they have the length of the first and may be read.
-    fn read_by_type(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8; MTU]) -> Answer {
+    /// type, as long as they have the length of the first and may be read,
+    /// each cut to the ATT MTU less 4 octets.
+    fn read_by_type(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8]) -> Answer {
         let (start, end, wanted) = typed_range(params)?;
+        // The opcode, the entries' length and the handle come before it.
+        let value_max = out.len().saturating_sub(4);
         let mut writer = Writer::new(out, READ_BY_TYPE_RESPONSE);
         let mut pair_len = None;
         for (handle, attr) in self.within(start, end) {
@@ -439,8 +731,8 @@ impl Server {
                 Err(error) if pair_len.is_none() => return Err((handle, error)),
                 Err(_) => break,
             };
-            let mut value: [u8; MTU.strict_sub(4)] = [0; MTU.strict_sub(4)];
-            let len = source.copy(0, &mut value).unwrap_or_default();
+            let mut value: [u8; ATT_MAX.strict_sub(4)] = [0; ATT_MAX.strict_sub(4)];
+            let len = source.copy(0, value.get_mut(..value_max).unwrap_or_default()).unwrap_or_default();
             let entry_len = len.saturating_add(2);
             if *pair_len.get_or_insert(entry_len) != entry_len {
                 break;
@@ -457,6 +749,45 @@ impl Server {
         writer.found(start)
     }
 
+    /// Answers a Read Multiple Variable Length Request: the length and value
+    /// of each attribute, in the order of the request, cut after the ATT MTU
+    /// less 1 octets, or before a length field that would not fit whole.
+    #[cfg(feature = "eatt")]
+    fn read_multiple(&self, params: &[u8], level: Sec, app: &dyn Handler, out: &mut [u8]) -> Answer {
+        let (handles, &[]) = params.as_chunks::<2>() else { return Err((0, AttError::INVALID_PDU)) };
+        if handles.len() < 2 {
+            return Err((0, AttError::INVALID_PDU));
+        }
+        // The first handle with the most important error, by its rank.
+        let mut failure: Option<(u8, Failure)> = None;
+        for &handle_bytes in handles {
+            let handle = u16::from_le_bytes(handle_bytes);
+            let error = self.db.attr(handle).map_or(Some(AttError::INVALID_HANDLE), |attr| {
+                permit(attr.access().read, level, AttError::READ_NOT_PERMITTED).err()
+            });
+            if let Some(found) = error
+                && failure.is_none_or(|(rank, _)| read_rank(found) < rank)
+            {
+                failure = Some((read_rank(found), (handle, found)));
+            }
+        }
+        if let Some((_, first)) = failure {
+            return Err(first);
+        }
+        let mut writer = Writer::new(out, READ_MULTIPLE_VARIABLE_RESPONSE);
+        for &handle_bytes in handles {
+            let handle = u16::from_le_bytes(handle_bytes);
+            let attr = self.db.attr(handle).ok_or((handle, AttError::INVALID_HANDLE))?;
+            let source = self.value(handle, attr, app).map_err(|error| (handle, error))?;
+            if !writer.push(&source.len().saturating_cast::<u16>().to_le_bytes()) {
+                break;
+            }
+            let len = source.copy(0, writer.rest()).map_err(|error| (handle, error))?;
+            writer.len = writer.len.saturating_add(len);
+        }
+        Ok(writer.finish())
+    }
+
     /// Takes the client characteristic configuration a bond restores. It
     /// counts as written on no link yet.
     ///
@@ -467,6 +798,13 @@ impl Server {
     /// buffer that pairing needs.
     #[inline]
     pub const fn restore(&mut self, subscriptions: Subscriptions) { self.subscriptions = subscriptions; }
+
+    /// Adds the Client Supported Features a bond restores, `bits`, to those
+    /// the client wrote on this link: a client never clears a bit, and one
+    /// that wrote before the link was encrypted keeps what it wrote.
+    #[cfg(feature = "eatt")]
+    #[inline]
+    pub const fn restore_client_features(&mut self, bits: u8) { self.client_features |= bits & CLIENT_FEATURES; }
 
     /// A Service Changed indication of the whole table, written into `out`,
     /// if the table has the characteristic and the client wrote its
@@ -512,6 +850,16 @@ impl Server {
                 bytes[..16].copy_from_slice(&hash);
                 hash.len()
             },
+            #[cfg(feature = "eatt")]
+            (_, Value::ClientFeatures) => {
+                bytes[0] = self.client_features;
+                1
+            },
+            #[cfg(feature = "eatt")]
+            (_, Value::ServerFeatures) => {
+                bytes[0] = SERVER_FEATURES;
+                1
+            },
             (_, Value::Zeros(len)) => return Ok(Source::Zeros(usize::from(len))),
         };
         Ok(Source::Local { bytes, len })
@@ -528,7 +876,19 @@ impl Server {
         let Some((&[handle0, handle1], data)) = params.split_first_chunk::<2>() else {
             return Err((0, AttError::INVALID_PDU));
         };
-        let handle = u16::from_le_bytes([handle0, handle1]);
+        self.write_value(u16::from_le_bytes([handle0, handle1]), data, level, app, with_response)
+    }
+
+    /// Writes `data` to the attribute at `handle`, for a Write Request
+    /// (`with_response`), a Write Command or an Execute Write Request.
+    fn write_value(
+        &mut self,
+        handle: u16,
+        data: &[u8],
+        level: Sec,
+        app: &dyn Handler,
+        with_response: bool,
+    ) -> Result<(), Failure> {
         let attr = self.db.attr(handle).ok_or((handle, AttError::INVALID_HANDLE))?;
         permit(attr.access().write, level, AttError::WRITE_NOT_PERMITTED).map_err(|error| (handle, error))?;
         match attr.value_source() {
@@ -540,11 +900,52 @@ impl Server {
             },
             Value::Dynamic(id) => app.write(id, data, with_response).map_err(|error| (handle, error)),
             Value::Sink => Ok(()),
+            #[cfg(feature = "eatt")]
+            Value::ClientFeatures => {
+                // An empty write is 0; a client never clears a bit it set.
+                let bits = data.first().copied().unwrap_or(0) & CLIENT_FEATURES;
+                if self.client_features & !bits != 0 {
+                    return Err((handle, AttError::VALUE_NOT_ALLOWED));
+                }
+                self.client_features = bits;
+                Ok(())
+            },
+            #[cfg(feature = "eatt")]
+            Value::ServerFeatures => Err((handle, AttError::WRITE_NOT_PERMITTED)),
             Value::Const(_) | Value::Empty | Value::Hash | Value::Zeros(_) => {
                 Err((handle, AttError::WRITE_NOT_PERMITTED))
             },
         }
     }
+}
+
+#[cfg(feature = "eatt")]
+impl Prepared {
+    /// An empty queue.
+    const fn new() -> Self { Self { bytes: [0; PREPARE_MAX], handle: 0, len: 0, offset: 0 } }
+
+    /// Queues `part` of the value of the attribute at `handle`, from
+    /// `offset` in it: the first part, or one that follows the last part of
+    /// the same attribute, as long as the queue holds it all. Returns
+    /// whether it was queued; a part that was not changes nothing.
+    const fn push(&mut self, handle: u16, offset: u16, part: &[u8]) -> bool {
+        let (start, queued) = if self.handle == 0 { (offset, 0) } else { (self.offset, usize::from(self.len)) };
+        let follows = self.handle == 0
+            || (handle == self.handle && usize::from(offset) == usize::from(self.offset).saturating_add(queued));
+        let total = queued.saturating_add(part.len());
+        let Some(target) = self.bytes.get_mut(queued..total) else { return false };
+        if !follows {
+            return false;
+        }
+        target.copy_from_slice(part);
+        self.handle = handle;
+        self.offset = start;
+        self.len = total.saturating_cast();
+        true
+    }
+
+    /// The queued octets.
+    const fn value(&self) -> &[u8] { self.bytes.get(..usize::from(self.len)).unwrap_or_default() }
 }
 
 impl Source {
@@ -569,6 +970,15 @@ impl Source {
         out.get_mut(..count).unwrap_or_default().copy_from_slice(source.get(..count).unwrap_or_default());
         Ok(count)
     }
+
+    /// The length of the whole value.
+    #[cfg(feature = "eatt")]
+    const fn len(&self) -> usize {
+        match *self {
+            Self::Local { bytes: _, len } | Self::Zeros(len) => len,
+            Self::Static(bytes) => bytes.len(),
+        }
+    }
 }
 
 impl<'out> Writer<'out> {
@@ -581,18 +991,20 @@ impl<'out> Writer<'out> {
         if self.len > 2 { Ok(self.len) } else { Err((start, AttError::ATTRIBUTE_NOT_FOUND)) }
     }
 
-    /// A response with `opcode` in `buf`.
-    const fn new(buf: &'out mut [u8; MTU], opcode: u8) -> Self {
-        buf[0] = opcode;
+    /// A response with `opcode` in `buf`; an empty `buf` holds nothing, not
+    /// even the opcode.
+    const fn new(buf: &'out mut [u8], opcode: u8) -> Self {
+        let Some(first) = buf.first_mut() else { return Self { buf, len: 0 } };
+        *first = opcode;
         Self { buf, len: 1 }
     }
 
     /// Appends `bytes` if they fit; returns whether they did.
     const fn push(&mut self, bytes: &[u8]) -> bool {
-        let end = self.len.saturating_add(bytes.len());
-        let Some(target) = self.buf.get_mut(self.len..end) else { return false };
+        let Some(rest) = self.buf.get_mut(self.len..) else { return false };
+        let Some(target) = rest.get_mut(..bytes.len()) else { return false };
         target.copy_from_slice(bytes);
-        self.len = end;
+        self.len = self.len.saturating_add(bytes.len());
         true
     }
 
@@ -623,7 +1035,7 @@ const fn check_notify(
 
 /// Writes an Error Response to the request `opcode` for `handle` with
 /// `error` into `out` and returns its length.
-const fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: AttError) -> usize {
+const fn error_response(out: &mut [u8], opcode: u8, handle: u16, error: AttError) -> usize {
     let [handle0, handle1] = handle.to_le_bytes();
     let mut writer = Writer::new(out, ERROR_RESPONSE);
     writer.push(&[opcode, handle0, handle1, error.code()]);
@@ -632,7 +1044,7 @@ const fn error_response(out: &mut [u8; MTU], opcode: u8, handle: u16, error: Att
 
 /// Writes a notification or indication (`opcode`) of `data` for `handle`
 /// into `out` and returns its length.
-const fn handle_value(out: &mut [u8; MTU], opcode: u8, handle: u16, data: &[u8]) -> usize {
+const fn handle_value(out: &mut [u8], opcode: u8, handle: u16, data: &[u8]) -> usize {
     let mut writer = Writer::new(out, opcode);
     writer.push(&handle.to_le_bytes());
     writer.push(data);
@@ -647,6 +1059,20 @@ const fn permit(required: Option<Sec>, level: Sec, denied: AttError) -> Result<(
         Some(sec) if sec.met_by(level) => Ok(()),
         Some(Sec::Authenticated) => Err(AttError::INSUFFICIENT_AUTHENTICATION),
         Some(_) => Err(AttError::INSUFFICIENT_ENCRYPTION),
+    }
+}
+
+/// The rank of an error of a Read Multiple Variable Length Request, the most
+/// important lowest: the specification's order of authentication,
+/// encryption, the handle and the permission, which every server error
+/// before the read of the value is.
+#[cfg(feature = "eatt")]
+const fn read_rank(error: AttError) -> u8 {
+    match error {
+        AttError::INSUFFICIENT_AUTHENTICATION => 0,
+        AttError::INSUFFICIENT_ENCRYPTION => 1,
+        AttError::INVALID_HANDLE => 2,
+        _ => 3,
     }
 }
 

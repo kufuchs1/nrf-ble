@@ -931,12 +931,14 @@ impl Connection {
 
     /// What an acknowledgement of our PDU completes, after the answer: the
     /// host's packet, a termination or a length response, and the hold of
-    /// the latency after a payload.
+    /// the latency after a payload other than LE Ping's.
     const fn after_ack(&mut self, acked: Acked) {
         self.stats.acked = self.stats.acked.wrapping_add(1);
         if acked.kind != TxKind::Empty {
             self.stats.acked_data = self.stats.acked_data.wrapping_add(1);
-            self.hold_latency_from(self.last_valid);
+            if !(acked.kind == TxKind::Control && is_ping(acked.opcode)) {
+                self.hold_latency_from(self.last_valid);
+            }
         }
         match acked.kind {
             TxKind::Acl => self.completed = self.completed.saturating_add(1),
@@ -1134,10 +1136,13 @@ impl Connection {
     /// anchor is fresh when the timing or the PHY changes. It stops too
     /// while the latency is held: in the first second of the link, a while
     /// after traffic, and while the host holds it, so that a central's
-    /// request is answered at the next event.
+    /// request is answered at the next event. And while our LE Ping waits
+    /// for its response, which then arrives within the authenticated
+    /// payload timeout however short.
     fn can_skip(&self, now: u32, shared: &Shared) -> bool {
         self.hold_until.is_none_or(|until| reached(now, until))
             && !shared.latency_held()
+            && self.ping_request.is_none()
             && matches!(self.expect, Expect::Anchor)
             && self.param_update.is_none()
             && self.phy_update.is_none()
@@ -1151,12 +1156,15 @@ impl Connection {
             && !shared.has_acl_out()
     }
 
-    /// Keeps authenticated packets coming (LE Ping): pings the central when
+    /// Keeps authenticated packets coming (LE Ping): pings the central once
     /// three quarters of the authenticated payload timeout passed without a
-    /// packet with a valid MIC, and tells the host when all of it passed.
+    /// packet with a valid MIC, at an event listened at anyway or at the
+    /// latest of [`Self::ping_window`], and tells the host when all of it
+    /// passed.
     fn check_payload(&mut self, now: u32, shared: &Shared) {
         let Some((last, pinged)) = self.payload_timer else { return };
         let timeout = shared.payload_timeout();
+        let (due, latest) = self.ping_window(timeout);
         let elapsed = now.wrapping_sub(last);
         if elapsed >= timeout {
             // Retained until the host takes it, once.
@@ -1167,7 +1175,8 @@ impl Connection {
             warn!("authenticated payload timeout expired");
         } else if !pinged
             && self.ping_request.is_none()
-            && elapsed >= timeout.saturating_sub(timeout.wrapping_shr(2))
+            && elapsed >= due
+            && (elapsed >= latest || !self.skips(now, shared))
             && self.encryption.phase == Phase::Idle
             && self.queue.is_empty()
         {
@@ -2337,7 +2346,9 @@ impl Connection {
             .filter_map(|request| if let Request::Requested(deadline) = request { Some(deadline) } else { None });
         let payload = self.payload_timer.into_iter().flat_map(|(last, pinged)| {
             let timeout = shared.payload_timeout();
-            let ping = (!pinged).then(|| last.wrapping_add(timeout.saturating_sub(timeout.wrapping_shr(2))));
+            // Before its latest time the ping waits for an event listened at
+            // anyway, which needs no deadline of its own.
+            let ping = (!pinged).then(|| last.wrapping_add(self.ping_window(timeout).1));
             ping.into_iter().chain(iter::once(last.wrapping_add(timeout)))
         });
         [
@@ -2391,6 +2402,20 @@ impl Connection {
         } else {
             self.abort = Some(ERROR_HARDWARE_FAILURE);
         }
+    }
+
+    /// When the LE Ping of the authenticated payload timeout `timeout` is
+    /// due and when it goes out at the latest, as times since the last
+    /// packet with a valid MIC. It is due after three quarters of the
+    /// timeout, and from then on waits for an event listened at anyway, so
+    /// that it breaks no run of skipped events. At the latest, twice the
+    /// longest run of events, skipped ones and the one listened at, remain:
+    /// one for our request to go out, one for the central's response. A
+    /// timeout too short for that pings once it is due.
+    const fn ping_window(&self, timeout: u32) -> (u32, u32) {
+        let due = timeout.saturating_sub(timeout.wrapping_shr(2));
+        let run = self.interval.saturating_mul(u32::from(self.latency).saturating_add(1));
+        (due, due.max(timeout.saturating_sub(run.saturating_mul(2))))
     }
 
     /// Points the radio at the PDU on the air, right after the access
@@ -3089,18 +3114,26 @@ impl Connection {
     fn stash(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool, shared: &Shared) {
         self.seq.received = false;
         self.stats.received = self.stats.received.wrapping_add(1);
-        // A payload, encrypted or not, holds the latency off for a while.
-        if rx[1] != 0 {
+        // Empty PDUs have no MIC and need not produce a CCM output packet.
+        let plain = encrypted && rx[1] != 0;
+        let (header, len, opcode) = {
+            let source = if plain { self.rx_plain.as_slice() } else { rx.as_slice() };
+            let byte = |index: usize| source.get(index).copied().unwrap_or_default();
+            (byte(0), byte(1), byte(DATA_HEADER_LEN))
+        };
+        // LE Ping: nothing follows its request but our response, which
+        // the queue sends at the next event, nor its response.
+        let ping = header & LLID_MASK == Llid::Control.bits() && len != 0 && is_ping(opcode);
+        // A payload other than LE Ping's, encrypted or not, holds the latency
+        // off for a while.
+        if rx[1] != 0 && !ping {
             self.hold_latency_from(self.last_valid);
         }
-        // Empty PDUs have no MIC and need not produce a CCM output packet.
-        let source = if encrypted && rx[1] != 0 { self.rx_plain.as_slice() } else { rx.as_slice() };
-        let header = source.first().copied().unwrap_or_default();
-        let len = source.get(1).copied().unwrap_or_default();
+        let source = if plain { self.rx_plain.as_slice() } else { rx.as_slice() };
         if encrypted && len != 0 {
             self.encryption.rx_counter = self.encryption.rx_counter.saturating_add(1);
         }
-        if len != 0 || header & MD != 0 {
+        if (len != 0 && !ping) || header & MD != 0 {
             self.skipped = self.latency;
         }
         if len == 0 {
@@ -3281,6 +3314,10 @@ const fn control_len(code: u8) -> Option<usize> {
         _ => None,
     }
 }
+
+/// Whether `opcode` is one of LE Ping, whose PDUs never hold the
+/// peripheral latency off: nothing follows them.
+const fn is_ping(opcode: u8) -> bool { matches!(opcode, OP_PING_REQ | OP_PING_RSP) }
 
 /// Power control flags of `level`: bit 0 at the lowest power, bit 1 at the
 /// highest.

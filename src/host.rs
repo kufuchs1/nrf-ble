@@ -198,6 +198,12 @@
 //!         }
 //!         service 0x1801 {
 //!             char 0x2B2A [read] = Value::Hash;
+//!             // With nrf-ble's `eatt`, which a firmware enables through a
+//!             // feature of its own of that name.
+//!             #[cfg(feature = "eatt")]
+//!             char 0x2B29 [read, write] = Value::ClientFeatures;
+//!             #[cfg(feature = "eatt")]
+//!             char 0x2B3A [read] = Value::ServerFeatures;
 //!         }
 //!         service 0x180F {
 //!             /// The battery level, which the application notifies.
@@ -346,13 +352,17 @@ pub mod adv;
 pub mod att;
 /// The bond with the one central and its stored form.
 pub mod bond;
+/// The credit based channels that carry Enhanced ATT.
+#[cfg(feature = "eatt")]
+pub mod ecfc;
 /// The protocol engine, without input or output of its own.
 pub mod engine;
 /// The GATT server's attribute table.
 pub mod gatt;
 /// The device's own identity address and identity resolving key.
 pub mod identity;
-/// The L2CAP fixed channels: demultiplexing, reassembly and fragmenting.
+/// The L2CAP channels: demultiplexing, reassembly and fragmenting, and with
+/// `eatt` the K-frames of the enhanced bearers.
 pub mod l2cap;
 /// The L2CAP signalling channel.
 pub mod signal;
@@ -410,10 +420,11 @@ pub type StateMutex = CriticalSectionRawMutex;
 #[derive(Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ConnEvent {
-    /// The bonded central changed its subscriptions or, with the feature
-    /// `directed-advertising`, did not answer directed advertising
-    /// ([`Bond::directed_works`]): the bond to store in place of the stored
-    /// one.
+    /// The bonded central changed its subscriptions, or with the feature
+    /// `eatt` its Client Supported Features ([`Bond::client_features`]), or
+    /// with the feature `directed-advertising` did not answer directed
+    /// advertising ([`Bond::directed_works`]): the bond to store in place of
+    /// the stored one.
     BondUpdated(Bond),
     /// A pairing made this bond, which the firmware stores: reported once
     /// the central acknowledged our identity keys.
@@ -498,8 +509,15 @@ pub enum NotifyError {
     /// The client has not enabled notifications, or the characteristic
     /// cannot notify.
     NotSubscribed,
-    /// The value is longer than [`att::NOTIFY_MAX`].
+    /// The value is longer than [`att::NOTIFY_MAX`]; for
+    /// `Conn::notify_multiple`, the values do not fit one PDU of
+    /// [`att::MTU`] octets.
     TooLong,
+    /// A Multiple Handle Value Notification ([`Conn::notify_multiple`]) for
+    /// a client that has not set bit 2 of its Client Supported Features, or
+    /// of fewer than two values.
+    #[cfg(feature = "eatt")]
+    Unsupported,
 }
 
 /// Why a passkey was not taken.
@@ -719,6 +737,8 @@ const impl From<AttNotifyError> for NotifyError {
             AttNotifyError::NotSubscribed => Self::NotSubscribed,
             AttNotifyError::Pending => Self::Busy,
             AttNotifyError::TooLong => Self::TooLong,
+            #[cfg(feature = "eatt")]
+            AttNotifyError::Unsupported => Self::Unsupported,
         }
     }
 }
@@ -857,6 +877,31 @@ where
         let _turn = self.host.notifier.lock().await;
         loop {
             match self.host.send_notification(self.epoch, characteristic, data) {
+                Err(NotifyError::Busy) => {},
+                result => return result,
+            }
+            self.host.wake.signal(());
+            self.host.room.wait().await;
+        }
+    }
+
+    /// Notifies `values`, each a characteristic and its value, in one
+    /// Multiple Handle Value Notification, waiting as [`Self::notify`] does.
+    /// Each value is checked as [`Self::notify`] checks it, and all of them
+    /// go into one PDU of at most [`att::MTU`] octets, never cut: the opcode,
+    /// then for each value its handle and length, 4 octets, and the value.
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be sent: [`NotifyError::Unsupported`] unless the
+    /// client set bit 2 of its Client Supported Features, or for fewer than
+    /// two values; never [`NotifyError::Busy`].
+    #[cfg(feature = "eatt")]
+    #[inline]
+    pub async fn notify_multiple(&self, values: &[(Char, &[u8])]) -> Result<(), NotifyError> {
+        let _turn = self.host.notifier.lock().await;
+        loop {
+            match self.host.send_multiple(self.epoch, values) {
                 Err(NotifyError::Busy) => {},
                 result => return result,
             }
@@ -1140,7 +1185,9 @@ where
     ///
     /// With the feature `passkey`, if the table has an attribute that needs
     /// authentication and `config` pairs with Just Works only: the attribute
-    /// could never be reached. In a `static`, this fails the build.
+    /// could never be reached. With the feature `eatt`, if the table lacks
+    /// the Client or the Server Supported Features characteristic
+    /// (`Db::has_features`). In a `static`, this fails the build.
     #[inline]
     #[must_use = "the host is only built"]
     pub const fn new(port: P, db: &'static Db, config: engine::Config) -> Self {
@@ -1148,6 +1195,11 @@ where
         assert!(
             !db.needs_authentication() || config.security.protects(),
             "a table with authenticated attributes needs a configuration that pairs with Passkey Entry"
+        );
+        #[cfg(feature = "eatt")]
+        assert!(
+            db.has_features(),
+            "with the feature eatt the table needs the Client and Server Supported Features in its GATT service"
         );
         Self {
             advertised: Signal::new(),
@@ -1242,6 +1294,32 @@ where
                 Either4::Second(()) | Either4::Fourth(()) => {},
             }
         }
+    }
+
+    /// Sends a Multiple Handle Value Notification of `values` on the link
+    /// `epoch` if there is room now, as [`Self::send_notification`] sends a
+    /// notification.
+    #[cfg(feature = "eatt")]
+    fn send_multiple(&self, epoch: Epoch, values: &[(Char, &[u8])]) -> Result<(), NotifyError> {
+        self.with(|state| {
+            let result = state.engine.notification_multiple(epoch, values).and_then(|fragment| {
+                if self.port.queue_room() < 2 || self.port.fragments_in_flight(epoch) >= state.engine.notify_depth() {
+                    return Err(NotifyError::Busy);
+                }
+                self.port.send_fragment(epoch, fragment.start(), fragment.bytes()).map_err(|error| match error {
+                    link::Error::Full => NotifyError::Busy,
+                    link::Error::Disallowed
+                    | link::Error::Gone
+                    | link::Error::Invalid
+                    | link::Error::Unsupported
+                    | link::Error::UnsupportedRemote => NotifyError::Disconnected,
+                })
+            });
+            if result == Err(NotifyError::Busy) {
+                state.notify_waiting = true;
+            }
+            result
+        })
     }
 
     /// Sends a notification on the link `epoch` if there is room now.

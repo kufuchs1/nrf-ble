@@ -1,7 +1,11 @@
 //! Tests of the table builder, the example table and the layout hash.
 
+extern crate alloc;
+extern crate std;
+
 use super::*;
-use crate::host::example::{self, DB, PARAMS, REPORT_MAP, REPORT_MAP_LEN};
+use crate::host::example::{self, DB, EATT_SHIFT, PARAMS, REPORT_MAP, REPORT_MAP_LEN};
+use alloc::vec::Vec;
 
 /// The example table again, with `$map` as its Report Map.
 macro_rules! example_with {
@@ -15,6 +19,10 @@ macro_rules! example_with {
             }
             service 0x1801 {
                 char 0x2B2A [read] = Value::Hash;
+                #[cfg(feature = "eatt")]
+                char 0x2B29 [read, write] = Value::ClientFeatures;
+                #[cfg(feature = "eatt")]
+                char 0x2B3A [read] = Value::ServerFeatures;
             }
             service 0x180F {
                 char 0x2A19 [read, notify] = Value::Dynamic(example::BATTERY_LEVEL_VALUE);
@@ -53,29 +61,44 @@ example_with!(ALTERED, ALTERED_MAP);
 
 #[test]
 fn the_example_table_has_its_handles() {
-    assert_eq!(DB.last_handle(), 36);
-    assert_eq!(DB.attrs().len(), 36);
+    // With `eatt`, 4 more after the Database Hash.
+    let shift = EATT_SHIFT;
+    assert_eq!(DB.last_handle(), 36 + shift);
+    assert_eq!(DB.attrs().len(), usize::from(36 + shift));
     assert_eq!(DB.cccds(), 4);
     assert_eq!(DB.service_changed(), None);
-    assert_eq!(example::BATTERY_LEVEL.handle(), 13);
+    assert_eq!(example::BATTERY_LEVEL.handle(), 13 + shift);
     assert_eq!(example::BATTERY_LEVEL.cccd(), Some(0));
     assert_eq!(example::BATTERY_LEVEL.sec(), Sec::Open);
-    assert_eq!(example::KEYBOARD.handle(), 26);
+    assert_eq!(example::KEYBOARD.handle(), 26 + shift);
     assert_eq!(example::KEYBOARD.cccd(), Some(1));
     assert_eq!(example::KEYBOARD.sec(), Sec::Encrypted);
     assert_eq!(example::KEYBOARD.props(), PROP_READ | PROP_NOTIFY);
-    assert_eq!(example::CONSUMER.handle(), 30);
+    assert_eq!(example::CONSUMER.handle(), 30 + shift);
     assert_eq!(example::CONSUMER.cccd(), Some(2));
-    assert_eq!(example::MOUSE.handle(), 34);
+    assert_eq!(example::MOUSE.handle(), 34 + shift);
     assert_eq!(example::MOUSE.cccd(), Some(3));
-    let services: [u16; 5] = [1, 8, 11, 15, 18];
-    let ends: [u16; 5] = [7, 10, 14, 17, 36];
+    let services: [u16; 5] = [1, 8, 11 + shift, 15 + shift, 18 + shift];
+    let ends: [u16; 5] = [7, 10 + shift, 14 + shift, 17 + shift, 36 + shift];
     for (start, end) in services.into_iter().zip(ends) {
         assert_eq!(DB.attr(start).unwrap().kind(), Kind::Service);
         assert_eq!(DB.group_end(start), end);
     }
     assert!(DB.attr(0).is_none());
-    assert!(DB.attr(37).is_none());
+    assert!(DB.attr(37 + shift).is_none());
+    #[cfg(feature = "eatt")]
+    {
+        assert!(DB.has_features());
+        for (handle, uuid, props, value) in [
+            (example::CLIENT_FEATURES, CLIENT_SUPPORTED_FEATURES, PROP_READ | PROP_WRITE, Value::ClientFeatures),
+            (example::SERVER_FEATURES, SERVER_SUPPORTED_FEATURES, PROP_READ, Value::ServerFeatures),
+        ] {
+            assert_eq!(DB.attr(handle - 1).unwrap().kind(), Kind::Characteristic(props));
+            let attr = DB.attr(handle).unwrap();
+            assert_eq!((attr.uuid(), attr.value_source()), (Uuid::U16(uuid), value));
+            assert_eq!(attr.access(), Access::from_props(props, Sec::Open));
+        }
+    }
 }
 
 #[test]
@@ -268,4 +291,140 @@ fn security_levels_are_ordered() {
     assert!(!Sec::Authenticated.met_by(Sec::Encrypted));
     assert_eq!(AttError::application(0x85).code(), 0x85);
     assert_eq!(AttError::application(0x05).code(), 0x80);
+}
+
+#[test]
+fn a_characteristic_under_cfg_is_in_the_table_only_where_the_condition_holds() {
+    crate::gatt! {
+        const CONDITIONAL;
+        service 0x180F {
+            /// Documented before the condition.
+            #[cfg(all())]
+            char KEPT: 0x2A19 [read] = Value::Const(&[50]);
+            #[cfg(any())]
+            /// Documented after it.
+            char DROPPED: 0x2A1A [read] = Value::Const(&[1]);
+            #[cfg(any())]
+            char 0x2A1B [read] = Value::Const(&[2]);
+            #[cfg(all())]
+            char 0x2A1C [read] = Value::Const(&[3]);
+            char AFTER: 0x2A1D [read, notify] = Value::Const(&[4]);
+            ccc;
+        }
+    }
+    crate::gatt! {
+        const PLAIN;
+        service 0x180F {
+            char 0x2A19 [read] = Value::Const(&[50]);
+            char 0x2A1C [read] = Value::Const(&[3]);
+            char 0x2A1D [read, notify] = Value::Const(&[4]);
+            ccc;
+        }
+    }
+    // The characteristics whose condition fails take no handles: the
+    // table is the one without them.
+    assert_eq!(CONDITIONAL.last_handle(), 8);
+    assert_eq!(CONDITIONAL.hash(), PLAIN.hash());
+    assert_eq!((KEPT.handle(), KEPT.cccd()), (3, None));
+    assert_eq!((AFTER.handle(), AFTER.cccd()), (7, Some(0)));
+    let Value::Const(bytes) = CONDITIONAL.attr(5).unwrap().value_source() else { panic!("not the kept value") };
+    assert_eq!(bytes, [3]);
+}
+
+#[test]
+fn the_hash_follows_the_feature_characteristics() {
+    // Built by hand, as a table may hold them only with `eatt`.
+    let gatt = Uuid::U16(GATT_SERVICE);
+    let hash = [
+        Attr::service(gatt),
+        Attr::characteristic(Uuid::U16(DATABASE_HASH), PROP_READ),
+        Attr::value(Uuid::U16(DATABASE_HASH), PROP_READ, Sec::Open, Value::Hash),
+    ];
+    let with = [
+        Attr::characteristic(Uuid::U16(SERVER_SUPPORTED_FEATURES), PROP_READ),
+        Attr::value(Uuid::U16(SERVER_SUPPORTED_FEATURES), PROP_READ, Sec::Open, Value::Const(&[1])),
+    ];
+    assert_ne!(hash::layout(&hash), hash::layout(&[&hash[..], &with[..]].concat()));
+    assert_ne!(hash::layout(&[&hash[..], &with[..]].concat()), [0; 16]);
+}
+
+/// The table of a GATT service (`service` 0x1801) or another, with the
+/// Database Hash and then `features`, each a characteristic declared with
+/// its UUID, properties and security and holding a value.
+fn features_table(service: u16, features: &[(u16, u8, Sec, Value)]) -> Db {
+    let mut attrs: Vec<Attr> = Vec::from([
+        Attr::service(Uuid::U16(service)),
+        Attr::characteristic(Uuid::U16(DATABASE_HASH), PROP_READ),
+        Attr::value(Uuid::U16(DATABASE_HASH), PROP_READ, Sec::Open, Value::Hash),
+    ]);
+    for &(uuid, props, sec, value) in features {
+        attrs.push(Attr::characteristic(Uuid::U16(uuid), props));
+        attrs.push(Attr::value(Uuid::U16(uuid), props, sec, value));
+    }
+    Db::new(attrs.leak())
+}
+
+/// The Server Supported Features as a table without `eatt` can only give
+/// them: a constant.
+#[cfg(not(feature = "eatt"))]
+#[test]
+#[should_panic(expected = "the Client and Server Supported Features characteristics need the feature eatt")]
+fn without_eatt_the_server_supported_features_are_refused() {
+    let _ = features_table(GATT_SERVICE, &[(SERVER_SUPPORTED_FEATURES, PROP_READ, Sec::Open, Value::Const(&[1]))]);
+}
+
+#[cfg(not(feature = "eatt"))]
+#[test]
+#[should_panic(expected = "the Client and Server Supported Features characteristics need the feature eatt")]
+fn without_eatt_the_client_supported_features_are_refused() {
+    let _ =
+        features_table(GATT_SERVICE, &[(CLIENT_SUPPORTED_FEATURES, PROP_READ | PROP_WRITE, Sec::Open, Value::Sink)]);
+}
+
+/// The Client and Server Supported Features as `eatt` takes them.
+#[cfg(feature = "eatt")]
+const FEATURES: [(u16, u8, Sec, Value); 2] = [
+    (CLIENT_SUPPORTED_FEATURES, PROP_READ | PROP_WRITE, Sec::Open, Value::ClientFeatures),
+    (SERVER_SUPPORTED_FEATURES, PROP_READ, Sec::Open, Value::ServerFeatures),
+];
+
+#[cfg(feature = "eatt")]
+#[test]
+fn with_eatt_the_features_are_found_once_each_in_the_gatt_service() {
+    assert!(features_table(GATT_SERVICE, &FEATURES).has_features());
+    assert!(!features_table(GATT_SERVICE, &FEATURES[..1]).has_features());
+    assert!(!features_table(GATT_SERVICE, &FEATURES[1..]).has_features());
+    assert!(!features_table(GATT_SERVICE, &[]).has_features());
+    assert!(!example::DB.attrs().is_empty() && example::DB.has_features());
+}
+
+/// Each way the feature characteristics can break the rules, refused.
+#[cfg(feature = "eatt")]
+#[test]
+fn with_eatt_the_features_are_checked() {
+    let client = FEATURES[0];
+    let server = FEATURES[1];
+    let cases: [(u16, Vec<(u16, u8, Sec, Value)>, &str); 8] = [
+        (0x180F, Vec::from(FEATURES), "the Client Supported Features are declared once"),
+        (GATT_SERVICE, Vec::from([client, client]), "the Client Supported Features are declared once"),
+        (GATT_SERVICE, Vec::from([server, server]), "the Server Supported Features are declared once"),
+        (GATT_SERVICE, Vec::from([(client.0, PROP_READ, client.2, client.3)]), "the Client Supported Features"),
+        (GATT_SERVICE, Vec::from([(server.0, PROP_READ | PROP_WRITE, server.2, server.3)]), "the Server Supported"),
+        (GATT_SERVICE, Vec::from([(client.0, client.1, Sec::Encrypted, client.3)]), "are open, with their own values"),
+        (GATT_SERVICE, Vec::from([(client.0, client.1, client.2, Value::ServerFeatures)]), "are open, with their own"),
+        (GATT_SERVICE, Vec::from([(0x2A19, PROP_READ, Sec::Open, Value::ServerFeatures)]), "belong to their own"),
+    ];
+    for (service, features, expected) in cases {
+        let caught = std::panic::catch_unwind(|| features_table(service, &features));
+        let message = caught.err().and_then(|payload| payload.downcast_ref::<&str>().copied());
+        assert!(message.is_some_and(|text| text.contains(expected)), "{features:?}: {message:?}");
+    }
+    // A descriptor cannot hold them either.
+    let attrs = Vec::from([
+        Attr::service(Uuid::U16(GATT_SERVICE)),
+        Attr::characteristic(Uuid::U16(0x2A19), PROP_READ),
+        Attr::value(Uuid::U16(0x2A19), PROP_READ, Sec::Open, Value::Const(&[1])),
+        Attr::descriptor(Uuid::U16(0x2901), PROP_READ, Sec::Open, Value::ClientFeatures),
+    ]);
+    assert!(std::panic::catch_unwind(|| Db::new(attrs.leak())).is_err());
 }
