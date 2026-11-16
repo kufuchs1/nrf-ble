@@ -44,8 +44,8 @@ What is done so far:
   (`host::signal`: the connection parameter update request and command rejects), with the feature `eatt` the credit
   based channels of the enhanced ATT bearers (`host::ecfc`), the ATT server at MTU 23, or up to 65 with the feature
   `att-mtu` (`host::att`; with `eatt` also Read Multiple Variable Length, Prepare and Execute Write and Multiple Handle
-  Value Notifications, on the fixed channel and each enhanced bearer), and the GATT table (`host::gatt`: the `gatt!` macro, per-link CCCD state
-  and a constant table hash; the table itself is the device's).
+  Value Notifications, on the fixed channel and each enhanced bearer), and the GATT table (`host::gatt`: the `gatt!`
+  macro, per-link CCCD state and a constant table hash; the table itself is the device's).
 - Our identity (`host::identity`: the address and identity resolving key derived from the device secret the way the MX
   firmwares do), advertising (`host::adv`: the advertising data writer, the pairing and reconnect modes with their
   phases, an optional directed first phase of a reconnection with the feature `directed-advertising`, high duty cycle,
@@ -193,25 +193,26 @@ release build keeps its size to the byte):
   | 2 | 1 source CID | 1, after the encryption on a reconnection |
   | 3 to 6 | 2 to 5 source CIDs, not ascending | none: Insufficient Resources, and every channel is gone at once (no 40 s wait); the fixed channel serves on |
 
-  The exception: a request with nothing leading to the encryption within 2 s, as on a plain `connect` without `pair`,
-  is refused for security, and after the encryption Linux sends one request for each channel, all at once, which open
-  as many bearers as the build has, each correctly bound, and refuse the rest with Insufficient Resources. A central
-  that names its source CIDs in ascending order, as Zephyr and Android do, gets as many bearers as the build has in one
+  The exception: a request with nothing leading to the encryption within 2 s, as on a plain `connect` without `pair`, is
+  refused for security, and after the encryption Linux sends one request for each channel, all at once, which open as
+  many bearers as the build has, each correctly bound, and refuse the rest with Insufficient Resources. A central that
+  names its source CIDs in ascending order, as Zephyr and Android do, gets as many bearers as the build has in one
   request. The setting is global: it also offers EATT to other devices of the computer. Static RAM: the engine grows by
-  296 bytes with one bearer over a build without `att-mtu`, and by 80 bytes for each further bearer. The table declares the Client Supported Features (0x2B29, read and write) and the Server Supported Features
-  (0x2B3A, read) in its GATT service, each without encryption, with `gatt::Value::ClientFeatures` and
-  `gatt::Value::ServerFeatures`; `Host::new` refuses a table without them, and a table that declares them without the
-  feature does not build. A firmware lists them under `#[cfg(feature = "eatt")]` (the `gatt!` macro takes one `#[cfg]`
-  on a `char` without descriptors), which changes the table's hash, so BlueZ discovers it again once. The client's
-  features (bits 0 to 2 of the octet it writes) are kept for the link and in the bond, flags bits 5 to 7: a client may
-  add bits but never clear one (Value Not Allowed, 0x13), a reconnection adds the bond's bits to those written before
-  the encryption, and only a change makes a `ConnEvent::BondUpdated`, so BlueZ's write on every connection costs no
-  flash write. The server serves Read Multiple Variable Length (0x20), Prepare and Execute Write for one value of up to
-  22 octets (`att::PREPARE_MAX`; anything else gets Prepare Queue Full, 0x09), and `Conn::notify_multiple` sends a
-  Multiple Handle Value Notification (0x23) of two values or more in one PDU of 23 octets to a client that set bit 2 of
-  its features (`NotifyError::Unsupported` otherwise). Robust Caching (bit 0) is stored, not acted on: the server never
-  answers Database Out Of Sync (0x12). That is enough for a table without Service Changed; a table with both Service
-  Changed and the Database Hash would have to serve Robust Caching (GATT 2.5.2.1), which the host does not do.
+  296 bytes with one bearer over a build without `att-mtu`, and by 80 bytes for each further bearer. The table declares
+  the Client Supported Features (0x2B29, read and write) and the Server Supported Features (0x2B3A, read) in its GATT
+  service, each without encryption, with `gatt::Value::ClientFeatures` and `gatt::Value::ServerFeatures`; `Host::new`
+  refuses a table without them, and a table that declares them without the feature does not build. A firmware lists them
+  under `#[cfg(feature = "eatt")]` (the `gatt!` macro takes one `#[cfg]` on a `char` without descriptors), which changes
+  the table's hash, so BlueZ discovers it again once. The client's features (bits 0 to 2 of the octet it writes) are
+  kept for the link and in the bond, flags bits 5 to 7: a client may add bits but never clear one (Value Not Allowed,
+  0x13), a reconnection adds the bond's bits to those written before the encryption, and only a change makes a
+  `ConnEvent::BondUpdated`, so BlueZ's write on every connection costs no flash write. The server serves Read Multiple
+  Variable Length (0x20), Prepare and Execute Write for one value of up to 22 octets (`att::PREPARE_MAX`; anything else
+  gets Prepare Queue Full, 0x09), and `Conn::notify_multiple` sends a Multiple Handle Value Notification (0x23) of two
+  values or more in one PDU of 23 octets to a client that set bit 2 of its features (`NotifyError::Unsupported`
+  otherwise). Robust Caching (bit 0) is stored, not acted on: the server never answers Database Out Of Sync (0x12). That
+  is enough for a table without Service Changed; a table with both Service Changed and the Database Hash would have to
+  serve Robust Caching (GATT 2.5.2.1), which the host does not do.
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride

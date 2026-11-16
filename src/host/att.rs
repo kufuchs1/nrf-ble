@@ -5,15 +5,14 @@
 //!
 //! [`Server`] decodes the requests `BlueZ` sends, answers them from the GATT
 //! table ([`crate::host::gatt::Db`]) with the error codes of the Core
-//! specification, and encodes notifications and indications. A request
-//! arrives on a [`Bearer`], whose ATT MTU bounds its response: the fixed
-//! channel, or with the feature `eatt` an enhanced bearer, which serves every
-//! request but the Exchange MTU (Request Not Supported, 0x06) and ignores a
-//! Handle Value Confirmation. One request is outstanding on each bearer at a
-//! time, so the engine keeps one response slot of [`ATT_MAX`] octets for
-//! each. One indication waits for
-//! its confirmation; the 30 s limit on that wait is for the engine to time,
-//! which does not send indications yet.
+//! specification, and encodes notifications and indications. A request arrives
+//! on a [`Bearer`], whose ATT MTU bounds its response: the fixed channel, or
+//! with the feature `eatt` an enhanced bearer, which serves every request but
+//! the Exchange MTU (Request Not Supported, 0x06) and ignores a Handle Value
+//! Confirmation. One request is outstanding on each bearer at a time, so the
+//! engine keeps one response slot of [`ATT_MAX`] octets for each. One
+//! indication waits for its confirmation; the 30 s limit on that wait is for
+//! the engine to time, which does not send indications yet.
 //!
 //! It serves exactly these requests:
 //!

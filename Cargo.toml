@@ -84,22 +84,21 @@ extended-advertising = []
 # of 23); flash +0.3 to 0.5 KB in the release builds of the three firmwares
 # (readme).
 att-mtu = []
-# `eatt`: Enhanced ATT (Core 5.2) as responder. A central opens enhanced
-# bearers with L2CAP's Enhanced Credit Based Flow Control mode on SPSM 0x0027
+# `eatt`: Enhanced ATT (Core 5.2) as responder. A central opens enhanced bearers
+# with L2CAP's Enhanced Credit Based Flow Control mode on SPSM 0x0027
 # (`host::ecfc`: MTU 65, MPS 67, 256 credits); each answers ATT requests in
-# K-frames beside the fixed channel, which carries every notification. A
-# request that arrives before the encryption waits for it, and is refused for
-# security if it fails or nothing leads to it within 2 s; two or more source
-# CIDs not in ascending order, as Linux 7.3 sends them and would cross the
-# answer, are refused: with BlueZ, `[GATT] Channels = 2` opens one bearer
-# (readme). Static RAM +296 B over a build without `att-mtu` (the engine with
-# one bearer, `att-mtu`'s 40 included). The table declares
-# the Client and Server Supported Features in its GATT service
-# (`gatt::Value::ClientFeatures`, `gatt::Value::ServerFeatures`, checked by
-# `host::Host::new`); the client's features are kept in the bond. The server
-# serves Read Multiple Variable Length, Prepare and Execute Write (one value
-# of up to 22 octets) and Multiple Handle Value Notifications
-# (`host::Conn::notify_multiple`). Implies `att-mtu`.
+# K-frames beside the fixed channel, which carries every notification. A request
+# that arrives before the encryption waits for it, and is refused for security
+# if it fails or nothing leads to it within 2 s; two or more source CIDs not in
+# ascending order, as Linux 7.3 sends them and would cross the answer, are
+# refused: with BlueZ, `[GATT] Channels = 2` opens one bearer (readme). Static
+# RAM +296 B over a build without `att-mtu` (the engine with one bearer,
+# `att-mtu`'s 40 included). The table declares the Client and Server Supported
+# Features in its GATT service (`gatt::Value::ClientFeatures`,
+# `gatt::Value::ServerFeatures`, checked by `host::Host::new`); the client's
+# features are kept in the bond. The server serves Read Multiple Variable
+# Length, Prepare and Execute Write (one value of up to 22 octets) and Multiple
+# Handle Value Notifications (`host::Conn::notify_multiple`). Implies `att-mtu`.
 eatt = ["att-mtu"]
 # `eatt-bearers-2` to `eatt-bearers-5`: up to 2, 3, 4 or 5 enhanced bearers on
 # a link instead of 1 (`host::ecfc::BEARERS`, the highest one enabled), each
