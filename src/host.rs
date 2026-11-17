@@ -8,8 +8,8 @@
 //! through the typed API of [`crate::link`], not through HCI.
 //!
 //! Three optional features add to the host, each off by default so a device
-//! without it builds as before: `param-requests` (the application's own
-//! connection parameter requests, `Conn::request_params`, and
+//! without it builds none of its code: `param-requests` (the application's
+//! own connection parameter requests, `Conn::request_params`, and
 //! `ConnEvent::ParamsRejected`), `key-missing` (a reconnection whose central
 //! has no key of the bond ends at once, `ConnEvent::KeyMissing`) and
 //! `passkey` (Passkey Entry: [`engine::Config`]'s security,

@@ -37,10 +37,9 @@ fn connection() -> Connection { critical_section::with(|_| new_connection()) }
 
 fn new_connection() -> Connection { Connection::new(&REQUEST, 100, Setup::LEGACY) }
 
-/// The steps of `Connection::respond` that need no radio, as before the
-/// split: the room counted, the packet validated and taken, and the
-/// acknowledgement of ours with what it completes. Returns whether the
-/// packet was new.
+/// The steps of `Connection::respond` that need no radio: the room counted,
+/// the packet validated and taken, and the acknowledgement of ours with what
+/// it completes. Returns whether the packet was new.
 impl Connection {
     fn receive(&mut self, header: u8, len: u8, mic_ok: bool, address: u32, shared: &Shared) -> Option<bool> {
         self.prepare_room(shared);
@@ -1631,7 +1630,7 @@ fn a_batch_of_skipped_events_ends_as_the_event_by_event_loop() {
                 link.handle_control(&[OP_CHANNEL_MAP_IND, 0x0F, 0xF0, 0x00, 0xFF, 0x01, instant0, instant1], false);
                 assert_eq!(link.abort, None);
             }
-            // Event by event, as before.
+            // Event by event.
             loop {
                 let _ = loop_top(&mut one, &shared);
                 if one.skipped >= one.latency {
@@ -1951,8 +1950,9 @@ fn after_an_event_that_heard_nothing_every_event_is_listened_at_until_the_centra
 /// them, with the central out of reach at the events of `fade`, until the
 /// first event after the fade that hears it. `break_latency` is whether an
 /// event that heard nothing makes the loop listen at the next (as
-/// `Connection::listened` does); without, as before. Returns that event, or
-/// `None` if the supervision timeout ended the link first.
+/// `Connection::listened` does); without, a miss leaves the latency to skip
+/// again. Returns that event, or `None` if the supervision timeout ended the
+/// link first.
 fn ride_out(
     link: &mut Connection,
     shared: &Shared,
@@ -1972,7 +1972,7 @@ fn ride_out(
         let heard = !fade.contains(&counter);
         listen_with(link, shared, if heard { Air::Heard } else { Air::Silent });
         if !break_latency {
-            // As before: a miss left the latency to skip again.
+            // A miss leaves the latency to skip again.
             link.skipped = 0;
         }
         if heard && counter > *fade.end() {

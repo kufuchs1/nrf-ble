@@ -7,17 +7,15 @@
 //! scalar multiplication through generic code of `primeorder` and
 //! `elliptic-curve`, and a generic function is compiled in the crate that
 //! instantiates it, with that crate's opt-level: called from nrf-ble, the
-//! point arithmetic was nrf-ble's code, built at the firmware's opt-level 3
-//! even with `p256` and the crates below it at "z" (about 34 KB more flash
-//! on the nRF52832 firmwares than here). This crate is the only one that uses
-//! `p256`, and its API is not generic: plain byte arrays and two opaque key
-//! types, no type parameters, no closures, no type of `p256` in a signature.
-//! Each entry point is `#[inline(never)]`, so its body, and every generic
-//! function of `p256`, `primeorder` and `elliptic-curve` it instantiates, is
-//! compiled here, and a firmware sets the opt-level of all of pairing's
-//! elliptic curve cryptography with profile overrides of this crate and of
-//! the five `RustCrypto` crates below it (the readme gives the lines), while
-//! nrf-ble's link layer and the firmware stay at theirs.
+//! point arithmetic would be built at the firmware's opt-level 3. This crate is
+//! the only one that uses `p256`, and its API is not generic: plain byte arrays
+//! and two opaque key types, no type parameters, no closures, no type of `p256`
+//! in a signature. Each entry point is `#[inline(never)]`, so its body, and
+//! every generic function of `p256`, `primeorder` and `elliptic-curve` it
+//! instantiates, is compiled here, and a firmware sets the opt-level of all of
+//! pairing's elliptic curve cryptography with profile overrides of this crate
+//! and of the five `RustCrypto` crates below it (the readme gives the lines),
+//! while nrf-ble's link layer and the firmware stay at theirs.
 //!
 //! Byte order: the private key, each coordinate and the Diffie-Hellman key
 //! most significant octet first, and a public key X then Y, as nrf-ble's

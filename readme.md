@@ -2,32 +2,25 @@
 
 A Bluetooth LE link layer for the nRF52832 and the nRF51, written in Rust on Embassy, together with a minimal host for
 Linux and BlueZ in the same crate. The link layer drives the radio directly; the host serves one central as a
-peripheral. The nRF51 path, for an nRF51802, runs on hardware with BlueZ in the firmware of a presentation remote (see
-[nRF51](#nrf51)); the nRF52832 path builds and passes the host tests but has not run on hardware since the fork from
-nrf-ll.
+peripheral. Three firmwares use it from its main branch: those of the Logitech MX Master 3S mouse and the MX Keys S
+keyboard on the nRF52832, and that of a presentation remote on an nRF51802. The nRF51 path runs on hardware with
+BlueZ in the presentation remote (see [nRF51](#nrf51)), the nRF52832 path in the mouse: extended and directed
+advertising on LE 2M, pairing, reconnection and EATT with BlueZ 5.88 on Linux 7.3.
 
 ## Status
 
-nrf-ble starts as a copy of nrf-ll, the link layer of the replacement firmwares for the Logitech MX Keys S keyboard
-and the MX Master 3S mouse, which talks to a host stack such as [TrouBLE](https://github.com/embassy-rs/trouble) over
-HCI. nrf-ll stays as it is, and the MX firmwares keep using it until they move here.
-
-This crate has no HCI: no bt-hci, no TrouBLE, and no command or event encoded into bytes. The host (`src/host`) talks
-to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs). Its only target is Linux with BlueZ.
+The host (`src/host`) talks to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs), with no HCI
+between them: no command or event is encoded into bytes. Its only target is Linux with BlueZ.
 
 The crate is device-agnostic: it holds no device's attribute table, name, appearance, connection parameters or
-advertising. Each firmware defines those itself with the crate's building blocks, as [A device](#a-device) shows; the
-first such firmware is that of a presentation remote on an nRF51802, later the MX firmwares. The design is not in this
-repository: it is `docs/host/design.md` in the repository of that first firmware,
-[kufuchs1/spotlight_rust](https://github.com/kufuchs1/spotlight_rust), with the fixes of its reviews. It was written
-for a separate host crate and an HCI adapter, and this crate replaces both with one crate and the typed API.
+advertising. Each firmware defines those itself with the crate's building blocks, as [A device](#a-device) shows.
 
-What is done so far:
+What it holds:
 
-- The link layer as copied from nrf-ll, with nrf-ll's byte level HCI module replaced by the typed API, and with the
-  peripheral latency hold (see below). Every behaviour nrf-ll's HCI offered stays, as a typed call: identity, filter
-  accept list, resolving list and privacy, advertising, long term key replies, disconnection, connection parameter
-  requests and replies, data length, PHY, authenticated payload timeout, RSSI and the central's features and version.
+- The link layer with its typed API and the peripheral latency hold (see below), each of its functions a typed call:
+  identity, filter accept list, resolving list and privacy, advertising, long term key replies, disconnection,
+  connection parameter requests and replies, data length, PHY, authenticated payload timeout, RSSI and the central's
+  features and version.
 - The host's AES seam (`host::Aes`, the hardware ECB behind `host::Ecb`, software AES in the tests).
 - The cryptography of pairing: f4, f5, f6, g2 and ah in `host::smp::toolbox`, over the AES-CMAC of the RustCrypto
   `cmac` crate, and P-256 key generation, Diffie-Hellman and public key checks in `host::smp::ecc`, from the RustCrypto
@@ -51,8 +44,7 @@ What is done so far:
   phases, an optional directed first phase of a reconnection with the feature `directed-advertising`, high duty cycle,
   or low duty cycle with `extended-advertising`, and their setup of the link layer's accept list, resolving list and
   privacy) and the bond (`host::bond`: the record of the one central with its fixed 50 octet stored form; bits 5 to 7
-  of its flags hold the central's Client Supported Features bits 0 to 2, which an nrf-ble from before them refuses, so
-  going back to one means pairing again).
+  of its flags hold the central's Client Supported Features bits 0 to 2).
 - The engine (`host::engine::Engine`): all of the host's protocol state for one link, without futures. It takes the
   link layer's events and fragments, the time and the results of the P-256 jobs, and gives the fragments to send (pulled
   one at a time, the connection parameter request leaving one place of the link layer's queue free), the calls of the
@@ -76,15 +68,9 @@ What is done so far:
   `host::Port` trait, which `link::Link` implements; the host tests drive the whole host over a stand-in link layer.
   The module documentation of `host` shows how a device's firmware wires it.
 
-On the nRF51 (thumbv6m, measured with `-Zprint-type-sizes`) the static `Host<Link>` takes 976 bytes, 864 of them the
-engine (432 the security manager, of which 64 for the copy of the public key a pairing shows, so the key pair slot
-can drop a used key pair at once), the `Host::run` future 136 bytes, the `Host::crypto` future 32, a `Host::advertise`
-future 96 and a `Conn::notify` future 48.
-
-What has run on hardware: the nRF51 path, with BlueZ, in the presentation remote's firmware. The nRF52832 path has not:
-since the fork from nrf-ll its link layer changed (the answer within the interframe space from two prepared slots,
-the next PDU prepared during the sleep, the latency hold after traffic), and the first nRF52832 firmware on nrf-ble is
-its first run. The optional features below have not run on hardware yet.
+What has run on hardware: the nRF51 path, with BlueZ, in the presentation remote's firmware. The nRF52832 path (the
+answer within the interframe space from two prepared slots, the next PDU prepared during the sleep, the latency hold
+after traffic) and the optional features below have not.
 
 ### Discovery
 
@@ -105,8 +91,7 @@ central that writes none of their descriptors.
 
 ## Optional features
 
-Each is off by default, so a device without it builds exactly as without the feature (the presentation remote's
-release build keeps its size to the byte):
+Each is off by default, so a device without it builds exactly as without the feature:
 
 - **`param-requests`**: the firmware drives its own connection parameter policy. `Conn::request_params(range)` sends
   an L2CAP Connection Parameter Update Request (`RequestError::Busy` while one waits for its response, at most 30 s,
@@ -116,7 +101,7 @@ release build keeps its size to the byte):
   engine's own on that link, so the two never race. A fallback range or a second request for the latency is the
   firmware's, with its own timers and `Conn::info`.
 - **`key-missing`**: in reconnection mode, a central that asks to encrypt with a key the host does not have gets the
-  negative reply as before, and the link then ends at once with reason 0x05 and `ConnEvent::KeyMissing`, instead of at
+  negative reply, and the link then ends at once with reason 0x05 and `ConnEvent::KeyMissing`, instead of at
   the schedule's security deadline. A pairable link goes on, as the central may still pair.
 - **`passkey`**: LE Secure Connections Passkey Entry as responder, for a keyboard. `Config::with_security(
   Security::new(IoCapability::KeyboardOnly, require_mitm))` answers with IO capability 0x02 and `AuthReq` 0x0D; a
@@ -135,10 +120,8 @@ release build keeps its size to the byte):
   data of f4, f5, f6 and g2.
 - **`directed-advertising`**: a reconnection schedule may start with `Phase::directed(adv::DIRECTED_MAX)`, high duty
   cycle directed advertising to the bonded central, to a resolvable private address made with its key if it sent one
-  (see [A device](#a-device)), or with `extended-advertising` low duty cycle directed advertising every 20 ms. About
-  1.2 KB of flash on the nRF52832 and 1.3 KB on the nRF51 with legacy advertising, 1.3 KB and 0.7 KB with
-  `extended-advertising`, 24 bytes of static RAM, and one AES block each time a directed phase starts (see
-  [Flash cost](#flash-cost)).
+  (see [A device](#a-device)), or with `extended-advertising` low duty cycle directed advertising every 20 ms. Each
+  directed phase costs one AES block when it starts.
 - **`extended-advertising`**: Bluetooth 5 extended advertising in place of legacy advertising, for centrals that scan
   with the extended commands (Linux with a Bluetooth 5 adapter). An `ADV_EXT_IND` on each primary channel points to
   one `AUX_ADV_IND` on a secondary channel, which holds up to 245 octets of advertising data (239 when directed; 242
@@ -157,33 +140,30 @@ release build keeps its size to the byte):
   request's `InitA` also for a central in device privacy mode that sends its identity address, against a
   recommendation of the specification, as initiators take no other. With the feature the link layer sets bit 12 (LE
   Extended Advertising) of its features. No legacy advertising is compiled in. With `directed-advertising`, a directed
-  phase is low duty cycle directed advertising, an `AUX_ADV_IND` with the target at the phase's interval. About 2.8 KB
-  more flash than legacy advertising on the nRF52832 and 2.5 KB on the nRF51, and about 0.4 KB more static RAM, most
-  of it the longer advertising data the link layer and the host keep (see [Flash cost](#flash-cost)). Not yet tried on
-  hardware.
+  phase is low duty cycle directed advertising, an `AUX_ADV_IND` with the target at the phase's interval. Not yet
+  tried on hardware.
 - **`att-mtu`**: the ATT server answers an Exchange MTU Request with 65 instead of 23 (`att::ATT_MAX`), and the fixed
   channel's ATT MTU becomes the smaller of the client's and 65, at least 23, from the next request on. BlueZ offers
   517, so in its first discovery after pairing a Read or Read Blob Response carries up to 64 octets of a value, a Find
   Information Response up to 15 entries of 16-bit UUIDs and a Read By Type Response up to 9 characteristic declarations,
   each in up to three link layer fragments: a Report Map of 167 octets takes 3 reads instead of 8. A reconnection with
   a cached table reads little and gains little. Notifications and indications stay within 20 octets and one fragment,
-  and a dynamic value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets,
-  and the engine by 40 bytes of static RAM; the release builds of the three firmwares grow by 260 B (mouse), 452 B
-  (keyboard) and 512 B (presenter) of flash with extended advertising, 252 B, 452 B and 320 B with legacy advertising.
-  `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Not yet tried on hardware.
+  and a dynamic value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets.
+  `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Runs on the mouse: BlueZ's Exchange MTU of 517
+  gets 65.
 - **`eatt`** (implies `att-mtu`): Enhanced ATT as responder. A central opens enhanced bearers with L2CAP's Enhanced
   Credit Based Flow Control mode on SPSM 0x0027 (`host::ecfc`): our CIDs from 0x0040, MTU 65, MPS 67 and 256 credits,
   topped up once 128 are used. A link has 1 enhanced bearer, or up to 2 to 5 with `eatt-bearers-2` to
   `eatt-bearers-5` (`ecfc::BEARERS`, the highest one enabled). Each bearer answers ATT requests, one at a time, with its
   ATT MTU (the smaller of 65 and the central's MTU) and in K-frames that each take one of the central's credits;
   between two K-frames other PDUs may go, and the bearers take turns. Notifications stay on the fixed channel, which
-  goes on as before, Exchange MTU included (an enhanced bearer answers it with Request Not Supported). A Credit Based
-  Connection Request that arrives before the link is encrypted with the host's key, as BlueZ sends it on every
-  reconnection, waits for the encryption; it is refused for security (Insufficient Encryption to the bonded central,
-  Insufficient Authentication to another) if the encryption fails, or 2 s after the first waiting request arrived
-  while neither a key went to the link layer nor a pairing runs. Linux then encrypts, or pairs, and asks again; this
-  refusal is never sent on an encrypted link, where Linux would ask for a pairing with protection against a man in the
-  middle. A request of two or more source CIDs not in ascending order gets Insufficient Resources with every
+  serves as without the feature, Exchange MTU included (an enhanced bearer answers it with Request Not Supported). A
+  Credit Based Connection Request that arrives before the link is encrypted with the host's key, as BlueZ sends it on
+  every reconnection, waits for the encryption; it is refused for security (Insufficient Encryption to the bonded
+  central, Insufficient Authentication to another) if the encryption fails, or 2 s after the first waiting request
+  arrived while neither a key went to the link layer nor a pairing runs. Linux then encrypts, or pairs, and asks again;
+  this refusal is never sent on an encrypted link, where Linux would ask for a pairing with protection against a man in
+  the middle. A request of two or more source CIDs not in ascending order gets Insufficient Resources with every
   destination CID 0: Linux 7.3 sends its CIDs in that order, newest first, and binds the destination CIDs of the answer
   to its channels shifted by one, so any bearer it opened would be crossed. With BlueZ's `[GATT] Channels`:
 
@@ -197,8 +177,7 @@ release build keeps its size to the byte):
   refused for security, and after the encryption Linux sends one request for each channel, all at once, which open as
   many bearers as the build has, each correctly bound, and refuse the rest with Insufficient Resources. A central that
   names its source CIDs in ascending order, as Zephyr and Android do, gets as many bearers as the build has in one
-  request. The setting is global: it also offers EATT to other devices of the computer. Static RAM: the engine grows by
-  296 bytes with one bearer over a build without `att-mtu`, and by 80 bytes for each further bearer. The table declares
+  request. The setting is global: it also offers EATT to other devices of the computer. The table declares
   the Client Supported Features (0x2B29, read and write) and the Server Supported Features (0x2B3A, read) in its GATT
   service, each without encryption, with `gatt::Value::ClientFeatures` and `gatt::Value::ServerFeatures`; `Host::new`
   refuses a table without them, and a table that declares them without the feature does not build. A firmware lists them
@@ -216,28 +195,23 @@ release build keeps its size to the byte):
 - **`event-timing`**: `Link::next_connection_event(epoch)` tells when the link layer listens next and until when a
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
-  the coming event. The link layer then plans each event in `link::Shared`: about 0.5 KB of flash on the nRF52832,
-  0.4 KB on the nRF51, and 32 bytes of RAM.
+  the coming event. The link layer then plans each event in `link::Shared`.
 
 A firmware enables the features it needs: a mouse, for example, `param-requests` and `key-missing`, a keyboard also
 `passkey`.
 
-### Flash cost
+### Cost
 
-The advertising features, measured in the release builds of three firmwares with this crate as a path dependency
-(`llvm-size`; flash is text and data, static RAM data and bss; the stack is not counted), each against the same
-firmware with legacy advertising and neither feature:
+Against a build without the feature (flash of a firmware's release build; static RAM):
 
-| Firmware (chip) | `directed-advertising` | `extended-advertising` | both | flash of `directed-advertising` on top of `extended-advertising` |
-|---|---|---|---|---|
-| MX Keys S keyboard (nRF52832) | +1208 B flash, +24 B RAM | +2776 B flash, +416 B RAM | +4088 B flash, +440 B RAM | +1312 B |
-| MX Master 3S mouse (nRF52832) | +1160 B flash, +24 B RAM | +2744 B flash, +408 B RAM | +3996 B flash, +432 B RAM | +1252 B |
-| Spotlight presenter (nRF51) | +1332 B flash, +24 B RAM | +2484 B flash, +448 B RAM | +3164 B flash, +472 B RAM | +680 B |
-
-The extended advertising event replaces legacy advertising's, and is larger; its static RAM is mostly the
-advertising data of up to 245 octets in the link layer's settings and the host's `Advertising`, in place of 31. Each
-copy of the link layer's settings on the stack grows by the same amount (one in the link layer task, one during an
-advertising event). The other features cost nothing when off.
+| Feature | nRF52832 | nRF51 |
+|---|---|---|
+| `data-length` | +1.5 KB RAM | not available |
+| `directed-advertising` | +1.2 KB flash, +24 B RAM | +1.3 KB flash, +24 B RAM |
+| `extended-advertising` | +2.8 KB flash, +0.4 KB RAM | +2.5 KB flash, +0.4 KB RAM |
+| `att-mtu` | +0.3 to 0.5 KB flash, +40 B RAM | +0.3 to 0.5 KB flash, +40 B RAM |
+| `eatt` | +296 B RAM, +80 B per further bearer | the same |
+| `event-timing` | +0.5 KB flash, +32 B RAM | +0.4 KB flash, +32 B RAM |
 
 ## The typed link API
 
@@ -349,9 +323,9 @@ advertising event). The other features cost nothing when off.
   The same holds where TIMER0 kept running because the event follows the last one within 3 ms: the sleep then waits
   on a timer and the host's signal until 300 µs before the radio, and a wake too late for the 500 µs rule is prepared
   at that point instead of waiting a whole interval.
-  The nRF51 keeps the earlier limit: its 300 µs after the restart also take a late crystal and the radio's setup on
-  the 16 MHz Cortex-M0, and a preparation takes up to 68 µs there; the 10 s report's `setup max` measures the first
-  two, so that the nRF51 can follow once they are known.
+  The nRF51 prepares nothing after the restart, so the 500 µs rule is its limit: its 300 µs after the restart also
+  take a late crystal and the radio's setup on the 16 MHz Cortex-M0, and a preparation takes up to 68 µs there; the
+  10 s report's `setup max` measures the first two.
 - **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
   instant; data from the host ends the skipping at the next connection event. It is also held off, so that every
   connection event is listened to: during the first second of a link, for 200 ms or 8 connection events, whichever is
@@ -406,11 +380,12 @@ P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomput
   digits, a table of 1 to 8 times the point read in full for every digit and selected with the constant time
   operations of `subtle`, and the complete addition formulas of Renes, Costello and Batina, which have no exceptional
   case to branch on.
-- What the crates claim of themselves, from their README files at the revisions in use (`p256` and `primeorder` 0.14.0
-  at 9c61da6, `crypto-bigint` 0.7.11 at 145de32): the arithmetic of `p256` and `primeorder` "has never been
+- What the crates claim of themselves, from their README files (`p256` and `primeorder` 0.14.0, `crypto-bigint`
+  0.7.11): the arithmetic of `p256` and `primeorder` "has never been
   independently audited"; it is designed so that the operations that depend on a secret run in constant time, but
   whether the generated machine code is constant time "has not been thoroughly assessed". `crypto-bigint`, the integer
-  arithmetic below them, was audited by NCC Group without significant findings, but has changed much since that audit.
+  arithmetic below them, was audited by NCC Group without significant findings, in a version much older than the one in
+  use.
 - Machine code checks: the CI of `crypto-bigint` runs `cargo checkct` (BINSEC) on thumbv6m and thumbv7em, among other
   targets, over the functions its `checkct/driver` names: limb carries and borrows, leading and trailing zeros,
   modular subtraction, the carries of wide multiplication and squaring, Montgomery multiplication and squaring,
@@ -432,29 +407,11 @@ P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomput
   itself), the recoded digits and the table of multiples of each multiplication, and in the Diffie-Hellman the shared
   point, projective and affine, whose X is the Diffie-Hellman key. A firmware that wants them gone can overwrite the
   part of its crypto task's stack the job used, after each job.
-- Time and size per multiplication, emulated, of nrf-ble-p256 (`p256` 0.14.0 at 9c61da6) in a test harness that calls
-  `SecretKey::public_key` and `SecretKey::diffie_hellman` as nrf-ble does (fat LTO, the harness at opt-level 3; the
-  first opt-level is that of nrf-ble-p256, the second that of the five RustCrypto crates; code is the harness's
-  `.text`, nearly all of it P-256; stack is painted RAM):
+- Emulated, a multiplication takes about 3.3 s on the nRF51 (16 MHz) and 234 ms on the nRF52832 (64 MHz) with the
+  overrides below, and about 2.7 s and 122 ms with nrf-ble-p256 and the five crates at opt-level 3; not measured on
+  the chips yet. The firmware's watchdog hook runs right before each multiplication.
 
-  | nrf-ble-p256, five crates | nRF51, 16 MHz | Code, stack (nRF51) | nRF52832, 64 MHz | Code, stack (nRF52832) |
-  |---|---|---|---|---|
-  | "z", "z" (the overrides below) | 3.28 s | 12,148 B, 3,348 B | 234 ms | 10,902 B, 3,360 B |
-  | "s", "z" | 3.27 s | 12,620 B, 3,228 B | 230 ms | 11,934 B, 3,248 B |
-  | "z", "s" | 3.02 s | 12,988 B, 3,436 B | 162 ms | 12,924 B, 3,272 B |
-  | "s", "s" | 3.01 s | 13,546 B, 3,316 B | 158 ms | 13,636 B, 3,112 B |
-  | 3, "z" (as at 184b694 with its overrides) | 3.23 s | 24,078 B, 4,492 B | 176 ms | 44,860 B, 3,996 B |
-  | 3, 3 | 2.68 s | 27,906 B, 4,548 B | 122 ms | 62,222 B, 4,132 B |
-
-  The nRF51 figures are a Cortex-M0 with the single cycle multiplier and no flash wait states, cycle by cycle after
-  its Technical Reference Manual; with the 32 cycle multiplier, about 3.7 s more. The nRF52832 figures are a rougher
-  estimate: the instructions the emulator ran, charged after the Cortex-M4 Technical Reference Manual (loads 2 cycles,
-  multiplies 1) with every basic block's end charged as a taken branch, and no flash wait states or cache misses. The
-  opt-level of nrf-ble-p256 hardly changes the time; that of the five crates does, as "z" keeps the field
-  multiplication of `crypto-bigint` out of line. Not measured on the chip yet, which has to be done before release
-  (TIMER or RTC around a job). The firmware's watchdog hook runs right before each multiplication.
-
-AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 at e905def with `zeroize`): the CMAC of RFC 4493 from the crate, over an
+AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 with `zeroize`): the CMAC of RFC 4493 from the crate, over an
 adapter that implements the block cipher traits of the `cipher` crate for one key and hands each block to
 `host::Aes::encrypt`, the hardware ECB in the firmware. The crate overwrites its chaining value and pending block when
 dropped, the adapter its copy of the key. The host tests check the adapter against FIPS 197, the CMAC against the four
@@ -465,56 +422,10 @@ coordinate not below the field prime). nrf-ble-p256's own tests (`cargo test -p 
 the same data sets both ways, edge scalars and 64 seeded random scalar pairs against `p256` used directly, and the
 refusal of a coordinate not below the field prime on either axis whose reduced value would be a point of the curve.
 
-What the crates cost, measured on the two nRF52832 firmwares (fat LTO, the firmware and nrf-ble at opt-level 3) with
-nrf-ble patched to a tree and the profile overrides given on the command line, nothing else changed: "own" is the
-loop and CMAC of our own before the crates (95ff5bf, no overrides); "184b694" is the crates called from nrf-ble itself,
-with the five RustCrypto crates at "z", as they were before nrf-ble-p256; "z" is this tree with the overrides below,
-all six crates at "z". Flash is text and data of the 253,952 B region (free in brackets, or how far over):
-
-| Build | Own (95ff5bf) | 184b694, five at "z" | This tree, six at "z" |
-|---|---|---|---|
-| MX Master 3S, release | 223,644 B (30,308) | 249,464 B (4,488) | 215,116 B (38,836) |
-| MX Master 3S, logging `defmt` | 238,608 B (15,344) | about 10,100 B over | 229,668 B (24,284) |
-| MX Master 3S, logging `defmt,wheel-trace` | 238,992 B (14,960) | about 10,500 B over | 230,044 B (23,908) |
-| MX Master 3S, logging `defmt,idle-diagnostics` | 239,628 B (14,324) | about 11,100 B over | 230,704 B (23,248) |
-| MX Master 3S, logging `defmt,wheel-trace,idle-diagnostics` | 240,076 B (13,876) | about 11,600 B over | 231,152 B (22,800) |
-| MX Master 3S, logging `defmt,lift-trace` | 239,064 B (14,888) | about 10,600 B over | 230,116 B (23,836) |
-| MX Master 3S, logging `defmt,shunt-trace` | 246,776 B (7,176) | about 18,300 B over | 237,876 B (16,076) |
-| MX Master 3S, logging `defmt,stronger-ratchet` | 238,664 B (15,288) | about 10,100 B over | 229,724 B (24,228) |
-| MX Keys S, release | 213,304 B (40,648) | 239,188 B (14,764) | 204,796 B (49,156) |
-| MX Keys S, release `mini` | 213,288 B (40,664) | 239,164 B (14,788) | 204,780 B (49,172) |
-| MX Keys S, logging `defmt` | 227,140 B (26,812) | 252,684 B (1,268) | 218,204 B (35,748) |
-| MX Keys S, logging `defmt,mini` | 227,156 B (26,796) | 252,700 B (1,252) | 218,228 B (35,724) |
-
-The firmwares at 216fb09 (mouse) and 8e7c022 (keyboard), each with its full logging (`DEFMT_LOG` as committed); the
-overflows of 184b694 are the linker's for the last section. With nrf-ble-p256 the P-256 of pairing takes about 34.4 KB
-less than at 184b694 in every build, and 8.5 KB to 8.9 KB less than the code of our own before the crates did at the
-firmwares' opt-level 3, so every build fits with the firmwares' reserves (16 KB for release, 8 KB for a logging
-build). At 184b694 most of the cost was generic code of `primeorder` instantiated in nrf-ble and so built at its
-opt-level 3 (`ProjectivePoint::add` 12.6 KB, `mul` 11.2 KB, `LookupTable::select` 6.5 KB on the MX Master 3S); in
-nrf-ble-p256 the same functions take 0.6 KB, 0.8 KB and 0.2 KB, and all functions named after the P-256 crates
-about 8.8 KB (the logging build `defmt`). Other choices, same builds:
-
-- nrf-ble-p256 at "s", the five crates at "z": 1,564 B (release) to 1,580 B more than all at "z", for at most 2 % less
-  time per multiplication (the table under "Time" above).
-- All six at "s": 2,728 B to 2,752 B more, for about 30 % less time on the nRF52832 and 8 % on the nRF51.
-- nrf-ble-p256 at "z", the five crates left at the firmware's 3: 4,672 B more (mouse release), 4,664 B (keyboard).
-
-The presentation remote (nRF51, 258,048 B) was measured at 184b694 only: 183,744 B before the crates, 189,112 B with
-the five overrides (+5,368), with a crypto task stack of 4,844 B at its deepest static path (3,140 B before); on the
-nRF51 nrf-ble-p256 takes the generic code out of nrf-ble as on the nRF52832 (the harness above: 12.1 KB of code and
-3.3 KB of stack per multiplication at "z", against 24.1 KB and 4.5 KB with the generic code at 3), to be measured on
-the remote's own builds. A firmware that uses this nrf-ble needs, in its own Cargo.toml (profile settings and patches
-apply only in the workspace being built, so nrf-ble cannot set them; a profile that inherits `release`, such as a
-logging profile, inherits them):
+A firmware that uses nrf-ble needs, in its own Cargo.toml (profile settings and patches apply only in the workspace
+being built, so nrf-ble cannot set them; a profile that inherits `release` inherits them):
 
 ```toml
-# The P-256 of nrf-ble's pairing for size: nrf-ble-p256 holds the point
-# arithmetic (the generic code of primeorder and elliptic-curve it
-# instantiates), the five RustCrypto crates the field and integer
-# arithmetic below it. Only nrf-ble's crypto task runs it, a pairing's two
-# multiplications; the firmware and nrf-ble, link layer included, stay at
-# their own opt-level.
 [profile.release.package.nrf-ble-p256]
 opt-level = "z"
 [profile.release.package.p256]
@@ -529,29 +440,22 @@ opt-level = "z"
 opt-level = "z"
 
 [patch.crates-io]
-# cmac's `cipher`, the same copy as nrf-ble's; without it the build fails
-# with two versions of `cipher`.
 cipher = { git = "https://github.com/RustCrypto/traits", branch = "master" }
 ```
 
 To keep every crate on its branch, a firmware also patches the rest of what `cmac` and `ecdh` bring in, as nrf-ble's
-own list does: `inout`, `dbl` and `block-buffer` from RustCrypto utils, `digest`, `hmac` and `hkdf`. The presentation
-remote's stack budget (`STACK_MIN` in its Makefile.toml, from a measured pairing peak of 4,844 B) has to grow with the
-crypto task, by about 1.7 KB with the five overrides at 184b694 (1.8 KB without), to about 7.2 KB, and its `RAM_LIMIT`
-shrink to match (static RAM of 7,148 B still fits); with nrf-ble-p256 at "z" the harness's multiplication needs about
-1.1 KB less stack than with its generic code at 3, so the growth is likely smaller. The pairing peak is measured again
-on the remote with its stack report build.
+own list does: `inout`, `dbl` and `block-buffer` from RustCrypto utils, `digest`, `hmac` and `hkdf`.
 
 ### Pairing timing
 
 An LE Secure Connections pairing needs two P-256 multiplications: our key pair (the generator times a fresh private
 key) and the Diffie-Hellman key. Each blocks the thread executor for its whole length; emulated, by build, about 2.7 s
-to 3.3 s on the nRF51 and about 120 ms to 235 ms on the nRF52832 (the table above). Not measured on the chips yet.
+to 3.3 s on the nRF51 and about 120 ms to 235 ms on the nRF52832 (above). Not measured on the chips yet.
 
 What blocks and what does not, during a multiplication:
 
 - The link layer runs in its interrupt executor and is not held up: connection events, acknowledgements,
-  retransmissions, the supervision timeout and the answers to the central's LL procedures go on as before, and its
+  retransmissions, the supervision timeout and the answers to the central's LL procedures go on, and its
   timing does not change. Its event queue holds 6 events and the connection 3 more for the time the host is blocked.
 - Everything in thread mode waits: the run task (ATT responses, the LTK reply to an encryption request, signalling,
   the queueing of fragments), `Conn::notify` and the application's own tasks of the thread executor, with whatever
@@ -582,7 +486,7 @@ pairings, of different centrals or two attempts of one, see the same public key,
 pairing.
 
 The cost: one multiplication more after each pairing that showed our public key and failed, and none otherwise. RAM:
-64 bytes in the security manager and 12 for a signal of the host (above).
+64 bytes in the security manager and 12 for a signal of the host.
 
 ## Power
 
@@ -669,27 +573,24 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   `P7` are the same level: the link layer must be in a higher pair than everything else, such as `P2` over `P4` or `P1`
   over `P2`, not `P2` over `P3`.
 - **RAM:** without the data length extension a `Connection` takes 1248 bytes, `link::Shared` 840 (872 with
-  `event-timing`) and the link layer task's future 2120 on thumbv6m (nrf-ll with HCI: 1224, 1040 and 2024), with
+  `event-timing`) and the link layer task's future 2120 on thumbv6m, with
   packet buffers of 40 bytes and two transmit slots of 76.
 - **Errata:** the nRF52832 workarounds are not applied. Of the nRF51's, only the sign of the temperature is fixed;
   the others wait for the nRF51802 errata document (see `src/chip/nrf51.rs`).
 - **Timing:** the radio latches the answer's packet pointer about 140 µs after the END of the central's packet, some
-  2,240 cycles of the 16 MHz CPU. The first hardware run answered an acknowledgement only after about 2,900 cycles,
-  copying and rotating the PDU queue within the interframe space, so the radio sent the received packet back: the
-  central never got `LL_FEATURE_RSP` and ended the link after the 40 s procedure timeout. The answer now takes about
-  400 to 600 cycles from the start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up
-  at the END (emulated on an nRF51 firmware's release build). The 10 s report and the end of each link log its
-  counters: `R retx (A with ack), K acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback,
-  prepare max P us, setup max S us`, where `late` counts answers in place only after the radio started sending,
-  `answer max` the time from the END until the answer was in place, `retx with ack` the central's retransmissions that
-  acknowledged ours, which also follow late answers without an acknowledgement (`late` less `on ack`), as those sent
-  our PDU with its previous flags, so that only a count beyond those points to an answer the central did not take,
-  such as an echo of its packet, `prepare max` the time preparing and sealing the next PDU takes between events, and
-  `setup max` the time from TIMER0's restart, 300 µs before the radio's start, until that start is programmed: a late
-  crystal and the radio's setup. The first eight events of a link log both headers of their first exchange, every
-  control PDU of ours logs when it is sent and acknowledged, and the radio's packet layout is logged once per link.
-  The `ifs-delay-test` feature makes the answer to an acknowledgement late on purpose every 16th event, 160 µs after
-  the END, past the radio's start but before our shortest packet ends, which `late` counts while the link goes on.
+  2,240 cycles of the 16 MHz CPU, and sends the buffer as it then holds it: an answer later than that resends our
+  previous PDU with its previous flags (see [What it does](#what-it-does)). The answer takes about 400 to 600 cycles
+  from the start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up at the END
+  (emulated on an nRF51 firmware's release build). The 10 s report and the end of each link log its counters: `R retx (A
+  with ack), K acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback, prepare max P us, setup max S
+  us`, where `late` counts answers in place only after the radio started sending, `answer max` the time from the END
+  until the answer was in place, `retx with ack` the central's retransmissions that acknowledged ours, which also follow
+  late answers without an acknowledgement (`late` less `on ack`), as those sent our PDU with its previous flags, so that
+  only a count beyond those points to an answer the central did not take, such as an echo of its packet, `prepare max`
+  the time preparing and sealing the next PDU takes between events, and `setup max` the time from TIMER0's restart,
+  300 µs before the radio's start, until that start is programmed: a late crystal and the radio's setup. The first eight
+  events of a link log both headers of their first exchange, every control PDU of ours logs when it is sent and
+  acknowledged, and the radio's packet layout is logged once per link.
   On the nRF51 the answer sets the turnaround after it at once, as the radio's own turnaround follows the END of our
   answer, about 230 µs after the central's for an empty PDU, also when the answer is late.
   The advertiser points the radio at the scan response once a request's access address came and stops at once for
@@ -732,25 +633,19 @@ constructors of `Engine`, `Responder` and `Shared` name only what varies, and `C
 values from its fields), `saturating_cast` and `truncate` (`integer_casts`, `integer_widen_truncate`) for the
 conversions that saturate or cannot lose bits, `split_array_ref` (`split_array`) for the front of a fixed array, such as
 the X coordinate of a public key, with no `Option` that cannot be `None`, and `#[rustc_unroll(never)]` (`loop_hints`) on
-one loop of the host, which keeps it rolled: the coordinate flip of pairing's public keys. When it was measured, on four
-loops (three of pairing, two of them in the P-256 code of our own the `p256` crate has since replaced, and the copy of
-the value of each ATT Read, Read Blob and Read By Type request), that was 3.2 KB less code in the library on the
-nRF52832 (2.8 KB on the nRF51) and 2.3 to 8 KB less flash in a firmware built with fat LTO, none of it in the radio or
-connection event code. The ATT copy is core's `copy_from_slice` and `fill` now, which compile to calls of `memcpy` and
-`memclr`. Its documentation, built with rustdoc, marks each item behind a Cargo feature with that feature (`doc_cfg`). A
-nightly that renames or changes one of those features breaks the build until the list there follows it.
+one loop of the host, which keeps it rolled: the coordinate flip of pairing's public keys. Its documentation, built
+with rustdoc, marks each item behind a Cargo feature with that feature (`doc_cfg`). A nightly that renames or changes
+one of those features breaks the build until the list there follows it.
 
 The crate follows the main branch of every dependency (the default branch, master, where a repository has none), and
 commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
 `Cargo.lock` keeps them until `cargo update`. Its own dependencies name their git source and branch, not a version: with
 only a version requirement Cargo can quietly fall back to an older crates.io release when a main branch drops a feature
-that is asked for (Embassy main removed embassy-nrf's `gpiote` feature, and a firmware asking for it got embassy-nrf
-0.10 from crates.io beside nrf-ble's 0.11 from git); a git source fails loudly instead. The `[patch.crates-io]` section
+that is asked for; a git source fails loudly instead. The `[patch.crates-io]` section
 of [`Cargo.toml`](Cargo.toml) takes each crate from its branch, so that the crates the dependencies pull from crates.io
 resolve to that same copy. Patches apply only to the workspace being built, so a
 firmware repeats them in its own `Cargo.toml`. Two crates come from the revision Embassy's main branch names, as Cargo
-cannot patch a Git dependency with another branch of the same repository: `nrf-pac` and `unitrait`, both at the head of
-their main branch when this was written.
+cannot patch a Git dependency with another branch of the same repository: `nrf-pac` and `unitrait`.
 
 ## A device
 
@@ -897,15 +792,15 @@ cargo fmt --check
 cargo doc --no-deps                                # rustdoc lints are errors too
 ```
 
-Clippy runs on the library for the chip targets, as in nrf-ll. The tests are not linted (`cargo clippy --all-targets`
-fails on the test code under the `restriction` group, as in nrf-ll).
+Clippy runs on the library for the chip targets. The tests are not linted (`cargo clippy --all-targets` fails on the
+test code under the `restriction` group).
 
 Every Clippy group, `restriction` included, is an error. [`Cargo.toml`](Cargo.toml) allows only lints that another lint
 or the strict setup itself contradicts (`separated_literal_suffix` among them: a literal is written `150_u32`), the two
 byte orders the code converts integers in (`little_endian_bytes`, `big_endian_bytes`; `host_endian_bytes` stays an
 error), `missing_asserts_for_indexing`, which the expansions of defmt's derive and level macros trip (`indexing_slicing`
 still refuses every slice index of the crate's own code), and `question_mark_used`, a choice of `?` over the early
-returns written out; each allowance gives its reason, and the code has no `#[allow]` or `#[expect]`.
+returns written out; the code has no `#[allow]` or `#[expect]`.
 
 ## License
 

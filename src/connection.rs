@@ -208,12 +208,6 @@ const RX_SLOTS: usize = 3;
 const TRACE_EVENTS: u16 = 8;
 /// Control PDUs sent or acknowledged per event that the log shows.
 const TRACE_CONTROLS: usize = 4;
-/// How long after the END the answer to an acknowledgement waits every 16th
-/// event with the `ifs-delay-test` feature: past the radio's start, about
-/// 150 us after the END, and well before our shortest packet, an empty PDU,
-/// ends about 230 us after it, by which the nRF51's turnaround must be set.
-#[cfg(feature = "ifs-delay-test")]
-const IFS_DELAY_TEST_US: u32 = 160;
 /// Time preparing the next PDU again may take, copy and sealing included,
 /// after the host woke the sleep before an event, on top of [`SETUP_US`].
 const PREPARE_AGAIN_US: u32 = 200;
@@ -2715,10 +2709,6 @@ impl Connection {
             None
         };
         let decision = self.decide(packet, clock.address_time(), fits, shared)?;
-        #[cfg(feature = "ifs-delay-test")]
-        if decision.acked.is_some() && self.counter.trailing_zeros() >= 4 {
-            clock.wait_until(clock.end_time().wrapping_add(IFS_DELAY_TEST_US));
-        }
         let buffer = self.answer_buffer(decision.follow.md);
         // SAFETY: the slots belong to this connection, and the exchange
         // disables the radio before it returns.
@@ -2816,13 +2806,12 @@ impl Connection {
                 if next != self.counter {
                     self.skip_to(next, shared);
                     if !timed_out {
-                        // As before: the host's data goes out at the next
-                        // event.
+                        // The host's data goes out at the next event.
                         self.skipped = self.latency;
                     }
                     continue;
                 }
-                // Woken before the current event: listen at it, as before.
+                // Woken before the current event: listen at it.
                 self.skipped = self.latency;
             }
             self.prepare_event(clock, shared);
