@@ -1,4 +1,2 @@
 target
-# No committed lock: a fresh checkout resolves the latest commits of the
-# dependencies' main branches; this local lock keeps them until `cargo update`.
 Cargo.lock

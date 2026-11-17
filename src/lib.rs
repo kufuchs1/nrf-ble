@@ -16,11 +16,7 @@
 // array, such as the X coordinate of a public key, with no `Option` that
 // cannot be `None`; and `#[rustc_unroll(never)]` (`loop_hints`) on one loop of
 // the host, off the link layer, which keeps it rolled: the byte order turn
-// of pairing's public keys. (The 3.2 KB once measured on the nRF52832
-// counted three more loops: two of the P-256 code of our own the `p256`
-// crate has replaced, and the copy of an ATT read value, now core's
-// `copy_from_slice` and `fill`, which compile to calls of `memcpy` and
-// `memclr`. The loop left is not measured on its own.)
+// of pairing's public keys.
 #![feature(
     const_bool,
     const_closures,

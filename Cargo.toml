@@ -8,115 +8,23 @@ readme = "readme.md"
 
 [features]
 default = ["nrf52832"]
-# The chip, exactly one: the nRF52832 by default, the nRF51 with
-# default-features = false.
 nrf52832 = ["embassy-nrf/nrf52832"]
 nrf51 = ["embassy-nrf/nrf51"]
 defmt = ["dep:defmt", "embassy-time/defmt"]
-# Data length extension: payloads of up to 251 octets instead of 27, at
-# about 1.5 KB more static RAM for the larger packet buffers. The nRF52832
-# only: the nRF51 CCM encrypts payloads of up to 27 octets.
 data-length = []
-# A test of the answer within the interframe space on hardware, never for
-# use: every 16th connection event, the answer to an acknowledgement waits
-# until 160 us after the END, past the radio's start, so it comes too late
-# and the radio resends our previous PDU. The `late` counters of the 10 s
-# report count those events, and the link goes on as with a lost answer.
-ifs-delay-test = []
-# The host's optional parts, each off by default so a device without it builds
-# exactly as before. `param-requests`: the application asks for connection
-# parameters itself (`host::Conn::request_params`), beyond the one request of
-# `host::engine::Config`, and learns when the central rejects one
-# (`ConnEvent::ParamsRejected`).
 param-requests = []
-# `key-missing`: a reconnection whose central asks for a key the host does
-# not have ends at once (`ConnEvent::KeyMissing`, reason 0x05), instead of at
-# the advertising schedule's security deadline.
 key-missing = []
-# `passkey`: LE Secure Connections Passkey Entry as responder, for a keyboard
-# that types the passkey the central displays (`host::smp::Security`,
-# `ConnEvent::PasskeyRequested`, `host::Conn::enter_passkey`), and attributes
-# that need an authenticated link.
 passkey = []
-# `event-timing`: the link layer tells the host when it listens next and until
-# when data queued then still goes out at that event
-# (`link::Link::next_connection_event`, `link::NextEvent`), for a firmware that
-# times its reports to the connection events. About 0.5 KB of flash on the
-# nRF52832, 0.4 KB on the nRF51, and 32 bytes of static RAM.
 event-timing = []
-# `directed-advertising`: a reconnection schedule may start with a directed
-# phase to the bonded central (`host::adv::Phase::directed`): high duty cycle
-# directed advertising, which Linux connects to about 30 to 50 ms sooner than
-# to undirected advertising at 20 ms, or with `extended-advertising` low duty
-# cycle directed advertising every 20 ms, which is no faster than undirected
-# advertising at that interval. A central that sent its identity resolving
-# key is targeted at a resolvable private address made with it, which only a
-# central with address resolution in its controller recognizes; the bond
-# remembers one that did not answer, and its reconnections skip the directed
-# phase. About 1.2 KB of flash on the nRF52832 and 1.3 KB on the nRF51 (1.3 KB and 0.7 KB
-# with `extended-advertising`) and 24 bytes of static RAM.
 directed-advertising = []
-# `extended-advertising`: Bluetooth 5 extended advertising in place of legacy
-# advertising, for centrals that scan with the extended commands: an
-# ADV_EXT_IND on each primary channel points to one AUX_ADV_IND on a secondary
-# channel, which holds up to 245 octets of advertising data (239 when
-# directed; 242 and 236 on the nRF51, whose radio sends a shorter payload) and
-# no scan response. A central connects with AUX_CONNECT_REQ, answered with
-# AUX_CONNECT_RSP within the interframe space, and the connection starts
-# 2.5 ms later on the secondary channel's PHY with channel selection
-# algorithm 2. The secondary channel runs on LE 1M, or on the nRF52832 on
-# LE 2M if the firmware asks for it (`host::adv::Advertising::with_secondary_phy`,
-# `link::AdvParams::secondary_phy`). No legacy advertising is compiled in: no
-# ADV_IND, ADV_DIRECT_IND or scan response. With `directed-advertising`, a
-# directed phase is low duty cycle directed advertising, an AUX_ADV_IND with
-# the central as its target, at the phase's interval. About 2.8 KB more
-# flash than legacy advertising on the nRF52832, 2.5 KB on the nRF51, and
-# 0.4 KB more static RAM. Not yet tried on hardware.
 extended-advertising = []
-# `att-mtu`: the ATT server answers Exchange MTU with 65 instead of 23, so the
-# fixed channel's ATT MTU becomes the smaller of the client's and 65, at least
-# 23 (`host::att::ATT_MAX`). A Read or Read Blob Response then carries up to
-# 64 octets of a value, Find Information up to 15 entries of 16-bit UUIDs and
-# Read By Type up to 9 characteristic declarations of 16-bit UUIDs, which
-# shortens a first discovery. A response of more than 23 octets goes out in
-# 2 or 3 link layer fragments; notifications stay at 20 octets and one
-# fragment. Static RAM +40 B (the engine's response slot of 65 octets instead
-# of 23); flash +0.3 to 0.5 KB in the release builds of the three firmwares
-# (readme).
 att-mtu = []
-# `eatt`: Enhanced ATT (Core 5.2) as responder. A central opens enhanced bearers
-# with L2CAP's Enhanced Credit Based Flow Control mode on SPSM 0x0027
-# (`host::ecfc`: MTU 65, MPS 67, 256 credits); each answers ATT requests in
-# K-frames beside the fixed channel, which carries every notification. A request
-# that arrives before the encryption waits for it, and is refused for security
-# if it fails or nothing leads to it within 2 s; two or more source CIDs not in
-# ascending order, as Linux 7.3 sends them and would cross the answer, are
-# refused: with BlueZ, `[GATT] Channels = 2` opens one bearer (readme). Static
-# RAM +296 B over a build without `att-mtu` (the engine with one bearer,
-# `att-mtu`'s 40 included). The table declares the Client and Server Supported
-# Features in its GATT service (`gatt::Value::ClientFeatures`,
-# `gatt::Value::ServerFeatures`, checked by `host::Host::new`); the client's
-# features are kept in the bond. The server serves Read Multiple Variable
-# Length, Prepare and Execute Write (one value of up to 22 octets) and Multiple
-# Handle Value Notifications (`host::Conn::notify_multiple`). Implies `att-mtu`.
 eatt = ["att-mtu"]
-# `eatt-bearers-2` to `eatt-bearers-5`: up to 2, 3, 4 or 5 enhanced bearers on
-# a link instead of 1 (`host::ecfc::BEARERS`, the highest one enabled), each
-# 16 bytes of `host::ecfc::Ecfc` and a response slot of 67 in the engine,
-# static RAM +80 B per bearer. Imply `eatt`.
 eatt-bearers-2 = ["eatt"]
 eatt-bearers-3 = ["eatt"]
 eatt-bearers-4 = ["eatt"]
 eatt-bearers-5 = ["eatt"]
 
-# Every dependency follows the main branch of its repository (the default
-# branch where it has no main): the crate's own dependencies name their git
-# source (a version requirement alone would let Cargo fall back to an older
-# crates.io release when a branch drops a requested feature), the patches at
-# the end take what the dependencies pull from crates.io from the same
-# branches, and no Cargo.lock is committed: a fresh checkout resolves the latest commits of
-# the branches, and the local, ignored Cargo.lock keeps them until
-# `cargo update`.
 [dependencies]
 cortex-m = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
 defmt = { git = "https://github.com/knurling-rs/defmt", branch = "main", version = "1", optional = true }
@@ -124,36 +32,18 @@ embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "mai
 embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["unstable-pac"] }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-# AES-CMAC (RFC 4493) for f4, f5, f6 and g2 of LE Secure Connections
-# pairing, over the hardware ECB as its block cipher, which implements the
-# block cipher traits of `cipher` (src/host/smp/toolbox.rs). `zeroize`
-# overwrites the CMAC's state when it is dropped.
 cipher = { git = "https://github.com/RustCrypto/traits", branch = "master" }
 cmac = { git = "https://github.com/RustCrypto/MACs", branch = "master", features = ["zeroize"] }
-# P-256 for LE Secure Connections pairing: the private key, the public key,
-# the check of the central's key and the Diffie-Hellman key, from the
-# RustCrypto `p256` crate behind the non-generic API of nrf-ble-p256, the
-# crate of this repository in p256/ (src/host/smp/ecc.rs; its readme says why
-# it is a crate of its own). It is the only crate that uses `p256`.
 nrf-ble-p256 = { path = "p256" }
 
 [dev-dependencies]
-# Software AES for the host tests, in place of the hardware ECB.
 aes = { git = "https://github.com/RustCrypto/block-ciphers", branch = "master" }
-# The RTC time driver only provides the time symbols for the host tests; no
-# test starts it. The chip comes from the chip feature: features unify, and
-# naming one here would build both chips for the other.
 embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["time", "time-driver-rtc1", "unstable-pac"] }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["tick-hz-32_768"] }
 
 [target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
 critical-section = { git = "https://github.com/rust-embedded/critical-section", branch = "main", features = ["std"] }
 
-# Standalone: not a member of the workspace of a firmware that uses it. Its
-# one other member is nrf-ble-p256 (p256/), a path dependency, so a firmware
-# that takes nrf-ble from Git gets it from the same repository and revision.
-# Plain `cargo` commands here build and test nrf-ble alone; `-p nrf-ble-p256`
-# or `--workspace` take in the other.
 [workspace]
 members = ["p256"]
 
@@ -161,23 +51,7 @@ members = ["p256"]
 test = true
 bench = false
 
-# Every crate of the graph from the main branch of its repository, or from
-# its default branch where it has no main (master), so that the crates the
-# dependencies pull from crates.io resolve to the same copy. A patch applies
-# only to the requirements its branch's version satisfies, so a few crates
-# stay on crates.io where a dependency needs an older major version than the
-# one on the branch: bitflags 1 (defmt), embedded-hal 0.2 and nb 0.1
-# (cortex-m, Embassy), embedded-io and embedded-io-async 0.6
-# (embassy-usb-driver), syn 2 (unitrait-macros, at the unitrait revision
-# Embassy names), and bare-metal 0.2, bitfield 0.13, rustc_version 0.2,
-# semver 0.9 and semver-parser 0.7 under cortex-m 0.7. Likewise futures-core and futures-sink 0.3 (Embassy), hash32
-# 0.3 (heapless) and libc 0.2 (cpufeatures): their main branches carry
-# unreleased pre-releases of the next major version (futures-core 1.0 and
-# futures-sink 0.4 alphas, hash32 1.0, libc 1.0 alphas). nrf-pac and unitrait
-# come from the revision Embassy's main branch names: Cargo refuses a patch
-# of a Git dependency from the same repository.
 [patch.crates-io]
-# Embassy, as for the firmware.
 embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
@@ -185,8 +59,6 @@ embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" 
 embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-# RustCrypto: P-256, CMAC and the traits, field and integer arithmetic below
-# them.
 p256 = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
 primefield = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
 primeorder = { git = "https://github.com/RustCrypto/elliptic-curves", branch = "master" }
@@ -215,11 +87,8 @@ zeroize = { git = "https://github.com/RustCrypto/utils", branch = "master" }
 ff = { git = "https://github.com/zkcrypto/ff", branch = "main" }
 group = { git = "https://github.com/zkcrypto/group", branch = "main" }
 rand_core = { git = "https://github.com/rust-random/rand_core", branch = "master" }
-# Its main branch is at 2.6.0: 2.6.1 on crates.io was released from another
-# branch and only drops an unused import.
 subtle = { git = "https://github.com/dalek-cryptography/subtle", branch = "main" }
 typenum = { git = "https://github.com/paholg/typenum", branch = "main" }
-# Embedded Rust and defmt.
 cortex-m = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
 cortex-m-macros = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
 cortex-m-rt = { git = "https://github.com/rust-embedded/cortex-m", branch = "main" }
@@ -235,11 +104,9 @@ volatile-register = { git = "https://github.com/rust-embedded/volatile-register"
 vcell = { git = "https://github.com/japaric/vcell", branch = "master" }
 embedded-storage = { git = "https://github.com/rust-embedded-community/embedded-storage", branch = "master" }
 embedded-storage-async = { git = "https://github.com/rust-embedded-community/embedded-storage", branch = "master" }
-# The repository also holds defmt 0.3, a shim over 1.
 defmt = { git = "https://github.com/knurling-rs/defmt", branch = "main", version = "1" }
 defmt-macros = { git = "https://github.com/knurling-rs/defmt", branch = "main" }
 defmt-parser = { git = "https://github.com/knurling-rs/defmt", branch = "main" }
-# Build-time and general crates.
 proc-macro2 = { git = "https://github.com/dtolnay/proc-macro2", branch = "master" }
 quote = { git = "https://github.com/dtolnay/quote", branch = "master" }
 syn = { git = "https://github.com/dtolnay/syn", branch = "master" }
@@ -258,7 +125,6 @@ void = { git = "https://github.com/reem/rust-void", branch = "master" }
 [lints]
 workspace = true
 
-# The lints of nrf-ble and nrf-ble-p256 alike.
 [workspace.lints.rust]
 warnings = "deny"
 
@@ -267,69 +133,22 @@ all = { level = "deny", priority = 1 }
 pedantic = { level = "deny", priority = 1 }
 restriction = { level = "deny", priority = 1 }
 nursery = { level = "deny", priority = 1 }
-# The only lints allowed. Each comment says why, and what the other way
-# would cost where one exists. No clippy.toml loosens any lint.
-#
-# It refuses enabling the restriction group as a whole. The other way, a deny
-# list of every restriction lint by name, would no longer take in the lints
-# each new nightly adds, and would turn the allows below into lints silently
-# left out; enabling the group keeps both visible.
 blanket_clippy_restriction_lints = { level = "allow", priority = 2 }
-# Pairs that contradict each other by definition, so one of each must be
-# allowed. `needless_return` (style) refuses the `return` that
-# `implicit_return` demands at the end of every function.
+# Contradicts needless_return.
 implicit_return = { level = "allow", priority = 2 }
-# `mod_module_files` refuses `foo/mod.rs`, `self_named_module_files` refuses
-# `foo.rs` beside `foo/`; the code uses `foo.rs`. With `inline_modules`, which
-# refuses `mod foo { .. }` outside the tests, the three leave one layout: every
-# child module loaded with `#[path]` from a folder that has no same-named file.
-# That layout is not Rust's convention and changes no code, so the allow stays.
+# Contradicts mod_module_files.
 self_named_module_files = { level = "allow", priority = 2 }
-# `pub_without_shorthand` refuses `pub(in crate)` and `pub(in super)`,
-# `pub_with_shorthand` refuses `pub(crate)` and `pub(super)`, the only two ways
-# to write those visibilities; the code writes the shorthand.
+# Contradicts pub_without_shorthand.
 pub_with_shorthand = { level = "allow", priority = 2 }
-# `unseparated_literal_suffix` refuses `5u32`, `separated_literal_suffix`
-# refuses `5_u32`: opposites by definition. With both denied a literal gets its
-# type only through the context or a type path (`u32::saturating_sub(150,
-# delay)`); the suffix says it at the literal, and the code writes `150_u32`.
+# Contradicts unseparated_literal_suffix.
 separated_literal_suffix = { level = "allow", priority = 2 }
-# `rest_pattern_accessible_field` refuses `..` in a struct pattern and
-# `unneeded_field_pattern` refuses `field: _`, the two ways to ignore a field
-# without binding it, so with both denied the only spelling left is an unused
-# `_name` binding. The code writes `field: _`, which keeps every field named,
-# so a new field still forces a review of each match.
+# Contradicts rest_pattern_accessible_field.
 unneeded_field_pattern = { level = "allow", priority = 2 }
-# Not a contradiction but a choice: `question_mark_used` refuses `?`, and
-# the code uses `?` for its early returns of `None` or an error. While
-# `question_mark_used` is denied, clippy's `question_mark` (style) stays silent
-# on such a return written out (let-else, `if let`, `match`), so that spelling
-# would pass too; `?` is the shorter one.
 question_mark_used = { level = "allow", priority = 2 }
-# `too_many_lines` (pedantic) and `cognitive_complexity` (nursery) are met by
-# splitting a long function into parts, each called once, which
-# `single_call_fn` refuses; inlining them back would make the long functions
-# those two refuse.
+# Contradicts too_many_lines and cognitive_complexity.
 single_call_fn = { level = "allow", priority = 2 }
-# `little_endian_bytes`, `big_endian_bytes` and `host_endian_bytes` together
-# refuse every conversion between an integer and its octets
-# (`{from,to}_{le,be,ne}_bytes`); they exist so that a crate allows the byte
-# orders it uses. The PDUs are least significant octet first (link layer:
-# Core, Vol 6, Part B, 1.2; host: Vol 3), and so is what the crate lays out
-# itself: the stored bond, the CCM counter, the table hash, the identity roots
-# from their FICR words. The security manager's functions are most significant
-# octet first (Core, Vol 3, Part H, 2.2): the Length of f5, the passkey in R
-# of f6, the result of g2. The other way, own helpers, needs `unsafe`
-# unaligned reads and writes to keep the code these methods compile to; built
-# from shifts instead, a value cut from a wider integer is stored octet by
-# octet at `opt-level = 3`, which made the connection event larger.
-# `host_endian_bytes` stays denied: it is the one that catches a conversion in
-# the CPU's byte order by mistake.
+# The PDUs are little endian, the SMP functions big endian.
 little_endian_bytes = { level = "allow", priority = 2 }
 big_endian_bytes = { level = "allow", priority = 2 }
-# defmt's `derive(Format)` and its level macros (`info!`, `warn!` and the
-# others, whenever `DEFMT_LOG` enables the level) expand to slice indexing that
-# this lint refuses, and no code can change a third-party expansion. For the
-# crate's own code `indexing_slicing` (still denied) refuses every slice index
-# anyway, so nothing is lost.
+# Fires in defmt's macro expansions.
 missing_asserts_for_indexing = { level = "allow", priority = 2 }

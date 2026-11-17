@@ -657,11 +657,6 @@ impl<'peripherals> Clock<'peripherals> {
         self.cancel_start();
     }
 
-    /// Busy-waits until `at` for callers that require microsecond precision.
-    /// Use [`Self::sleep_until`] outside timing-critical sections.
-    #[inline]
-    pub fn wait_until(&self, at: u32) { while !reached(self.now(), at) {} }
-
     /// Sets up the timer, the RTC and the capture channels, and takes the
     /// clock sources of the board: the crystal frequency is set here, so
     /// nothing else may start the crystal before; keep Embassy's

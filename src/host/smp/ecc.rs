@@ -70,10 +70,10 @@
 //! returns is the caller's to wipe, once f5 has derived the keys from it.
 //!
 //! Each multiplication blocks the thread for several seconds on the nRF51
-//! (the readme gives the emulated figures per build; not yet measured on the
-//! chip), so the security manager runs them as jobs outside its state
-//! machine, and each call here takes a hook it calls right before its
-//! multiplication, for the firmware to feed its watchdog.
+//! (the readme gives the emulated figures; not yet measured on the chip), so
+//! the security manager runs them as jobs outside its state machine, and each
+//! call here takes a hook it calls right before its multiplication, for the
+//! firmware to feed its watchdog.
 
 use crate::crypto::wipe;
 use nrf_ble_p256::{PublicKey, SecretKey};
