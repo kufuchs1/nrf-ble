@@ -4,8 +4,8 @@ A Bluetooth LE link layer for the nRF52832 and the nRF51, written in Rust on Emb
 Linux and BlueZ in the same crate. The link layer drives the radio directly; the host serves one central as a
 peripheral. Three firmwares use it from its main branch: those of the Logitech MX Master 3S mouse and the MX Keys S
 keyboard on the nRF52832, and that of a presentation remote on an nRF51802. The nRF51 path runs on hardware with
-BlueZ in the presentation remote (see [nRF51](#nrf51)); the nRF52832 path builds and passes the host tests but has not
-run on hardware yet.
+BlueZ in the presentation remote (see [nRF51](#nrf51)), the nRF52832 path in the mouse: extended and directed
+advertising on LE 2M, pairing, reconnection and EATT with BlueZ 5.88 on Linux 7.3.
 
 ## Status
 
@@ -149,7 +149,8 @@ Each is off by default, so a device without it builds exactly as without the fea
   each in up to three link layer fragments: a Report Map of 167 octets takes 3 reads instead of 8. A reconnection with
   a cached table reads little and gains little. Notifications and indications stay within 20 octets and one fragment,
   and a dynamic value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets.
-  `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Not yet tried on hardware.
+  `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Runs on the mouse: BlueZ's Exchange MTU of 517
+  gets 65.
 - **`eatt`** (implies `att-mtu`): Enhanced ATT as responder. A central opens enhanced bearers with L2CAP's Enhanced
   Credit Based Flow Control mode on SPSM 0x0027 (`host::ecfc`): our CIDs from 0x0040, MTU 65, MPS 67 and 256 credits,
   topped up once 128 are used. A link has 1 enhanced bearer, or up to 2 to 5 with `eatt-bearers-2` to
