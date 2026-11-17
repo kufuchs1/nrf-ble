@@ -76,11 +76,6 @@ What is done so far:
   `host::Port` trait, which `link::Link` implements; the host tests drive the whole host over a stand-in link layer.
   The module documentation of `host` shows how a device's firmware wires it.
 
-On the nRF51 (thumbv6m, measured with `-Zprint-type-sizes`) the static `Host<Link>` takes 976 bytes, 864 of them the
-engine (432 the security manager, of which 64 for the copy of the public key a pairing shows, so the key pair slot
-can drop a used key pair at once), the `Host::run` future 136 bytes, the `Host::crypto` future 32, a `Host::advertise`
-future 96 and a `Conn::notify` future 48.
-
 What has run on hardware: the nRF51 path, with BlueZ, in the presentation remote's firmware. The nRF52832 path has not:
 since the fork from nrf-ll its link layer changed (the answer within the interframe space from two prepared slots,
 the next PDU prepared during the sleep, the latency hold after traffic), and the first nRF52832 firmware on nrf-ble is
@@ -419,8 +414,9 @@ P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomput
   itself), the recoded digits and the table of multiples of each multiplication, and in the Diffie-Hellman the shared
   point, projective and affine, whose X is the Diffie-Hellman key. A firmware that wants them gone can overwrite the
   part of its crypto task's stack the job used, after each job.
-- Emulated, a multiplication takes about 3.3 s on the nRF51 (16 MHz) and 234 ms on the nRF52832 (64 MHz); not
-  measured on the chips yet. The firmware's watchdog hook runs right before each multiplication.
+- Emulated, a multiplication takes about 3.3 s on the nRF51 (16 MHz) and 234 ms on the nRF52832 (64 MHz) with the
+  overrides below, and about 2.7 s and 122 ms with nrf-ble-p256 and the five crates at opt-level 3; not measured on
+  the chips yet. The firmware's watchdog hook runs right before each multiplication.
 
 AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 at e905def with `zeroize`): the CMAC of RFC 4493 from the crate, over an
 adapter that implements the block cipher traits of the `cipher` crate for one key and hands each block to
@@ -460,8 +456,8 @@ own list does: `inout`, `dbl` and `block-buffer` from RustCrypto utils, `digest`
 ### Pairing timing
 
 An LE Secure Connections pairing needs two P-256 multiplications: our key pair (the generator times a fresh private
-key) and the Diffie-Hellman key. Each blocks the thread executor for its whole length; emulated, about 3.3 s on the
-nRF51 and 234 ms on the nRF52832. Not measured on the chips yet.
+key) and the Diffie-Hellman key. Each blocks the thread executor for its whole length; emulated, by build, about 2.7 s
+to 3.3 s on the nRF51 and about 120 ms to 235 ms on the nRF52832 (above). Not measured on the chips yet.
 
 What blocks and what does not, during a multiplication:
 
@@ -497,7 +493,7 @@ pairings, of different centrals or two attempts of one, see the same public key,
 pairing.
 
 The cost: one multiplication more after each pairing that showed our public key and failed, and none otherwise. RAM:
-64 bytes in the security manager and 12 for a signal of the host (above).
+64 bytes in the security manager and 12 for a signal of the host.
 
 ## Power
 
@@ -645,8 +641,9 @@ constructors of `Engine`, `Responder` and `Shared` name only what varies, and `C
 values from its fields), `saturating_cast` and `truncate` (`integer_casts`, `integer_widen_truncate`) for the
 conversions that saturate or cannot lose bits, `split_array_ref` (`split_array`) for the front of a fixed array, such as
 the X coordinate of a public key, with no `Option` that cannot be `None`, and `#[rustc_unroll(never)]` (`loop_hints`) on
-one loop of the host, which keeps it rolled: the coordinate flip of pairing's public keys. Its documentation, built with rustdoc, marks each item behind a Cargo feature with that feature (`doc_cfg`). A
-nightly that renames or changes one of those features breaks the build until the list there follows it.
+one loop of the host, which keeps it rolled: the coordinate flip of pairing's public keys. Its documentation, built
+with rustdoc, marks each item behind a Cargo feature with that feature (`doc_cfg`). A nightly that renames or changes
+one of those features breaks the build until the list there follows it.
 
 The crate follows the main branch of every dependency (the default branch, master, where a repository has none), and
 commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
