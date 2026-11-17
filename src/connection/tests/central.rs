@@ -9,9 +9,9 @@
 //! connection points it at the PDU on the air at the access address, and an
 //! answer that comes too late goes out as that buffer held it then. Faults
 //! are injected per exchange: late answers, lost and corrupted packets each
-//! way. The model of the bug of the first hardware run, a late answer that
-//! sends the received packet back, reproduces its log: two new packets in
-//! three events, and an `LL_FEATURE_RSP` that never arrives.
+//! way. A radio that sends the received packet back on a late answer shows
+//! two new packets in three events, and an `LL_FEATURE_RSP` that never
+//! arrives.
 
 extern crate std;
 
@@ -34,8 +34,8 @@ const EVENTS_MAX: u32 = 400;
 enum Late {
     /// A late answer goes out as the buffer the radio points at held it.
     Latched,
-    /// A late answer sends the received packet back: the radio pointed at
-    /// the receive buffer, as before the fix.
+    /// A late answer sends the received packet back: the radio points at
+    /// the receive buffer.
     Echo,
 }
 

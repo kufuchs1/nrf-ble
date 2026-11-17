@@ -45,12 +45,12 @@
 //! operations that depend on a secret run in constant time, but it has never
 //! been independently audited, and whether the generated machine code is
 //! constant time has not been assessed thoroughly. `crypto-bigint` was
-//! audited by NCC Group, before larger changes since; its CI checks the
-//! machine code of the functions its `checkct` driver names, on thumbv6m and
-//! thumbv7em among others, but those are its own building blocks (limb
-//! carries, wide multiplication, Montgomery multiplication and squaring,
-//! inversion, division), not the P-256 code built from them: the field
-//! functions of `p256`, the table selection and the point formulas of
+//! audited by NCC Group in a much older version than the one in use; its
+//! CI checks the machine code of the functions its `checkct` driver names,
+//! on thumbv6m and thumbv7em among others, but those are its own building
+//! blocks (limb carries, wide multiplication, Montgomery multiplication and
+//! squaring, inversion, division), not the P-256 code built from them: the
+//! field functions of `p256`, the table selection and the point formulas of
 //! `primeorder` are not checked that way, nor the code the firmware's build
 //! makes of them. On the multipliers, the readme (section "Cryptography of
 //! pairing") gives the instruction timing of both cores and its sources.

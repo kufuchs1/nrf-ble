@@ -31,16 +31,10 @@
 //! | 42 to 45 | The client characteristic configuration bits, least significant octet first |
 //! | 46 to 49 | The layout, the first four octets of the table's hash, or zeros |
 //!
-//! Bit 4 came after the first records of this version: they have it clear,
-//! which reads as directed advertising working, the state of a new bond. A
-//! record with it set is refused by a build from before it.
-//!
-//! Bits 5 to 7 came after bit 4: records from before them have them clear,
-//! which reads as a central that wrote no Client Supported Features bit, the
-//! state of a new bond. A record with one of them set is refused by a build
-//! from before them, so after going back to such a build the central pairs
-//! again. Every bit of the flags octet now has a meaning: a further flag needs
-//! another version, [`BOND_VERSION`] 2, or another octet.
+//! Bit 4 clear reads as directed advertising working, and bits 5 to 7 clear
+//! as a central that wrote no Client Supported Features bit: both the state
+//! of a new bond. Every bit of the flags octet has a meaning: a further flag
+//! needs another version, [`BOND_VERSION`] 2, or another octet.
 //!
 //! Keys are kept least significant octet first, the order the security
 //! manager's PDUs carry them in and [`crate::link::Link::ltk_reply`] and

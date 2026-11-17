@@ -15,11 +15,10 @@ It is the only crate of nrf-ble that uses the RustCrypto `p256` crate (with `ari
 | `SecretKey::diffie_hellman(&self, &PublicKey) -> [u8; 32]` | The Diffie-Hellman key, the X coordinate of the product | one |
 
 `SecretKey` and `PublicKey` are opaque; `SecretKey` (`p256::SecretKey`) overwrites itself when it is dropped, and the
-shared secret of the Diffie-Hellman key overwrites itself before `diffie_hellman` returns. Everything around it stays
-in nrf-ble (`host::smp::ecc`): the debug key and our own key refused as the central's key, the firmware's watchdog hook
-before each multiplication, overwriting the caller's octets, and nrf-ble's own API, which is unchanged. nrf-ble's
-readme, section "Cryptography of pairing", describes what the crates claim about constant time and what stays on the
-stack.
+shared secret of the Diffie-Hellman key overwrites itself before `diffie_hellman` returns. Everything around it stays in
+nrf-ble (`host::smp::ecc`): the debug key and our own key refused as the central's key, the firmware's watchdog hook
+before each multiplication, overwriting the caller's octets, and nrf-ble's own API. nrf-ble's readme, section
+"Cryptography of pairing", describes what the crates claim about constant time and what stays on the stack.
 
 ## Why a crate of its own
 

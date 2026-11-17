@@ -2,32 +2,25 @@
 
 A Bluetooth LE link layer for the nRF52832 and the nRF51, written in Rust on Embassy, together with a minimal host for
 Linux and BlueZ in the same crate. The link layer drives the radio directly; the host serves one central as a
-peripheral. The nRF51 path, for an nRF51802, runs on hardware with BlueZ in the firmware of a presentation remote (see
-[nRF51](#nrf51)); the nRF52832 path builds and passes the host tests but has not run on hardware since the fork from
-nrf-ll.
+peripheral. Three firmwares use it from its main branch: those of the Logitech MX Master 3S mouse and the MX Keys S
+keyboard on the nRF52832, and that of a presentation remote on an nRF51802. The nRF51 path runs on hardware with
+BlueZ in the presentation remote (see [nRF51](#nrf51)); the nRF52832 path builds and passes the host tests but has not
+run on hardware yet.
 
 ## Status
 
-nrf-ble starts as a copy of nrf-ll, the link layer of the replacement firmwares for the Logitech MX Keys S keyboard
-and the MX Master 3S mouse, which talks to a host stack such as [TrouBLE](https://github.com/embassy-rs/trouble) over
-HCI. nrf-ll stays as it is, and the MX firmwares keep using it until they move here.
-
-This crate has no HCI: no bt-hci, no TrouBLE, and no command or event encoded into bytes. The host (`src/host`) talks
-to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs). Its only target is Linux with BlueZ.
+The host (`src/host`) talks to the link layer through the typed Rust API of [`src/link.rs`](src/link.rs), with no HCI
+between them: no command or event is encoded into bytes. Its only target is Linux with BlueZ.
 
 The crate is device-agnostic: it holds no device's attribute table, name, appearance, connection parameters or
-advertising. Each firmware defines those itself with the crate's building blocks, as [A device](#a-device) shows; the
-first such firmware is that of a presentation remote on an nRF51802, later the MX firmwares. The design is not in this
-repository: it is `docs/host/design.md` in the repository of that first firmware,
-[kufuchs1/spotlight_rust](https://github.com/kufuchs1/spotlight_rust), with the fixes of its reviews. It was written
-for a separate host crate and an HCI adapter, and this crate replaces both with one crate and the typed API.
+advertising. Each firmware defines those itself with the crate's building blocks, as [A device](#a-device) shows.
 
-What is done so far:
+What it holds:
 
-- The link layer as copied from nrf-ll, with nrf-ll's byte level HCI module replaced by the typed API, and with the
-  peripheral latency hold (see below). Every behaviour nrf-ll's HCI offered stays, as a typed call: identity, filter
-  accept list, resolving list and privacy, advertising, long term key replies, disconnection, connection parameter
-  requests and replies, data length, PHY, authenticated payload timeout, RSSI and the central's features and version.
+- The link layer with its typed API and the peripheral latency hold (see below), each of its functions a typed call:
+  identity, filter accept list, resolving list and privacy, advertising, long term key replies, disconnection,
+  connection parameter requests and replies, data length, PHY, authenticated payload timeout, RSSI and the central's
+  features and version.
 - The host's AES seam (`host::Aes`, the hardware ECB behind `host::Ecb`, software AES in the tests).
 - The cryptography of pairing: f4, f5, f6, g2 and ah in `host::smp::toolbox`, over the AES-CMAC of the RustCrypto
   `cmac` crate, and P-256 key generation, Diffie-Hellman and public key checks in `host::smp::ecc`, from the RustCrypto
@@ -51,8 +44,7 @@ What is done so far:
   phases, an optional directed first phase of a reconnection with the feature `directed-advertising`, high duty cycle,
   or low duty cycle with `extended-advertising`, and their setup of the link layer's accept list, resolving list and
   privacy) and the bond (`host::bond`: the record of the one central with its fixed 50 octet stored form; bits 5 to 7
-  of its flags hold the central's Client Supported Features bits 0 to 2, which an nrf-ble from before them refuses, so
-  going back to one means pairing again).
+  of its flags hold the central's Client Supported Features bits 0 to 2).
 - The engine (`host::engine::Engine`): all of the host's protocol state for one link, without futures. It takes the
   link layer's events and fragments, the time and the results of the P-256 jobs, and gives the fragments to send (pulled
   one at a time, the connection parameter request leaving one place of the link layer's queue free), the calls of the
@@ -76,10 +68,9 @@ What is done so far:
   `host::Port` trait, which `link::Link` implements; the host tests drive the whole host over a stand-in link layer.
   The module documentation of `host` shows how a device's firmware wires it.
 
-What has run on hardware: the nRF51 path, with BlueZ, in the presentation remote's firmware. The nRF52832 path has not:
-since the fork from nrf-ll its link layer changed (the answer within the interframe space from two prepared slots,
-the next PDU prepared during the sleep, the latency hold after traffic), and the first nRF52832 firmware on nrf-ble is
-its first run. The optional features below have not run on hardware yet.
+What has run on hardware: the nRF51 path, with BlueZ, in the presentation remote's firmware. The nRF52832 path (the
+answer within the interframe space from two prepared slots, the next PDU prepared during the sleep, the latency hold
+after traffic) and the optional features below have not.
 
 ### Discovery
 
@@ -110,7 +101,7 @@ Each is off by default, so a device without it builds exactly as without the fea
   engine's own on that link, so the two never race. A fallback range or a second request for the latency is the
   firmware's, with its own timers and `Conn::info`.
 - **`key-missing`**: in reconnection mode, a central that asks to encrypt with a key the host does not have gets the
-  negative reply as before, and the link then ends at once with reason 0x05 and `ConnEvent::KeyMissing`, instead of at
+  negative reply, and the link then ends at once with reason 0x05 and `ConnEvent::KeyMissing`, instead of at
   the schedule's security deadline. A pairable link goes on, as the central may still pair.
 - **`passkey`**: LE Secure Connections Passkey Entry as responder, for a keyboard. `Config::with_security(
   Security::new(IoCapability::KeyboardOnly, require_mitm))` answers with IO capability 0x02 and `AuthReq` 0x0D; a
@@ -165,13 +156,13 @@ Each is off by default, so a device without it builds exactly as without the fea
   `eatt-bearers-5` (`ecfc::BEARERS`, the highest one enabled). Each bearer answers ATT requests, one at a time, with its
   ATT MTU (the smaller of 65 and the central's MTU) and in K-frames that each take one of the central's credits;
   between two K-frames other PDUs may go, and the bearers take turns. Notifications stay on the fixed channel, which
-  goes on as before, Exchange MTU included (an enhanced bearer answers it with Request Not Supported). A Credit Based
-  Connection Request that arrives before the link is encrypted with the host's key, as BlueZ sends it on every
-  reconnection, waits for the encryption; it is refused for security (Insufficient Encryption to the bonded central,
-  Insufficient Authentication to another) if the encryption fails, or 2 s after the first waiting request arrived
-  while neither a key went to the link layer nor a pairing runs. Linux then encrypts, or pairs, and asks again; this
-  refusal is never sent on an encrypted link, where Linux would ask for a pairing with protection against a man in the
-  middle. A request of two or more source CIDs not in ascending order gets Insufficient Resources with every
+  serves as without the feature, Exchange MTU included (an enhanced bearer answers it with Request Not Supported). A
+  Credit Based Connection Request that arrives before the link is encrypted with the host's key, as BlueZ sends it on
+  every reconnection, waits for the encryption; it is refused for security (Insufficient Encryption to the bonded
+  central, Insufficient Authentication to another) if the encryption fails, or 2 s after the first waiting request
+  arrived while neither a key went to the link layer nor a pairing runs. Linux then encrypts, or pairs, and asks again;
+  this refusal is never sent on an encrypted link, where Linux would ask for a pairing with protection against a man in
+  the middle. A request of two or more source CIDs not in ascending order gets Insufficient Resources with every
   destination CID 0: Linux 7.3 sends its CIDs in that order, newest first, and binds the destination CIDs of the answer
   to its channels shifted by one, so any bearer it opened would be crossed. With BlueZ's `[GATT] Channels`:
 
@@ -331,9 +322,9 @@ Against a build without the feature (flash of a firmware's release build; static
   The same holds where TIMER0 kept running because the event follows the last one within 3 ms: the sleep then waits
   on a timer and the host's signal until 300 µs before the radio, and a wake too late for the 500 µs rule is prepared
   at that point instead of waiting a whole interval.
-  The nRF51 keeps the earlier limit: its 300 µs after the restart also take a late crystal and the radio's setup on
-  the 16 MHz Cortex-M0, and a preparation takes up to 68 µs there; the 10 s report's `setup max` measures the first
-  two, so that the nRF51 can follow once they are known.
+  The nRF51 prepares nothing after the restart, so the 500 µs rule is its limit: its 300 µs after the restart also
+  take a late crystal and the radio's setup on the 16 MHz Cortex-M0, and a preparation takes up to 68 µs there; the
+  10 s report's `setup max` measures the first two.
 - **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
   instant; data from the host ends the skipping at the next connection event. It is also held off, so that every
   connection event is listened to: during the first second of a link, for 200 ms or 8 connection events, whichever is
@@ -388,11 +379,12 @@ P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomput
   digits, a table of 1 to 8 times the point read in full for every digit and selected with the constant time
   operations of `subtle`, and the complete addition formulas of Renes, Costello and Batina, which have no exceptional
   case to branch on.
-- What the crates claim of themselves, from their README files at the revisions in use (`p256` and `primeorder` 0.14.0
-  at 9c61da6, `crypto-bigint` 0.7.11 at 145de32): the arithmetic of `p256` and `primeorder` "has never been
+- What the crates claim of themselves, from their README files (`p256` and `primeorder` 0.14.0, `crypto-bigint`
+  0.7.11): the arithmetic of `p256` and `primeorder` "has never been
   independently audited"; it is designed so that the operations that depend on a secret run in constant time, but
   whether the generated machine code is constant time "has not been thoroughly assessed". `crypto-bigint`, the integer
-  arithmetic below them, was audited by NCC Group without significant findings, but has changed much since that audit.
+  arithmetic below them, was audited by NCC Group without significant findings, in a version much older than the one in
+  use.
 - Machine code checks: the CI of `crypto-bigint` runs `cargo checkct` (BINSEC) on thumbv6m and thumbv7em, among other
   targets, over the functions its `checkct/driver` names: limb carries and borrows, leading and trailing zeros,
   modular subtraction, the carries of wide multiplication and squaring, Montgomery multiplication and squaring,
@@ -418,7 +410,7 @@ P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomput
   overrides below, and about 2.7 s and 122 ms with nrf-ble-p256 and the five crates at opt-level 3; not measured on
   the chips yet. The firmware's watchdog hook runs right before each multiplication.
 
-AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 at e905def with `zeroize`): the CMAC of RFC 4493 from the crate, over an
+AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 with `zeroize`): the CMAC of RFC 4493 from the crate, over an
 adapter that implements the block cipher traits of the `cipher` crate for one key and hands each block to
 `host::Aes::encrypt`, the hardware ECB in the firmware. The crate overwrites its chaining value and pending block when
 dropped, the adapter its copy of the key. The host tests check the adapter against FIPS 197, the CMAC against the four
@@ -462,7 +454,7 @@ to 3.3 s on the nRF51 and about 120 ms to 235 ms on the nRF52832 (above). Not me
 What blocks and what does not, during a multiplication:
 
 - The link layer runs in its interrupt executor and is not held up: connection events, acknowledgements,
-  retransmissions, the supervision timeout and the answers to the central's LL procedures go on as before, and its
+  retransmissions, the supervision timeout and the answers to the central's LL procedures go on, and its
   timing does not change. Its event queue holds 6 events and the connection 3 more for the time the host is blocked.
 - Everything in thread mode waits: the run task (ATT responses, the LTK reply to an encryption request, signalling,
   the queueing of fragments), `Conn::notify` and the application's own tasks of the thread executor, with whatever
@@ -585,20 +577,19 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
 - **Errata:** the nRF52832 workarounds are not applied. Of the nRF51's, only the sign of the temperature is fixed;
   the others wait for the nRF51802 errata document (see `src/chip/nrf51.rs`).
 - **Timing:** the radio latches the answer's packet pointer about 140 µs after the END of the central's packet, some
-  2,240 cycles of the 16 MHz CPU. The first hardware run answered an acknowledgement only after about 2,900 cycles,
-  copying and rotating the PDU queue within the interframe space, so the radio sent the received packet back: the
-  central never got `LL_FEATURE_RSP` and ended the link after the 40 s procedure timeout. The answer now takes about
-  400 to 600 cycles from the start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up
-  at the END (emulated on an nRF51 firmware's release build). The 10 s report and the end of each link log its
-  counters: `R retx (A with ack), K acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback,
-  prepare max P us, setup max S us`, where `late` counts answers in place only after the radio started sending,
-  `answer max` the time from the END until the answer was in place, `retx with ack` the central's retransmissions that
-  acknowledged ours, which also follow late answers without an acknowledgement (`late` less `on ack`), as those sent
-  our PDU with its previous flags, so that only a count beyond those points to an answer the central did not take,
-  such as an echo of its packet, `prepare max` the time preparing and sealing the next PDU takes between events, and
-  `setup max` the time from TIMER0's restart, 300 µs before the radio's start, until that start is programmed: a late
-  crystal and the radio's setup. The first eight events of a link log both headers of their first exchange, every
-  control PDU of ours logs when it is sent and acknowledged, and the radio's packet layout is logged once per link.
+  2,240 cycles of the 16 MHz CPU; an answer later than that would make the radio send the received packet back, and
+  the central would end the link after the 40 s procedure timeout. The answer takes about 400 to 600 cycles from the
+  start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up at the END (emulated on an
+  nRF51 firmware's release build). The 10 s report and the end of each link log its counters: `R retx (A with ack), K
+  acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback, prepare max P us, setup max S us`, where
+  `late` counts answers in place only after the radio started sending, `answer max` the time from the END until the
+  answer was in place, `retx with ack` the central's retransmissions that acknowledged ours, which also follow late
+  answers without an acknowledgement (`late` less `on ack`), as those sent our PDU with its previous flags, so that only
+  a count beyond those points to an answer the central did not take, such as an echo of its packet, `prepare max` the
+  time preparing and sealing the next PDU takes between events, and `setup max` the time from TIMER0's restart, 300 µs
+  before the radio's start, until that start is programmed: a late crystal and the radio's setup. The first eight events
+  of a link log both headers of their first exchange, every control PDU of ours logs when it is sent and acknowledged,
+  and the radio's packet layout is logged once per link.
   On the nRF51 the answer sets the turnaround after it at once, as the radio's own turnaround follows the END of our
   answer, about 230 µs after the central's for an empty PDU, also when the answer is late.
   The advertiser points the radio at the scan response once a request's access address came and stops at once for
@@ -649,13 +640,11 @@ The crate follows the main branch of every dependency (the default branch, maste
 commits no `Cargo.lock`: a fresh checkout resolves the latest commits of the branches, and the local, ignored
 `Cargo.lock` keeps them until `cargo update`. Its own dependencies name their git source and branch, not a version: with
 only a version requirement Cargo can quietly fall back to an older crates.io release when a main branch drops a feature
-that is asked for (Embassy main removed embassy-nrf's `gpiote` feature, and a firmware asking for it got embassy-nrf
-0.10 from crates.io beside nrf-ble's 0.11 from git); a git source fails loudly instead. The `[patch.crates-io]` section
+that is asked for; a git source fails loudly instead. The `[patch.crates-io]` section
 of [`Cargo.toml`](Cargo.toml) takes each crate from its branch, so that the crates the dependencies pull from crates.io
 resolve to that same copy. Patches apply only to the workspace being built, so a
 firmware repeats them in its own `Cargo.toml`. Two crates come from the revision Embassy's main branch names, as Cargo
-cannot patch a Git dependency with another branch of the same repository: `nrf-pac` and `unitrait`, both at the head of
-their main branch when this was written.
+cannot patch a Git dependency with another branch of the same repository: `nrf-pac` and `unitrait`.
 
 ## A device
 
@@ -802,8 +791,8 @@ cargo fmt --check
 cargo doc --no-deps                                # rustdoc lints are errors too
 ```
 
-Clippy runs on the library for the chip targets, as in nrf-ll. The tests are not linted (`cargo clippy --all-targets`
-fails on the test code under the `restriction` group, as in nrf-ll).
+Clippy runs on the library for the chip targets. The tests are not linted (`cargo clippy --all-targets` fails on the
+test code under the `restriction` group).
 
 Every Clippy group, `restriction` included, is an error. [`Cargo.toml`](Cargo.toml) allows only lints that another lint
 or the strict setup itself contradicts (`separated_literal_suffix` among them: a literal is written `150_u32`), the two

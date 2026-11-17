@@ -73,11 +73,11 @@ fn directed_advertising_that_went_unanswered_is_stored_in_bit_4() {
     let decoded = Bond::from_bytes(&bytes).unwrap();
     assert!(!decoded.directed_works);
     assert!(decoded == bond);
-    // A record from before the bit has it clear: directed advertising
-    // works, as for a new bond.
-    let mut older = bytes;
-    older[1] = 0;
-    assert!(Bond::from_bytes(&older).unwrap().directed_works);
+    // A record with the bit clear: directed advertising works, as for a new
+    // bond.
+    let mut clear = bytes;
+    clear[1] = 0;
+    assert!(Bond::from_bytes(&clear).unwrap().directed_works);
 }
 
 #[test]
@@ -121,19 +121,19 @@ fn client_features_past_bit_2_are_not_stored() {
 
 #[test]
 fn a_record_from_before_client_features_reads_none() {
-    // A record as a build from before bits 5 to 7 stored it, with every flag
-    // it knew set: a static random identity, an identity resolving key, an
-    // authenticated pairing, a layout and directed advertising unanswered.
-    let mut older = [0; BOND_LEN];
-    older[0] = BOND_VERSION;
-    older[1] = 0x1F;
-    older[2..8].copy_from_slice(&[9, 8, 7, 6, 5, 0xC4]);
-    older[8..24].copy_from_slice(&IRK);
-    older[24..40].copy_from_slice(&LTK);
-    older[40..42].copy_from_slice(&[0x02, 0x01]);
-    older[42..46].copy_from_slice(&[0x05, 0, 0, 0]);
-    older[46..].copy_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4]);
-    let decoded = Bond::from_bytes(&older).unwrap();
+    // A record with bits 5 to 7 clear and every other flag set: a static
+    // random identity, an identity resolving key, an authenticated pairing,
+    // a layout and directed advertising unanswered.
+    let mut record = [0; BOND_LEN];
+    record[0] = BOND_VERSION;
+    record[1] = 0x1F;
+    record[2..8].copy_from_slice(&[9, 8, 7, 6, 5, 0xC4]);
+    record[8..24].copy_from_slice(&IRK);
+    record[24..40].copy_from_slice(&LTK);
+    record[40..42].copy_from_slice(&[0x02, 0x01]);
+    record[42..46].copy_from_slice(&[0x05, 0, 0, 0]);
+    record[46..].copy_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4]);
+    let decoded = Bond::from_bytes(&record).unwrap();
     assert_eq!(decoded.client_features, 0);
     assert!(decoded.peer == Peer::new([9, 8, 7, 6, 5, 0xC4], true));
     assert_eq!(decoded.peer_irk, Some(IRK));
@@ -141,22 +141,20 @@ fn a_record_from_before_client_features_reads_none() {
     assert_eq!(decoded.layout, Some(0xD4C3_B2A1));
     assert_eq!(decoded.cccd, 5);
     // It is stored again as it was.
-    assert_eq!(decoded.to_bytes(), older);
+    assert_eq!(decoded.to_bytes(), record);
 }
 
 #[test]
 fn a_build_from_before_client_features_refuses_a_record_with_them() {
-    // The flags a build from before bits 5 to 7 accepted: bits 0 to 4. It
-    // refused a record with any other bit set, so going back to such a build
-    // refuses a bond with Client Supported Features bits and the central
-    // pairs again; a bond without them it still reads.
-    const OLDER_FLAGS: u8 = 0x1F;
+    // Bits 0 to 4: a bond with Client Supported Features bits sets a flag
+    // beyond them, a bond without them does not.
+    const FLAGS_0_TO_4: u8 = 0x1F;
     for features in 0..=CLIENT_FEATURES {
         let mut bond = example_bond();
         bond.directed_works = false;
         bond.client_features = features;
         let flags = bond.to_bytes()[1];
-        assert_eq!(flags & !OLDER_FLAGS != 0, features != 0);
+        assert_eq!(flags & !FLAGS_0_TO_4 != 0, features != 0);
     }
 }
 

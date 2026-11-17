@@ -757,8 +757,8 @@ pub fn pause_calibration() {
 ///
 /// The task measures the temperature and calibrates at once, whatever the
 /// temperature, within about the crystal's start and the calibration's time
-/// (a few milliseconds), and then as before. Without a pause it changes
-/// nothing.
+/// (a few milliseconds), and then at the usual interval. Without a pause it
+/// changes nothing.
 #[inline]
 pub fn resume_calibration() {
     CALIBRATION_PAUSED.store(false, Ordering::Relaxed);

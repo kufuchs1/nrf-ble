@@ -2806,13 +2806,12 @@ impl Connection {
                 if next != self.counter {
                     self.skip_to(next, shared);
                     if !timed_out {
-                        // As before: the host's data goes out at the next
-                        // event.
+                        // The host's data goes out at the next event.
                         self.skipped = self.latency;
                     }
                     continue;
                 }
-                // Woken before the current event: listen at it, as before.
+                // Woken before the current event: listen at it.
                 self.skipped = self.latency;
             }
             self.prepare_event(clock, shared);

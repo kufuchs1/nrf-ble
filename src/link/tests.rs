@@ -1,5 +1,4 @@
-//! Tests of the typed link API: the behaviour the byte level HCI module
-//! checked, expressed with typed calls, and the additions of the typed API.
+//! Tests of the typed link API.
 
 use super::*;
 use core::{
