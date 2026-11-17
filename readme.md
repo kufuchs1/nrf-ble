@@ -577,19 +577,19 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
 - **Errata:** the nRF52832 workarounds are not applied. Of the nRF51's, only the sign of the temperature is fixed;
   the others wait for the nRF51802 errata document (see `src/chip/nrf51.rs`).
 - **Timing:** the radio latches the answer's packet pointer about 140 µs after the END of the central's packet, some
-  2,240 cycles of the 16 MHz CPU; an answer later than that would make the radio send the received packet back, and
-  the central would end the link after the 40 s procedure timeout. The answer takes about 400 to 600 cycles from the
-  start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up at the END (emulated on an
-  nRF51 firmware's release build). The 10 s report and the end of each link log its counters: `R retx (A with ack), K
-  acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback, prepare max P us, setup max S us`, where
-  `late` counts answers in place only after the radio started sending, `answer max` the time from the END until the
-  answer was in place, `retx with ack` the central's retransmissions that acknowledged ours, which also follow late
-  answers without an acknowledgement (`late` less `on ack`), as those sent our PDU with its previous flags, so that only
-  a count beyond those points to an answer the central did not take, such as an echo of its packet, `prepare max` the
-  time preparing and sealing the next PDU takes between events, and `setup max` the time from TIMER0's restart, 300 µs
-  before the radio's start, until that start is programmed: a late crystal and the radio's setup. The first eight events
-  of a link log both headers of their first exchange, every control PDU of ours logs when it is sent and acknowledged,
-  and the radio's packet layout is logged once per link.
+  2,240 cycles of the 16 MHz CPU, and sends the buffer as it then holds it: an answer later than that resends our
+  previous PDU with its previous flags (see [What it does](#what-it-does)). The answer takes about 400 to 600 cycles
+  from the start of `Connection::respond` to the packet pointer, and about 100 more from the wake-up at the END
+  (emulated on an nRF51 firmware's release build). The 10 s report and the end of each link log its counters: `R retx (A
+  with ack), K acked (D data), L late (La on ack), answer max X us (ack Y us), F fallback, prepare max P us, setup max S
+  us`, where `late` counts answers in place only after the radio started sending, `answer max` the time from the END
+  until the answer was in place, `retx with ack` the central's retransmissions that acknowledged ours, which also follow
+  late answers without an acknowledgement (`late` less `on ack`), as those sent our PDU with its previous flags, so that
+  only a count beyond those points to an answer the central did not take, such as an echo of its packet, `prepare max`
+  the time preparing and sealing the next PDU takes between events, and `setup max` the time from TIMER0's restart,
+  300 µs before the radio's start, until that start is programmed: a late crystal and the radio's setup. The first eight
+  events of a link log both headers of their first exchange, every control PDU of ours logs when it is sent and
+  acknowledged, and the radio's packet layout is logged once per link.
   On the nRF51 the answer sets the turnaround after it at once, as the radio's own turnaround follows the END of our
   answer, about 230 µs after the central's for an empty PDU, also when the answer is late.
   The advertiser points the radio at the scan response once a request's access address came and stops at once for
