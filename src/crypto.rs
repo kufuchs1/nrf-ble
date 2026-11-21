@@ -44,7 +44,7 @@ const DIRECTION_OFFSET: usize = 24;
 const IV_OFFSET: usize = 25;
 /// Octets of the MIC the CCM appends to an encrypted payload, and adds to
 /// its length.
-const MIC_LEN: u8 = 4;
+pub(crate) const MIC_LEN: u8 = 4;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
 pub(crate) const PPI_CRYPT: usize = 25;
 /// Scratch space for every length the CCM may take from a packet.
@@ -190,10 +190,16 @@ pub(crate) unsafe fn seal(
 }
 
 /// [`seal`] on the CCM. The CCM is stopped, disabled and enabled first, as
-/// [`arm_decrypt`] does, and its events cleared. The seal counts as complete
-/// only if its own key stream ended and its encryption ended without an
-/// error, and the CCM wrote the length with the MIC: the length octet of
-/// `output` is cleared first, so a stale `output` cannot pass for this one.
+/// [`arm_decrypt`] does, and its events cleared, so that no other operation
+/// runs that could end into this one.
+///
+/// The seal counts as complete only if its own key stream ended, its
+/// encryption ended without an error, and the length octet of `output`,
+/// cleared before the start, holds the input length plus the MIC. The CCM
+/// writes that octet before the payload and the MIC, so the check shows only
+/// that this encryption began to write `output`: it rejects an ENDCRYPT that
+/// came before then, not one that came while the CCM still wrote. That the
+/// MIC is written rests on the reset before the start.
 ///
 /// # Safety
 ///
@@ -230,8 +236,9 @@ unsafe fn seal_ccm(
     let completed = CCM.events_endksgen().read() != 0
         && CCM.events_endcrypt().read() != 0
         && CCM.events_error().read() == 0
-        // SAFETY: the length octet of `output`, which the CCM wrote before
-        // its encryption ended.
+        // SAFETY: the length octet of `output`, read once the encryption
+        // ended or the wait ran out. A CCM still running is stopped below,
+        // and the seal then counts as failed whatever the octet holds.
         && unsafe { (&raw const output.0[1]).read_volatile() } == input.0[1].wrapping_add(MIC_LEN);
     disarm();
     if !completed {

@@ -105,8 +105,8 @@ const FEATURE_DATA_LENGTH: u8 = 0x20;
 const FEATURE_EXTENDED_ADVERTISING: u8 = 0x10;
 /// Longest time on the air of a data PDU the specification allows.
 const LENGTH_TIME_MAX: u16 = 17_040;
-/// Length of a message integrity check.
-const MIC_LEN: usize = 4;
+/// Length of a message integrity check: [`crypto::MIC_LEN`] as an index.
+const MIC_LEN: usize = usize::from(crypto::MIC_LEN);
 /// Connection parameter change at an instant.
 const OP_CONNECTION_UPDATE_IND: u8 = 0x00;
 /// Channel map change at an instant.
@@ -1415,11 +1415,16 @@ impl Connection {
     /// another exchange fits before the next event. Validates and takes the
     /// packet, takes the acknowledgement of ours, and chooses MD and whether
     /// the event goes on: while either side has more data and it fits. A CRC
-    /// error, a control PDU, a packet without room, or a running encryption
-    /// or termination procedure closes it. Returns `None` if no answer may
+    /// error, a control PDU, a packet without room, a running encryption or
+    /// termination procedure, or a fault that ends the link, such as a
+    /// failed seal in the event, closes it. Returns `None` if no answer may
     /// be sent.
     fn decide(&mut self, packet: Option<(u8, u8, bool)>, address: At, fits: bool, shared: &Shared) -> Option<Decision> {
-        let mut open = fits && self.encryption.phase.is_idle() && self.terminate.is_none() && self.terminated.is_none();
+        let mut open = fits
+            && self.encryption.phase.is_idle()
+            && self.terminate.is_none()
+            && self.terminated.is_none()
+            && self.abort.is_none();
         let mut decision = Decision {
             acked:     None,
             central:   None,

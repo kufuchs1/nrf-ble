@@ -561,6 +561,34 @@ fn a_failed_seal_ends_the_link_with_the_pdu_unsent_and_its_counter_unused() {
     }
 }
 
+#[test]
+fn a_failed_seal_in_the_event_closes_it() {
+    for fails in [false, true] {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        let mut link = encrypted();
+        link.enqueue(Llid::Control, &[OP_PING_RSP]);
+        link.enqueue(Llid::Control, &[OP_PING_RSP]);
+        link.enqueue(Llid::Control, &[OP_PING_RSP]);
+        link.load_next(&shared);
+        // The next PDU is sealed while ours goes out.
+        crypto::SEAL_FAILS.set(fails);
+        link.prepare_next(&shared);
+        crypto::SEAL_FAILS.set(false);
+        assert_eq!(link.abort.is_some(), fails);
+        // The central's next packet acknowledges ours and has more: after
+        // the failed seal our answer neither sets MD nor keeps the event
+        // open. Without it, MD tells of the queued PDUs where the next is
+        // prepared while ours goes out.
+        link.prepare_room(&shared);
+        let decision =
+            link.decide(Some((Llid::Continuation.bits() | NESN | MD, 0, true)), At(1000), true, &shared).unwrap();
+        assert!(decision.acked.is_some());
+        assert_eq!(decision.follow.md, !fails && chip::PREPARE_IN_EVENT);
+        assert_eq!(decision.follow.more, !fails);
+    }
+}
+
 /// Queued PDUs as `load_next` sends them until the queue is empty: their
 /// first payload octet and whether each went out encrypted.
 fn send_queue(link: &mut Connection, shared: &Shared) -> Vec<(u8, bool)> {
