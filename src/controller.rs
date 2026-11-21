@@ -23,10 +23,6 @@ const ADV_DELAY_MAX_US: u32 = 10_000;
 const HIGH_DUTY_DURATION: Duration = Duration::from_millis(1280);
 /// Interval of high duty cycle directed advertising events.
 const HIGH_DUTY_INTERVAL_US: u32 = 3750;
-/// Disconnection reason: connection timeout.
-const REASON_TIMEOUT: u8 = 0x08;
-/// Disconnection reason: connection terminated by local host.
-const REASON_LOCAL_HOST: u8 = 0x16;
 
 /// Ends high duty cycle directed advertising after its time. `since` is
 /// when the advertising was enabled. Returns true if it ended.
@@ -153,12 +149,8 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             shared.complete_reset();
             continue;
         }
-        let reason = match ended {
-            Ended::Error(code) | Ended::Terminated(code) => code,
-            Ended::Local(_) => REASON_LOCAL_HOST,
-            Ended::Lost => REASON_TIMEOUT,
-            Ended::Reset => continue,
-        };
+        let Some(how) = ended.link_end() else { continue };
+        let reason = how.reason();
         shared.set_connected(false);
         if matches!(
             select(shared.push_event(Event::Disconnected(reason)), shared.reset_requested()).await,

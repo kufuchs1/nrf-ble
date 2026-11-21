@@ -243,6 +243,12 @@ Against a build without the feature (flash of a firmware's release build; static
   separately, our own address on the air (the resolvable private address or the identity), the parameters and the
   central's clock accuracy: pairing uses the addresses on the air.
 - **Long term key:** `ltk_reply` takes the key least significant octet first, as the link layer uses it.
+- **Link counters:** `Link::counters` gives the link layer's counters of the current link as of its last 10 s report,
+  or of the last link with how it ended (`End`: supervision timeout, the central's or the host's termination, or an
+  error of the link layer, with the code), until the next link starts or a reset: connection events, skipped and
+  missed events, CRC errors, packets received, retransmissions, late crystal starts with the crystal's current lead,
+  and the largest anchor drift with the window widening it came with. The link layer copies them under the lock every
+  10 s and when the link ends, from the counters of its statistics log, so a firmware can keep them without a log.
 
 ## What it does
 

@@ -363,6 +363,34 @@ fn disconnect_reasons_and_links_are_checked() {
 }
 
 #[test]
+fn the_counters_of_a_link_stay_after_its_end_until_the_next_link_or_a_reset() {
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    assert_eq!(link.counters(), Counters::default());
+    connect(&shared);
+    let ended = Counters { events: 500, missed: 9, end: Some(End::Timeout), ..Counters::NONE };
+    shared.set_counters(ended);
+    assert_eq!(link.counters(), ended);
+    // Read on the disconnection event, after the link ended.
+    shared.set_connected(false);
+    assert_eq!(link.counters(), ended);
+    // The next link starts from nothing, before its first report.
+    connect(&shared);
+    assert_eq!(link.counters(), Counters::NONE);
+    shared.set_counters(ended);
+    shared.complete_reset();
+    assert_eq!(link.counters(), Counters::NONE);
+}
+
+#[test]
+fn each_end_gives_the_reason_of_its_disconnection_event() {
+    assert_eq!(End::Timeout.reason(), 0x08);
+    assert_eq!(End::Local(0x13).reason(), 0x16);
+    assert_eq!(End::Remote(0x13).reason(), 0x13);
+    assert_eq!(End::Error(0x3D).reason(), 0x3D);
+}
+
+#[test]
 fn reset_forgets_keys_settings_and_the_link() {
     let shared = Shared::new();
     let link = Link::new(&shared);
