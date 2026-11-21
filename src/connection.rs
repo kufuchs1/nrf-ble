@@ -2819,7 +2819,7 @@ impl Connection {
 
     /// Runs connection events until the connection ends, exchanging data and
     /// events with the host through `shared`, and with `SLOT_GUARD` checking
-    /// the TX slots after each event ([`Self::check_slots`]).
+    /// the TX slots after each event.
     #[inline]
     pub async fn run<const SLOT_GUARD: bool>(
         &mut self,

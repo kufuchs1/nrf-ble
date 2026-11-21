@@ -694,14 +694,14 @@ Everything that makes a device what it is lives in the device's own crate, typic
   reconnections skip that phase (`Mode::skips`); a new pairing directs again. The all-zero key that a central without
   one may send with its identity address counts as none, and its bond is stored. A bond keeps only an identity address
   (`pdu::IdentityAddress`): a central that pairs from a private address and sends no identity address gets no bond and
-  no `ConnEvent::Bonded`, its link staying encrypted with the pairing's key. In pairing mode a directed phase advertises
-  undirected at 20 ms instead, for the same time (`Mode::directs`). With `extended-advertising` as well, which has no
-  high duty cycle directed advertising, the directed phase is low duty cycle directed advertising instead: an
-  `AUX_ADV_IND` with `TargetA` (the central's identity, or the resolvable private address made with its key, `RxAdd`
-  set) every 20 ms plus the random advDelay, connectable only by that central (its identity, or an `InitA` that resolves
-  to it with the bond's key), for the phase's time, at most 1.28 s. It is no faster than undirected advertising at 20
-  ms, so it only helps a central that connects to directed advertising sooner than to undirected; the target, the bond's
-  bit and the skip are the same.
+  no `ConnEvent::Bonded`, its link staying encrypted with the pairing's key; a key refresh on that link finds no key and
+  ends it. In pairing mode a directed phase advertises undirected at 20 ms instead, for the same time (`Mode::directs`).
+  With `extended-advertising` as well, which has no high duty cycle directed advertising, the directed phase is low duty
+  cycle directed advertising instead: an `AUX_ADV_IND` with `TargetA` (the central's identity, or the resolvable private
+  address made with its key, `RxAdd` set) every 20 ms plus the random advDelay, connectable only by that central (its
+  identity, or an `InitA` that resolves to it with the bond's key), for the phase's time, at most 1.28 s. It is no
+  faster than undirected advertising at 20 ms, so it only helps a central that connects to directed advertising sooner
+  than to undirected; the target, the bond's bit and the skip are the same.
 
 ```rust
 use embassy_time::Duration;

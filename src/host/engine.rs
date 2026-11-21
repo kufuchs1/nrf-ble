@@ -91,14 +91,15 @@
 //!   identity or its address on the air, and our variant. A bond keeps only an
 //!   [`IdentityAddress`]: a central that paired from a private address and sent
 //!   no identity address gets no bond, and its link stays encrypted with the
-//!   pairing's key without [`ConnEvent::Bonded`]. It reports
-//!   [`ConnEvent::Bonded`] only once the central acknowledged every fragment
-//!   sent so far, our Identity Address Information among them: the kernel
-//!   stores its bond only when that PDU arrives, and a bond the firmware stored
-//!   without it would make every reconnection fail. The
-//!   [`crate::host::smp::Bonded`] it gets is `Copy`, so the engine overwrites
-//!   its copy of the keys once the [`Bond`] holds them; the security manager
-//!   overwrites its own Diffie-Hellman key, `MacKey` and long term key.
+//!   pairing's key without [`ConnEvent::Bonded`]; a key refresh on that link
+//!   finds no key and ends it. It reports [`ConnEvent::Bonded`] only once the
+//!   central acknowledged every fragment sent so far, our Identity Address
+//!   Information among them: the kernel stores its bond only when that PDU
+//!   arrives, and a bond the firmware stored without it would make every
+//!   reconnection fail. The [`crate::host::smp::Bonded`] it gets is `Copy`, so
+//!   the engine overwrites its copy of the keys once the [`Bond`] holds them;
+//!   the security manager overwrites its own Diffie-Hellman key, `MacKey` and
+//!   long term key.
 //! - It ends the link: [`SECURITY_FAILURE`] when the link is not encrypted
 //!   within the advertising schedule's security deadline (with the feature
 //!   `key-missing`, at once when the central of a reconnection asks for a key
