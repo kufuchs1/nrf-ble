@@ -10,7 +10,6 @@ use crate::{
         ADV_IND,
         ADV_NONCONN_IND,
         ADV_SCAN_IND,
-        BUFFER_LEN,
         ConnectInd,
         LegacyAdvertisement,
         Peer,
@@ -18,7 +17,7 @@ use crate::{
         is_scan_request,
         scan_request,
     },
-    radio::{Radio, Turnaround},
+    radio::{PacketBuffer, Radio, Turnaround},
 };
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -148,7 +147,7 @@ pub fn event(
     clock: &Clock<'_>,
     settings: &Settings,
     pdus: (&LegacyAdvertisement, &LegacyAdvertisement),
-    rx: &mut [u8; BUFFER_LEN],
+    rx: &mut PacketBuffer,
 ) -> Option<(ConnectInd, u32)> {
     radio.set_access_address(ADV_ACCESS_ADDRESS);
     radio.set_crc_init(ADV_CRC_INIT);
@@ -178,24 +177,29 @@ fn on_channel(
     clock: &Clock<'_>,
     settings: &Settings,
     (advertisement, scan_response): (&LegacyAdvertisement, &LegacyAdvertisement),
-    rx: &mut [u8; BUFFER_LEN],
+    rx: &mut PacketBuffer,
     channel: u8,
 ) -> Option<(ConnectInd, u32)> {
     radio.set_channel(channel);
     let listen = settings.kind != Kind::NonConnectable;
     let after = if listen { Turnaround::Receive } else { Turnaround::None };
-    // SAFETY: the radio only reads the advertisement, which is borrowed for
-    // this event; every path out waits until the radio is disabled.
-    unsafe { radio.prepare(advertisement.as_bytes().as_ptr().cast_mut(), after) }
+    // The advertisement goes out from `rx`, which then takes the request:
+    // the reception the turnaround starts finds the radio pointing at it
+    // however late the CPU is, as with extended advertising's
+    // `AUX_ADV_IND`.
+    let bytes = advertisement.as_bytes();
+    if let Some(head) = rx.0.get_mut(..bytes.len()) {
+        head.copy_from_slice(bytes);
+    }
+    // SAFETY: `rx` is borrowed for this event; every path out waits until
+    // the radio is disabled.
+    unsafe { radio.prepare(rx, after) }
     radio.transmit();
     radio.wait_end();
     if !listen {
         radio.wait_disabled();
         return None;
     }
-    // SAFETY: `rx` is a full packet buffer borrowed for this event; every
-    // path out waits until the radio is disabled.
-    unsafe { radio.set_buffer(rx.as_mut_ptr()) }
     radio.wait_switched();
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
@@ -209,14 +213,15 @@ fn on_channel(
     }
     // The reception latched `rx`: the pointer now applies to the answer.
     // SAFETY: the radio only reads the scan response, borrowed for this
-    // event, and is disabled before it returns.
-    unsafe { radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut()) }
+    // event, and is disabled before it returns; the turnaround after the
+    // reception sends.
+    unsafe { radio.set_send_buffer(scan_response.as_bytes()) }
     radio.clear_ready();
     radio.wait_end();
     let end = clock.end_time();
     let valid = radio.crc_ok();
-    if valid && is_scan_request(rx[0]) {
-        let answer = scan_request(rx, settings.own).is_some_and(|scanner| accepts_scan(settings, scanner));
+    if valid && is_scan_request(rx.0[0]) {
+        let answer = scan_request(&rx.0, settings.own).is_some_and(|scanner| accepts_scan(settings, scanner));
         if radio.tx_started() {
             LATE_SCAN_DECISIONS.store(late_scan_decisions().wrapping_add(1), Ordering::Relaxed);
         }
@@ -235,7 +240,7 @@ fn on_channel(
     if !valid {
         return None;
     }
-    ConnectInd::parse(rx, settings.own)
+    ConnectInd::parse(&rx.0, settings.own)
         .filter(|request| settings.accepts_connection(request.central()))
         .map(|request| (request, end))
 }

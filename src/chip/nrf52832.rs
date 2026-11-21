@@ -154,6 +154,16 @@ pub fn set_calibration_workaround(calibrating: bool) {
     unsafe { write_volatile(register, if calibrating { 2 } else { 0 }) }
 }
 
+/// The most octets the radio writes to RAM for a packet received with the
+/// packet layout of [`set_packet_layout`]: S0, length, the S1 byte on the
+/// data channels, and as many octets as MAXLEN admits.
+#[inline]
+#[must_use = "the length is only computed"]
+pub const fn packet_ram_len(data_channel: bool) -> usize {
+    let s1: usize = if data_channel { 1 } else { 0 };
+    2_usize.strict_add(s1).strict_add(MAX_PAYLOAD.strict_cast())
+}
+
 /// Sets whether packets in RAM carry the S1 byte, which the CCM needs on
 /// data channels.
 #[inline]

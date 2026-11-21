@@ -192,7 +192,7 @@ struct Sim {
     replied: bool,
     /// The host's packets that wait for room in the link layer's queue.
     host_tx: VecDeque<Vec<u8>>,
-    rx:      [u8; BUFFER_LEN],
+    rx:      PacketBuffer,
     /// The time of the central's packets in the event, in microseconds.
     time:    u32,
 }
@@ -223,7 +223,7 @@ impl Sim {
             host_rx: Vec::new(),
             replied: false,
             host_tx: VecDeque::new(),
-            rx: [0; BUFFER_LEN],
+            rx: PacketBuffer::ZERO,
             time: 1000,
         }
     }
@@ -257,11 +257,11 @@ impl Sim {
             }
             heard = true;
             let (header, payload) = self.central.packet();
-            self.rx.fill(0);
-            self.rx[0] = header;
+            self.rx.0.fill(0);
+            self.rx.0[0] = header;
             let sealed_len = if encrypted && !payload.is_empty() { payload.len() + 4 } else { payload.len() };
-            self.rx[1] = u8::try_from(sealed_len).unwrap();
-            self.rx[3..3 + payload.len()].copy_from_slice(&payload);
+            self.rx.0[1] = u8::try_from(sealed_len).unwrap();
+            self.rx.0[3..3 + payload.len()].copy_from_slice(&payload);
             self.link.rx_plain.fill(0);
             self.link.rx_plain[0] = header;
             self.link.rx_plain[1] = u8::try_from(payload.len()).unwrap();
@@ -270,9 +270,9 @@ impl Sim {
             let latched_slot = self.link.cur;
             let latched = *self.link.current_mut().on_air();
             let crc_ok = !self.random.chance(self.faults.corrupted);
-            let packet = crc_ok.then_some((header, self.rx[1], true));
+            let packet = crc_ok.then_some((header, self.rx.0[1], true));
             let decision = self.link.decide(packet, self.time, true, &self.shared).expect("the link goes on");
-            let buffer = self.link.answer_buffer(decision.follow.md);
+            let buffer = self.link.answer_buffer(decision.follow.md).0.as_ptr();
             let on_air = |link: &mut Connection, slot: bool| *link.slot_mut(slot).on_air();
             // Within the interframe space, only the header of the buffer
             // the radio points at changes.
@@ -282,12 +282,12 @@ impl Sim {
             } else {
                 self.faults.late_noack
             });
-            assert_eq!(self.link.current_mut().on_air().0.as_ptr(), buffer.cast_const());
+            assert_eq!(self.link.current_mut().on_air().0.as_ptr(), buffer);
             let answer = *self.link.current_mut().on_air();
             let sent: Vec<u8> = match (late, self.late) {
                 (false, _) => answer.0.to_vec(),
                 (true, Late::Latched) => latched.0.to_vec(),
-                (true, Late::Echo) => self.rx[..DATA_BUFFER_LEN].to_vec(),
+                (true, Late::Echo) => self.rx.0[..DATA_BUFFER_LEN].to_vec(),
             };
             let rx = self.rx;
             self.link.after_answer(decision, &rx, (None, late, 0), &self.shared);
@@ -504,9 +504,9 @@ fn the_answer_patches_only_the_header_of_the_pdu_on_the_air() {
         let before = *link.current_mut().on_air();
         link.seq.sn = true;
         link.seq.nesn = true;
-        let buffer = link.answer_buffer(true);
+        let buffer = link.answer_buffer(true).0.as_ptr();
         let after = *link.current_mut().on_air();
-        assert_eq!(buffer.cast_const(), link.current_mut().on_air().0.as_ptr());
+        assert_eq!(buffer, link.current_mut().on_air().0.as_ptr());
         assert_eq!(after.0[0], before.0[0] | SN | NESN | MD);
         assert_eq!(after.0[1..], before.0[1..]);
         // The plain copy keeps its header when the sealed one goes out.
@@ -548,12 +548,12 @@ fn a_second_acknowledgement_in_an_event_is_answered_with_an_empty_pdu() {
     // The first acknowledgement sends the prepared PDU.
     let empty = Llid::Continuation.bits();
     let first = link.decide(Some((empty | NESN, 0, true)), 1000, true, &shared).unwrap();
-    link.after_answer(first, &[0; BUFFER_LEN], (None, false, 0), &shared);
+    link.after_answer(first, &PacketBuffer::ZERO, (None, false, 0), &shared);
     assert!(link.tx_kind == TxKind::Control && !first.fallback);
     assert_eq!(first.follow.md, chip::PREPARE_IN_EVENT);
     // The second, before anything is prepared again, an empty one.
     let second = link.decide(Some((empty | SN, 0, true)), 1000, true, &shared).unwrap();
-    link.after_answer(second, &[0; BUFFER_LEN], (None, false, 0), &shared);
+    link.after_answer(second, &PacketBuffer::ZERO, (None, false, 0), &shared);
     assert!(link.tx_kind == TxKind::Empty && second.fallback);
     assert_eq!(link.stats.fallback, 1);
     assert_eq!(link.queue.len(), 1);
@@ -572,7 +572,7 @@ fn a_loss_after_a_late_answer_is_not_the_path() {
     link.late_answer = true;
     let decision = link.decide(Some((Llid::Continuation.bits(), 0, true)), 1000, true, &shared).unwrap();
     assert!(decision.nacked);
-    link.after_answer(decision, &[0; BUFFER_LEN], (None, false, 0), &shared);
+    link.after_answer(decision, &PacketBuffer::ZERO, (None, false, 0), &shared);
     assert_eq!(for_phy_mut(&mut link.power, link.tx_phy).level(), level);
     assert!(!link.late_answer);
 }

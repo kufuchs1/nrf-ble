@@ -233,10 +233,10 @@ fn security_notification_survives_host_queue_pressure() {
     link.encryption.phase = Phase::AwaitingStartResponse;
     link.encryption.rx_on = true;
     link.handle_control(&[OP_START_ENC_RSP], true);
-    link.process(&[0; BUFFER_LEN], true, &full);
+    link.process(&PacketBuffer::ZERO, true, &full);
     assert_eq!(link.encryption_change, Some((0, true)));
     let available = Shared::new();
-    link.process(&[0; BUFFER_LEN], true, &available);
+    link.process(&PacketBuffer::ZERO, true, &available);
     assert_eq!(link.encryption_change, None);
     assert_eq!(available.take_event(), Some(Event::Encryption { on: true, refresh: false, status: 0 }));
     assert_eq!(queued(&available), 0);
@@ -401,10 +401,10 @@ fn empty_packets_use_raw_header_instead_of_stale_ccm_output() {
     let mut link = connection();
     link.encryption.rx_on = true;
     link.rx_plain.fill(0xFF);
-    let mut rx = [0; BUFFER_LEN];
-    rx[0] = Llid::Continuation.bits();
+    let mut rx = PacketBuffer::ZERO;
+    rx.0[0] = Llid::Continuation.bits();
     let shared = Shared::new();
-    assert_eq!(link.receive(rx[0], 0, true, 999, &shared), Some(true));
+    assert_eq!(link.receive(rx.0[0], 0, true, 999, &shared), Some(true));
     link.process(&rx, true, &shared);
     assert_eq!(link.encryption.rx_counter, 0);
     assert_eq!(link.abort, None);
@@ -1243,14 +1243,14 @@ fn entropy_wait_preserves_response_deadline_and_accepts_termination() {
 fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_end() {
     let shared = Shared::new();
     let mut link = connection();
-    let mut rx = [0; BUFFER_LEN];
+    let mut rx = PacketBuffer::ZERO;
     let packets: [(u8, &[u8]); 3] =
         [(Llid::Start.bits(), &[0xA1]), (Llid::Start.bits() | SN, &[0xA2]), (Llid::Control.bits(), &[OP_PING_REQ])];
     for (header, payload) in packets {
-        rx[0] = header;
-        rx[1] = u8::try_from(payload.len()).unwrap();
-        rx[DATA_HEADER_LEN..DATA_HEADER_LEN + payload.len()].copy_from_slice(payload);
-        assert_eq!(link.receive(header, rx[1], true, 999, &shared), Some(true));
+        rx.0[0] = header;
+        rx.0[1] = u8::try_from(payload.len()).unwrap();
+        rx.0[DATA_HEADER_LEN..DATA_HEADER_LEN + payload.len()].copy_from_slice(payload);
+        assert_eq!(link.receive(header, rx.0[1], true, 999, &shared), Some(true));
         assert!(link.seq.received);
         link.stash(&rx, false, &shared);
     }
@@ -1267,8 +1267,8 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
     link.seq.nesn = !link.seq.nesn;
     assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 999, &shared), Some(true));
     assert!(link.seq.received);
-    rx[0] = Llid::Continuation.bits();
-    rx[1] = 0;
+    rx.0[0] = Llid::Continuation.bits();
+    rx.0[1] = 0;
     link.stash(&rx, false, &shared);
     link.process(&rx, false, &shared);
     assert_eq!(
@@ -1289,11 +1289,11 @@ fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
     let shared = Shared::new();
     let mut link = connection();
     link.encryption.rx_on = true;
-    let mut rx = [0; BUFFER_LEN];
-    rx[0] = Llid::Start.bits();
-    rx[1] = 5;
+    let mut rx = PacketBuffer::ZERO;
+    rx.0[0] = Llid::Start.bits();
+    rx.0[1] = 5;
     link.rx_plain[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
-    assert_eq!(link.receive(rx[0], 5, true, 999, &shared), Some(true));
+    assert_eq!(link.receive(rx.0[0], 5, true, 999, &shared), Some(true));
     link.stash(&rx, true, &shared);
     assert_eq!(link.encryption.rx_counter, 1);
     assert_eq!(shared.take_acl_in().map(|acl| (acl.payload()[0], acl.encrypted())), Some((0x42, true)));
@@ -1812,15 +1812,15 @@ fn a_received_payload_holds_the_latency_off_for_a_while() {
     let now = link.anchor;
     assert!(link.can_skip(now, &shared));
     // An empty PDU holds nothing.
-    let mut rx = [0; BUFFER_LEN];
-    rx[0] = Llid::Continuation.bits();
-    assert_eq!(link.receive(rx[0], 0, true, now, &shared), Some(true));
+    let mut rx = PacketBuffer::ZERO;
+    rx.0[0] = Llid::Continuation.bits();
+    assert_eq!(link.receive(rx.0[0], 0, true, now, &shared), Some(true));
     link.stash(&rx, false, &shared);
     assert!(link.can_skip(now, &shared));
     // A payload holds for 200 ms, longer than 8 events of 15 ms.
-    rx[0] = Llid::Start.bits() | SN;
-    rx[1] = 1;
-    assert_eq!(link.receive(rx[0], 1, true, now, &shared), Some(true));
+    rx.0[0] = Llid::Start.bits() | SN;
+    rx.0[1] = 1;
+    assert_eq!(link.receive(rx.0[0], 1, true, now, &shared), Some(true));
     link.stash(&rx, false, &shared);
     assert!(!link.can_skip(now.wrapping_add(LATENCY_HOLD_US - 1), &shared));
     assert!(link.can_skip(now.wrapping_add(LATENCY_HOLD_US), &shared));
@@ -1872,14 +1872,14 @@ fn encrypted_data_is_marked_before_the_host_learns_of_the_encryption() {
     link.encryption.phase = Phase::AwaitingStartResponse;
     link.encryption.rx_on = true;
     link.handle_control(&[OP_START_ENC_RSP], true);
-    link.process(&[0; BUFFER_LEN], true, &full);
+    link.process(&PacketBuffer::ZERO, true, &full);
     // The encryption change waits for room; data arrives meanwhile.
     assert_eq!(link.encryption_change, Some((0, true)));
-    let mut rx = [0; BUFFER_LEN];
-    rx[0] = Llid::Start.bits();
-    rx[1] = 5;
+    let mut rx = PacketBuffer::ZERO;
+    rx.0[0] = Llid::Start.bits();
+    rx.0[1] = 5;
     link.rx_plain[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
-    assert_eq!(link.receive(rx[0], 5, true, 999, &full), Some(true));
+    assert_eq!(link.receive(rx.0[0], 5, true, 999, &full), Some(true));
     link.stash(&rx, true, &full);
     let acl = full.take_acl_in().unwrap();
     assert!(acl.encrypted());
@@ -1918,7 +1918,7 @@ fn acknowledged_host_packets_are_counted_for_the_host() {
     assert!(link.tx_kind == TxKind::Acl);
     assert_eq!(link_api.in_flight(epoch), 1);
     assert_eq!(link.acknowledge(NESN, &shared), Some(()));
-    link.process(&[0; BUFFER_LEN], false, &shared);
+    link.process(&PacketBuffer::ZERO, false, &shared);
     assert_eq!(link_api.in_flight(epoch), 0);
     assert_eq!(link_api.acked(), 1);
 }
@@ -2185,4 +2185,22 @@ fn each_end_but_a_reset_names_how_the_link_ended() {
     assert_eq!(Ended::Local(0x13).link_end(), Some(End::Local(0x13)));
     assert_eq!(Ended::Error(0x22).link_end(), Some(End::Error(0x22)));
     assert_eq!(Ended::Reset.link_end(), None);
+}
+
+#[test]
+fn a_reception_into_a_tx_slot_is_counted_and_cleared() {
+    let shared = Shared::new();
+    let mut link = connection();
+    link.start_slots(&shared);
+    link.check_slots();
+    assert_eq!(link.stats.slot_overruns, 0);
+    if DATA_BUFFER_LEN < BUFFER_LEN {
+        // A long packet received into the sealed buffer of the second slot.
+        link.slots.1.sealed.0[..BUFFER_LEN].fill(0xA5);
+        link.check_slots();
+        assert_eq!(link.stats.slot_overruns, 1);
+        assert!(link.slots.1.sealed.0[DATA_BUFFER_LEN..].iter().all(|&byte| byte == 0));
+        link.check_slots();
+        assert_eq!(link.stats.slot_overruns, 1);
+    }
 }
