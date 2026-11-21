@@ -223,6 +223,10 @@ pub fn radio_trim() {
     }
 }
 
+/// Nothing to set: the nRF51 has no configurable RAM priorities.
+#[inline]
+pub const fn ram_priority() {}
+
 /// The die temperature in units of 0.25 °C, once a measurement is ready. The
 /// register holds a 10-bit two's complement value that the nRF51 does not
 /// sign-extend (PAN 28, as the nRF51 SDK handles it); extending it is right
