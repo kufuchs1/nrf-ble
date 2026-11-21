@@ -13,7 +13,7 @@ use crate::{
     advertiser::Setup,
     channel::{Hopping, UsedChannels},
     chip,
-    clock::{At, Clock, Micros, SETUP, SETUP_US},
+    clock::{At, Clock, CrystalStats, Micros, SETUP, SETUP_US},
     crypto::{self, CONFIG_LEN, SCRATCH_LEN},
     health,
     link::{
@@ -774,6 +774,16 @@ struct Update {
     win_offset: Micros,
     /// Transmit window size.
     win_size:   Micros,
+}
+
+/// The receive window of an event: when the radio starts, and the latest
+/// time at which the central's access address can arrive.
+#[derive(Clone, Copy)]
+struct Window {
+    /// Radio start.
+    enable: At,
+    /// Latest time of the access address.
+    latest: At,
 }
 
 /// An established connection.
@@ -1639,7 +1649,7 @@ impl Connection {
         radio: &mut Radio<'_>,
         clock: &mut Clock<'_>,
         rx: &mut PacketBuffer,
-        (enable, deadline): (At, At),
+        Window { enable, latest: deadline }: Window,
         shared: &Shared,
     ) -> Option<At> {
         // Only LE 2M makes the PHYs differ.
@@ -2424,7 +2434,7 @@ impl Connection {
 
     /// Counts a missed event and moves an expected transmit window to the
     /// next event.
-    fn note_miss(&mut self, channel: u8, window: (At, At)) {
+    fn note_miss(&mut self, channel: u8, window: Window) {
         self.stats.missed = self.stats.missed.wrapping_add(1);
         // Tells timing from the radio: how long since the last packet, how
         // long the radio listened, and whether a transmit window after a
@@ -2434,8 +2444,8 @@ impl Connection {
             self.counter,
             channel,
             self.counter.wrapping_sub(self.anchor_counter),
-            window.1.since(self.anchor).0,
-            window.1.since(window.0).0,
+            window.latest.since(self.anchor).0,
+            window.latest.since(window.enable).0,
             !matches!(self.expect, Expect::Anchor),
             self.phy == Phy::M2
         );
@@ -2654,21 +2664,21 @@ impl Connection {
     }
 
     /// Tells the host the link's counters ([`crate::link::Link::counters`]),
-    /// with the crystal's restarts `late` as the clock counts them and its
-    /// `lead`, and how the link ended once it did. The drift since the last
-    /// report counts towards the largest.
-    fn publish_counters(&mut self, (late, lead): (u32, Micros), end: Option<End>, shared: &Shared) {
+    /// with the crystal's restarts as the clock counts them, and how the
+    /// link ended once it did. The drift since the last report counts
+    /// towards the largest.
+    fn publish_counters(&mut self, crystal: CrystalStats, end: Option<End>, shared: &Shared) {
         if self.drift.0.unsigned_abs() > self.drift_max.0.unsigned_abs() {
             self.drift_max = self.drift;
         }
         let (drift_us, widening_us) = self.drift_max;
         shared.set_counters(Counters {
             crc_errors: self.stats.crc_errors,
-            crystal_lead_us: lead.0,
+            crystal_lead_us: crystal.lead.0,
             drift_us,
             end,
             events: self.stats.events,
-            late_crystal: late.wrapping_sub(self.late_start),
+            late_crystal: crystal.late.wrapping_sub(self.late_start),
             missed: self.stats.missed,
             received: self.stats.received,
             retransmissions: self.stats.retx,
@@ -2686,12 +2696,12 @@ impl Connection {
     #[cfg(feature = "event-timing")]
     fn publish_event(&self, clock: &Clock<'_>, start: At, shared: &Shared) {
         let ahead = start.offset_from(clock.now());
-        shared.set_next_event(embassy_time::Instant::now(), ahead, queue_lead(clock.lead()), self.interval);
+        shared.set_next_event(embassy_time::Instant::now(), ahead, queue_lead(clock.crystal().lead), self.interval);
     }
 
     /// Logs the counters since the last call and tells the host the link's
-    /// counters.
-    fn report(&mut self, (late, lead): (u32, Micros), shared: &Shared) {
+    /// counters, with the crystal's restarts as the clock counts them.
+    fn report(&mut self, crystal: CrystalStats, shared: &Shared) {
         let (last, last_late) = self.reported;
         info!(
             "10 s: {} events, {} skipped, {} missed, {} crc errors, {} packets, {} late crystal (lead {} us), {} dBm, drift {} of +-{} us",
@@ -2700,8 +2710,8 @@ impl Connection {
             self.stats.missed.wrapping_sub(last.missed),
             self.stats.crc_errors.wrapping_sub(last.crc_errors),
             self.stats.received.wrapping_sub(last.received),
-            late.wrapping_sub(last_late),
-            lead.0,
+            crystal.late.wrapping_sub(last_late),
+            crystal.lead.0,
             tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()),
             self.drift.0,
             self.drift.1.0
@@ -2722,10 +2732,10 @@ impl Connection {
             self.stats.fallback.wrapping_sub(last.fallback),
             self.peaks.prepare.0
         );
-        self.publish_counters((late, lead), None, shared);
+        self.publish_counters(crystal, None, shared);
         self.peaks = Peaks::default();
         self.drift = NO_DRIFT;
-        self.reported = (self.stats, late);
+        self.reported = (self.stats, crystal.late);
         self.report_at = self.report_at.after(REPORT_INTERVAL_US);
     }
 
@@ -2833,7 +2843,7 @@ impl Connection {
                 Either::Second(never) => never,
             };
         if let Some(end) = ended.link_end() {
-            self.publish_counters((clock.late(), clock.lead()), Some(end), shared);
+            self.publish_counters(clock.crystal(), Some(end), shared);
         }
         (ended, stats)
     }
@@ -2872,7 +2882,7 @@ impl Connection {
             let window = self.window();
             // An anchor that passed during a flash pause is skipped, as with
             // latency; a transmit window is searched in the miss path below.
-            if matches!(self.expect, Expect::Anchor) && window.0.reached_by(clock.now()) {
+            if matches!(self.expect, Expect::Anchor) && window.enable.reached_by(clock.now()) {
                 self.stats.skipped = self.stats.skipped.wrapping_add(1);
                 self.counter = self.counter.wrapping_add(1);
                 continue;
@@ -2915,24 +2925,24 @@ impl Connection {
                 break Ended::Error(reason);
             }
             #[cfg(feature = "event-timing")]
-            self.publish_event(clock, window.0, shared);
+            self.publish_event(clock, window.enable, shared);
             // The host runs while the link layer sleeps: what it queues then
             // wakes the sleep and is prepared again, so that it goes out at
             // this event rather than the next.
             // A wake too close to the event for that is remembered, as it
             // took the host's signal.
             let mut refused = false;
-            while !clock.sleep_until(window.0, shared.wakeup()).await {
-                refused |= !self.prepare_after_wake(clock.now(), window.0, shared);
+            while !clock.sleep_until(window.enable, shared.wakeup()).await {
+                refused |= !self.prepare_after_wake(clock.now(), window.enable, shared);
             }
             // The sleep listens for the host only until the crystal starts;
             // what the host queued since, or in a wake refused above, is
             // prepared once TIMER0 runs, where the chip has the time.
-            self.prepare_after_restart(refused, || clock.now(), window.0, shared);
+            self.prepare_after_restart(refused, || clock.now(), window.enable, shared);
             if let Some(reason) = self.abort {
                 break Ended::Error(reason);
             }
-            if !clock.ensure_crystal().await && window.0.reached_by(clock.now()) {
+            if !clock.ensure_crystal().await && window.enable.reached_by(clock.now()) {
                 self.stats.skipped = self.stats.skipped.wrapping_add(1);
                 self.counter = self.counter.wrapping_add(1);
                 continue;
@@ -2958,7 +2968,7 @@ impl Connection {
                 break ended;
             }
             if self.report_at.reached_by(clock.now()) {
-                self.report((clock.late(), clock.lead()), shared);
+                self.report(clock.crystal(), shared);
             }
             self.counter = self.counter.wrapping_add(1);
         };
@@ -3287,10 +3297,10 @@ impl Connection {
     }
 
     /// Radio start and access address deadline of the current event.
-    const fn window(&self) -> (At, At) { self.window_at(self.counter) }
+    const fn window(&self) -> Window { self.window_at(self.counter) }
 
     /// Radio start and access address deadline of event `counter`.
-    const fn window_at(&self, counter: u16) -> (At, At) {
+    const fn window_at(&self, counter: u16) -> Window {
         let (earliest, latest) = match self.expect {
             Expect::Anchor => {
                 let expected =
@@ -3308,7 +3318,7 @@ impl Connection {
             .before(Micros(self.phy.address_offset_us()))
             .before(RAMP_UP_US)
             .before(RX_MARGIN_US);
-        (enable, latest.after(widening).after(RX_TAIL_US))
+        Window { enable, latest: latest.after(widening).after(RX_TAIL_US) }
     }
 }
 

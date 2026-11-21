@@ -1694,7 +1694,7 @@ fn the_start_of_a_later_event_matches_its_window() {
         let counter = 1000_u16.wrapping_add(offset);
         let start = link.enable_at(counter);
         link.counter = counter;
-        assert_eq!(link.window().0, start);
+        assert_eq!(link.window().enable, start);
     }
     // Across the counter and time wrap.
     let mut link = latent(true);
@@ -1704,7 +1704,7 @@ fn the_start_of_a_later_event_matches_its_window() {
         let counter = link.anchor_counter.wrapping_add(offset);
         let start = link.enable_at(counter);
         link.counter = counter;
-        assert_eq!(link.window().0, start);
+        assert_eq!(link.window().enable, start);
     }
 }
 
@@ -2147,7 +2147,7 @@ fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ende
     link.stats.received = 40;
     link.stats.retx = 2;
     link.drift = (-40, Micros(60));
-    link.report((9, Micros(900)), &shared);
+    link.report(CrystalStats { late: 9, lead: Micros(900) }, &shared);
     let reported = counters.counters();
     assert_eq!(
         (reported.events, reported.skipped, reported.missed, reported.crc_errors, reported.received),
@@ -2159,11 +2159,11 @@ fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ende
     // largest of the link.
     assert_eq!(link.drift, NO_DRIFT);
     link.drift = (25, Micros(50));
-    link.report((9, Micros(898)), &shared);
+    link.report(CrystalStats { late: 9, lead: Micros(898) }, &shared);
     assert_eq!((counters.counters().drift_us, counters.counters().widening_us), (-40, 60));
     // The end counts the drift since the last report too.
     link.drift = (70, Micros(80));
-    link.publish_counters((10, Micros(998)), Ended::Lost.link_end(), &shared);
+    link.publish_counters(CrystalStats { late: 10, lead: Micros(998) }, Ended::Lost.link_end(), &shared);
     let ended = counters.counters();
     assert_eq!((ended.drift_us, ended.widening_us, ended.late_crystal, ended.crystal_lead_us), (70, 80, 3, 998));
     assert_eq!(ended.end, Some(End::Timeout));

@@ -73,7 +73,7 @@ static TEMPERATURE_READY: AtomicWaker = AtomicWaker::new();
 /// Time after which the crystal is started again when it does not run.
 const CRYSTAL_RETRY_US: u32 = 2000;
 /// Time the high frequency crystal gets to start before TIMER0 restarts, at
-/// first. It then follows the crystal: see [`Clock::lead`].
+/// first. It then follows the crystal: see [`CrystalStats::lead`].
 const CRYSTAL_LEAD_US: Micros = Micros(chip::CRYSTAL_LEAD_US);
 /// Bounds of the crystal lead time.
 const CRYSTAL_LEAD_RANGE_US: (Micros, Micros) = {
@@ -222,6 +222,19 @@ impl Micros {
     #[inline]
     #[must_use = "the duration is only computed"]
     pub(crate) const fn wrapping_mul(self, count: u32) -> Self { Self(self.0.wrapping_mul(count)) }
+}
+
+/// The crystal's restarts as the clock counts them: how many found it late,
+/// and the lead time it currently gets.
+#[derive(Clone, Copy)]
+pub(crate) struct CrystalStats {
+    /// Restarts at which the crystal was not running yet.
+    pub late: u32,
+    /// Time the crystal currently gets to start before an event. It shrinks
+    /// by 2 us while the crystal runs at least 100 us before TIMER0
+    /// restarts and grows by 100 us when it was late, within 300 to 1500 us,
+    /// or to 2500 us on the nRF51.
+    pub lead: Micros,
 }
 
 /// Free-running 32-bit microsecond time. Times wrap after 71 minutes, so
@@ -397,6 +410,11 @@ impl<'peripherals> Clock<'peripherals> {
         });
     }
 
+    /// The crystal's late restarts and its current lead time.
+    #[inline]
+    #[must_use = "the statistics are only read"]
+    pub(crate) const fn crystal(&self) -> CrystalStats { CrystalStats { late: self.late, lead: self.lead } }
+
     /// Time of the last packet end.
     #[inline]
     #[must_use = "the time is only read"]
@@ -498,14 +516,6 @@ impl<'peripherals> Clock<'peripherals> {
     #[inline]
     #[must_use = "the count is only read"]
     pub const fn late(&self) -> u32 { self.late }
-
-    /// Time the crystal currently gets to start before an event. It shrinks
-    /// by 2 us while the crystal runs at least 100 us before TIMER0
-    /// restarts and grows by 100 us when it was late, within 300 to 1500 us,
-    /// or to 2500 us on the nRF51.
-    #[inline]
-    #[must_use = "the lead time is only read"]
-    pub(crate) const fn lead(&self) -> Micros { self.lead }
 
     /// Sets up the timer, the RTC and the capture channels, for the default
     /// clock sources of [`Config`]. The clock starts paused.
