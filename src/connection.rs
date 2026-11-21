@@ -20,6 +20,8 @@ use crate::{
         ACL_MAX,
         AclOut,
         ConnectionParams,
+        Counters,
+        End,
         Event,
         LATENCY_HOLD_EVENTS,
         LATENCY_HOLD_START_US,
@@ -248,6 +250,20 @@ pub enum Ended {
     Reset,
     /// The central terminated the connection with this error code.
     Terminated(u8),
+}
+
+impl Ended {
+    /// How the link ended as [`Counters::end`] gives it, `None` after a
+    /// reset.
+    pub(crate) const fn link_end(self) -> Option<End> {
+        match self {
+            Self::Error(code) => Some(End::Error(code)),
+            Self::Local(code) => Some(End::Local(code)),
+            Self::Lost => Some(End::Timeout),
+            Self::Reset => None,
+            Self::Terminated(code) => Some(End::Remote(code)),
+        }
+    }
 }
 
 /// Counters of a connection.
@@ -771,6 +787,8 @@ pub struct Connection {
     /// the last report, and the window widening it was received with, in
     /// microseconds.
     drift:                  (i32, u32),
+    /// The same since the start of the link, up to the last report.
+    drift_max:              (i32, u32),
     /// Link encryption.
     encryption:             Encryption,
     /// Security notification retained until the host event queue has room.
@@ -802,6 +820,8 @@ pub struct Connection {
     /// Whether our last answer was in place only after the radio started
     /// sending it: a missing acknowledgement that follows is ours.
     late_answer:            bool = false,
+    /// Crystal restarts the clock had counted when the link started.
+    late_start:             u32 = 0,
     /// Peripheral latency in events.
     latency:                u16,
     /// Data length extension state.
@@ -2272,6 +2292,7 @@ impl Connection {
             central_features: None,
             channel_update: None,
             drift: NO_DRIFT,
+            drift_max: NO_DRIFT,
             hopping: if request.csa2 { Hopping::csa2(request.access_address) } else { Hopping::new(request.hop) },
             encryption: Encryption {
                 iv:         [0; 8],
@@ -2596,6 +2617,30 @@ impl Connection {
         self.log_trace();
     }
 
+    /// Tells the host the link's counters ([`crate::link::Link::counters`]),
+    /// with the crystal's restarts `late` as the clock counts them and its
+    /// `lead`, and how the link ended once it did. The drift since the last
+    /// report counts towards the largest.
+    fn publish_counters(&mut self, (late, lead): (u32, u32), end: Option<End>, shared: &Shared) {
+        if self.drift.0.unsigned_abs() > self.drift_max.0.unsigned_abs() {
+            self.drift_max = self.drift;
+        }
+        let (drift_us, widening_us) = self.drift_max;
+        shared.set_counters(Counters {
+            crc_errors: self.stats.crc_errors,
+            crystal_lead_us: lead,
+            drift_us,
+            end,
+            events: self.stats.events,
+            late_crystal: late.wrapping_sub(self.late_start),
+            missed: self.stats.missed,
+            received: self.stats.received,
+            retransmissions: self.stats.retx,
+            skipped: self.stats.skipped,
+            widening_us,
+        });
+    }
+
     /// Tells the host when the radio starts for the event the link layer is
     /// to listen at, at `start` on its clock, and by when data has to be
     /// queued to go out then ([`crate::link::Link::next_connection_event`]).
@@ -2607,8 +2652,9 @@ impl Connection {
         shared.set_next_event(embassy_time::Instant::now(), ahead, queue_lead(clock.lead()), self.interval);
     }
 
-    /// Logs the counters since the last call.
-    fn report(&mut self, (late, lead): (u32, u32)) {
+    /// Logs the counters since the last call and tells the host the link's
+    /// counters.
+    fn report(&mut self, (late, lead): (u32, u32), shared: &Shared) {
         let (last, last_late) = self.reported;
         info!(
             "10 s: {} events, {} skipped, {} missed, {} crc errors, {} packets, {} late crystal (lead {} us), {} dBm, drift {} of +-{} us",
@@ -2639,6 +2685,7 @@ impl Connection {
             self.stats.fallback.wrapping_sub(last.fallback),
             self.peaks.prepare
         );
+        self.publish_counters((late, lead), None, shared);
         self.peaks = Peaks::default();
         self.drift = NO_DRIFT;
         self.reported = (self.stats, late);
@@ -2736,10 +2783,17 @@ impl Connection {
         shared: &Shared,
     ) -> (Ended, Stats) {
         let entropy = Prefetch::new();
-        match select(self.run_events(radio, clock, rx, shared, &entropy), entropy.run()).await {
+        // The crystal's late restarts count from here, also in the log.
+        self.late_start = clock.late();
+        self.reported.1 = self.late_start;
+        let (ended, stats) = match select(self.run_events(radio, clock, rx, shared, &entropy), entropy.run()).await {
             Either::First(result) => result,
             Either::Second(never) => never,
+        };
+        if let Some(end) = ended.link_end() {
+            self.publish_counters((clock.late(), clock.lead()), Some(end), shared);
         }
+        (ended, stats)
     }
 
     /// Schedules radio events independently of entropy collection progress.
@@ -2861,7 +2915,7 @@ impl Connection {
                 break ended;
             }
             if reached(clock.now(), self.report_at) {
-                self.report((clock.late(), clock.lead()));
+                self.report((clock.late(), clock.lead()), shared);
             }
             self.counter = self.counter.wrapping_add(1);
         };

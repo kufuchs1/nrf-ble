@@ -2105,3 +2105,50 @@ fn the_host_learns_how_long_before_an_event_its_data_is_due() {
         }
     }
 }
+
+#[test]
+fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ended() {
+    let shared = Shared::new();
+    let counters = Link::new(&shared);
+    let mut link = connection();
+    // The clock had counted 7 late crystals before the link.
+    link.late_start = 7;
+    link.reported.1 = 7;
+    link.stats.events = 1200;
+    link.stats.skipped = 300;
+    link.stats.missed = 12;
+    link.stats.crc_errors = 3;
+    link.stats.received = 40;
+    link.stats.retx = 2;
+    link.drift = (-40, 60);
+    link.report((9, 900), &shared);
+    let reported = counters.counters();
+    assert_eq!(
+        (reported.events, reported.skipped, reported.missed, reported.crc_errors, reported.received),
+        (1200, 300, 12, 3, 40)
+    );
+    assert_eq!((reported.retransmissions, reported.late_crystal, reported.crystal_lead_us), (2, 2, 900));
+    assert_eq!((reported.drift_us, reported.widening_us, reported.end), (-40, 60, None));
+    // The log's drift starts again at each report; the host's stays the
+    // largest of the link.
+    assert_eq!(link.drift, NO_DRIFT);
+    link.drift = (25, 50);
+    link.report((9, 898), &shared);
+    assert_eq!((counters.counters().drift_us, counters.counters().widening_us), (-40, 60));
+    // The end counts the drift since the last report too.
+    link.drift = (70, 80);
+    link.publish_counters((10, 998), Ended::Lost.link_end(), &shared);
+    let ended = counters.counters();
+    assert_eq!((ended.drift_us, ended.widening_us, ended.late_crystal, ended.crystal_lead_us), (70, 80, 3, 998));
+    assert_eq!(ended.end, Some(End::Timeout));
+    assert_eq!(ended.end.map(End::reason), Some(0x08));
+}
+
+#[test]
+fn each_end_but_a_reset_names_how_the_link_ended() {
+    assert_eq!(Ended::Lost.link_end(), Some(End::Timeout));
+    assert_eq!(Ended::Terminated(0x13).link_end(), Some(End::Remote(0x13)));
+    assert_eq!(Ended::Local(0x13).link_end(), Some(End::Local(0x13)));
+    assert_eq!(Ended::Error(0x22).link_end(), Some(End::Error(0x22)));
+    assert_eq!(Ended::Reset.link_end(), None);
+}

@@ -61,6 +61,16 @@
 //! before and queue its report in time, rather than at a random point of the
 //! interval.
 //!
+//! # Counters of a link
+//!
+//! [`Link::counters`] gives the link layer's counters of the current link, or
+//! of the last one with how it ended ([`Counters`], [`End`]), for a firmware
+//! that keeps them without a log: connection events, skipped and missed
+//! events, CRC errors, retransmissions, late crystal starts with the crystal's
+//! current lead, and the largest anchor drift with its window widening. They
+//! come from the counters of the 10 s statistics log, which the link layer
+//! copies under the lock every 10 s and when the link ends.
+//!
 //! # Peripheral latency
 //!
 //! The link layer skips connection events as the peripheral latency allows
@@ -157,6 +167,10 @@ const QUERY_CONNECTION_UPDATE: u8 = 0x08;
 /// Host query bit: a central's connection parameter request the host is
 /// asked about.
 const QUERY_REMOTE_PARAMETERS: u8 = 0x10;
+/// Disconnection reason: connection timeout.
+const REASON_TIMEOUT: u8 = 0x08;
+/// Disconnection reason: connection terminated by local host.
+const REASON_LOCAL_HOST: u8 = 0x16;
 
 /// Why the link layer refused a request of the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,6 +289,100 @@ pub struct Info {
     /// `TxAdd` of the connection request). Pairing uses this address and
     /// [`Self::local`], not the identities.
     pub peer:             Peer,
+}
+
+/// How a link ended, as [`Counters::end`] gives it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum End {
+    /// The link layer ended the link with this error code, such as 0x22
+    /// when the central did not answer a procedure in time, 0x28 for an
+    /// instant that passed, 0x3D for a packet with a bad MIC or 0x03 when
+    /// the host's event queue overflowed.
+    Error(u8),
+    /// The host terminated the link ([`Link::disconnect`]), with the code it
+    /// sent to the central.
+    Local(u8),
+    /// The central terminated the link with this error code.
+    Remote(u8),
+    /// The supervision timeout expired: no packet from the central for that
+    /// long.
+    Timeout,
+}
+
+impl End {
+    /// The reason [`Event::Disconnected`] carries for this end: the code of
+    /// [`Self::Error`] and [`Self::Remote`], 0x16 for [`Self::Local`] and
+    /// 0x08 for [`Self::Timeout`].
+    #[inline]
+    #[must_use = "the reason is only computed"]
+    pub const fn reason(self) -> u8 {
+        match self {
+            Self::Error(code) | Self::Remote(code) => code,
+            Self::Local(_) => REASON_LOCAL_HOST,
+            Self::Timeout => REASON_TIMEOUT,
+        }
+    }
+}
+
+/// The link layer's counters of the current or the last link: see
+/// [`Link::counters`]. Each count runs from the start of the link and wraps.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub struct Counters {
+    /// Packets received with a CRC error.
+    pub crc_errors:      u32,
+    /// The time the crystal currently gets to start before an event, in
+    /// microseconds: it grows by 100 us after each late start and shrinks by
+    /// 2 us after each early one, within the chip's bounds.
+    pub crystal_lead_us: u32,
+    /// The largest deviation of the central's anchor from where the link
+    /// layer expected it, in microseconds, positive for a late anchor: the
+    /// sum of both sleep clocks' drift, which [`Self::widening_us`] has to
+    /// cover. Only anchors heard count.
+    pub drift_us:        i32,
+    /// How the link ended, `None` while it runs.
+    pub end:             Option<End>,
+    /// Connection events the link layer listened at.
+    pub events:          u32,
+    /// Times the crystal was not running when the link layer needed it: at
+    /// the clock's restart before an event, despite
+    /// [`Self::crystal_lead_us`], or stopped while in use.
+    pub late_crystal:    u32,
+    /// Events the link layer listened at without hearing the central.
+    pub missed:          u32,
+    /// New data PDUs received.
+    pub received:        u32,
+    /// Packets the central sent again that the link layer had taken: the
+    /// central missed its answer, or the answer came late.
+    pub retransmissions: u32,
+    /// Events not listened at: skipped with the peripheral latency, passed
+    /// during a flash operation, or passed while a crystal that had stopped
+    /// started again.
+    pub skipped:         u32,
+    /// The window widening the anchor of [`Self::drift_us`] was received
+    /// with, in microseconds: the room the link layer allowed for the drift
+    /// at that event.
+    pub widening_us:     u32,
+}
+
+impl Counters {
+    /// No link yet, or a new one before its first report.
+    const NONE: Self = Self {
+        crc_errors:      0,
+        crystal_lead_us: 0,
+        drift_us:        0,
+        end:             None,
+        events:          0,
+        late_crystal:    0,
+        missed:          0,
+        received:        0,
+        retransmissions: 0,
+        skipped:         0,
+        widening_us:     0,
+    };
 }
 
 /// When the link layer listens next on a link: see
@@ -610,6 +718,8 @@ struct HostState {
     adv_enabled:      bool,
     /// Whether a connection exists.
     connected:        bool,
+    /// Counters of the current or the last link.
+    counters:         Counters,
     /// Changes at each link boundary so requests cannot cross links.
     epoch:            u32,
     /// What the host learns about the current link.
@@ -680,6 +790,7 @@ impl HostState {
             adv: AdvSettings::new(),
             adv_enabled: false,
             connected: false,
+            counters: Counters::NONE,
             epoch,
             info: None,
             ltk_pending: false,
@@ -1099,6 +1210,12 @@ impl Shared {
         }
     }
 
+    /// Records the counters of the link, every 10 s while it runs and once
+    /// when it ended. One copy under the lock.
+    pub(crate) fn set_counters(&self, counters: Counters) {
+        self.state.lock(|cell| cell.borrow_mut().counters = counters);
+    }
+
     /// Records what the host learns about the link that just started, from
     /// the central's address on the air, our own, the parameters, the
     /// central's clock accuracy and whether the request answered directed
@@ -1113,6 +1230,7 @@ impl Shared {
             let mut state = cell.borrow_mut();
             let epoch = Epoch(state.epoch);
             state.info = Some(Info { central_accuracy, directed, epoch, identity, local, params, peer });
+            state.counters = Counters::NONE;
             epoch
         })
     }
@@ -1456,6 +1574,16 @@ impl<'shared> Link<'shared> {
         self.shared.state.lock(|cell| cell.borrow_mut().forget_keys());
         Ok(())
     }
+
+    /// The link layer's counters of the current link, as of its last 10 s
+    /// report, or those of the last link once it ended, with how it ended:
+    /// they stay until the next link starts or a reset. Read them on
+    /// [`Event::Disconnected`] to keep them. The link layer copies them under
+    /// the lock every 10 s and at the end of the link, from the counters it
+    /// keeps for its statistics log anyway.
+    #[inline]
+    #[must_use = "the counters are only read"]
+    pub fn counters(&self) -> Counters { self.shared.state.lock(|cell| cell.borrow().counters) }
 
     /// Ends the link with `reason`: authentication failure (0x05), remote
     /// user (0x13), low resources (0x14), power off (0x15), unsupported
