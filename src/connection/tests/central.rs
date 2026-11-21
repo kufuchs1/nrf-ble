@@ -262,10 +262,10 @@ impl Sim {
             let sealed_len = if encrypted && !payload.is_empty() { payload.len() + 4 } else { payload.len() };
             self.rx.0[1] = u8::try_from(sealed_len).unwrap();
             self.rx.0[3..3 + payload.len()].copy_from_slice(&payload);
-            self.link.rx_plain.fill(0);
-            self.link.rx_plain[0] = header;
-            self.link.rx_plain[1] = u8::try_from(payload.len()).unwrap();
-            self.link.rx_plain[3..3 + payload.len()].copy_from_slice(&payload);
+            self.link.rx_plain.bytes_mut().fill(0);
+            self.link.rx_plain.bytes_mut()[0] = header;
+            self.link.rx_plain.bytes_mut()[1] = u8::try_from(payload.len()).unwrap();
+            self.link.rx_plain.bytes_mut()[3..3 + payload.len()].copy_from_slice(&payload);
             // The radio points at the PDU on the air from the access address.
             let latched_slot = self.link.cur;
             let latched = *self.link.current_mut().on_air();

@@ -5,7 +5,7 @@
 //! keeps the time on the low frequency clock and restarts TIMER0 at an exact
 //! tick before the next event.
 
-use crate::{chip, sleep};
+use crate::{chip, radio::Radio, sleep};
 #[cfg(feature = "nrf51")]
 use core::future::pending;
 use core::{
@@ -474,13 +474,18 @@ impl<'peripherals> Clock<'peripherals> {
         self.paused = Some((tick, time));
     }
 
-    /// Starts receiving at `at`. Returns how long before `at` the start was
-    /// programmed, or `None` if `at` is not in the future.
-    pub(crate) fn receive_ahead(&mut self, at: u32) -> Option<u32> { self.start_at(at, PPI_RXEN) }
-
-    /// Starts receiving at `at`. Returns false if `at` is not in the future.
-    #[inline]
-    pub fn receive_at(&mut self, at: u32) -> bool { self.receive_ahead(at).is_some() }
+    /// Starts receiving at `at` into the buffer `radio` points at. Returns
+    /// how long before `at` the start was programmed, or `None` if `at` is
+    /// not in the future.
+    ///
+    /// # Panics
+    ///
+    /// If `radio` points at a buffer too short for the packet layout, as
+    /// for [`Radio::receive`].
+    pub(crate) fn receive_ahead(&mut self, radio: &Radio<'_>, at: u32) -> Option<u32> {
+        radio.check_receivable();
+        self.start_at(at, PPI_RXEN)
+    }
 
     /// Restarts TIMER0 as soon as the crystal can run.
     ///
@@ -647,7 +652,7 @@ impl<'peripherals> Clock<'peripherals> {
         CLOCK.intenclr().write(|w| w.set_hfclkstarted(true));
     }
 
-    /// Sleeps until the radio start of [`Self::receive_at`] or
+    /// Sleeps until the radio start of a reception or of
     /// [`Self::transmit_at`] fired, which frees its compare for a deadline.
     #[inline]
     pub fn wait_started(&mut self) {

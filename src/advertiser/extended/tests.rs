@@ -281,8 +281,8 @@ fn an_event_s_pdus_point_to_the_auxiliary_packet_on_its_channel_and_phy() {
     }
     // The auxiliary packet in its buffer, which also takes the request.
     let auxiliary = auxiliary(&settings);
-    assert_eq!(pdus.auxiliary[..auxiliary.as_bytes().len()], *auxiliary.as_bytes());
-    assert_eq!(pdus.auxiliary.len(), 2 + usize::from(crate::chip::ADV_MAXLEN));
+    assert_eq!(pdus.auxiliary.0[..auxiliary.as_bytes().len()], *auxiliary.as_bytes());
+    assert_eq!(pdus.auxiliary.0.len(), 2 + usize::from(crate::chip::ADV_MAXLEN));
     // Another event, another channel in time: CSA #2 over the 37 channels.
     assert!((0..8).any(|counter| Pdus::new(&settings, counter).aux_channel != pdus.aux_channel));
 }

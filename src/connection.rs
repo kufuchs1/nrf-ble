@@ -36,18 +36,7 @@ use crate::{
         Shared,
     },
     maintenance,
-    pdu::{
-        BUFFER_LEN,
-        ConnectInd,
-        LLID_MASK,
-        Llid,
-        NESN,
-        SN,
-        concat_into,
-        field,
-        valid_channel_map,
-        valid_connection_parameters,
-    },
+    pdu::{ConnectInd, LLID_MASK, Llid, NESN, SN, concat_into, field, valid_channel_map, valid_connection_parameters},
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
     radio::{PacketBuffer, Phy, RX_READY_US, Radio, TURNAROUND_IN_ANSWER, Turnaround},
 };
@@ -893,7 +882,7 @@ pub struct Connection {
     /// Room for new packets from the central in the coming event.
     room:                   Room,
     /// Decrypted received PDU.
-    rx_plain:               [u8; BUFFER_LEN],
+    rx_plain:               crypto::Decrypted,
     /// Sum of both sleep clock accuracies in ppm.
     sca_ppm:                u32,
     /// The sequence numbers both ways, and whether the received PDU is new.
@@ -1133,7 +1122,7 @@ impl Connection {
 
     /// Prepares the decryption of the next received packet, if the link is
     /// encrypted. Returns false and ends the link if the counter ran out.
-    fn arm_decryption(&mut self, rx: &mut PacketBuffer) -> bool {
+    fn arm_decryption(&mut self, rx: &PacketBuffer) -> bool {
         if !self.encryption.rx_on {
             return true;
         }
@@ -1141,12 +1130,11 @@ impl Connection {
             self.abort = Some(ERROR_MIC_FAILURE);
             return false;
         }
-        let pointers = (rx.0.as_mut_ptr(), self.rx_plain.as_mut_ptr());
-        let scratch = &mut self.encryption.scratch;
+        let (config, scratch) = (&self.encryption.rx_config, &mut self.encryption.scratch);
         // SAFETY: the configuration, scratch and both buffers live in this
         // connection or are borrowed for the exchange, which ends the
         // decryption with `wait_decrypted`, `stop` or `disarm`.
-        unsafe { crypto::arm_decrypt(&self.encryption.rx_config, pointers, scratch, self.phy) }
+        unsafe { crypto::arm_decrypt(config, rx, &mut self.rx_plain, scratch, self.phy) }
         true
     }
 
@@ -1649,7 +1637,7 @@ impl Connection {
         if !self.arm_decryption(rx) {
             return None;
         }
-        let Some(ahead) = clock.receive_ahead(enable) else {
+        let Some(ahead) = clock.receive_ahead(radio, enable) else {
             clock.cancel_start();
             radio.disable();
             crypto::disarm();
@@ -1808,7 +1796,7 @@ impl Connection {
     fn finish(&mut self, radio: &mut Radio<'_>) {
         crypto::disable();
         self.encryption.wipe();
-        crypto::wipe(&mut self.rx_plain);
+        crypto::wipe(self.rx_plain.bytes_mut());
         for held in self.pending.items_mut() {
             crypto::wipe(&mut held.bytes);
         }
@@ -2381,7 +2369,7 @@ impl Connection {
                 STATUS_SUCCESS,
                 ConnectionParams::new(request.interval, request.latency, request.timeout),
             ),
-            rx_plain: [0; BUFFER_LEN],
+            rx_plain: crypto::Decrypted::ZERO,
             sca_ppm: request.sca_ppm.saturating_add(chip::sleep_clock_ppm()),
             stats: Stats::default(),
             terminate: None,
@@ -2583,13 +2571,13 @@ impl Connection {
             self.next_ready = false;
             return;
         }
-        let pointers = (slot.plain.0.as_ptr(), slot.sealed.0.as_mut_ptr());
+        let (config, scratch) = (&self.encryption.tx_config, &mut self.encryption.scratch);
         // SAFETY: the configuration, scratch and both buffers belong to this
-        // connection, the CCM is done with them when `seal` returns, and no
-        // decryption is armed: between events, or while our answer goes out
-        // after the received packet was decrypted.
-        let sealed =
-            unsafe { crypto::seal(&self.encryption.tx_config, pointers, &mut self.encryption.scratch, self.tx_phy) };
+        // connection, the CCM is done with them when `seal` returns, the PDU
+        // with its MIC fits a slot, and no decryption is armed: between
+        // events, or while our answer goes out after the received packet was
+        // decrypted.
+        let sealed = unsafe { crypto::seal(config, &slot.plain, &mut slot.sealed, scratch, self.tx_phy) };
         if !sealed {
             self.abort = Some(ERROR_HARDWARE_FAILURE);
             self.next_ready = false;
@@ -3219,7 +3207,7 @@ impl Connection {
         // Empty PDUs have no MIC and need not produce a CCM output packet.
         let plain = encrypted && rx.0[1] != 0;
         let (header, len, opcode) = {
-            let source = if plain { self.rx_plain.as_slice() } else { rx.0.as_slice() };
+            let source = if plain { self.rx_plain.bytes().as_slice() } else { rx.0.as_slice() };
             let byte = |index: usize| source.get(index).copied().unwrap_or_default();
             (byte(0), byte(1), byte(DATA_HEADER_LEN))
         };
@@ -3231,7 +3219,7 @@ impl Connection {
         if rx.0[1] != 0 && !ping {
             self.hold_latency_from(self.last_valid);
         }
-        let source = if plain { self.rx_plain.as_slice() } else { rx.0.as_slice() };
+        let source = if plain { self.rx_plain.bytes().as_slice() } else { rx.0.as_slice() };
         if encrypted && len != 0 {
             self.encryption.rx_counter = self.encryption.rx_counter.saturating_add(1);
         }

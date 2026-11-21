@@ -182,14 +182,15 @@ pub struct Radio<'peripherals> {
     /// PHY the turnarounds are timed for.
     #[cfg(feature = "nrf52832")]
     phy:         Phy,
-    /// Size of the buffer the radio points at, 0 for a PDU only to send.
+    /// Size of the buffer the radio points at, 0 for a PDU only to send or
+    /// once the radio is disabled.
     pointed:     usize,
 }
 
 impl<'peripherals> Radio<'peripherals> {
     /// Panics unless the radio points at a buffer that takes the longest
     /// packet the layout lets it write, before a reception may start.
-    fn check_receivable(&self) {
+    pub(crate) fn check_receivable(&self) {
         assert!(self.pointed >= self.longest, "a reception into a buffer too short for it");
     }
 
@@ -221,6 +222,8 @@ impl<'peripherals> Radio<'peripherals> {
     pub fn crc_ok(&self) -> bool { REGS.crcstatus().read().crcstatus() == Crcstatus::CrcOk }
 
     /// Stops sending or receiving and waits until the radio is disabled.
+    /// The radio then points at no buffer a reception may take, until it is
+    /// given one again.
     #[inline]
     pub fn disable(&mut self) {
         // The turnaround goes first: on the nRF51 the disabled event that
@@ -233,6 +236,10 @@ impl<'peripherals> Radio<'peripherals> {
             Self::sleep_on(|w| w.set_disabled(true), || self.is_disabled());
         }
         REGS.events_disabled().write_value(0);
+        // Not in `wait_disabled` or `wait_stopped`: on the nRF52832 a
+        // turnaround to receive enables the radio again after it was
+        // disabled.
+        self.pointed = 0;
         compiler_fence(Ordering::SeqCst);
     }
 

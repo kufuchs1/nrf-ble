@@ -1,7 +1,10 @@
 //! Regression tests for the actual link state machine, without radio MMIO.
 
 use super::*;
-use crate::link::{Epoch, Link, ParamRange};
+use crate::{
+    link::{Epoch, Link, ParamRange},
+    pdu::BUFFER_LEN,
+};
 
 /// The answer path against a central that follows the specification.
 mod central;
@@ -366,7 +369,7 @@ fn encrypted_payload_cannot_omit_mic() {
 fn empty_packets_use_raw_header_instead_of_stale_ccm_output() {
     let mut link = connection();
     link.encryption.rx_on = true;
-    link.rx_plain.fill(0xFF);
+    link.rx_plain.bytes_mut().fill(0xFF);
     let mut rx = PacketBuffer::ZERO;
     rx.0[0] = Llid::Continuation.bits();
     let shared = Shared::new();
@@ -1258,7 +1261,7 @@ fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
     let mut rx = PacketBuffer::ZERO;
     rx.0[0] = Llid::Start.bits();
     rx.0[1] = 5;
-    link.rx_plain[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
+    link.rx_plain.bytes_mut()[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
     assert_eq!(link.receive(rx.0[0], 5, true, 999, &shared), Some(true));
     link.stash(&rx, true, &shared);
     assert_eq!(link.encryption.rx_counter, 1);
@@ -1844,7 +1847,7 @@ fn encrypted_data_is_marked_before_the_host_learns_of_the_encryption() {
     let mut rx = PacketBuffer::ZERO;
     rx.0[0] = Llid::Start.bits();
     rx.0[1] = 5;
-    link.rx_plain[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
+    link.rx_plain.bytes_mut()[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
     assert_eq!(link.receive(rx.0[0], 5, true, 999, &full), Some(true));
     link.stash(&rx, true, &full);
     let acl = full.take_acl_in().unwrap();
