@@ -1,10 +1,13 @@
 //! Regression tests for the actual link state machine, without radio MMIO.
 
+extern crate std;
+
 use super::*;
 use crate::{
     link::{Epoch, Link, ParamRange},
     pdu::BUFFER_LEN,
 };
+use std::{vec, vec::Vec};
 
 /// The answer path against a central that follows the specification.
 mod central;
@@ -186,7 +189,7 @@ fn unanswered_control_procedures_end_the_link_despite_keepalives() {
 fn keepalive_packets_cannot_extend_a_local_disconnect_deadline() {
     let mut link = connection();
     link.establishment_deadline = None;
-    link.terminate = Some((0x13, false));
+    link.terminate = Some((0x13, Termination::Queued));
     link.terminate_deadline = Some(At(1000));
     link.last_valid = At(999);
     assert!(link.ended(At(999)).is_none());
@@ -524,6 +527,128 @@ fn a_pdu_loaded_in_plain_is_never_sealed_with_an_unassigned_counter() {
     link.load_next(&Shared::new());
     assert!(link.current().encrypted);
     assert_eq!(link.encryption.tx_counter, 1);
+}
+
+#[test]
+fn a_failed_seal_ends_the_link_with_the_pdu_unsent_and_its_counter_unused() {
+    let shared = Shared::new();
+    shared.set_connected(true);
+    for acl in [false, true] {
+        let mut link = encrypted();
+        link.encryption.tx_counter = 5;
+        if acl {
+            assert!(shared.queue_acl_for_test(&[7; 20]));
+        } else {
+            link.enqueue(Llid::Control, &[OP_PING_RSP]);
+        }
+        crypto::SEAL_FAILS.set(true);
+        link.prepare_next(&shared);
+        crypto::SEAL_FAILS.set(false);
+        assert_eq!(link.abort, Some(ERROR_HARDWARE_FAILURE));
+        assert!(!link.next_ready);
+        // The central's acknowledgement in the same event sends an empty
+        // PDU in its place.
+        link.acknowledge(NESN, &shared);
+        assert!(link.tx_kind == TxKind::Empty);
+        assert!(!link.current().encrypted);
+        assert_eq!(link.current().plain.0[1], 0);
+        assert_eq!(link.encryption.tx_counter, 5);
+        if acl {
+            assert_eq!(link.acl.as_ref().map(|current| current.1), Some(0));
+        } else {
+            assert_eq!(link.queue.front().map(|queued| queued.data[0]), Some(OP_PING_RSP));
+        }
+    }
+}
+
+/// Queued PDUs as `load_next` sends them until the queue is empty: their
+/// first payload octet and whether each went out encrypted.
+fn send_queue(link: &mut Connection, shared: &Shared) -> Vec<(u8, bool)> {
+    let mut sent = Vec::new();
+    while !link.queue.is_empty() {
+        link.load_next(shared);
+        sent.push((link.current().plain.0[DATA_HEADER_LEN], link.current().encrypted));
+    }
+    sent
+}
+
+#[test]
+fn a_parameter_answer_waits_until_encryption_has_started() {
+    for host_decides in [false, true] {
+        let shared = if host_decides { Shared::with_all_events() } else { Shared::new() };
+        shared.set_connected(true);
+        let mut link = connection();
+        link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), false);
+        assert!(link.remote_request.is_some());
+        if host_decides {
+            link.drive_remote_request(At(0), &shared);
+            assert_eq!(
+                Link::new(&shared).reply_params(Epoch::for_test(1), Ok(ParamRange::new(12, 24, 4, 600))),
+                Ok(())
+            );
+        }
+        // Encryption starts before the answer went out.
+        link.encryption.phase = Phase::Starting;
+        link.enqueue(Llid::Control, &[OP_START_ENC_REQ]);
+        link.drive_remote_request(At(10), &shared);
+        assert_eq!(send_queue(&mut link, &shared), vec![(OP_START_ENC_REQ, false)]);
+        link.exchanged(At(1000));
+        assert!(link.encryption.phase == Phase::AwaitingStartResponse);
+        // The central decrypts our PDUs now, which are still plain: the
+        // answer still waits, also past the host's deadline.
+        link.drive_remote_request(At(HOST_REPLY_US.0 + 10), &shared);
+        assert!(link.queue.is_empty());
+        link.handle_control(&[OP_START_ENC_RSP], true);
+        link.drive_remote_request(At(HOST_REPLY_US.0 + 10), &shared);
+        assert!(link.remote_request.is_none());
+        assert_eq!(send_queue(&mut link, &shared), vec![(OP_START_ENC_RSP, true), (OP_CONNECTION_PARAM_RSP, true)]);
+        assert_eq!(link.abort, None);
+    }
+}
+
+#[test]
+fn a_termination_waits_while_the_central_would_misread_it_and_its_deadline_runs() {
+    for (phase, settled) in [
+        (Phase::Starting, Phase::Encrypted),
+        (Phase::AwaitingStartResponse, Phase::Encrypted),
+        (Phase::Pausing, Phase::Paused),
+        (Phase::AwaitingPauseResponse, Phase::Paused),
+    ] {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        let prefetch = Prefetch::new();
+        let mut link = connection();
+        link.establishment_deadline = None;
+        link.encryption.phase = phase;
+        assert_eq!(Link::new(&shared).disconnect(Epoch::for_test(1), 0x13), Ok(()));
+        link.drive_host(At(0), &shared, &prefetch);
+        assert!(link.queue.is_empty());
+        assert!(link.terminate == Some((0x13, Termination::Waiting)));
+        // A procedure that stalls ends the link at the termination's
+        // deadline, without it.
+        let deadline = link.terminate_deadline.unwrap();
+        assert!(link.ended(deadline.before(Micros(1))).is_none());
+        assert!(matches!(link.ended(deadline), Some(Ended::Local(0x13))));
+        // Once the procedure is done the termination goes out, once, as
+        // the central reads it.
+        link.encryption.phase = settled;
+        link.drive_host(At(10), &shared, &prefetch);
+        link.drive_host(At(20), &shared, &prefetch);
+        assert_eq!(send_queue(&mut link, &shared), vec![(OP_TERMINATE_IND, settled.tx_on())]);
+        assert!(link.tx_kind == TxKind::Terminate);
+        assert!(link.terminate == Some((0x13, Termination::Queued)));
+    }
+    // Before our start request is queued both ways are plain: the
+    // termination goes out at once, ahead of it.
+    for phase in [Phase::Plain, Phase::AwaitingKey(KeyLookup { ediv: [0; 2], rand: [0; 8] }, true)] {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        let mut link = connection();
+        link.encryption.phase = phase;
+        assert_eq!(Link::new(&shared).disconnect(Epoch::for_test(1), 0x13), Ok(()));
+        link.drive_host(At(0), &shared, &Prefetch::new());
+        assert_eq!(link.queue.front().map(|queued| queued.data[..2] == [OP_TERMINATE_IND, 0x13]), Some(true));
+    }
 }
 
 #[test]

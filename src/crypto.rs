@@ -10,6 +10,8 @@
 //! cannot start one of its own in between, and retries with interrupts on, so
 //! a radio event that aborted it is not delayed.
 
+#[cfg(test)] extern crate std;
+
 use crate::{
     chip,
     pdu::BUFFER_LEN,
@@ -40,6 +42,9 @@ const COUNTER_END: usize = COUNTER_OFFSET.strict_add(COUNTER_LEN);
 const DIRECTION_OFFSET: usize = 24;
 /// Offset of the IV in a CCM configuration.
 const IV_OFFSET: usize = 25;
+/// Octets of the MIC the CCM appends to an encrypted payload, and adds to
+/// its length.
+const MIC_LEN: u8 = 4;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
 pub(crate) const PPI_CRYPT: usize = 25;
 /// Scratch space for every length the CCM may take from a packet.
@@ -54,6 +59,13 @@ const _: () = {
 };
 /// The packet counter is 39 bits; the next bit belongs to the direction.
 pub(crate) const COUNTER_LIMIT: u64 = 1_u64.strict_shl(39);
+
+#[cfg(test)]
+std::thread_local! {
+    /// Whether [`seal_stand_in`] fails on this thread, as the CCM does on an
+    /// error: for the tests of a failed seal.
+    pub(crate) static SEAL_FAILS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
 
 /// A received PDU as the CCM decrypts it ([`arm_decrypt`]): header, length,
 /// the S1 byte and payload, without the MIC.
@@ -150,11 +162,17 @@ pub(crate) fn start_on_address(heard: impl Fn() -> bool) -> bool {
 /// the header it authenticates (Core, Vol 6, Part E). Returns
 /// false if the CCM failed or did not finish in time.
 ///
+/// Whatever the CCM still runs is ended first: a key stream [`arm_decrypt`]
+/// started for a packet that never came, or a decryption an access address
+/// started as the radio was disabled. Neither can then end into this
+/// operation or mix with it.
+///
 /// # Safety
 ///
 /// The CCM reads `config` and `input` and writes `output` and `scratch` by
-/// DMA until this returns. `input` must be in RAM and hold a PDU that with
-/// its MIC fits `output`. No decryption may be armed.
+/// DMA until this returns. `input` must be in RAM and hold a non-empty PDU
+/// that with its MIC fits `output`. No decryption may be armed whose packet
+/// is still to be used.
 #[inline]
 pub(crate) unsafe fn seal(
     config: &[u8; CONFIG_LEN],
@@ -171,7 +189,11 @@ pub(crate) unsafe fn seal(
     }
 }
 
-/// [`seal`] on the CCM.
+/// [`seal`] on the CCM. The CCM is stopped, disabled and enabled first, as
+/// [`arm_decrypt`] does, and its events cleared. The seal counts as complete
+/// only if its own key stream ended and its encryption ended without an
+/// error, and the CCM wrote the length with the MIC: the length octet of
+/// `output` is cleared first, so a stale `output` cannot pass for this one.
 ///
 /// # Safety
 ///
@@ -185,19 +207,32 @@ unsafe fn seal_ccm(
     phy: Phy,
 ) -> bool {
     PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
-    chip::ccm_mode(Mode::Encryption, phy);
-    set_pointers(config, input, output, scratch);
-    CCM.shorts().write(|w| w.set_endksgen_crypt(true));
+    CCM.tasks_stop().write_value(1);
+    CCM.enable().write(|w| w.set_enable(Enable::Disabled));
+    CCM.enable().write(|w| w.set_enable(Enable::Enabled));
+    CCM.shorts().write(|w| w.set_endksgen_crypt(false));
     CCM.events_endksgen().write_value(0);
     CCM.events_endcrypt().write_value(0);
     CCM.events_error().write_value(0);
+    // SAFETY: the length octet of `output`, which nothing but the CPU
+    // accesses until the CCM starts below.
+    unsafe { (&raw mut output.0[1]).write_volatile(0) }
+    chip::ccm_mode(Mode::Encryption, phy);
+    set_pointers(config, input, output, scratch);
+    CCM.shorts().write(|w| w.set_endksgen_crypt(true));
     compiler_fence(Ordering::SeqCst);
     CCM.tasks_ksgen().write_value(1);
     let mut remaining = chip::SEAL_WAIT;
     while CCM.events_endcrypt().read() == 0 && CCM.events_error().read() == 0 && remaining != 0 {
         remaining = remaining.saturating_sub(1);
     }
-    let completed = CCM.events_endcrypt().read() != 0 && CCM.events_error().read() == 0;
+    compiler_fence(Ordering::SeqCst);
+    let completed = CCM.events_endksgen().read() != 0
+        && CCM.events_endcrypt().read() != 0
+        && CCM.events_error().read() == 0
+        // SAFETY: the length octet of `output`, which the CCM wrote before
+        // its encryption ended.
+        && unsafe { (&raw const output.0[1]).read_volatile() } == input.0[1].wrapping_add(MIC_LEN);
     disarm();
     if !completed {
         stop();
@@ -210,12 +245,17 @@ unsafe fn seal_ccm(
 /// header, adds the MIC to the length, flips the payload and puts the low
 /// four octets of the packet counter where the MIC goes, so a test sees
 /// which counter sealed a PDU. Returns false if the PDU with its MIC does
-/// not fit `output`.
+/// not fit `output`, or in a test that set `SEAL_FAILS`.
 fn seal_stand_in(config: &[u8; CONFIG_LEN], input: &PacketBuffer, output: &mut PacketBuffer) -> bool {
+    #[cfg(test)]
+    if SEAL_FAILS.get() {
+        return false;
+    }
     let Some(&length) = input.0.get(1) else { return false };
     // The PDU is its header, its length octet's payload and the S1 octet.
     let plain_len = usize::from(length).saturating_add(3);
-    let (Some(plain), Some(sealed)) = (input.0.get(..plain_len), output.0.get_mut(..plain_len.saturating_add(4)))
+    let (Some(plain), Some(sealed)) =
+        (input.0.get(..plain_len), output.0.get_mut(..plain_len.saturating_add(MIC_LEN.into())))
     else {
         return false;
     };
@@ -225,7 +265,7 @@ fn seal_stand_in(config: &[u8; CONFIG_LEN], input: &PacketBuffer, output: &mut P
         return false;
     };
     *sealed_head = *head;
-    sealed_head[1] = length.wrapping_add(4);
+    sealed_head[1] = length.wrapping_add(MIC_LEN);
     let Some((sealed_payload, mic)) = sealed_rest.split_at_mut_checked(payload.len()) else { return false };
     for (target, source) in sealed_payload.iter_mut().zip(payload) {
         *target = !*source;
@@ -359,7 +399,9 @@ fn set_pointers(
     CCM.scratchptr().write_value(scratch.as_mut_ptr().addr().strict_cast());
 }
 
-/// Stops a decryption the radio started, for a packet that is not used.
+/// Stops the CCM: a decryption the radio started for a packet that is not
+/// used, or the key stream [`arm_decrypt`] started for a packet that never
+/// came.
 #[inline]
 pub(crate) fn stop() {
     CCM.tasks_stop().write_value(1);
