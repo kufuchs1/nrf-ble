@@ -219,6 +219,7 @@ impl<'peripherals> Radio<'peripherals> {
         sleep::enable();
         REGS.power().write(|w| w.set_power(true));
         chip::radio_trim();
+        chip::ram_priority();
         REGS.mode().write(|w| w.set_mode(Mode::Ble1mbit));
         chip::fast_ramp_up();
         REGS.tifs().write(|w| w.set_tifs(IFS_US));

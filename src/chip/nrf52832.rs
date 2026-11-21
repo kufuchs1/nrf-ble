@@ -24,6 +24,10 @@ const ANOMALY_182_BIT: u32 = 1_u32.strict_shl(10);
 /// frequency can be off by more than 500 ppm after a calibration during
 /// which the CPU slept.
 const ANOMALY_192_REGISTER: usize = 0x4000_0C34;
+/// AMLI RAM priority register of the radio.
+const AMLI_RAMPRI_RADIO: usize = 0x4000_0E08;
+/// AMLI RAM priority register of the CCM.
+const AMLI_RAMPRI_CCM: usize = 0x4000_0E10;
 /// Time the high frequency crystal gets to start before TIMER0 restarts, at
 /// first: the 32 MHz crystal typically starts in about 360 us.
 pub const CRYSTAL_LEAD_US: u32 = 800;
@@ -107,6 +111,22 @@ pub fn radio_trim() {
     let value = unsafe { read_volatile(register) };
     // SAFETY: Nordic documents this write for the anomaly 182 fix.
     unsafe { write_volatile(register, value | ANOMALY_182_BIT) }
+}
+
+/// Gives the radio and the CCM the highest priority on every RAM block, as
+/// Zephyr does on the nRF52832. The CCM decrypts a packet while the radio
+/// writes it to RAM; a radio write that waits behind the CPU or another DMA
+/// master, such as SPIM, SAADC or PWM, lets the CCM read stale bytes
+/// and fail a packet with a valid CRC on its MIC. All other masters keep
+/// their reset priority.
+#[inline]
+pub fn ram_priority() {
+    for register in [AMLI_RAMPRI_RADIO, AMLI_RAMPRI_CCM] {
+        // SAFETY: the AMLI RAM priority registers of the radio and the CCM,
+        // word-aligned, with one priority field per RAM block; 0 is the
+        // highest.
+        unsafe { write_volatile(with_exposed_provenance_mut::<u32>(register), 0) }
+    }
 }
 
 /// Accuracy of the low frequency clock in ppm: the RC oscillator, which
