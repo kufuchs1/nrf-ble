@@ -1734,7 +1734,9 @@ impl Connection {
                 // radio pointing at the slot it sent, which it would receive
                 // into: a central's packet there fails its MIC, as the CCM
                 // reads `rx`, and noise with a long length overruns the slot.
-                if more && radio.wait_tx_started(chip::DECRYPT_WAIT) {
+                // Not once our answer ended: a turnaround still armed to send
+                // would then start a second answer from `rx`.
+                if more && radio.wait_tx_started(chip::DECRYPT_WAIT) && !radio.is_end() {
                     // SAFETY: as for `prepare` above.
                     unsafe { radio.set_buffer(rx.as_mut_ptr()) }
                 }
