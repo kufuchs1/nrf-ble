@@ -461,6 +461,22 @@ impl<'peripherals> Radio<'peripherals> {
     /// next turnaround only after this, or it replaces the pending one.
     #[inline]
     pub fn wait_switched(&mut self) { switch::wait(); }
+
+    /// Polls until the transmission the turnaround enabled has started and so
+    /// latched its packet pointer ([`Self::tx_started`]), at most `polls`
+    /// times. Returns whether it started.
+    #[inline]
+    #[must_use = "the pointer may only change once the transmission started"]
+    pub fn wait_tx_started(&self, polls: u32) -> bool {
+        let mut remaining = polls;
+        while !self.tx_started() {
+            if remaining == 0 {
+                return false;
+            }
+            remaining = remaining.saturating_sub(1);
+        }
+        true
+    }
 }
 
 /// Radio frequency offset from 2400 MHz of a BLE channel index.
