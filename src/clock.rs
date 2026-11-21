@@ -15,6 +15,8 @@ use core::{
     task::Poll,
 };
 use embassy_futures::select::{Either, select};
+#[cfg(feature = "nrf51")]
+use embassy_nrf::peripherals::{PPI_CH9, PPI_CH11};
 use embassy_nrf::{
     Peri,
     pac::{
@@ -25,7 +27,13 @@ use embassy_nrf::{
         TIMER0 as REGS,
         timer::vals::{Bitmode, Mode},
     },
-    peripherals::{self, RTC0, TIMER0},
+    peripherals::{self, PPI_CH0, PPI_CH1, PPI_CH3, PPI_GROUP0, PPI_GROUP1, RTC0, TIMER0},
+    ppi::Group as _,
+};
+#[cfg(feature = "nrf52832")]
+use embassy_nrf::{
+    peripherals::{PPI_CH20, PPI_CH21, PPI_CH26, PPI_CH27},
+    ppi::Channel as _,
 };
 use embassy_sync::{blocking_mutex::CriticalSectionMutex, waitqueue::AtomicWaker};
 use embassy_time::{Duration, Timer, with_timeout};
@@ -132,6 +140,18 @@ const _: () = assert!(
     chip::forks_are_free(&[PPI_SYNC, PPI_CALIBRATE], &[PPI_RESUME, PPI_SYNC, PPI_CALIBRATE]),
     "a FORK stand-in channel is taken or not programmable"
 );
+// Embassy gives the nRF51's channels no number to check the tokens of
+// `Ppi` and `CalibrationPpi` against, so their types name the channels
+// here: `PPI_CHn` is channel n.
+#[cfg(feature = "nrf51")]
+const _: () = assert!(
+    PPI_RESUME == 0
+        && PPI_SYNC == 1
+        && PPI_CALIBRATE == 3
+        && chip::fork_channel(PPI_SYNC) == 9
+        && chip::fork_channel(PPI_CALIBRATE) == 11,
+    "a PPI channel of the clock is not the one its token names"
+);
 
 /// Number of users that need the high frequency crystal. The count and the
 /// start or stop task change together in a critical section: a release that
@@ -237,9 +257,27 @@ pub(crate) struct CrystalStats {
     pub lead: Micros,
 }
 
+/// The PPI channel and the channel group of [`calibrate_rc`], which it owns
+/// while it runs.
+///
+/// They are the programmable channel 3, which starts a calibration when the
+/// crystal has started, and group 0, which disables it after its first
+/// event. On the nRF51 channel 11 stands in for the FORK of channel 3.
+pub struct CalibrationPpi<'peripherals> {
+    /// Channel 3: CLOCK HFCLKSTARTED to CLOCK CAL.
+    _channel: Peri<'peripherals, PPI_CH3>,
+    /// Channel 11, standing in for the FORK of channel 3.
+    #[cfg(feature = "nrf51")]
+    _fork:    Peri<'peripherals, PPI_CH11>,
+    /// Group 0, which holds channel 3 alone.
+    _group:   Peri<'peripherals, PPI_GROUP0>,
+}
+
 /// Free-running 32-bit microsecond time. Times wrap after 71 minutes, so
 /// they are compared with wrapping differences.
 pub struct Clock<'peripherals> {
+    /// The PPI channels and the group, owned for the lifetime of the clock.
+    _ppi:   Ppi<'peripherals>,
     /// The RTC, owned for the lifetime of the clock.
     _rtc:   Peri<'peripherals, RTC0>,
     /// The timer, owned for the lifetime of the clock.
@@ -320,6 +358,40 @@ pub enum LowFrequency {
     Rc,
 }
 
+/// The PPI channels and the channel group of a [`Clock`], which it owns for
+/// its lifetime.
+///
+/// They are the programmable channels 0, from the RTC to the timer's start,
+/// and 1, from the RTC to a capture of the timer, and group 1, which
+/// disables channel 1 after its first event. On the nRF52832 they include
+/// the fixed channels 20 and 21, which start the radio, and 26 and 27, which
+/// capture its packet timing. On the nRF51, whose fixed channels have no
+/// Embassy tokens, channel 9 stands in for the FORK of channel 1 instead.
+/// [`crate::PPI_CHANNELS`] holds every channel of the link layer.
+pub struct Ppi<'peripherals> {
+    /// Fixed channel 26: RADIO ADDRESS to TIMER0 CAPTURE1.
+    #[cfg(feature = "nrf52832")]
+    _address:    Peri<'peripherals, PPI_CH26>,
+    /// Fixed channel 27: RADIO END to TIMER0 CAPTURE2.
+    #[cfg(feature = "nrf52832")]
+    _end:        Peri<'peripherals, PPI_CH27>,
+    /// Channel 0: RTC0 COMPARE0 to TIMER0 START.
+    _resume:     Peri<'peripherals, PPI_CH0>,
+    /// Fixed channel 21: TIMER0 COMPARE0 to RADIO RXEN.
+    #[cfg(feature = "nrf52832")]
+    _rxen:       Peri<'peripherals, PPI_CH21>,
+    /// Channel 1: RTC0 COMPARE1 to TIMER0 CAPTURE3.
+    _sync:       Peri<'peripherals, PPI_CH1>,
+    /// Channel 9, standing in for the FORK of channel 1.
+    #[cfg(feature = "nrf51")]
+    _sync_fork:  Peri<'peripherals, PPI_CH9>,
+    /// Group 1, which holds channel 1 alone.
+    _sync_group: Peri<'peripherals, PPI_GROUP1>,
+    /// Fixed channel 20: TIMER0 COMPARE0 to RADIO TXEN.
+    #[cfg(feature = "nrf52832")]
+    _txen:       Peri<'peripherals, PPI_CH20>,
+}
+
 /// Undoes a calibration's setup when it completes or its future is dropped.
 struct Calibration;
 
@@ -391,6 +463,76 @@ impl Drop for ResumeGuard<'_, '_> {
         if self.requested {
             CLOCK.intenclr().write(|w| w.set_hfclkstarted(true));
             release_crystal();
+        }
+    }
+}
+
+impl<'peripherals> CalibrationPpi<'peripherals> {
+    /// Takes channel 3, and on the nRF51 its FORK stand-in channel 11, and
+    /// group 0.
+    #[inline]
+    #[must_use = "the channel is only claimed while the calibration holds it"]
+    pub fn new(
+        channel: Peri<'peripherals, PPI_CH3>,
+        #[cfg(feature = "nrf51")] fork: Peri<'peripherals, PPI_CH11>,
+        group: Peri<'peripherals, PPI_GROUP0>,
+    ) -> Self {
+        #[cfg(feature = "nrf52832")]
+        debug_assert_eq!(channel.number(), PPI_CALIBRATE, "the calibration's PPI channel is not its token");
+        debug_assert_eq!(group.number(), PPI_GROUP_CALIBRATE, "the calibration's PPI group is not its token");
+        Self {
+            _channel: channel,
+            #[cfg(feature = "nrf51")]
+            _fork: fork,
+            _group: group,
+        }
+    }
+}
+
+impl<'peripherals> Ppi<'peripherals> {
+    /// Takes the channels 0 and 1, the FORK stand-in channel 9 and group 1
+    /// on the nRF51.
+    #[cfg(feature = "nrf51")]
+    #[inline]
+    #[must_use = "the channels are only claimed while the clock holds them"]
+    pub fn new(
+        resume: Peri<'peripherals, PPI_CH0>,
+        sync: Peri<'peripherals, PPI_CH1>,
+        sync_fork: Peri<'peripherals, PPI_CH9>,
+        sync_group: Peri<'peripherals, PPI_GROUP1>,
+    ) -> Self {
+        debug_assert_eq!(sync_group.number(), PPI_GROUP_SYNC, "the clock's PPI group is not its token");
+        Self { _resume: resume, _sync: sync, _sync_fork: sync_fork, _sync_group: sync_group }
+    }
+
+    /// Takes the channels 0, 1, 20, 21, 26 and 27 and group 1 on the
+    /// nRF52832.
+    #[cfg(feature = "nrf52832")]
+    #[inline]
+    #[must_use = "the channels are only claimed while the clock holds them"]
+    pub fn new(
+        resume: Peri<'peripherals, PPI_CH0>,
+        sync: Peri<'peripherals, PPI_CH1>,
+        txen: Peri<'peripherals, PPI_CH20>,
+        rxen: Peri<'peripherals, PPI_CH21>,
+        address: Peri<'peripherals, PPI_CH26>,
+        end: Peri<'peripherals, PPI_CH27>,
+        sync_group: Peri<'peripherals, PPI_GROUP1>,
+    ) -> Self {
+        debug_assert_eq!(
+            [resume.number(), sync.number(), txen.number(), rxen.number(), address.number(), end.number()],
+            [PPI_RESUME, PPI_SYNC, PPI_TXEN, PPI_RXEN, PPI_ADDRESS, PPI_END],
+            "a PPI channel of the clock is not its token"
+        );
+        debug_assert_eq!(sync_group.number(), PPI_GROUP_SYNC, "the clock's PPI group is not its token");
+        Self {
+            _address:    address,
+            _end:        end,
+            _resume:     resume,
+            _rxen:       rxen,
+            _sync:       sync,
+            _sync_group: sync_group,
+            _txen:       txen,
         }
     }
 }
@@ -517,21 +659,23 @@ impl<'peripherals> Clock<'peripherals> {
     #[must_use = "the count is only read"]
     pub const fn late(&self) -> u32 { self.late }
 
-    /// Sets up the timer, the RTC and the capture channels, for the default
-    /// clock sources of [`Config`]. The clock starts paused.
+    /// Sets up the timer, the RTC and the PPI channels of `ppi`, for the
+    /// default clock sources of [`Config`]. The clock starts paused.
     #[cfg(feature = "nrf51")]
     #[inline]
     #[must_use = "the clock stops being usable once dropped"]
-    pub fn new(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>) -> Self {
-        Self::with_config(timer, rtc, Config::new())
+    pub fn new(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>, ppi: Ppi<'peripherals>) -> Self {
+        Self::with_config(timer, rtc, ppi, Config::new())
     }
 
-    /// Sets up the timer, the RTC and the capture channels. The clock starts
-    /// paused.
+    /// Sets up the timer, the RTC and the PPI channels of `ppi`. The clock
+    /// starts paused.
     #[cfg(feature = "nrf52832")]
     #[inline]
     #[must_use = "the clock stops being usable once dropped"]
-    pub fn new(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>) -> Self { Self::setup(timer, rtc) }
+    pub fn new(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>, ppi: Ppi<'peripherals>) -> Self {
+        Self::setup(timer, rtc, ppi)
+    }
 
     /// The current time. While paused it follows the RTC, to about 30 us.
     #[inline]
@@ -603,9 +747,9 @@ impl<'peripherals> Clock<'peripherals> {
         restart.finish();
     }
 
-    /// Sets up the timer, the RTC and the capture channels.
+    /// Sets up the timer, the RTC and the PPI channels of `ppi`.
     #[inline]
-    fn setup(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>) -> Self {
+    fn setup(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>, ppi: Ppi<'peripherals>) -> Self {
         REGS.tasks_stop().write_value(1);
         // STOP alone keeps drawing current (nRF52832 anomaly 78), and on the
         // nRF51 only SHUTDOWN powers the timer down.
@@ -636,6 +780,7 @@ impl<'peripherals> Clock<'peripherals> {
             w.set_ch(PPI_END, true);
         });
         Self {
+            _ppi:   ppi,
             _rtc:   rtc,
             _timer: timer,
             base:   At::ZERO,
@@ -767,8 +912,8 @@ impl<'peripherals> Clock<'peripherals> {
         self.cancel_start();
     }
 
-    /// Sets up the timer, the RTC and the capture channels, and takes the
-    /// clock sources of the board: the crystal frequency is set here, so
+    /// Sets up the timer, the RTC and the PPI channels of `ppi`, and takes
+    /// the clock sources of the board: the crystal frequency is set here, so
     /// nothing else may start the crystal before; keep Embassy's
     /// `hfclk_source` internal. [`calibrate_rc`] waits for it. The clock
     /// starts paused. Build only one clock: a second one with another
@@ -777,9 +922,14 @@ impl<'peripherals> Clock<'peripherals> {
     #[cfg(feature = "nrf51")]
     #[inline]
     #[must_use = "the clock stops being usable once dropped"]
-    pub fn with_config(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>, config: Config) -> Self {
+    pub fn with_config(
+        timer: Peri<'peripherals, TIMER0>,
+        rtc: Peri<'peripherals, RTC0>,
+        ppi: Ppi<'peripherals>,
+        config: Config,
+    ) -> Self {
         chip::configure_clocks(config.high_frequency, config.low_frequency);
-        Self::setup(timer, rtc)
+        Self::setup(timer, rtc, ppi)
     }
 }
 
@@ -792,7 +942,8 @@ impl<'peripherals> Clock<'peripherals> {
 /// frequency clock it then waits forever without calibrating; without a
 /// clock it waits forever.
 ///
-/// Owns TEMP exclusively. The TEMP data-ready interrupt (calling
+/// Owns TEMP and the PPI channel and group of its [`CalibrationPpi`]
+/// exclusively. The TEMP data-ready interrupt (calling
 /// [`on_temperature_interrupt`]) and the `CLOCK_POWER` interrupt (calling
 /// [`on_clock_interrupt`]) wake it, and both must be enabled: nothing polls
 /// the events. Dropping the future releases the crystal and stops a running
@@ -804,7 +955,7 @@ impl<'peripherals> Clock<'peripherals> {
 /// stops both while the radio idles for long, and [`resume_calibration`]
 /// starts them again with a calibration at once.
 #[inline]
-pub async fn calibrate_rc(_temperature: Peri<'_, peripherals::TEMP>) -> ! {
+pub async fn calibrate_rc(_temperature: Peri<'_, peripherals::TEMP>, _ppi: CalibrationPpi<'_>) -> ! {
     #[cfg(feature = "nrf51")]
     if !chip::calibrates_rc().await {
         info!("the low frequency clock is a crystal: no RC calibration");

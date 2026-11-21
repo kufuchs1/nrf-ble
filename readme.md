@@ -506,6 +506,20 @@ masks for the chip built for, so a firmware that uses PPI checks its own channel
 assert. TIMER0 and TIMER1 are shut down, not only stopped, between uses, which avoids the standby current of nRF52832
 anomaly 78. The nRF51 differs: see [nRF51](#nrf51).
 
+The link layer also takes Embassy's tokens of its PPI channels and groups, so no Embassy driver can have them:
+`clock::Ppi` for `Clock::new` (channels 0, 1, 20, 21, 26 and 27 and group 1), `clock::CalibrationPpi` for
+`clock::calibrate_rc` (channel 3 and group 0) and `radio::Ppi` for `Radio::new` (channels 4, 5 and 25). `Radio::new`
+takes the `RNG` too, which `rng` drives for the link layer and the host:
+
+```rust
+use nrf_ble::{clock::{self, Clock}, radio::{self, Radio}};
+let radio_ppi = radio::Ppi::new(p.PPI_CH4, p.PPI_CH5, p.PPI_CH25);
+let radio = Radio::new(p.RADIO, p.TIMER1, radio_ppi, p.RNG);
+let clock_ppi = clock::Ppi::new(p.PPI_CH0, p.PPI_CH1, p.PPI_CH20, p.PPI_CH21, p.PPI_CH26, p.PPI_CH27, p.PPI_GROUP1);
+let clock = Clock::new(p.TIMER0, p.RTC0, clock_ppi);
+let calibration = clock::calibrate_rc(p.TEMP, clock::CalibrationPpi::new(p.PPI_CH3, p.PPI_GROUP0));
+```
+
 The high frequency crystal and TIMER0 run only around radio events and RC calibrations. Between events RTC0 keeps the
 time and restarts TIMER0 at an exact tick before the next event. During radio events the CPU sleeps with `WFE` inside
 the link layer interrupt and wakes only on the radio events and, for the end of a receive window, a TIMER0 compare,
@@ -527,9 +541,10 @@ The link layer counts on 500 ppm for its own sleep clock. Following the nRF52832
 anomaly 192 workaround set, the channel starting it disables itself after the first crystal start event, which may come
 twice (anomaly 201), and the crystal counts as running once it reported its start, without reading `HFCLKSTAT`. The
 channel capturing the timer at an RTC tick disables itself after the first compare event too, which may also come twice
-(anomaly 179). `clock::calibrate_rc` takes the `TEMP` peripheral and is driven by interrupts only: bind and enable
-`TEMP` to `clock::on_temperature_interrupt` and `CLOCK_POWER` to `clock::on_clock_interrupt`, or it waits forever for
-its first temperature. A calibration whose crystal or end does not come within 100 ms is retried at the next interval.
+(anomaly 179). `clock::calibrate_rc` takes the `TEMP` peripheral and its `clock::CalibrationPpi`, and is driven by
+interrupts only: bind and enable `TEMP` to `clock::on_temperature_interrupt` and `CLOCK_POWER` to
+`clock::on_clock_interrupt`, or it waits forever for its first temperature. A calibration whose crystal or end does not
+come within 100 ms is retried at the next interval.
 Dropping the calibration future releases the crystal. A firmware whose radio idles for long (a light sleep without
 advertising or a link) calls `clock::pause_calibration`: the task finishes a calibration under way, then measures no
 temperature and starts no crystal, so the crystal stays off; `clock::resume_calibration` before advertising again
@@ -552,10 +567,12 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   `data-length` does not build for the nRF51), the fast ramp-up, and +3 dBm: the power steps through -20, -16, -12,
   -8, -4, 0 and +4 dBm.
 - **Turnarounds:** the radio's own interframe timing, with the shortcuts from the end of a packet over the disabled
-  state to the next TXEN or RXEN, as Nordic's nRF51 SoftDevices and Zephyr do. `Radio::new` takes only `RADIO`; TIMER1,
-  TIMER2 and the PPI channels 4 and 5 stay free. The link layer uses the programmable PPI channels 0, 1 and 3, and 9 and
-  11 in place of the FORK registers the nRF51 lacks, beside the same fixed channels and groups as on the nRF52832;
-  `nrf_ble::PPI_CHANNELS` includes 9 and 11.
+  state to the next TXEN or RXEN, as Nordic's nRF51 SoftDevices and Zephyr do. `Radio::new` takes only `RADIO` and
+  `RNG`; TIMER1, TIMER2 and the PPI channels 4 and 5 stay free. The link layer uses the programmable PPI channels 0, 1
+  and 3, and 9 and 11 in place of the FORK registers the nRF51 lacks, beside the same fixed channels and groups as on
+  the nRF52832; `nrf_ble::PPI_CHANNELS` includes 9 and 11. `clock::Ppi::new` takes the channels 0, 1 and 9 and group
+  1, `clock::CalibrationPpi::new` channels 3 and 11 and group 0. Embassy has no tokens for the nRF51's fixed channels,
+  so only `nrf_ble::PPI_CHANNELS` covers them.
 - **Ramp-up:** about 140 µs. Each receive window opens about 100 µs earlier than on the nRF52832, which costs a little
   more receive current per connection event.
 - **Radio trim:** after powering the radio the link layer copies its BLE 1 Mbit trim values from FICR when FICR asks
@@ -570,7 +587,8 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   let config = clock::Config::new()
       .high_frequency(HighFrequency::Mhz32)
       .low_frequency(LowFrequency::Crystal { ppm: 50 });
-  let clock = Clock::with_config(p.TIMER0, p.RTC0, config);
+  let ppi = clock::Ppi::new(p.PPI_CH0, p.PPI_CH1, p.PPI_CH9, p.PPI_GROUP1);
+  let clock = Clock::with_config(p.TIMER0, p.RTC0, ppi, config);
   ```
 
   The crystal frequency goes to `CLOCK.XTALFREQ`, whose reset value comes from `UICR.XTALFREQ`. With the RC oscillator

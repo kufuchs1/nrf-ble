@@ -143,13 +143,19 @@ const LINK_PPI_GROUPS: [usize; 2] = [clock::PPI_GROUP_CALIBRATE, clock::PPI_GROU
 /// A firmware that uses PPI checks its channels against this mask at
 /// compile time, for example with
 /// `const _: () = assert!(nrf_ble::PPI_CHANNELS & MY_CHANNELS == 0);`.
+///
+/// The link layer owns the Embassy tokens of the channels that have one
+/// ([`clock::Ppi`], [`clock::CalibrationPpi`] and on the nRF52832
+/// `radio::Ppi`), so no Embassy driver can take them. The fixed channels of
+/// the nRF51 have no tokens, and only this mask covers them.
 pub const PPI_CHANNELS: u32 = ppi_mask(&LINK_PPI_CHANNELS);
 /// Every PPI channel group the link layer uses, as a mask with bit `n` set
 /// for group `n`.
 ///
 /// The link layer writes the channels of these groups and triggers their
-/// enable and disable tasks. A firmware must not use them, and checks its
-/// own groups against this mask at compile time like [`PPI_CHANNELS`].
+/// enable and disable tasks, and owns their Embassy tokens. A firmware must
+/// not use them, and checks its own groups against this mask at compile
+/// time like [`PPI_CHANNELS`].
 pub const PPI_GROUPS: u8 = ppi_mask(&LINK_PPI_GROUPS).strict_cast();
 
 // Each list names every channel or group once: two constants on the same
@@ -172,4 +178,45 @@ const fn ppi_mask(numbers: &[usize]) -> u32 {
         rest = tail;
     }
     mask
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::clock::{CalibrationPpi, Ppi};
+    use embassy_nrf::peripherals;
+
+    /// The token of `$peripheral`, which a test only builds.
+    macro_rules! token {
+        ($peripheral:ident) => {
+            // SAFETY: the test builds the token alone, and nothing else
+            // holds it.
+            unsafe { peripherals::$peripheral::steal() }
+        };
+    }
+
+    /// The token sets check in debug builds that each token is the channel
+    /// or group its constant numbers.
+    #[test]
+    fn ppi_tokens_are_the_channels_programmed() {
+        #[cfg(feature = "nrf52832")]
+        let _clock = Ppi::new(
+            token!(PPI_CH0),
+            token!(PPI_CH1),
+            token!(PPI_CH20),
+            token!(PPI_CH21),
+            token!(PPI_CH26),
+            token!(PPI_CH27),
+            token!(PPI_GROUP1),
+        );
+        #[cfg(feature = "nrf51")]
+        let _clock = Ppi::new(token!(PPI_CH0), token!(PPI_CH1), token!(PPI_CH9), token!(PPI_GROUP1));
+        let _calibration = CalibrationPpi::new(
+            token!(PPI_CH3),
+            #[cfg(feature = "nrf51")]
+            token!(PPI_CH11),
+            token!(PPI_GROUP0),
+        );
+        #[cfg(feature = "nrf52832")]
+        let _radio = crate::radio::Ppi::new(token!(PPI_CH4), token!(PPI_CH5), token!(PPI_CH25));
+    }
 }

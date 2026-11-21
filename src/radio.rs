@@ -9,10 +9,9 @@ mod switch;
 #[path = "radio/switch_timer.rs"]
 mod switch;
 
+#[cfg(feature = "nrf52832")] use crate::crypto;
 use crate::{chip, pdu::BUFFER_LEN, sleep};
 use core::sync::atomic::{Ordering, compiler_fence};
-#[cfg(feature = "nrf52832")]
-use embassy_nrf::peripherals::TIMER1;
 use embassy_nrf::{
     Peri,
     interrupt::{self, InterruptExt as _},
@@ -23,7 +22,12 @@ use embassy_nrf::{
             vals::{Crcstatus, Endian, Len, Mode, Skipaddr, State, Txpower},
         },
     },
-    peripherals::RADIO,
+    peripherals::{RADIO, RNG},
+};
+#[cfg(feature = "nrf52832")]
+use embassy_nrf::{
+    peripherals::{PPI_CH4, PPI_CH5, PPI_CH25, TIMER1},
+    ppi::Channel as _,
 };
 /// The PPI channels of the turnaround, for [`crate::PPI_CHANNELS`].
 #[cfg(feature = "nrf52832")]
@@ -172,10 +176,51 @@ pub enum Turnaround {
     Transmit,
 }
 
+/// The PPI channels of a [`Radio`] on the nRF52832, which it owns for its
+/// lifetime.
+///
+/// They are the programmable channels 4 and 5 of the turnaround, and the
+/// fixed channel 25, from the access address to the CCM's decryption.
+/// [`crate::PPI_CHANNELS`] holds every channel of the link layer.
+#[cfg(feature = "nrf52832")]
+pub struct Ppi<'peripherals> {
+    /// Fixed channel 25: RADIO ADDRESS to CCM CRYPT.
+    _crypt:         Peri<'peripherals, PPI_CH25>,
+    /// Channel 5: TIMER1 COMPARE0 to RADIO TXEN or RXEN.
+    _switch_enable: Peri<'peripherals, PPI_CH5>,
+    /// Channel 4: RADIO END to TIMER1 START.
+    _switch_start:  Peri<'peripherals, PPI_CH4>,
+}
+
+#[cfg(feature = "nrf52832")]
+impl<'peripherals> Ppi<'peripherals> {
+    /// Takes the channels 4, 5 and 25.
+    #[inline]
+    #[must_use = "the channels are only claimed while the radio holds them"]
+    pub fn new(
+        switch_start: Peri<'peripherals, PPI_CH4>,
+        switch_enable: Peri<'peripherals, PPI_CH5>,
+        crypt: Peri<'peripherals, PPI_CH25>,
+    ) -> Self {
+        debug_assert_eq!(
+            [switch_start.number(), switch_enable.number(), crypt.number()],
+            [PPI_SWITCH_START, PPI_SWITCH_ENABLE, crypto::PPI_CRYPT],
+            "a PPI channel of the radio is not its token"
+        );
+        Self { _crypt: crypt, _switch_enable: switch_enable, _switch_start: switch_start }
+    }
+}
+
 /// The radio, configured for BLE, with fast ramp-up on the nRF52832.
 pub struct Radio<'peripherals> {
     /// The radio peripheral, owned for the lifetime of the driver.
     _peripheral: Peri<'peripherals, RADIO>,
+    /// The PPI channels, owned for the lifetime of the driver.
+    #[cfg(feature = "nrf52832")]
+    _ppi:        Ppi<'peripherals>,
+    /// The random number generator, which [`crate::rng`] drives for the
+    /// link layer and the host, owned for the lifetime of the driver.
+    _rng:        Peri<'peripherals, RNG>,
     /// The timer of the turnarounds, owned for the lifetime of the driver.
     #[cfg(feature = "nrf52832")]
     _switch:     Peri<'peripherals, TIMER1>,
@@ -262,14 +307,18 @@ impl<'peripherals> Radio<'peripherals> {
     pub fn is_end(&self) -> bool { REGS.events_end().read() != 0 }
 
     /// Powers the radio and configures it for BLE 1 Mbit: on the nRF52832
-    /// with the fast ramp-up and TIMER1 timing the turnarounds, on the nRF51
-    /// with the radio's own interframe timing and the radio trim values of
-    /// FICR. The high frequency crystal must be running.
+    /// with the fast ramp-up and TIMER1 timing the turnarounds through the
+    /// channels of `ppi`, on the nRF51 with the radio's own interframe timing
+    /// and the radio trim values of FICR. The high frequency crystal must be
+    /// running. Takes the RNG, which [`crate::rng`] drives, so that no other
+    /// driver can.
     #[inline]
     #[must_use = "the radio is unusable once dropped"]
     pub fn new(
         radio: Peri<'peripherals, RADIO>,
         #[cfg(feature = "nrf52832")] switch: Peri<'peripherals, TIMER1>,
+        #[cfg(feature = "nrf52832")] ppi: Ppi<'peripherals>,
+        rng: Peri<'peripherals, RNG>,
     ) -> Self {
         sleep::enable();
         REGS.power().write(|w| w.set_power(true));
@@ -301,6 +350,9 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.txpower().write(|w| w.set_txpower(Txpower::_0dBm));
         Self {
             _peripheral: radio,
+            #[cfg(feature = "nrf52832")]
+            _ppi: ppi,
+            _rng: rng,
             #[cfg(feature = "nrf52832")]
             _switch: switch,
             longest: chip::packet_ram_len(false),
