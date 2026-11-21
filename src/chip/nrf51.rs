@@ -291,6 +291,16 @@ pub fn set_packet_layout(data_channel: bool) {
     });
 }
 
+/// The most octets the radio writes to RAM for a packet received with the
+/// packet layout of [`set_packet_layout`]: S0, length, the S1 byte on the
+/// data channels, and as many octets as MAXLEN admits.
+#[inline]
+#[must_use = "the length is only computed"]
+pub const fn packet_ram_len(data_channel: bool) -> usize {
+    let (maxlen, s1) = if data_channel { (DATA_MAXLEN, 1) } else { (ADV_MAXLEN, 0) };
+    2_usize.strict_add(s1).strict_add(maxlen.strict_cast())
+}
+
 /// Sets the radio mode of `phy`: BLE 1 Mbit, the only one. The radio must be
 /// disabled.
 #[inline]

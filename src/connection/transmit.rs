@@ -9,8 +9,12 @@
 //! queue and the host's packet, so it can run again before every event; a
 //! PDU leaves them only when it becomes the one on the air.
 
-use super::{DATA_BUFFER_LEN, Packet, Source, Trace, TxKind, TxSlot};
-use crate::{crypto, pdu::Llid};
+use super::{Packet, Source, Trace, TxKind, TxSlot};
+use crate::{
+    crypto,
+    pdu::{BUFFER_LEN, Llid},
+    radio::Buffer,
+};
 
 /// Up to `N` items in order, kept in place: taking the first moves no
 /// other.
@@ -100,13 +104,13 @@ impl<Item: Copy, const N: usize> Ring<Item, N> {
 impl TxSlot {
     /// A slot holding an empty PDU.
     pub(super) const fn empty() -> Self {
-        let mut plain = [0; DATA_BUFFER_LEN];
+        let mut plain = [0; BUFFER_LEN];
         plain[0] = Llid::Continuation.bits();
         Self {
             encrypted: false,
             kind:      TxKind::Empty,
-            plain:     Packet(plain),
-            sealed:    Packet([0; DATA_BUFFER_LEN]),
+            plain:     Buffer(plain),
+            sealed:    Packet::ZERO,
             source:    Source::Empty,
         }
     }

@@ -10,8 +10,7 @@ use crate::{
     health,
     link::{ConnectionParams, Event, Shared},
     maintenance,
-    pdu::BUFFER_LEN,
-    radio::Radio,
+    radio::{PacketBuffer, Radio},
     rng,
 };
 use embassy_futures::select::{Either, select};
@@ -65,7 +64,7 @@ fn start_after_aux(setup: Setup, shared: &Shared) {
 /// Runs the link layer forever.
 #[inline]
 pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) -> ! {
-    let mut rx: [u8; BUFFER_LEN] = [0; BUFFER_LEN];
+    let mut rx = PacketBuffer::ZERO;
     let mut since = None;
     let mut counters = Counters::new();
     loop {

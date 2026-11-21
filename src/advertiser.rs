@@ -21,8 +21,8 @@ use crate::pdu::Adi;
 use crate::{
     clock::Clock,
     crypto,
-    pdu::{BUFFER_LEN, ConnectInd, Peer},
-    radio::{Phy, Radio},
+    pdu::{ConnectInd, Peer},
+    radio::{PacketBuffer, Phy, Radio},
 };
 #[cfg(feature = "extended-advertising")]
 use extended as variant;
@@ -288,7 +288,7 @@ pub fn event(
     clock: &Clock<'_>,
     settings: &Settings,
     _counters: &mut Counters,
-    rx: &mut [u8; BUFFER_LEN],
+    rx: &mut PacketBuffer,
 ) -> (u32, Option<Accepted>) {
     let (primary, scan_response) = legacy::pdus(settings);
     let started = clock.now();
@@ -316,7 +316,7 @@ pub fn event(
     clock: &mut Clock<'_>,
     settings: &Settings,
     counters: &mut Counters,
-    _rx: &mut [u8; BUFFER_LEN],
+    _rx: &mut PacketBuffer,
 ) -> (u32, Option<Accepted>) {
     extended::event(radio, clock, settings, counters)
 }

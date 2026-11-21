@@ -59,7 +59,7 @@ use crate::{
         ext_primary,
         retarget,
     },
-    radio::{self, Phy, Radio, Turnaround},
+    radio::{self, Buffer, Phy, Radio, Turnaround},
 };
 use core::{
     array,
@@ -199,6 +199,9 @@ const _: () = {
     }
 };
 
+/// The buffer of an `AUX_ADV_IND` and the request that follows it.
+pub type AuxBuffer = Buffer<AUX_BUFFER_LEN>;
+
 /// The advertiser's state from one event to the next: the event counter of
 /// the secondary channel's selection, the counters of late packets and
 /// decisions, and what the log last showed.
@@ -287,7 +290,7 @@ pub struct Pdus {
     /// The secondary channel.
     pub aux_channel: u8,
     /// The buffer of the `AUX_ADV_IND`, which then takes the request.
-    pub auxiliary:   [u8; AUX_BUFFER_LEN],
+    pub auxiliary:   AuxBuffer,
     /// The enabled primary channels in order, as many as [`Self::count`].
     pub channels:    [u8; 3],
     /// How many primary channels are enabled.
@@ -313,7 +316,7 @@ impl Pdus {
             let offset = if index < count { aux_offset(count, index) } else { 0 };
             primary(settings, AuxPtr::new(aux_channel, offset, phy))
         });
-        Self { aux_channel, auxiliary: auxiliary(settings).into_buffer(), channels, count, phy, primaries }
+        Self { aux_channel, auxiliary: Buffer(auxiliary(settings).into_buffer()), channels, count, phy, primaries }
     }
 }
 
@@ -504,8 +507,9 @@ pub fn event(
     for (index, (&channel, pdu)) in pdus.channels.iter().zip(&pdus.primaries).take(pdus.count).enumerate() {
         radio.set_channel(channel);
         // SAFETY: the radio only reads the primary, which lives until the
-        // event returns; every path out waits until the radio is disabled.
-        unsafe { radio.prepare(pdu.as_bytes().as_ptr().cast_mut(), Turnaround::None) }
+        // event returns, and no turnaround follows it; every path out waits
+        // until the radio is disabled.
+        unsafe { radio.prepare_send(pdu.as_bytes()) }
         if !arm(radio, clock, primary_txen(first, index)) {
             count(&LATE_STARTS);
             continue;
@@ -520,11 +524,9 @@ pub fn event(
     radio.set_channel(pdus.aux_channel);
     radio.set_phy(pdus.phy);
     // SAFETY: the radio sends the `AUX_ADV_IND` from the buffer and then
-    // receives the request into it, which takes the longest packet the
-    // advertising channels admit (`chip::ADV_MAXLEN`, asserted in
-    // `pdu`); the buffer lives until the event returns, and every path
-    // out waits until the radio is disabled.
-    unsafe { radio.prepare(pdus.auxiliary.as_mut_ptr(), Turnaround::Receive) }
+    // receives the request into it; the buffer lives until the event
+    // returns, and every path out waits until the radio is disabled.
+    unsafe { radio.prepare(&mut pdus.auxiliary, Turnaround::Receive) }
     let accepted = if arm(radio, clock, aux_txen(first, pdus.count, pdus.phy)) {
         radio.wait_end();
         #[cfg(feature = "defmt")]
@@ -594,13 +596,12 @@ fn listen(
     radio: &mut Radio<'_>,
     clock: &Clock<'_>,
     settings: &Settings,
-    buffer: &mut [u8; AUX_BUFFER_LEN],
+    buffer: &mut AuxBuffer,
     (decoy, answer): (&AuxConnectRsp, &mut AuxConnectRsp),
 ) -> Option<(ConnectInd, u32)> {
-    // SAFETY: `buffer` takes any packet the advertising channels admit
-    // (`chip::ADV_MAXLEN`, asserted in `pdu`) and is borrowed for this
-    // event; every path out waits until the radio is disabled.
-    unsafe { radio.set_buffer(buffer.as_mut_ptr()) }
+    // SAFETY: `buffer` is borrowed for this event; every path out waits
+    // until the radio is disabled.
+    unsafe { radio.set_buffer(buffer) }
     radio.wait_switched();
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
@@ -613,18 +614,20 @@ fn listen(
         return None;
     }
     // SAFETY: the radio only reads the decoy, which lives until the event
-    // returns; every path out waits until the radio is disabled.
-    unsafe { radio.set_buffer(decoy.as_bytes().as_ptr().cast_mut()) }
+    // returns; every path out waits until the radio is disabled. The
+    // request's access address came, so its reception latched `buffer`, and
+    // the turnaround after it sends.
+    unsafe { radio.set_send_buffer(decoy.as_bytes()) }
     radio.clear_ready();
     radio.wait_end();
     let end = clock.end_time();
-    let Some(initiator) = radio.crc_ok().then(|| aux_connect_initiator(buffer)).flatten() else {
+    let Some(initiator) = radio.crc_ok().then(|| aux_connect_initiator(&buffer.0)).flatten() else {
         radio.disable();
         return None;
     };
     retarget(answer, initiator);
     // SAFETY: as for the decoy; the radio has not read the answer before.
-    unsafe { radio.set_buffer(answer.as_bytes().as_ptr().cast_mut()) }
+    unsafe { radio.set_send_buffer(answer.as_bytes()) }
     let late = radio.tx_started();
     if radio::TURNAROUND_IN_ANSWER {
         // The nRF51's DISABLED to TXEN shortcut started the answer a few
@@ -633,7 +636,7 @@ fn listen(
         radio.wait_switched();
         radio.set_turnaround(Turnaround::None);
     }
-    let request = (!late).then(|| accepted_request(settings, buffer)).flatten();
+    let request = (!late).then(|| accepted_request(settings, &buffer.0)).flatten();
     // Late: the answer was pointed at after it started, or it ended before
     // the check did, past `decision_budget_us`, when a refusal no longer
     // stops it.

@@ -49,7 +49,7 @@ use crate::{
         valid_connection_parameters,
     },
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
-    radio::{Phy, RX_READY_US, Radio, TURNAROUND_IN_ANSWER, Turnaround},
+    radio::{PacketBuffer, Phy, RX_READY_US, Radio, TURNAROUND_IN_ANSWER, Turnaround},
 };
 use core::{iter, mem};
 use embassy_futures::select::{Either, select};
@@ -340,6 +340,9 @@ pub struct Stats {
     pub setup_us_max:      u32,
     /// Connection events skipped with peripheral latency.
     pub skipped:           u32,
+    /// Receptions the radio wrote into a TX slot, past the longest PDU it
+    /// holds: the radio pointed at the slot when a reception started.
+    pub slot_overruns:     u32,
 }
 
 impl Stats {
@@ -719,10 +722,10 @@ enum TxKind {
 }
 
 /// A data PDU in RAM as the radio and the CCM read it: header, length, the
-/// S1 byte, payload and MIC. Word aligned, so that its copies move words.
-#[derive(Clone, Copy)]
-#[repr(C, align(4))]
-struct Packet([u8; DATA_BUFFER_LEN]);
+/// S1 byte, payload and MIC, in the first [`DATA_BUFFER_LEN`] octets. A whole
+/// [`PacketBuffer`], as the radio points at it while a reception may start
+/// (see [`Connection::exchange`]).
+type Packet = PacketBuffer;
 
 /// Where a prepared PDU comes from, which committing it takes it from.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1014,7 +1017,7 @@ impl Connection {
     fn after_answer(
         &mut self,
         decision: Decision,
-        rx: &[u8; BUFFER_LEN],
+        rx: &PacketBuffer,
         (signal, late, answer_us): (Option<u8>, bool, u32),
         shared: &Shared,
     ) {
@@ -1106,11 +1109,11 @@ impl Connection {
     /// buffer the radio sends: the only write within the interframe space
     /// to a buffer the radio may already read, one byte, whose old or new
     /// value are both a valid answer.
-    const fn answer_buffer(&mut self, md: bool) -> *mut u8 {
+    const fn answer_buffer(&mut self, md: bool) -> &mut PacketBuffer {
         let flags = if self.seq.sn { SN } else { 0 } | if self.seq.nesn { NESN } else { 0 } | if md { MD } else { 0 };
-        let buffer = &mut self.current_mut().on_air().0;
-        buffer[0] = (buffer[0] & LLID_MASK) | flags;
-        buffer.as_mut_ptr()
+        let buffer = self.current_mut().on_air();
+        buffer.0[0] = (buffer.0[0] & LLID_MASK) | flags;
+        buffer
     }
 
     /// Applies parameter and channel map updates due at the current event.
@@ -1164,7 +1167,7 @@ impl Connection {
 
     /// Prepares the decryption of the next received packet, if the link is
     /// encrypted. Returns false and ends the link if the counter ran out.
-    fn arm_decryption(&mut self, rx: &mut [u8; BUFFER_LEN]) -> bool {
+    fn arm_decryption(&mut self, rx: &mut PacketBuffer) -> bool {
         if !self.encryption.rx_on {
             return true;
         }
@@ -1172,7 +1175,7 @@ impl Connection {
             self.abort = Some(ERROR_MIC_FAILURE);
             return false;
         }
-        let pointers = (rx.as_mut_ptr(), self.rx_plain.as_mut_ptr());
+        let pointers = (rx.0.as_mut_ptr(), self.rx_plain.as_mut_ptr());
         let scratch = &mut self.encryption.scratch;
         // SAFETY: the configuration, scratch and both buffers live in this
         // connection or are borrowed for the exchange, which ends the
@@ -1237,6 +1240,25 @@ impl Connection {
         } else {
             // Authenticated traffic is recent enough.
         }
+    }
+
+    /// Counts a reception the radio wrote into a TX slot past the longest PDU
+    /// the slot holds, [`DATA_BUFFER_LEN`] octets, where nothing else writes,
+    /// and clears that part again. Its first words suffice: a reception
+    /// fills the buffer from its start.
+    fn check_slots(&mut self) {
+        let mut overruns: u32 = 0;
+        for slot in [&mut self.slots.0, &mut self.slots.1] {
+            for packet in [&mut slot.plain, &mut slot.sealed] {
+                if let Some(tail) = packet.0.get_mut(DATA_BUFFER_LEN..)
+                    && tail.iter().take(8).any(|&byte| byte != 0)
+                {
+                    tail.fill(0);
+                    overruns = overruns.saturating_add(1);
+                }
+            }
+        }
+        self.stats.slot_overruns = self.stats.slot_overruns.wrapping_add(overruns);
     }
 
     /// Validates a packet with a valid CRC within the interframe space and
@@ -1668,7 +1690,7 @@ impl Connection {
         &mut self,
         radio: &mut Radio<'_>,
         clock: &mut Clock<'_>,
-        rx: &mut [u8; BUFFER_LEN],
+        rx: &mut PacketBuffer,
         (enable, deadline): (u32, u32),
         shared: &Shared,
     ) -> Option<u32> {
@@ -1676,7 +1698,7 @@ impl Connection {
         let asymmetric = chip::PHY_2M && self.phy != self.tx_phy;
         // SAFETY: `rx` is a full packet buffer borrowed for this whole
         // exchange, which disables the radio on every path out.
-        unsafe { radio.prepare(rx.as_mut_ptr(), if asymmetric { Turnaround::None } else { Turnaround::Transmit }) }
+        unsafe { radio.prepare(rx, if asymmetric { Turnaround::None } else { Turnaround::Transmit }) }
         if !self.arm_decryption(rx) {
             return None;
         }
@@ -1738,7 +1760,7 @@ impl Connection {
                 // would then start a second answer from `rx`.
                 if more && radio.wait_tx_started(chip::DECRYPT_WAIT) && !radio.is_end() {
                     // SAFETY: as for `prepare` above.
-                    unsafe { radio.set_buffer(rx.as_mut_ptr()) }
+                    unsafe { radio.set_buffer(rx) }
                 }
                 // While ours goes out, the next PDU, into the slot the radio
                 // does not send: not after a late answer, which sends it.
@@ -1754,7 +1776,7 @@ impl Connection {
             // The switch starts receiving one interframe space after the
             // end; the buffer and the decryption are ready before.
             // SAFETY: as for `prepare` above.
-            unsafe { radio.rearm_receive(rx.as_mut_ptr()) }
+            unsafe { radio.rearm_receive(rx) }
             if !self.arm_decryption(rx) {
                 radio.disable();
                 crypto::disarm();
@@ -2514,10 +2536,9 @@ impl Connection {
     /// buffer already: the pointer then applies to the answer. An answer
     /// decided too late sends it again rather than the received packet.
     fn point_at_current(&mut self, radio: &mut Radio<'_>) {
-        let buffer = self.current_mut().on_air().0.as_mut_ptr();
         // SAFETY: the slots belong to this connection, and the exchange
         // disables the radio before it returns.
-        unsafe { radio.set_buffer(buffer) }
+        unsafe { radio.set_buffer(self.current_mut().on_air()) }
         radio.clear_ready();
     }
 
@@ -2659,7 +2680,7 @@ impl Connection {
     /// Handles the control PDUs received in the event, in order, and reports
     /// acknowledged ACL data.
     #[inline(never)]
-    fn process(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool, shared: &Shared) {
+    fn process(&mut self, rx: &PacketBuffer, encrypted: bool, shared: &Shared) {
         self.flush_notifications(shared);
         if self.seq.received {
             self.stash(rx, encrypted, shared);
@@ -2719,6 +2740,7 @@ impl Connection {
             recheck_passed: self.stats.recheck_passed,
             retransmissions: self.stats.retx,
             skipped: self.stats.skipped,
+            slot_overruns: self.stats.slot_overruns,
             widening_us,
         });
     }
@@ -2739,13 +2761,13 @@ impl Connection {
     /// passes: whether the decryption with the radio or the packet in RAM was
     /// corrupted. The packet is still in `rx`, as an event ends after a
     /// packet it did not take.
-    fn recheck_mic(&mut self, rx: &[u8; BUFFER_LEN]) {
+    fn recheck_mic(&mut self, rx: &PacketBuffer) {
         if !mem::take(&mut self.mic.recheck)
             || !crypto::set_counter(&mut self.encryption.rx_config, self.encryption.rx_counter)
         {
             return;
         }
-        let pointers = (rx.as_ptr(), self.rx_plain.as_mut_ptr());
+        let pointers = (rx.0.as_ptr(), self.rx_plain.as_mut_ptr());
         // SAFETY: the configuration, scratch and both buffers belong to this
         // connection, no decryption is armed after the event, and the CCM is
         // done or stopped when this returns.
@@ -2851,7 +2873,7 @@ impl Connection {
         &mut self,
         radio: &mut Radio<'_>,
         clock: &Clock<'_>,
-        rx: &[u8; BUFFER_LEN],
+        rx: &PacketBuffer,
         fits: bool,
         shared: &Shared,
     ) -> Option<(bool, bool)> {
@@ -2859,8 +2881,7 @@ impl Connection {
         // CCM must not start again at ours.
         crypto::disarm();
         let packet = if radio.crc_ok() {
-            let header = rx[0];
-            let len = rx[1];
+            let [header, len, ..] = rx.0;
             let (mic_ok, checked) = if self.encryption.rx_on && len != 0 {
                 // A decryption not started fails the MIC at once, which the
                 // central's retransmission gets another try at.
@@ -2915,7 +2936,7 @@ impl Connection {
         &mut self,
         radio: &mut Radio<'_>,
         clock: &mut Clock<'_>,
-        rx: &mut [u8; BUFFER_LEN],
+        rx: &mut PacketBuffer,
         shared: &Shared,
     ) -> (Ended, Stats) {
         let entropy = Prefetch::new();
@@ -2937,7 +2958,7 @@ impl Connection {
         &mut self,
         radio: &mut Radio<'_>,
         clock: &mut Clock<'_>,
-        rx: &mut [u8; BUFFER_LEN],
+        rx: &mut PacketBuffer,
         shared: &Shared,
         entropy: &Prefetch,
     ) -> (Ended, Stats) {
@@ -3043,6 +3064,7 @@ impl Connection {
                 self.note_miss(channel, window);
             }
             self.recheck_mic(rx);
+            self.check_slots();
             self.listened(heard_before);
             if self.counter == 0 {
                 log_radio(radio);
@@ -3304,13 +3326,13 @@ impl Connection {
     /// host at once, and keeps a control PDU for [`Self::process`] after the
     /// event. Its CCM counter is used up at once, as the next packet of the
     /// event may be decrypted before then.
-    fn stash(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool, shared: &Shared) {
+    fn stash(&mut self, rx: &PacketBuffer, encrypted: bool, shared: &Shared) {
         self.seq.received = false;
         self.stats.received = self.stats.received.wrapping_add(1);
         // Empty PDUs have no MIC and need not produce a CCM output packet.
-        let plain = encrypted && rx[1] != 0;
+        let plain = encrypted && rx.0[1] != 0;
         let (header, len, opcode) = {
-            let source = if plain { self.rx_plain.as_slice() } else { rx.as_slice() };
+            let source = if plain { self.rx_plain.as_slice() } else { rx.0.as_slice() };
             let byte = |index: usize| source.get(index).copied().unwrap_or_default();
             (byte(0), byte(1), byte(DATA_HEADER_LEN))
         };
@@ -3319,10 +3341,10 @@ impl Connection {
         let ping = header & LLID_MASK == Llid::Control.bits() && len != 0 && is_ping(opcode);
         // A payload other than LE Ping's, encrypted or not, holds the latency
         // off for a while.
-        if rx[1] != 0 && !ping {
+        if rx.0[1] != 0 && !ping {
             self.hold_latency_from(self.last_valid);
         }
-        let source = if plain { self.rx_plain.as_slice() } else { rx.as_slice() };
+        let source = if plain { self.rx_plain.as_slice() } else { rx.0.as_slice() };
         if encrypted && len != 0 {
             self.encryption.rx_counter = self.encryption.rx_counter.saturating_add(1);
         }

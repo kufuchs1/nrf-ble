@@ -379,6 +379,9 @@ pub struct Counters {
     /// during a flash operation, or passed while a crystal that had stopped
     /// started again.
     pub skipped:          u32,
+    /// Receptions the radio wrote into a buffer it was to send from, past
+    /// the packet there: it pointed at that buffer when a reception started.
+    pub slot_overruns:    u32,
     /// The window widening the anchor of [`Self::drift_us`] was received
     /// with, in microseconds: the room the link layer allowed for the drift
     /// at that event.
@@ -404,6 +407,7 @@ impl Counters {
         recheck_passed:   0,
         retransmissions:  0,
         skipped:          0,
+        slot_overruns:    0,
         widening_us:      0,
     };
 }

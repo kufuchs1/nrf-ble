@@ -9,7 +9,7 @@ mod switch;
 #[path = "radio/switch_timer.rs"]
 mod switch;
 
-use crate::{chip, sleep};
+use crate::{chip, pdu::BUFFER_LEN, sleep};
 use core::sync::atomic::{Ordering, compiler_fence};
 #[cfg(feature = "nrf52832")]
 use embassy_nrf::peripherals::TIMER1;
@@ -50,6 +50,30 @@ pub const TURNAROUND_IN_ANSWER: bool = switch::SET_IN_ANSWER;
 const RX_EARLY_US: u32 = 8;
 /// Whitening initial value bit that the radio requires to be set.
 const WHITENING_BIT6: u8 = 0x40;
+
+/// A buffer of `N` octets the radio may receive into.
+///
+/// Every buffer the radio points at while a reception may start is one
+/// ([`Radio::prepare`], [`Radio::set_buffer`], [`Radio::rearm_receive`]),
+/// and the radio takes it only if it holds the longest packet the current
+/// packet layout lets the radio write ([`Radio::set_s1_included`]): a
+/// reception stays inside it whatever arrives, and whenever the hardware
+/// starts it. Only [`Radio::prepare_send`] and [`Radio::set_send_buffer`]
+/// take a shorter PDU, for a transmission no reception can follow. Word
+/// aligned, so that its copies move words.
+#[derive(Clone, Copy)]
+#[non_exhaustive]
+#[repr(C, align(4))]
+pub struct Buffer<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> Buffer<N> {
+    /// A buffer of zeros.
+    pub const ZERO: Self = Self([0; N]);
+}
+
+/// The packet buffer of the data channels and of legacy advertising,
+/// [`BUFFER_LEN`] octets.
+pub type PacketBuffer = Buffer<BUFFER_LEN>;
 
 /// Physical layer of a connection.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -152,15 +176,36 @@ pub struct Radio<'peripherals> {
     /// The timer of the turnarounds, owned for the lifetime of the driver.
     #[cfg(feature = "nrf52832")]
     _switch:     Peri<'peripherals, TIMER1>,
+    /// The most octets the current packet layout lets the radio write to
+    /// RAM for a reception.
+    longest:     usize,
     /// PHY the turnarounds are timed for.
     #[cfg(feature = "nrf52832")]
     phy:         Phy,
+    /// Size of the buffer the radio points at, 0 for a PDU only to send.
+    pointed:     usize,
 }
 
 impl<'peripherals> Radio<'peripherals> {
+    /// Panics unless the radio points at a buffer that takes the longest
+    /// packet the layout lets it write, before a reception may start.
+    fn check_receivable(&self) {
+        assert!(self.pointed >= self.longest, "a reception into a buffer too short for it");
+    }
+
     /// Clears the access address event.
     #[inline]
     pub fn clear_address(&mut self) { REGS.events_address().write_value(0); }
+
+    /// Sets `turnaround` and clears the events of the packet before.
+    fn clear_for(&mut self, turnaround: Turnaround) {
+        self.set_turnaround(turnaround);
+        REGS.events_address().write_value(0);
+        REGS.events_end().write_value(0);
+        REGS.events_disabled().write_value(0);
+        REGS.events_rssiend().write_value(0);
+        compiler_fence(Ordering::SeqCst);
+    }
 
     /// Clears the ready event, so that [`Self::tx_started`] tells of the
     /// next ramp-up only.
@@ -248,27 +293,38 @@ impl<'peripherals> Radio<'peripherals> {
             _peripheral: radio,
             #[cfg(feature = "nrf52832")]
             _switch: switch,
+            longest: chip::packet_ram_len(false),
             #[cfg(feature = "nrf52832")]
             phy: Phy::M1,
+            pointed: 0,
         }
     }
 
-    /// Clears the events and arms the radio for a reception started by a
-    /// task or a PPI channel, with `turnaround` after the packet.
+    /// Clears the events and arms the radio for a packet started by a task
+    /// or a PPI channel, from or into `buffer`, with `turnaround` after it.
     ///
     /// # Safety
     ///
     /// As for [`Self::set_buffer`].
     #[inline]
-    pub unsafe fn prepare(&mut self, buffer: *mut u8, turnaround: Turnaround) {
+    pub unsafe fn prepare<const N: usize>(&mut self, buffer: &mut Buffer<N>, turnaround: Turnaround) {
         // SAFETY: the caller upholds the contract of `set_buffer`.
         unsafe { self.set_buffer(buffer) }
-        self.set_turnaround(turnaround);
-        REGS.events_address().write_value(0);
-        REGS.events_end().write_value(0);
-        REGS.events_disabled().write_value(0);
-        REGS.events_rssiend().write_value(0);
-        compiler_fence(Ordering::SeqCst);
+        self.clear_for(turnaround);
+    }
+
+    /// Clears the events and arms the radio to send `pdu`, started by a task
+    /// or a PPI channel, with nothing after it.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::set_send_buffer`].
+    #[inline]
+    pub unsafe fn prepare_send(&mut self, pdu: &[u8]) {
+        // SAFETY: the caller upholds the contract of `set_send_buffer`, and
+        // no turnaround follows the transmission.
+        unsafe { self.set_send_buffer(pdu) }
+        self.clear_for(Turnaround::None);
     }
 
     /// Points the radio at `buffer` for the reception that the shortcut after
@@ -280,7 +336,7 @@ impl<'peripherals> Radio<'peripherals> {
     ///
     /// As for [`Self::set_buffer`].
     #[inline]
-    pub unsafe fn rearm_receive(&mut self, buffer: *mut u8) {
+    pub unsafe fn rearm_receive<const N: usize>(&mut self, buffer: &mut Buffer<N>) {
         // SAFETY: the caller upholds the contract of `set_buffer`.
         unsafe { self.set_buffer(buffer) }
         REGS.events_address().write_value(0);
@@ -290,8 +346,16 @@ impl<'peripherals> Radio<'peripherals> {
     }
 
     /// Starts receiving now.
+    ///
+    /// # Panics
+    ///
+    /// If the radio points at a buffer too short for the packet layout
+    /// ([`Buffer`]).
     #[inline]
-    pub fn receive(&mut self) { REGS.tasks_rxen().write_value(1); }
+    pub fn receive(&mut self) {
+        self.check_receivable();
+        REGS.tasks_rxen().write_value(1);
+    }
 
     /// The packet layout, interframe space and whitening as the radio holds
     /// them: PCNF0, PCNF1, TIFS and DATAWHITEIV, for the log.
@@ -316,22 +380,27 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.prefix0().write(|w| w.set_ap0(address.wrapping_shr(24).truncate()));
     }
 
-    /// Sets the packet buffer the radio sends from or receives into by DMA.
+    /// Sets the packet buffer the radio sends from or receives into by DMA,
+    /// at the next packet's start. A reception, whatever arrives and
+    /// whenever it starts, stays inside `buffer`.
+    ///
+    /// # Panics
+    ///
+    /// If `buffer` is shorter than the longest packet the packet layout lets
+    /// the radio write ([`Self::set_s1_included`]).
     ///
     /// # Safety
     ///
-    /// `buffer` must point to RAM holding the whole PDU its header announces
-    /// for a transmission, and for a reception writable bytes for the
-    /// longest packet the packet layout admits:
-    /// [`BUFFER_LEN`](crate::pdu::BUFFER_LEN) on the data channels and with
-    /// legacy advertising, the header and `AUX_PAYLOAD_MAX` octets with
-    /// extended advertising. It must stay valid, and the CPU must not access it
-    /// while the radio may, until the radio is disabled or given
-    /// another buffer.
+    /// The radio keeps the address: `buffer` must stay valid until the radio
+    /// is disabled or given another buffer, and the CPU must not access it
+    /// meanwhile while the radio may, but for the one header byte of an
+    /// answer it patches before the answer starts.
     #[inline]
-    pub unsafe fn set_buffer(&mut self, buffer: *mut u8) {
+    pub unsafe fn set_buffer<const N: usize>(&mut self, buffer: &mut Buffer<N>) {
+        assert!(N >= self.longest, "a radio buffer shorter than the packets the layout admits");
+        self.pointed = N;
         compiler_fence(Ordering::SeqCst);
-        REGS.packetptr().write_value(buffer.addr().strict_cast());
+        REGS.packetptr().write_value(buffer.0.as_mut_ptr().addr().strict_cast());
     }
 
     /// Tunes to a BLE channel index and sets the matching whitening.
@@ -362,11 +431,39 @@ impl<'peripherals> Radio<'peripherals> {
     /// Sets the packet layout of the data channels, whose header in RAM
     /// carries the S1 byte the CCM needs, or of the advertising channels.
     #[inline]
-    pub fn set_s1_included(&mut self, included: bool) { chip::set_packet_layout(included); }
+    pub fn set_s1_included(&mut self, included: bool) {
+        chip::set_packet_layout(included);
+        self.longest = chip::packet_ram_len(included);
+    }
+
+    /// Sets `pdu` as the packet the radio sends next, a PDU shorter than a
+    /// [`Buffer`], which the radio only reads.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::set_buffer`], and no reception may start while the
+    /// radio points at `pdu`, as it would overrun it: no turnaround to
+    /// receive is armed, and a reception the last one started has latched
+    /// its buffer, as its access address tells. `pdu` must hold the whole PDU
+    /// its header announces.
+    #[inline]
+    pub unsafe fn set_send_buffer(&mut self, pdu: &[u8]) {
+        self.pointed = 0;
+        compiler_fence(Ordering::SeqCst);
+        REGS.packetptr().write_value(pdu.as_ptr().addr().strict_cast());
+    }
 
     /// Sets what the radio does after the current packet.
+    ///
+    /// # Panics
+    ///
+    /// For a reception, if the radio points at a buffer too short for the
+    /// packet layout ([`Buffer`]).
     #[inline]
     pub fn set_turnaround(&mut self, turnaround: Turnaround) {
+        if turnaround == Turnaround::Receive {
+            self.check_receivable();
+        }
         #[cfg(feature = "nrf51")]
         switch::arm(turnaround);
         #[cfg(feature = "nrf52832")]
