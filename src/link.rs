@@ -93,7 +93,7 @@ use crate::{
     chip,
     clock::Micros,
     crypto,
-    pdu::{Llid, Peer, valid_connection_parameters},
+    pdu::{Llid, ParamCheck, Peer},
     rng,
 };
 #[cfg(feature = "extended-advertising")]
@@ -255,7 +255,14 @@ impl ParamRange {
     pub(crate) const fn is_valid(self) -> bool {
         self.interval_min <= self.interval_max
             && self.interval_min >= 6
-            && valid_connection_parameters(self.interval_max, self.latency, self.timeout, 1, 0)
+            && ParamCheck {
+                interval:   self.interval_max,
+                latency:    self.latency,
+                timeout:    self.timeout,
+                win_offset: 0,
+                win_size:   1,
+            }
+            .is_valid()
     }
 
     /// A range from its link layer units.

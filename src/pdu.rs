@@ -475,7 +475,14 @@ impl ConnectInd {
 
     /// Whether the parameters are within the ranges of the specification.
     fn is_valid(&self) -> bool {
-        valid_connection_parameters(self.interval, self.latency, self.timeout, self.win_size, self.win_offset)
+        let timing = ParamCheck {
+            interval:   self.interval,
+            latency:    self.latency,
+            timeout:    self.timeout,
+            win_offset: self.win_offset,
+            win_size:   self.win_size,
+        };
+        timing.is_valid()
             && (HOP_MIN..=HOP_MAX).contains(&self.hop)
             && valid_channel_map(self.channel_map)
             && valid_access_address(self.access_address)
@@ -551,27 +558,42 @@ impl ConnectInd {
     }
 }
 
+/// Connection timing to check against the ranges of the specification, both
+/// when connecting and when updating an existing link. Named fields keep the
+/// values of equal type from being swapped.
+#[derive(Clone, Copy)]
+pub(crate) struct ParamCheck {
+    /// Connection interval in units of 1.25 ms.
+    pub interval:   u16,
+    /// Peripheral latency in connection events.
+    pub latency:    u16,
+    /// Supervision timeout in units of 10 ms.
+    pub timeout:    u16,
+    /// Transmit window offset in units of 1.25 ms.
+    pub win_offset: u16,
+    /// Transmit window size in units of 1.25 ms.
+    pub win_size:   u8,
+}
+
+impl ParamCheck {
+    /// Whether the timing is within the ranges of the specification.
+    #[inline]
+    pub(crate) const fn is_valid(self) -> bool {
+        let Self { interval, latency, timeout, win_offset, win_size } = self;
+        (INTERVAL_MIN..=INTERVAL_MAX).contains(&interval)
+            && (TIMEOUT_MIN..=TIMEOUT_MAX).contains(&timeout)
+            && latency <= LATENCY_MAX
+            && u32::from(latency).saturating_add(1).saturating_mul(u32::from(interval))
+                < u32::from(timeout).saturating_mul(4)
+            && (1..=WIN_SIZE_MAX).contains(&win_size)
+            && u16::from(win_size) < interval
+            && win_offset <= interval
+    }
+}
+
 /// Whether a data channel map has at least two channels and no reserved bits.
 pub(crate) fn valid_channel_map(map: [u8; 5]) -> bool {
     map[4] & 0xE0 == 0 && map.iter().map(|byte| byte.count_ones()).sum::<u32>() >= 2
-}
-
-/// Validates timing both when connecting and when updating an existing link.
-pub(crate) const fn valid_connection_parameters(
-    interval: u16,
-    latency: u16,
-    timeout: u16,
-    win_size: u8,
-    win_offset: u16,
-) -> bool {
-    (INTERVAL_MIN..=INTERVAL_MAX).contains(&interval)
-        && (TIMEOUT_MIN..=TIMEOUT_MAX).contains(&timeout)
-        && latency <= LATENCY_MAX
-        && u32::from(latency).saturating_add(1).saturating_mul(u32::from(interval))
-            < u32::from(timeout).saturating_mul(4)
-        && (1..=WIN_SIZE_MAX).contains(&win_size)
-        && u16::from(win_size) < interval
-        && win_offset <= interval
 }
 
 /// LE 1M data access address constraints (Core, Vol 6, Part B, 2.1.2).
@@ -783,13 +805,13 @@ mod tests {
 
     #[test]
     fn supervision_timeout_must_exceed_twice_maximum_latency() {
-        assert!(!valid_connection_parameters(40, 0, 10, 1, 0));
-        assert!(valid_connection_parameters(39, 0, 10, 1, 0));
-        assert!(!valid_connection_parameters(12, 500, 3200, 1, 0));
-        assert!(!valid_connection_parameters(5, 0, 100, 1, 0));
-        assert!(!valid_connection_parameters(12, 0, 100, 0, 0));
-        assert!(!valid_connection_parameters(12, 0, 100, 1, 13));
-        assert!(valid_connection_parameters(12, 30, 600, 1, 0));
+        assert!(!ParamCheck { interval: 40, latency: 0, timeout: 10, win_offset: 0, win_size: 1 }.is_valid());
+        assert!(ParamCheck { interval: 39, latency: 0, timeout: 10, win_offset: 0, win_size: 1 }.is_valid());
+        assert!(!ParamCheck { interval: 12, latency: 500, timeout: 3200, win_offset: 0, win_size: 1 }.is_valid());
+        assert!(!ParamCheck { interval: 5, latency: 0, timeout: 100, win_offset: 0, win_size: 1 }.is_valid());
+        assert!(!ParamCheck { interval: 12, latency: 0, timeout: 100, win_offset: 0, win_size: 0 }.is_valid());
+        assert!(!ParamCheck { interval: 12, latency: 0, timeout: 100, win_offset: 13, win_size: 1 }.is_valid());
+        assert!(ParamCheck { interval: 12, latency: 30, timeout: 600, win_offset: 0, win_size: 1 }.is_valid());
     }
 
     #[test]

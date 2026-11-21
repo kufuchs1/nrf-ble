@@ -36,7 +36,7 @@ use crate::{
         Shared,
     },
     maintenance,
-    pdu::{ConnectInd, LLID_MASK, Llid, NESN, SN, concat_into, field, valid_channel_map, valid_connection_parameters},
+    pdu::{ConnectInd, LLID_MASK, Llid, NESN, ParamCheck, SN, concat_into, field, valid_channel_map},
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
     radio::{PacketBuffer, Phy, RX_READY_US, Radio, TURNAROUND_IN_ANSWER, Turnaround},
 };
@@ -3348,7 +3348,14 @@ const fn parse_update(bytes: &[u8]) -> Option<Update> {
     let timeout = u16::from_le_bytes([timeout0, timeout1]);
     let offset = u16::from_le_bytes([offset0, offset1]);
     let params = ConnectionParams::new(interval, u16::from_le_bytes([latency0, latency1]), timeout);
-    if !valid_connection_parameters(params.interval, params.latency, params.timeout, win_size, offset) {
+    let check = ParamCheck {
+        interval: params.interval,
+        latency: params.latency,
+        timeout: params.timeout,
+        win_offset: offset,
+        win_size,
+    };
+    if !check.is_valid() {
         return None;
     }
     Some(Update {
@@ -3441,8 +3448,8 @@ const fn valid_request(params: &[u8]) -> bool {
     let latency = u16::from_le_bytes([latency0, latency1]);
     let timeout = u16::from_le_bytes([timeout0, timeout1]);
     min <= max
-        && valid_connection_parameters(min, latency, timeout, 1, 0)
-        && valid_connection_parameters(max, latency, timeout, 1, 0)
+        && ParamCheck { interval: min, latency, timeout, win_offset: 0, win_size: 1 }.is_valid()
+        && ParamCheck { interval: max, latency, timeout, win_offset: 0, win_size: 1 }.is_valid()
 }
 
 #[cfg(test)] mod tests;
