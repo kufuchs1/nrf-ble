@@ -74,17 +74,20 @@ static TEMPERATURE_READY: AtomicWaker = AtomicWaker::new();
 const CRYSTAL_RETRY_US: u32 = 2000;
 /// Time the high frequency crystal gets to start before TIMER0 restarts, at
 /// first. It then follows the crystal: see [`Clock::lead`].
-const CRYSTAL_LEAD_US: u32 = chip::CRYSTAL_LEAD_US;
+const CRYSTAL_LEAD_US: Micros = Micros(chip::CRYSTAL_LEAD_US);
 /// Bounds of the crystal lead time.
-const CRYSTAL_LEAD_RANGE_US: (u32, u32) = chip::CRYSTAL_LEAD_RANGE_US;
+const CRYSTAL_LEAD_RANGE_US: (Micros, Micros) = {
+    let (shortest, longest) = chip::CRYSTAL_LEAD_RANGE_US;
+    (Micros(shortest), Micros(longest))
+};
 /// Lead time given up after a restart whose crystal ran early. With the
 /// step up, it sets how many restarts find the crystal late once the lead
 /// settled: 2 / (2 + 100), about 2 %.
-const CRYSTAL_LEAD_DOWN_US: u32 = 2;
+const CRYSTAL_LEAD_DOWN_US: Micros = Micros(2);
 /// Lead time added after a restart whose crystal was late.
-const CRYSTAL_LEAD_UP_US: u32 = 100;
+const CRYSTAL_LEAD_UP_US: Micros = Micros(100);
 /// Time before TIMER0 restarts at which the task wakes to wait for it.
-const RESUME_EARLY_US: u32 = 100;
+const RESUME_EARLY_US: Micros = Micros(100);
 /// How much earlier than [`SETUP_US`] before the time slept for TIMER0 may
 /// restart: on an RTC tick, which comes every 30.5 us.
 #[cfg(any(test, feature = "event-timing"))]
@@ -114,11 +117,13 @@ const RTC_MIN_TICKS: u32 = 2;
 /// Accuracy of the RC oscillator in ppm, which [`calibrate_rc`] keeps it
 /// within.
 pub const RC_PPM: u32 = 500;
-/// Time from the TIMER0 restart until the time slept for: how early
-/// [`Clock::sleep_until`] returns, for the caller to program a radio start.
+/// Time from the TIMER0 restart until the time slept for: how early the
+/// clock's sleep returns, for the caller to program a radio start.
 pub const SETUP_US: u32 = 300;
+/// [`SETUP_US`] as a duration of the clock.
+pub(crate) const SETUP: Micros = Micros(SETUP_US);
 /// Shortest wait for which TIMER0 and the crystal stop.
-const SLEEP_MIN_US: u32 = 3000;
+const SLEEP_MIN_US: Micros = Micros(3000);
 
 // The channels standing in for the FORK of the self-disabling channels on
 // the nRF51 must be programmable channels that nothing else here uses.
@@ -134,6 +139,91 @@ const _: () = assert!(
 /// otherwise stop it under a user that requested it in between.
 static CRYSTAL_USERS: CriticalSectionMutex<Cell<u8>> = CriticalSectionMutex::new(Cell::new(0));
 
+/// An instant of the link layer's clock: TIMER0's microseconds, continued on
+/// the RTC while TIMER0 stops. It wraps after 71.6 minutes, so instants have
+/// no order: two of them compare only through their wrapping difference,
+/// which the methods here take.
+#[derive(Clone, Copy, Eq)]
+#[derive_const(PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[repr(transparent)]
+pub(crate) struct At(pub u32);
+
+impl At {
+    /// The instant at which the clock started counting.
+    pub(crate) const ZERO: Self = Self(0);
+
+    /// The instant `duration` after this one.
+    #[inline]
+    #[must_use = "the instant is only computed"]
+    pub(crate) const fn after(self, duration: Micros) -> Self { Self(self.0.wrapping_add(duration.0)) }
+
+    /// Time from `now` until this instant, if it is still to come, less than
+    /// half the clock's range ahead.
+    #[inline]
+    #[must_use = "the time is only computed"]
+    pub(crate) const fn ahead_of(self, now: Self) -> Option<Micros> {
+        let difference = self.0.wrapping_sub(now.0);
+        if is_ahead(difference) { Some(Micros(difference)) } else { None }
+    }
+
+    /// The instant `duration` before this one.
+    #[inline]
+    #[must_use = "the instant is only computed"]
+    pub(crate) const fn before(self, duration: Micros) -> Self { Self(self.0.wrapping_sub(duration.0)) }
+
+    /// Signed time from `other` to this instant: negative if this one comes
+    /// first.
+    #[inline]
+    #[must_use = "the difference is only computed"]
+    pub(crate) const fn offset_from(self, other: Self) -> i32 { self.0.wrapping_sub(other.0).cast_signed() }
+
+    /// Whether `now` is at or past this instant, by less than half the
+    /// clock's range.
+    #[inline]
+    #[must_use = "the comparison is only computed"]
+    pub(crate) const fn reached_by(self, now: Self) -> bool { now.0.wrapping_sub(self.0) < u32::MAX.wrapping_shr(1) }
+
+    /// Time from `earlier` to this instant, as a wrapping difference: only
+    /// meaningful if `earlier` does not come after it.
+    #[inline]
+    #[must_use = "the time is only computed"]
+    pub(crate) const fn since(self, earlier: Self) -> Micros { Micros(self.0.wrapping_sub(earlier.0)) }
+}
+
+/// A duration in microseconds of the link layer's clock.
+#[derive(Clone, Copy, Default)]
+#[derive_const(Eq, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(test, derive(Debug))]
+#[repr(transparent)]
+pub(crate) struct Micros(pub u32);
+
+impl Micros {
+    /// No time.
+    pub(crate) const ZERO: Self = Self(0);
+
+    /// The sum, at most the largest duration.
+    #[inline]
+    #[must_use = "the duration is only computed"]
+    pub(crate) const fn saturating_add(self, other: Self) -> Self { Self(self.0.saturating_add(other.0)) }
+
+    /// `count` times this duration, at most the largest duration.
+    #[inline]
+    #[must_use = "the duration is only computed"]
+    pub(crate) const fn saturating_mul(self, count: u32) -> Self { Self(self.0.saturating_mul(count)) }
+
+    /// The difference, at least no time.
+    #[inline]
+    #[must_use = "the duration is only computed"]
+    pub(crate) const fn saturating_sub(self, other: Self) -> Self { Self(self.0.saturating_sub(other.0)) }
+
+    /// `count` times this duration, wrapping as instants do: for the time
+    /// from an anchor to an event `count` intervals later.
+    #[inline]
+    #[must_use = "the duration is only computed"]
+    pub(crate) const fn wrapping_mul(self, count: u32) -> Self { Self(self.0.wrapping_mul(count)) }
+}
+
 /// Free-running 32-bit microsecond time. Times wrap after 71 minutes, so
 /// they are compared with wrapping differences.
 pub struct Clock<'peripherals> {
@@ -142,13 +232,13 @@ pub struct Clock<'peripherals> {
     /// The timer, owned for the lifetime of the clock.
     _timer: Peri<'peripherals, TIMER0>,
     /// Time at which TIMER0 counted zero.
-    base:   u32,
+    base:   At,
     /// Restarts at which the crystal was not running yet.
     late:   u32,
     /// Current crystal lead time.
-    lead:   u32,
+    lead:   Micros,
     /// RTC tick and time at it while TIMER0 is stopped.
-    paused: Option<(u32, u32)>,
+    paused: Option<(u32, At)>,
 }
 
 /// The clock sources of an nRF51 board, which only its firmware knows: the
@@ -249,7 +339,7 @@ struct ResumeGuard<'clock, 'peripherals> {
     /// Successful restarts transfer their crystal reference to the clock.
     finished:  bool,
     /// Original RTC time base restored when the future is cancelled.
-    origin:    (u32, u32),
+    origin:    (u32, At),
     /// Whether this operation acquired a high frequency clock reference.
     requested: bool,
 }
@@ -259,7 +349,7 @@ impl<'clock, 'peripherals> ResumeGuard<'clock, 'peripherals> {
     fn finish(mut self) { self.finished = true; }
 
     /// Starts a restart transaction without acquiring the crystal early.
-    const fn new(clock: &'clock mut Clock<'peripherals>, origin: (u32, u32)) -> Self {
+    const fn new(clock: &'clock mut Clock<'peripherals>, origin: (u32, At)) -> Self {
         Self { clock, finished: false, origin, requested: false }
     }
 
@@ -296,7 +386,7 @@ impl<'peripherals> Clock<'peripherals> {
     /// Time of the last access address the radio sent or received.
     #[inline]
     #[must_use = "the time is only read"]
-    pub fn address_time(&self) -> u32 { self.base.wrapping_add(REGS.cc(CC_ADDRESS).read()) }
+    pub(crate) fn address_time(&self) -> At { self.base.after(Micros(REGS.cc(CC_ADDRESS).read())) }
 
     /// Stops starting the radio from the timer.
     #[inline]
@@ -310,7 +400,7 @@ impl<'peripherals> Clock<'peripherals> {
     /// Time of the last packet end.
     #[inline]
     #[must_use = "the time is only read"]
-    pub fn end_time(&self) -> u32 { self.base.wrapping_add(REGS.cc(CC_END).read()) }
+    pub(crate) fn end_time(&self) -> At { self.base.after(Micros(REGS.cc(CC_END).read())) }
 
     /// Starts the crystal again if it stopped while TIMER0 runs, which
     /// leaves the radio and the time base on the inaccurate internal
@@ -332,12 +422,12 @@ impl<'peripherals> Clock<'peripherals> {
     /// NVIC. A pending radio start is cancelled; [`Self::stop_expiry`] ends
     /// it.
     #[inline]
-    pub fn expire_at(&self, at: u32) {
+    pub(crate) fn expire_at(&self, at: At) {
         PPI.chenclr().write(|w| {
             w.set_ch(PPI_TXEN, true);
             w.set_ch(PPI_RXEN, true);
         });
-        REGS.cc(CC_START).write_value(at.wrapping_sub(self.base));
+        REGS.cc(CC_START).write_value(at.since(self.base).0);
         REGS.events_compare(CC_START).write_value(0);
         REGS.intenset().write(|w| w.set_compare(CC_START, true));
     }
@@ -345,16 +435,18 @@ impl<'peripherals> Clock<'peripherals> {
     /// Whether the deadline `at` armed with [`Self::expire_at`] passed.
     #[inline]
     #[must_use = "the comparison is only computed"]
-    pub fn expired(&self, at: u32) -> bool { REGS.events_compare(CC_START).read() != 0 || reached(self.now(), at) }
+    pub(crate) fn expired(&self, at: At) -> bool {
+        REGS.events_compare(CC_START).read() != 0 || at.reached_by(self.now())
+    }
 
     /// Waits until TIMER0 restarted at RTC tick `tick + ticks` and continues
     /// the time from `time` at `tick`. If this restart `started` the
     /// crystal, the lead time follows it: shorter when the crystal already
     /// ran shortly before the restart, longer when it was late.
-    async fn finish_resume(&mut self, tick: u32, time: u32, ticks: u32, started: bool) {
+    async fn finish_resume(&mut self, tick: u32, time: At, ticks: u32, started: bool) {
         let remaining = ticks.wrapping_sub(rtc_now().wrapping_sub(tick) & RTC_MASK);
         let early = if is_ahead(remaining) {
-            Timer::after_micros(u64::from(ticks_to_us(remaining).saturating_sub(RESUME_EARLY_US))).await;
+            Timer::after_micros(u64::from(ticks_to_us(remaining).saturating_sub(RESUME_EARLY_US).0)).await;
             crystal_running()
         } else {
             false
@@ -368,7 +460,7 @@ impl<'peripherals> Clock<'peripherals> {
             warn!("clock restart missed its tick");
         }
         PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
-        self.base = time.wrapping_add(ticks_to_us(started_at));
+        self.base = time.after(ticks_to_us(started_at));
         self.paused = None;
         let (shortest, longest) = CRYSTAL_LEAD_RANGE_US;
         if !crystal_running() {
@@ -387,20 +479,17 @@ impl<'peripherals> Clock<'peripherals> {
     /// Pauses and waits until `at` or until `interrupt` completes. Returns
     /// true if `at` was reached.
     #[inline]
-    pub async fn idle_until<F>(&mut self, at: u32, interrupt: F) -> bool
+    pub(crate) async fn idle_until<F>(&mut self, at: At, interrupt: F) -> bool
     where
         F: Future,
     {
         self.pause();
-        let ahead = at.wrapping_sub(self.now());
-        if !is_ahead(ahead) {
-            return true;
-        }
-        matches!(select(Timer::after_micros(u64::from(ahead)), interrupt).await, Either::First(()))
+        let Some(ahead) = at.ahead_of(self.now()) else { return true };
+        matches!(select(Timer::after_micros(u64::from(ahead.0)), interrupt).await, Either::First(()))
     }
 
-    /// Whether TIMER0 runs, so that [`Self::now`] counts microseconds
-    /// rather than RTC ticks.
+    /// Whether TIMER0 runs, so that the time counts microseconds rather than
+    /// RTC ticks.
     #[inline]
     #[must_use = "the state is only read"]
     pub const fn is_running(&self) -> bool { self.paused.is_none() }
@@ -416,7 +505,7 @@ impl<'peripherals> Clock<'peripherals> {
     /// or to 2500 us on the nRF51.
     #[inline]
     #[must_use = "the lead time is only read"]
-    pub const fn lead(&self) -> u32 { self.lead }
+    pub(crate) const fn lead(&self) -> Micros { self.lead }
 
     /// Sets up the timer, the RTC and the capture channels, for the default
     /// clock sources of [`Config`]. The clock starts paused.
@@ -437,12 +526,12 @@ impl<'peripherals> Clock<'peripherals> {
     /// The current time. While paused it follows the RTC, to about 30 us.
     #[inline]
     #[must_use = "the time is only read"]
-    pub fn now(&self) -> u32 {
+    pub(crate) fn now(&self) -> At {
         if let Some((tick, time)) = self.paused {
-            return time.wrapping_add(ticks_to_us(rtc_now().wrapping_sub(tick) & RTC_MASK));
+            return time.after(ticks_to_us(rtc_now().wrapping_sub(tick) & RTC_MASK));
         }
         REGS.tasks_capture(CC_NOW).write_value(1);
-        self.base.wrapping_add(REGS.cc(CC_NOW).read())
+        self.base.after(Micros(REGS.cc(CC_NOW).read()))
     }
 
     /// Stops TIMER0 and releases the crystal. The time continues on the RTC.
@@ -464,7 +553,7 @@ impl<'peripherals> Clock<'peripherals> {
             }
         };
         chip::disable_channel(PPI_SYNC);
-        let time = self.base.wrapping_add(REGS.cc(CC_NOW).read());
+        let time = self.base.after(Micros(REGS.cc(CC_NOW).read()));
         REGS.tasks_stop().write_value(1);
         // STOP alone keeps drawing current (nRF52832 anomaly 78), and on the
         // nRF51 only SHUTDOWN powers the timer down.
@@ -482,7 +571,7 @@ impl<'peripherals> Clock<'peripherals> {
     ///
     /// If `radio` points at a buffer too short for the packet layout, as
     /// for [`Radio::receive`].
-    pub(crate) fn receive_ahead(&mut self, radio: &Radio<'_>, at: u32) -> Option<u32> {
+    pub(crate) fn receive_ahead(&mut self, radio: &Radio<'_>, at: At) -> Option<Micros> {
         radio.check_receivable();
         self.start_at(at, PPI_RXEN)
     }
@@ -536,34 +625,40 @@ impl<'peripherals> Clock<'peripherals> {
             w.set_ch(PPI_ADDRESS, true);
             w.set_ch(PPI_END, true);
         });
-        Self { _rtc: rtc, _timer: timer, base: 0, late: 0, lead: CRYSTAL_LEAD_US, paused: Some((rtc_now(), 0)) }
+        Self {
+            _rtc:   rtc,
+            _timer: timer,
+            base:   At::ZERO,
+            late:   0,
+            lead:   CRYSTAL_LEAD_US,
+            paused: Some((rtc_now(), At::ZERO)),
+        }
     }
 
     /// Waits until `at` or until `interrupt` completes, with TIMER0 and the
     /// crystal stopped for long waits. Returns true if `at` was reached. The
     /// clock runs afterwards if `at` was reached and stays paused otherwise.
     #[inline]
-    pub async fn sleep_until<F>(&mut self, at: u32, interrupt: F) -> bool
+    pub(crate) async fn sleep_until<F>(&mut self, at: At, interrupt: F) -> bool
     where
         F: Future,
     {
-        let ahead = at.wrapping_sub(self.now());
-        if !is_ahead(ahead) {
+        let Some(ahead) = at.ahead_of(self.now()) else {
             self.resume_now().await;
             return true;
-        }
+        };
         if self.paused.is_none() && ahead < SLEEP_MIN_US {
             // The radio start is timed by the TIMER0 compare, so the caller
             // wakes [`SETUP_US`] early to program it, as after a pause.
-            let early = ahead.saturating_sub(SETUP_US);
-            if early == 0 {
+            let early = ahead.saturating_sub(SETUP);
+            if early == Micros::ZERO {
                 return true;
             }
-            return matches!(select(Timer::after_micros(u64::from(early)), interrupt).await, Either::First(()));
+            return matches!(select(Timer::after_micros(u64::from(early.0)), interrupt).await, Either::First(()));
         }
         self.pause();
         let Some((tick, time)) = self.paused else { return true };
-        let ticks = us_to_ticks(at.wrapping_sub(SETUP_US).wrapping_sub(time));
+        let ticks = us_to_ticks(at.before(SETUP).since(time));
         let resume = tick.wrapping_add(ticks) & RTC_MASK;
         let elapsed = rtc_now().wrapping_sub(tick) & RTC_MASK;
         if ticks < elapsed.saturating_add(us_to_ticks(self.lead)).saturating_add(RTC_MIN_TICKS) {
@@ -575,7 +670,7 @@ impl<'peripherals> Clock<'peripherals> {
         RTC.events_compare(RTC_RESUME).write_value(0);
         PPI.chenset().write(|w| w.set_ch(PPI_RESUME, true));
         let wake = ticks_to_us(ticks.wrapping_sub(elapsed)).saturating_sub(restart.clock.lead);
-        if let Either::Second(_) = select(Timer::after_micros(u64::from(wake)), interrupt).await {
+        if let Either::Second(_) = select(Timer::after_micros(u64::from(wake.0)), interrupt).await {
             return false;
         }
         let started = restart.request();
@@ -594,12 +689,12 @@ impl<'peripherals> Clock<'peripherals> {
     /// cancelled and reported as missed, and the radio may have started
     /// all the same, so the caller disables it.
     #[cfg(feature = "extended-advertising")]
-    fn start_ahead(&mut self, at: u32, lead: u32, channel: usize) -> bool {
+    fn start_ahead(&mut self, at: At, lead: Micros, channel: usize) -> bool {
         self.cancel_start();
-        REGS.cc(CC_START).write_value(at.wrapping_sub(self.base));
+        REGS.cc(CC_START).write_value(at.since(self.base).0);
         REGS.events_compare(CC_START).write_value(0);
-        let ahead = at.wrapping_sub(self.now());
-        if !is_ahead(ahead) || ahead < lead {
+        let Some(ahead) = at.ahead_of(self.now()) else { return false };
+        if ahead < lead {
             return false;
         }
         PPI.chenset().write(|w| w.set_ch(channel, true));
@@ -612,16 +707,15 @@ impl<'peripherals> Clock<'peripherals> {
 
     /// Starts the radio through `channel` at `at`. Returns how long before
     /// `at` the start was programmed, or `None` if `at` is not in the future.
-    fn start_at(&mut self, at: u32, channel: usize) -> Option<u32> {
+    fn start_at(&mut self, at: At, channel: usize) -> Option<Micros> {
         self.cancel_start();
-        REGS.cc(CC_START).write_value(at.wrapping_sub(self.base));
+        REGS.cc(CC_START).write_value(at.since(self.base).0);
         REGS.events_compare(CC_START).write_value(0);
         PPI.chenset().write(|w| w.set_ch(channel, true));
-        let ahead = at.wrapping_sub(self.now());
-        is_ahead(ahead).then_some(ahead)
+        at.ahead_of(self.now())
     }
 
-    /// Disarms the deadline of [`Self::expire_at`].
+    /// Disarms the deadline of a wait that the TIMER0 compare wakes.
     #[inline]
     pub fn stop_expiry(&self) {
         REGS.intenclr().write(|w| w.set_compare(CC_START, true));
@@ -634,11 +728,12 @@ impl<'peripherals> Clock<'peripherals> {
     /// then disables.
     #[cfg(feature = "extended-advertising")]
     #[inline]
-    pub fn transmit_ahead(&mut self, at: u32, lead: u32) -> bool { self.start_ahead(at, lead, PPI_TXEN) }
+    pub(crate) fn transmit_ahead(&mut self, at: At, lead: Micros) -> bool { self.start_ahead(at, lead, PPI_TXEN) }
 
     /// Starts sending at `at`. Returns false if `at` is not in the future.
+    #[cfg(feature = "nrf52832")]
     #[inline]
-    pub fn transmit_at(&mut self, at: u32) -> bool { self.start_at(at, PPI_TXEN).is_some() }
+    pub(crate) fn transmit_at(&mut self, at: At) -> bool { self.start_at(at, PPI_TXEN).is_some() }
 
     /// Sleeps until the crystal runs, starting it again if it does not come
     /// up in time.
@@ -652,8 +747,8 @@ impl<'peripherals> Clock<'peripherals> {
         CLOCK.intenclr().write(|w| w.set_hfclkstarted(true));
     }
 
-    /// Sleeps until the radio start of a reception or of
-    /// [`Self::transmit_at`] fired, which frees its compare for a deadline.
+    /// Sleeps until the timer started the radio for a reception or a
+    /// transmission, which frees its compare for a deadline.
     #[inline]
     pub fn wait_started(&mut self) {
         REGS.intenset().write(|w| w.set_compare(CC_START, true));
@@ -865,11 +960,6 @@ fn crystal_running() -> bool { CLOCK.events_hfclkstarted().read() != 0 }
 /// Whether a wrapping difference is a positive time.
 const fn is_ahead(difference: u32) -> bool { difference > 0 && difference < u32::MAX.wrapping_shr(1) }
 
-/// Whether `now` is at or past `at`.
-#[inline]
-#[must_use = "the comparison is only computed"]
-pub const fn reached(now: u32, at: u32) -> bool { now.wrapping_sub(at) < u32::MAX.wrapping_shr(1) }
-
 /// Drops one user of the high frequency crystal and stops it after the last.
 fn release_crystal() {
     CRYSTAL_USERS.lock(|users| {
@@ -905,8 +995,10 @@ fn passed(tick: u32) -> bool {
 /// The RTC counter.
 fn rtc_now() -> u32 { RTC.counter().read().counter() }
 
-/// Microseconds of `ticks` RTC ticks, 15625/512 us each.
-const fn ticks_to_us(ticks: u32) -> u32 { u64::from(ticks).saturating_mul(15_625).wrapping_shr(9).saturating_cast() }
+/// Time of `ticks` RTC ticks, 15625/512 us each.
+const fn ticks_to_us(ticks: u32) -> Micros {
+    Micros(u64::from(ticks).saturating_mul(15_625).wrapping_shr(9).saturating_cast())
+}
 
-/// Whole RTC ticks in `us` microseconds.
-const fn us_to_ticks(us: u32) -> u32 { u64::from(us).wrapping_shl(9).strict_div(15_625).saturating_cast() }
+/// Whole RTC ticks in `time`.
+const fn us_to_ticks(time: Micros) -> u32 { u64::from(time.0).wrapping_shl(9).strict_div(15_625).saturating_cast() }

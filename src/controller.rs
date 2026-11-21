@@ -5,7 +5,7 @@
 use crate::advertiser::Setup;
 use crate::{
     advertiser::{self, Accepted, Counters, Settings},
-    clock::{Clock, SETUP_US},
+    clock::{Clock, Micros, SETUP},
     connection::{Connection, Ended},
     health,
     link::{ConnectionParams, Event, Shared},
@@ -21,7 +21,7 @@ const ADV_DELAY_MAX_US: u32 = 10_000;
 /// Duration of high duty cycle directed advertising.
 const HIGH_DUTY_DURATION: Duration = Duration::from_millis(1280);
 /// Interval of high duty cycle directed advertising events.
-const HIGH_DUTY_INTERVAL_US: u32 = 3750;
+const HIGH_DUTY_INTERVAL_US: Micros = Micros(3750);
 
 /// Ends high duty cycle directed advertising after its time. `since` is
 /// when the advertising was enabled. Returns true if it ended.
@@ -43,13 +43,13 @@ async fn check_limits(settings: &Settings, since: &mut Option<Instant>, shared: 
 
 /// Time until the next advertising event. The random delay comes from the
 /// RNG interrupt while other tasks run.
-async fn interval(settings: &Settings) -> u32 {
+async fn interval(settings: &Settings) -> Micros {
     if settings.kind.is_high_duty() {
         return HIGH_DUTY_INTERVAL_US;
     }
     let mut jitter: [u8; 2] = [0; 2];
     rng::fill_async(&mut jitter).await;
-    settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).strict_rem(ADV_DELAY_MAX_US))
+    Micros(settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).strict_rem(ADV_DELAY_MAX_US)))
 }
 
 /// Publishes the PHY of a link that starts after an `AUX_CONNECT_REQ`, the
@@ -101,14 +101,14 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         let (started, event) = advertiser::event(radio, clock, &settings, &mut counters, &mut rx);
         counters.log();
         let Some(Accepted { end, request, setup }) = event else {
-            let next = started.wrapping_add(interval(&settings).await);
+            let next = started.after(interval(&settings).await);
             // The sleep returns `SETUP_US` early, for a radio start the timer
             // triggers; advertising starts when it returns, so it sleeps that
             // much longer to keep the advertising interval. High duty cycle
             // directed advertising keeps the early start instead: its events
             // must be at most 3.75 ms apart, which the loop's own time would
             // otherwise exceed.
-            let wake = if settings.kind.is_high_duty() { next } else { next.wrapping_add(SETUP_US) };
+            let wake = if settings.kind.is_high_duty() { next } else { next.after(SETUP) };
             if !clock.sleep_until(wake, shared.changed()).await {
                 since = None;
             }

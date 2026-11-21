@@ -91,6 +91,7 @@ use crate::{advertiser::extended::RENEWAL_LEN, radio::Phy};
 use crate::{
     advertiser::{Kind, SCAN_DATA_MAX, Settings as AdvSettings, privacy::FILTER_LIST_SIZE},
     chip,
+    clock::Micros,
     crypto,
     pdu::{Llid, Peer, valid_connection_parameters},
     rng,
@@ -421,9 +422,9 @@ pub struct NextEvent {
 #[cfg(feature = "event-timing")]
 #[derive(Clone, Copy)]
 struct Planned {
-    /// Time from [`Self::at`] until the radio's start, signed as a wrapping
-    /// difference of the link layer's clock.
-    ahead:    u32,
+    /// Time from [`Self::at`] until the radio's start in microseconds,
+    /// negative if it passed.
+    ahead:    i32,
     /// The host's time when the event was planned.
     at:       Instant,
     /// The link's generation: a plan of an earlier link is never given for
@@ -439,10 +440,10 @@ struct Planned {
 impl Planned {
     /// The event in the host's time.
     fn resolve(self) -> NextEvent {
-        let ahead = self.ahead.cast_signed();
-        let distance = Duration::from_micros(u64::from(ahead.unsigned_abs()));
-        let start = if ahead.is_negative() { self.at.checked_sub(distance) } else { self.at.checked_add(distance) }
-            .unwrap_or(self.at);
+        let distance = Duration::from_micros(u64::from(self.ahead.unsigned_abs()));
+        let start =
+            if self.ahead.is_negative() { self.at.checked_sub(distance) } else { self.at.checked_add(distance) }
+                .unwrap_or(self.at);
         NextEvent {
             interval: Duration::from_micros(u64::from(self.interval)),
             queue_by: start.checked_sub(Duration::from_micros(u64::from(self.lead))).unwrap_or(start),
@@ -1032,9 +1033,9 @@ impl Shared {
         address
     }
 
-    /// The authenticated payload timeout in microseconds.
-    pub(crate) fn payload_timeout(&self) -> u32 {
-        self.state.lock(|cell| u32::from(cell.borrow().payload_timeout).saturating_mul(10_000))
+    /// The authenticated payload timeout.
+    pub(crate) fn payload_timeout(&self) -> Micros {
+        self.state.lock(|cell| Micros(u32::from(cell.borrow().payload_timeout).saturating_mul(10_000)))
     }
 
     /// Sets the authenticated payload timeout in units of 10 ms, as
@@ -1243,13 +1244,13 @@ impl Shared {
 
     /// Records the next event the link layer listens at: its radio starts
     /// `ahead` microseconds after the host's time `at`, data must be queued
-    /// `lead` microseconds before, and events are `interval` microseconds
-    /// apart. One copy under the lock; the conversion waits for the host.
+    /// `lead` before, and events are `interval` apart. One copy under the
+    /// lock; the conversion waits for the host.
     #[cfg(feature = "event-timing")]
-    pub(crate) fn set_next_event(&self, at: Instant, ahead: u32, lead: u32, interval: u32) {
+    pub(crate) fn set_next_event(&self, at: Instant, ahead: i32, lead: Micros, interval: Micros) {
         self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            state.next_event = Some(Planned { ahead, at, epoch: state.epoch, interval, lead });
+            state.next_event = Some(Planned { ahead, at, epoch: state.epoch, interval: interval.0, lead: lead.0 });
         });
     }
 

@@ -3,7 +3,7 @@
 
 use super::{CHANNELS, LISTEN_US, Settings};
 use crate::{
-    clock::Clock,
+    clock::{At, Clock, Micros},
     pdu::{
         ADV_ACCESS_ADDRESS,
         ADV_CRC_INIT,
@@ -142,13 +142,13 @@ fn accepts_scan(settings: &Settings, scanner: Peer) -> bool {
 /// Runs one advertising event on the enabled channels. Returns a valid
 /// connection request and the time its packet ended.
 #[inline]
-pub fn event(
+pub(crate) fn event(
     radio: &mut Radio<'_>,
     clock: &Clock<'_>,
     settings: &Settings,
     pdus: (&LegacyAdvertisement, &LegacyAdvertisement),
     rx: &mut PacketBuffer,
-) -> Option<(ConnectInd, u32)> {
+) -> Option<(ConnectInd, At)> {
     radio.set_access_address(ADV_ACCESS_ADDRESS);
     radio.set_crc_init(ADV_CRC_INIT);
     CHANNELS
@@ -179,7 +179,7 @@ fn on_channel(
     (advertisement, scan_response): (&LegacyAdvertisement, &LegacyAdvertisement),
     rx: &mut PacketBuffer,
     channel: u8,
-) -> Option<(ConnectInd, u32)> {
+) -> Option<(ConnectInd, At)> {
     radio.set_channel(channel);
     let listen = settings.kind != Kind::NonConnectable;
     let after = if listen { Turnaround::Receive } else { Turnaround::None };
@@ -203,7 +203,7 @@ fn on_channel(
     radio.wait_switched();
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
-    let deadline = clock.end_time().wrapping_add(LISTEN_US);
+    let deadline = clock.end_time().after(Micros(LISTEN_US));
     clock.expire_at(deadline);
     let heard = radio.wait_address(|| clock.expired(deadline));
     clock.stop_expiry();

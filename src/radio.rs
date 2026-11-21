@@ -519,7 +519,7 @@ impl<'peripherals> Radio<'peripherals> {
 
     /// Sleeps until an access address arrives or `expired` holds, which is
     /// checked on every wake: it must depend on an event that wakes the CPU,
-    /// such as the deadline of [`crate::clock::Clock::expire_at`]. Returns
+    /// such as the deadline the clock arms on its TIMER0 compare. Returns
     /// whether the address arrived.
     #[inline]
     pub fn wait_address<Expired>(&mut self, mut expired: Expired) -> bool
