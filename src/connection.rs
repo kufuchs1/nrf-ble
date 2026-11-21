@@ -283,29 +283,18 @@ pub struct Stats {
     pub answer_us_max:     u32,
     /// Packets received with a CRC error.
     pub crc_errors:        u32,
-    /// Decryptions the CCM did not finish, or ended with an error.
-    pub decrypt_timeouts:  u32,
     /// Connection events.
     pub events:            u32,
     /// Acknowledgements answered with an empty PDU although more of ours
     /// waited, as nothing was prepared: a second acknowledgement in one
     /// event where only one PDU is prepared per event.
     pub fallback:          u32,
-    /// Decryptions not started as the key stream was not complete by the
-    /// access address, or not in time.
-    pub keystream_late:    u32,
     /// Answers to an acknowledgement in place only after the radio started
     /// sending: it sent our previous PDU again, with its previous flags.
     pub late_ack:          u32,
     /// Answers without an acknowledgement in place only after the radio
     /// started sending: our PDU went out with its previous flags.
     pub late_noack:        u32,
-    /// Encrypted packets with a payload whose MIC was checked: new ones, and
-    /// those the central sent again after their MIC failed.
-    pub mic_checked:       u32,
-    /// Of [`Self::mic_checked`], those whose MIC failed once and that the
-    /// central was asked to send again, unacknowledged.
-    pub mic_retries:       u32,
     /// Connection events without a packet from the central.
     pub missed:            u32,
     /// Longest preparation of the next PDU between events, copy and
@@ -313,13 +302,6 @@ pub struct Stats {
     pub prepare_us_max:    u32,
     /// New data PDUs received.
     pub received:          u32,
-    /// Packets whose MIC failed on the fly and again when decrypted after
-    /// the event: the packet in RAM differs from what was sent.
-    pub recheck_failed:    u32,
-    /// Packets whose MIC failed on the fly and passed when the CPU had the
-    /// CCM decrypt them again after the event: the decryption with the
-    /// radio was corrupted, not the packet in RAM.
-    pub recheck_passed:    u32,
     /// Packets the central sent again that we had taken: it missed our
     /// answer, or our answer came late. A packet refused for lack of room
     /// comes again as a new one and is not counted.
@@ -423,27 +405,13 @@ enum Procedure {
     Refresh,
 }
 
-/// The MIC check of received packets.
-#[derive(Clone, Copy)]
-struct MicCheck {
+/// Link encryption state.
+struct Encryption {
     /// Whether the decryption of the packet under way was started on its
     /// access address ([`crypto::start_on_address`]).
     armed:      bool,
-    /// Whether the packet of the last event failed its MIC once and is to be
-    /// decrypted again after the event ([`Connection::recheck_mic`]).
-    recheck:    bool,
-    /// Whether the packet just classified failed its MIC once: its
-    /// unauthenticated header acknowledges nothing.
-    unverified: bool,
-}
-
-/// Link encryption state.
-struct Encryption {
     /// IV of the session.
     iv:         [u8; 8],
-    /// Packet counter of the received packet whose MIC failed once: a
-    /// second failure with the same counter ends the link.
-    mic_retry:  Option<u64>,
     /// State of the start procedure.
     phase:      Phase,
     /// Whether the start is the first or refreshes the key.
@@ -871,8 +839,6 @@ pub struct Connection {
     /// Status for the connection parameter requests that were part of the
     /// host's answer, once the central's request ended without an update.
     merged_outcome:         Option<u8> = None,
-    /// The MIC check of the packet under way and of the last one.
-    mic:                    MicCheck = MicCheck { armed: false, recheck: false, unverified: false },
     /// Whether the free slot holds a prepared PDU to send next.
     next_ready:             bool = false,
     /// Transmit PHY to apply with the next PHY instant.
@@ -1267,17 +1233,7 @@ impl Connection {
     /// the previous CCM counter and must not be delivered or consume another
     /// nonce, as in the Core receive sequence and Zephyr. Returns whether it
     /// is a duplicate, or `None` if it ends the link.
-    ///
-    /// A new packet whose MIC fails is not taken the first time, like one
-    /// without room: its header acknowledges nothing
-    /// ([`MicCheck::unverified`]), the central sends it again with the same
-    /// packet counter, and only a second failure with that counter ends the
-    /// link. The Core ends the link at once; a packet with a valid CRC whose
-    /// MIC fails once and then passes was corrupted on its way through the CCM,
-    /// not forged, and a forger gains one more try per counter against a 32-bit
-    /// MIC.
     const fn classify(&mut self, header: u8, len: u8, mic_ok: bool, address: u32) -> Option<bool> {
-        self.mic.unverified = false;
         let llid = header & LLID_MASK;
         let maximum = ACL_MAX.saturating_add(if self.encryption.rx_on { MIC_LEN } else { 0 });
         if llid == 0 || usize::from(len) > maximum || (len == 0 && llid != Llid::Continuation.bits()) {
@@ -1289,19 +1245,9 @@ impl Connection {
             self.last_valid = address;
             return Some(true);
         }
-        if self.encryption.rx_on && len != 0 {
-            if usize::from(len) <= MIC_LEN {
-                self.abort = Some(ERROR_MIC_FAILURE);
-                return None;
-            }
-            self.stats.mic_checked = self.stats.mic_checked.wrapping_add(1);
-            if !mic_ok {
-                if !self.refuse_failed_mic() {
-                    return None;
-                }
-                self.mic.unverified = true;
-                return Some(false);
-            }
+        if self.encryption.rx_on && len != 0 && (usize::from(len) <= MIC_LEN || !mic_ok) {
+            self.abort = Some(ERROR_MIC_FAILURE);
+            return None;
         }
         // Once the central asked to start or pause encryption, it sends no
         // data until encryption runs again (Core, Vol 6, Part B, 5.1.3). Data
@@ -1449,10 +1395,10 @@ impl Connection {
         let mut central_more = false;
         if let Some((header, len, mic_ok)) = packet {
             decision.duplicate = self.classify(header, len, mic_ok, address)?;
-            let (acked, fallback) = if self.mic.unverified { (None, false) } else { self.ack_fast(header) };
+            let (acked, fallback) = self.ack_fast(header);
             // The central's first packet of the link acknowledges nothing
-            // yet, nor does one whose MIC failed.
-            decision.nacked = acked.is_none() && self.stats.received != 0 && !self.mic.unverified;
+            // yet.
+            decision.nacked = acked.is_none() && self.stats.received != 0;
             decision.acked = acked;
             decision.fallback = fallback;
             decision.central = Some(header);
@@ -1462,8 +1408,7 @@ impl Connection {
                 // is handled before the central sends more.
                 open &= header & LLID_MASK != Llid::Control.bits();
             } else if !decision.duplicate {
-                // No room for it, or its MIC failed once: the central sends
-                // it again next event.
+                // No room for it: the central sends it again next event.
                 open = false;
             } else {
                 // A retransmission acknowledges our packet only.
@@ -1506,7 +1451,6 @@ impl Connection {
                 self.encryption.tx_config = crypto::config(key, self.encryption.iv, false);
                 crypto::wipe(&mut key);
                 self.encryption.rx_counter = 0;
-                self.encryption.mic_retry = None;
                 self.encryption.tx_counter = 0;
                 crypto::enable();
                 self.enqueue(Llid::Control, &[OP_START_ENC_REQ]);
@@ -1726,9 +1670,7 @@ impl Connection {
             let Some((more, late)) = self.respond(radio, clock, rx, fits, shared) else {
                 radio.disable();
                 crypto::disarm();
-                // Unanswered: the link ends, or the packet's decryption did
-                // not finish and the central sends it again.
-                return self.abort.is_none().then_some(anchor);
+                return None;
             };
             if asymmetric {
                 // The other PHY is set while the radio is disabled, and the
@@ -2392,8 +2334,8 @@ impl Connection {
             drift_max: NO_DRIFT,
             hopping: if request.csa2 { Hopping::csa2(request.access_address) } else { Hopping::new(request.hop) },
             encryption: Encryption {
+                armed:      false,
                 iv:         [0; 8],
-                mic_retry:  None,
                 phase:      Phase::Idle,
                 procedure:  Procedure::First,
                 rx_config:  [0; CONFIG_LEN],
@@ -2726,18 +2668,12 @@ impl Connection {
         shared.set_counters(Counters {
             crc_errors: self.stats.crc_errors,
             crystal_lead_us: lead,
-            decrypt_timeouts: self.stats.decrypt_timeouts,
             drift_us,
             end,
             events: self.stats.events,
-            keystream_late: self.stats.keystream_late,
             late_crystal: late.wrapping_sub(self.late_start),
-            mic_checked: self.stats.mic_checked,
-            mic_retries: self.stats.mic_retries,
             missed: self.stats.missed,
             received: self.stats.received,
-            recheck_failed: self.stats.recheck_failed,
-            recheck_passed: self.stats.recheck_passed,
             retransmissions: self.stats.retx,
             skipped: self.stats.skipped,
             slot_overruns: self.stats.slot_overruns,
@@ -2754,46 +2690,6 @@ impl Connection {
     fn publish_event(&self, clock: &Clock<'_>, start: u32, shared: &Shared) {
         let ahead = start.wrapping_sub(clock.now());
         shared.set_next_event(embassy_time::Instant::now(), ahead, queue_lead(clock.lead()), self.interval);
-    }
-
-    /// Decrypts the packet of the last event again, now and from the CPU, if
-    /// its MIC failed on the fly ([`Self::classify`]), and counts whether it
-    /// passes: whether the decryption with the radio or the packet in RAM was
-    /// corrupted. The packet is still in `rx`, as an event ends after a
-    /// packet it did not take.
-    fn recheck_mic(&mut self, rx: &PacketBuffer) {
-        if !mem::take(&mut self.mic.recheck)
-            || !crypto::set_counter(&mut self.encryption.rx_config, self.encryption.rx_counter)
-        {
-            return;
-        }
-        let pointers = (rx.0.as_ptr(), self.rx_plain.as_mut_ptr());
-        // SAFETY: the configuration, scratch and both buffers belong to this
-        // connection, no decryption is armed after the event, and the CCM is
-        // done or stopped when this returns.
-        let valid = unsafe {
-            crypto::decrypt_now(&self.encryption.rx_config, pointers, &mut self.encryption.scratch, self.phy)
-        };
-        if valid == Some(true) {
-            self.stats.recheck_passed = self.stats.recheck_passed.wrapping_add(1);
-        } else {
-            self.stats.recheck_failed = self.stats.recheck_failed.wrapping_add(1);
-        }
-    }
-
-    /// Refuses a packet whose MIC failed, or whose decryption did not finish,
-    /// for the first time with its packet counter, so that the central sends
-    /// it again, and returns true; ends the link and returns false if the
-    /// packet with that counter failed before ([`Self::classify`]).
-    const fn refuse_failed_mic(&mut self) -> bool {
-        let counter = self.encryption.rx_counter;
-        if matches!(self.encryption.mic_retry, Some(failed) if failed == counter) {
-            self.abort = Some(ERROR_MIC_FAILURE);
-            return false;
-        }
-        self.encryption.mic_retry = Some(counter);
-        self.stats.mic_retries = self.stats.mic_retries.wrapping_add(1);
-        true
     }
 
     /// Logs the counters since the last call and tells the host the link's
@@ -2851,8 +2747,7 @@ impl Connection {
     /// packet with a CRC error is answered too, with the unacknowledged PDU
     /// again (Core, Vol 6, Part B, 4.5.6). Returns `None` if no answer may
     /// be sent, and otherwise whether the event goes on after the answer
-    /// (see [`Self::decide`]) and whether the answer came too late. A packet
-    /// whose decryption does not finish is not answered either.
+    /// (see [`Self::decide`]) and whether the answer came too late.
     ///
     /// The radio latches the packet pointer when the answer starts, about
     /// 140 us after the END on the nRF51, and sends whatever it points at.
@@ -2880,39 +2775,30 @@ impl Connection {
         // The decryption of the packet started at its access address; the
         // CCM must not start again at ours.
         crypto::disarm();
-        let packet = if radio.crc_ok() {
-            let [header, len, ..] = rx.0;
-            let (mic_ok, checked) = if self.encryption.rx_on && len != 0 {
-                // A decryption not started fails the MIC at once, which the
-                // central's retransmission gets another try at.
-                let valid = if self.mic.armed { crypto::wait_decrypted() } else { None };
-                if valid.is_none() {
-                    crypto::stop();
-                    if self.mic.armed {
-                        // Not finished, and the interframe space is over:
-                        // no answer, and the central sends the packet again.
-                        self.stats.decrypt_timeouts = self.stats.decrypt_timeouts.wrapping_add(1);
-                        _ = self.refuse_failed_mic();
-                        return None;
-                    }
-                }
-                (valid == Some(true), valid.is_some())
+        let [header, len, ..] = rx.0;
+        let encrypted = self.encryption.rx_on && len != 0;
+        let packet = if radio.crc_ok() && (!encrypted || self.encryption.armed) {
+            let mic_ok = if encrypted {
+                let Some(valid) = crypto::wait_decrypted() else {
+                    self.abort = Some(ERROR_HARDWARE_FAILURE);
+                    return None;
+                };
+                valid
             } else {
-                (true, false)
+                true
             };
-            // Only a MIC the CCM checked and failed is decrypted again after
-            // the event.
-            self.mic.recheck = checked && !mic_ok;
             Some((header, len, mic_ok))
         } else {
-            // Its length may be corrupt: the decryption is not waited for.
+            // A CRC error, whose length may be corrupt, or a packet whose
+            // decryption never started (`start_decryption`): not taken,
+            // counted as a CRC error, and the central sends it again. Its
+            // decryption is not waited for.
             if self.encryption.rx_on {
                 crypto::stop();
             }
             None
         };
         let decision = self.decide(packet, clock.address_time(), fits, shared)?;
-        self.mic.recheck &= self.mic.unverified;
         let buffer = self.answer_buffer(decision.follow.md);
         // SAFETY: the slots belong to this connection, and the exchange
         // disables the radio before it returns.
@@ -3063,7 +2949,6 @@ impl Connection {
             } else {
                 self.note_miss(channel, window);
             }
-            self.recheck_mic(rx);
             self.check_slots();
             self.listened(heard_before);
             if self.counter == 0 {
@@ -3177,15 +3062,12 @@ impl Connection {
 
     /// Lets the access address start the decryption [`Self::arm_decryption`]
     /// armed, once its key stream is complete ([`crypto::start_on_address`]).
-    /// A packet whose decryption did not start fails its MIC.
+    /// A packet whose decryption did not start is taken as not received.
     fn start_decryption(&mut self, radio: &Radio<'_>) {
         if !self.encryption.rx_on {
             return;
         }
-        self.mic.armed = crypto::start_on_address(|| radio.has_address());
-        if !self.mic.armed {
-            self.stats.keystream_late = self.stats.keystream_late.wrapping_add(1);
-        }
+        self.encryption.armed = crypto::start_on_address(|| radio.has_address());
     }
 
     /// Answers an encryption request: sends the peripheral's session key

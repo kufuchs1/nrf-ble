@@ -90,10 +90,10 @@ pub(crate) unsafe fn arm_decrypt(
 /// only then lets the radio's access address start the decryption. Returns
 /// false, with the decryption not armed, if `heard` tells that the access
 /// address came first or the key stream took longer than
-/// [`chip::DECRYPT_WAIT`]: the packet then cannot be decrypted, and its MIC
-/// counts as failed.
+/// [`chip::DECRYPT_WAIT`]: the packet then cannot be decrypted and is taken
+/// as not received.
 #[inline]
-#[must_use = "an unarmed decryption fails the packet's MIC"]
+#[must_use = "a packet whose decryption did not start cannot be taken"]
 pub(crate) fn start_on_address(heard: impl Fn() -> bool) -> bool {
     let mut remaining = chip::DECRYPT_WAIT;
     while CCM.events_endksgen().read() == 0 {
@@ -154,50 +154,8 @@ unsafe fn seal_ccm(
     scratch: &mut [u8; SCRATCH_LEN],
     phy: Phy,
 ) -> bool {
-    // SAFETY: the caller's guarantees are those of `run_now`.
-    unsafe { run_now(Mode::Encryption, config, (input, output), scratch, phy, chip::SEAL_WAIT) }
-}
-
-/// Decrypts the received packet at `input` into `output` again, started by
-/// the CPU, which polls until the CCM is done: a check of a packet whose MIC
-/// failed on the fly. Returns whether its MIC is valid, `None` if the CCM
-/// failed or did not finish in time.
-///
-/// # Safety
-///
-/// As for [`seal`], with `input` pointing to the received packet.
-#[inline]
-pub(crate) unsafe fn decrypt_now(
-    config: &[u8; CONFIG_LEN],
-    pointers: (*const u8, *mut u8),
-    scratch: &mut [u8; SCRATCH_LEN],
-    phy: Phy,
-) -> Option<bool> {
-    // The CCM decrypts at the pace of `phy`'s data rate, as on the fly: up to
-    // about 2 ms for the longest packet on LE 1M.
-    // SAFETY: the caller's guarantees are those of `run_now`.
-    let completed =
-        unsafe { run_now(Mode::Decryption, config, pointers, scratch, phy, chip::SEAL_WAIT.saturating_mul(4)) };
-    completed.then(|| CCM.micstatus().read().micstatus() == Micstatus::CheckPassed)
-}
-
-/// Runs one CCM operation in `mode` now, key stream and then the operation,
-/// and polls until it is done, at most `wait` iterations. Returns false if
-/// the CCM failed or did not finish in time.
-///
-/// # Safety
-///
-/// As for [`seal`].
-unsafe fn run_now(
-    mode: Mode,
-    config: &[u8; CONFIG_LEN],
-    (input, output): (*const u8, *mut u8),
-    scratch: &mut [u8; SCRATCH_LEN],
-    phy: Phy,
-    wait: u32,
-) -> bool {
     PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
-    chip::ccm_mode(mode, phy);
+    chip::ccm_mode(Mode::Encryption, phy);
     set_pointers(config, input, output, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(true));
     CCM.events_endksgen().write_value(0);
@@ -205,7 +163,7 @@ unsafe fn run_now(
     CCM.events_error().write_value(0);
     compiler_fence(Ordering::SeqCst);
     CCM.tasks_ksgen().write_value(1);
-    let mut remaining = wait;
+    let mut remaining = chip::SEAL_WAIT;
     while CCM.events_endcrypt().read() == 0 && CCM.events_error().read() == 0 && remaining != 0 {
         remaining = remaining.saturating_sub(1);
     }
