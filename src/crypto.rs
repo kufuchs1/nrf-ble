@@ -109,6 +109,13 @@ pub(crate) fn start_on_address(heard: impl Fn() -> bool) -> bool {
         remaining = remaining.saturating_sub(1);
     }
     PPI.chenset().write(|w| w.set_ch(PPI_CRYPT, true));
+    // An access address that came before the channel was on started nothing;
+    // one right after it did, but cannot be told apart, so both count as not
+    // armed.
+    if heard() {
+        PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
+        return false;
+    }
     true
 }
 

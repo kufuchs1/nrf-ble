@@ -1275,14 +1275,9 @@ impl Connection {
             }
             self.stats.mic_checked = self.stats.mic_checked.wrapping_add(1);
             if !mic_ok {
-                let counter = self.encryption.rx_counter;
-                if matches!(self.encryption.mic_retry, Some(failed) if failed == counter) {
-                    self.abort = Some(ERROR_MIC_FAILURE);
+                if !self.refuse_failed_mic() {
                     return None;
                 }
-                self.encryption.mic_retry = Some(counter);
-                self.stats.mic_retries = self.stats.mic_retries.wrapping_add(1);
-                self.mic.recheck = true;
                 self.mic.unverified = true;
                 return Some(false);
             }
@@ -1726,7 +1721,9 @@ impl Connection {
             let Some((more, late)) = self.respond(radio, clock, rx, fits, shared) else {
                 radio.disable();
                 crypto::disarm();
-                return None;
+                // Unanswered: the link ends, or the packet's decryption did
+                // not finish and the central sends it again.
+                return self.abort.is_none().then_some(anchor);
             };
             if asymmetric {
                 // The other PHY is set while the radio is disabled, and the
@@ -2767,6 +2764,21 @@ impl Connection {
         }
     }
 
+    /// Refuses a packet whose MIC failed, or whose decryption did not finish,
+    /// for the first time with its packet counter, so that the central sends
+    /// it again, and returns true; ends the link and returns false if the
+    /// packet with that counter failed before ([`Self::classify`]).
+    const fn refuse_failed_mic(&mut self) -> bool {
+        let counter = self.encryption.rx_counter;
+        if matches!(self.encryption.mic_retry, Some(failed) if failed == counter) {
+            self.abort = Some(ERROR_MIC_FAILURE);
+            return false;
+        }
+        self.encryption.mic_retry = Some(counter);
+        self.stats.mic_retries = self.stats.mic_retries.wrapping_add(1);
+        true
+    }
+
     /// Logs the counters since the last call and tells the host the link's
     /// counters.
     fn report(&mut self, (late, lead): (u32, u32), shared: &Shared) {
@@ -2822,7 +2834,8 @@ impl Connection {
     /// packet with a CRC error is answered too, with the unacknowledged PDU
     /// again (Core, Vol 6, Part B, 4.5.6). Returns `None` if no answer may
     /// be sent, and otherwise whether the event goes on after the answer
-    /// (see [`Self::decide`]) and whether the answer came too late.
+    /// (see [`Self::decide`]) and whether the answer came too late. A packet
+    /// whose decryption does not finish is not answered either.
     ///
     /// The radio latches the packet pointer when the answer starts, about
     /// 140 us after the END on the nRF51, and sends whatever it points at.
@@ -2853,20 +2866,27 @@ impl Connection {
         let packet = if radio.crc_ok() {
             let header = rx[0];
             let len = rx[1];
-            let mic_ok = if self.encryption.rx_on && len != 0 {
-                // A decryption not started or not finished fails the MIC,
-                // which the central's retransmission gets another try at.
+            let (mic_ok, checked) = if self.encryption.rx_on && len != 0 {
+                // A decryption not started fails the MIC at once, which the
+                // central's retransmission gets another try at.
                 let valid = if self.mic.armed { crypto::wait_decrypted() } else { None };
                 if valid.is_none() {
                     crypto::stop();
                     if self.mic.armed {
+                        // Not finished, and the interframe space is over:
+                        // no answer, and the central sends the packet again.
                         self.stats.decrypt_timeouts = self.stats.decrypt_timeouts.wrapping_add(1);
+                        _ = self.refuse_failed_mic();
+                        return None;
                     }
                 }
-                valid == Some(true)
+                (valid == Some(true), valid.is_some())
             } else {
-                true
+                (true, false)
             };
+            // Only a MIC the CCM checked and failed is decrypted again after
+            // the event.
+            self.mic.recheck = checked && !mic_ok;
             Some((header, len, mic_ok))
         } else {
             // Its length may be corrupt: the decryption is not waited for.
@@ -2876,6 +2896,7 @@ impl Connection {
             None
         };
         let decision = self.decide(packet, clock.address_time(), fits, shared)?;
+        self.mic.recheck &= self.mic.unverified;
         let buffer = self.answer_buffer(decision.follow.md);
         // SAFETY: the slots belong to this connection, and the exchange
         // disables the radio before it returns.

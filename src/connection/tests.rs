@@ -288,7 +288,7 @@ fn bad_mic_cannot_acknowledge_acl_or_move_sequence_numbers() {
     // packet is checked again after the event.
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &shared), Some(true));
     assert_eq!(link.abort, None);
-    assert!(link.mic.unverified && link.mic.recheck);
+    assert!(link.mic.unverified);
     assert_eq!(link.encryption.mic_retry, Some(0));
     assert!(!link.seq.sn && !link.seq.nesn && !link.seq.received);
     assert_eq!(link.completed, 0);
