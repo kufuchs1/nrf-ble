@@ -105,8 +105,8 @@ const FEATURE_DATA_LENGTH: u8 = 0x20;
 const FEATURE_EXTENDED_ADVERTISING: u8 = 0x10;
 /// Longest time on the air of a data PDU the specification allows.
 const LENGTH_TIME_MAX: u16 = 17_040;
-/// Length of a message integrity check.
-const MIC_LEN: usize = 4;
+/// Length of a message integrity check: [`crypto::MIC_LEN`] as an index.
+const MIC_LEN: usize = usize::from(crypto::MIC_LEN);
 /// Connection parameter change at an instant.
 const OP_CONNECTION_UPDATE_IND: u8 = 0x00;
 /// Channel map change at an instant.
@@ -386,6 +386,15 @@ enum Phase {
 }
 
 impl Phase {
+    /// Whether a PDU queued now goes out as the central reads it: no
+    /// procedure runs, or one that has not yet queued the PDU after which the
+    /// central reads ours differently, our `LL_START_ENC_REQ` or
+    /// `LL_PAUSE_ENC_RSP`. Behind either a PDU would go out plain to a
+    /// central that decrypts it, or encrypted to one that no longer does.
+    const fn consistent(self) -> bool {
+        matches!(self, Self::AwaitingEntropy(_) | Self::AwaitingKey(..) | Self::Encrypted | Self::Paused | Self::Plain)
+    }
+
     /// Whether no encryption procedure runs.
     const fn is_idle(self) -> bool { matches!(self, Self::Encrypted | Self::Plain) }
 
@@ -416,6 +425,19 @@ enum Procedure {
     First,
     /// A key refresh after a pause.
     Refresh,
+}
+
+/// How far the termination the host asked for got.
+#[derive(Clone, Copy, Eq)]
+#[derive_const(PartialEq)]
+enum Termination {
+    /// The central acknowledged our `LL_TERMINATE_IND`.
+    Acknowledged,
+    /// Our `LL_TERMINATE_IND` is queued or on the air.
+    Queued,
+    /// Not queued yet: an encryption procedure keeps it back
+    /// ([`Phase::consistent`]).
+    Waiting,
 }
 
 /// Link encryption state.
@@ -924,8 +946,8 @@ pub struct Connection {
     slots:                  (TxSlot, TxSlot),
     /// Counters.
     stats:                  Stats,
-    /// Termination requested by the host, and whether it was acknowledged.
-    terminate:              Option<(u8, bool)>,
+    /// Termination requested by the host, and how far it got.
+    terminate:              Option<(u8, Termination)>,
     /// Local termination cannot be prolonged by incoming keepalive packets.
     terminate_deadline:     Option<At> = None,
     /// Termination received from the central.
@@ -982,8 +1004,8 @@ impl Connection {
         match acked.kind {
             TxKind::Acl => self.completed = self.completed.saturating_add(1),
             TxKind::Terminate => {
-                if let Some((reason, false)) = self.terminate {
-                    self.terminate = Some((reason, true));
+                if let Some((reason, Termination::Queued)) = self.terminate {
+                    self.terminate = Some((reason, Termination::Acknowledged));
                 }
             },
             TxKind::Control if acked.opcode == OP_LENGTH_RSP => self.length.offer_taken(),
@@ -1393,11 +1415,16 @@ impl Connection {
     /// another exchange fits before the next event. Validates and takes the
     /// packet, takes the acknowledgement of ours, and chooses MD and whether
     /// the event goes on: while either side has more data and it fits. A CRC
-    /// error, a control PDU, a packet without room, or a running encryption
-    /// or termination procedure closes it. Returns `None` if no answer may
+    /// error, a control PDU, a packet without room, a running encryption or
+    /// termination procedure, or a fault that ends the link, such as a
+    /// failed seal in the event, closes it. Returns `None` if no answer may
     /// be sent.
     fn decide(&mut self, packet: Option<(u8, u8, bool)>, address: At, fits: bool, shared: &Shared) -> Option<Decision> {
-        let mut open = fits && self.encryption.phase.is_idle() && self.terminate.is_none() && self.terminated.is_none();
+        let mut open = fits
+            && self.encryption.phase.is_idle()
+            && self.terminate.is_none()
+            && self.terminated.is_none()
+            && self.abort.is_none();
         let mut decision = Decision {
             acked:     None,
             central:   None,
@@ -1485,14 +1512,22 @@ impl Connection {
     }
 
     /// Services host traffic before the next radio event, a termination the
-    /// host asked for first.
+    /// host asked for first. The termination is queued once the central
+    /// reads our PDUs as they are sent ([`Phase::consistent`]); while an
+    /// encryption procedure keeps it back, its deadline still runs and ends
+    /// the link without it.
     fn drive_host(&mut self, now: At, shared: &Shared, entropy: &Prefetch) {
         if self.terminate.is_none()
             && let Some(reason) = shared.take_disconnect()
         {
-            self.enqueue(Llid::Control, &[OP_TERMINATE_IND, reason]);
-            self.terminate = Some((reason, false));
+            self.terminate = Some((reason, Termination::Waiting));
             self.terminate_deadline = Some(now.after(self.timeout));
+        }
+        if let Some((reason, Termination::Waiting)) = self.terminate
+            && self.encryption.phase.consistent()
+        {
+            self.enqueue(Llid::Control, &[OP_TERMINATE_IND, reason]);
+            self.terminate = Some((reason, Termination::Queued));
         }
         if self.hold_until.is_some_and(|until| until.reached_by(now)) {
             self.hold_until = None;
@@ -1524,14 +1559,21 @@ impl Connection {
     /// answers the central as the host decides: with its parameters and the
     /// central's offsets, or with a rejection. A host that does not answer
     /// in [`HOST_REPLY_US`] has the request rejected. Without a host that
-    /// decides, the link layer accepts any valid request.
+    /// decides, the link layer accepts any valid request. The answer waits
+    /// while an encryption procedure runs: it would get in its way, and
+    /// behind our `LL_START_ENC_REQ` it would go out plain to a central that
+    /// decrypts it.
     fn drive_remote_request(&mut self, now: At, shared: &Shared) {
         if let Some(status) = self.merged_outcome.take() {
             let params = self.current_params();
             self.complete_updates(shared.take_merged_updates(), status, params, shared);
         }
         let Some(request) = self.remote_request else { return };
+        let idle = self.encryption.phase.is_idle();
         if request.asked.is_none() && !shared.host_decides_parameters() {
+            if !idle {
+                return;
+            }
             // Any parameters the central proposes suit the device.
             self.remote_request = None;
             let mut response: [u8; 24] = [0; 24];
@@ -1547,6 +1589,9 @@ impl Connection {
             self.remote_request = Some(RemoteRequest { asked: Some(now.after(HOST_REPLY_US)), ..request });
             return;
         };
+        if !idle {
+            return;
+        }
         let reply = match shared.take_parameter_reply() {
             Some(reply) => reply,
             None if deadline.reached_by(now) => {
@@ -1608,8 +1653,9 @@ impl Connection {
         if self.procedure_deadline.is_some_and(const |deadline| deadline.reached_by(now)) {
             return Some(Ended::Error(ERROR_RESPONSE_TIMEOUT));
         }
-        if let Some((reason, acknowledged)) = self.terminate
-            && (acknowledged || self.terminate_deadline.is_some_and(const |deadline| deadline.reached_by(now)))
+        if let Some((reason, progress)) = self.terminate
+            && (progress == Termination::Acknowledged
+                || self.terminate_deadline.is_some_and(const |deadline| deadline.reached_by(now)))
         {
             return Some(Ended::Local(reason));
         }
@@ -1664,6 +1710,9 @@ impl Connection {
             clock.cancel_start();
             radio.disable();
             crypto::disarm();
+            // The key stream `arm_decryption` started ends too: it would run
+            // on into the next seal.
+            self.stop_decryption();
             return None;
         };
         // What the setup since TIMER0's restart left of `SETUP_US`.
@@ -1671,8 +1720,7 @@ impl Connection {
         self.start_decryption(radio);
         clock.wait_started();
         if !Self::wait_address(radio, clock, deadline) {
-            radio.disable();
-            crypto::disarm();
+            self.stop_listening(radio);
             return None;
         }
         self.point_at_current(radio);
@@ -1684,6 +1732,9 @@ impl Connection {
             let Some((more, late)) = self.respond(radio, clock, rx, fits, shared) else {
                 radio.disable();
                 crypto::disarm();
+                // A decryption the answer did not wait for, or one that
+                // failed, ends too.
+                self.stop_decryption();
                 return None;
             };
             if asymmetric {
@@ -1744,8 +1795,7 @@ impl Connection {
             let listen_until =
                 clock.end_time().after(T_IFS_US).after(Micros(self.phy.address_offset_us())).after(RX_TAIL_US);
             if !Self::wait_address(radio, clock, listen_until) {
-                radio.disable();
-                crypto::disarm();
+                self.stop_listening(radio);
                 return Some(anchor);
             }
             self.point_at_current(radio);
@@ -2818,6 +2868,12 @@ impl Connection {
         }
         let late = radio.tx_started();
         let answer_us = clock.now().since(clock.end_time());
+        if self.encryption.phase.rx_on() && len == 0 {
+            // The decryption an empty PDU's access address started is not
+            // waited for: it ends here, once the answer is in place, so that
+            // it cannot run on into the next seal.
+            crypto::stop();
+        }
         self.after_answer(decision, rx, (radio.rssi(), late, answer_us), shared);
         Some((decision.follow.more, late))
     }
@@ -3263,6 +3319,26 @@ impl Connection {
             let kind = if header & LLID_MASK == Llid::Start.bits() { Llid::Start } else { Llid::Continuation };
             _ = shared.push_acl_in(kind, payload, encrypted);
         }
+    }
+
+    /// Ends the decryption [`Self::arm_decryption`] armed, if the link
+    /// receives encrypted: its key stream, or the decryption an access
+    /// address started, whose packet is not used. Nothing of it then runs on
+    /// into the next seal.
+    fn stop_decryption(&self) {
+        if self.encryption.phase.rx_on() {
+            crypto::stop();
+        }
+    }
+
+    /// Stops listening once no access address came by the deadline: first
+    /// the PPI channel from the access address to the CCM, so that an access
+    /// address from then on starts no decryption, then the radio, then the
+    /// decryption one started before the channel went off.
+    fn stop_listening(&self, radio: &mut Radio<'_>) {
+        crypto::disarm();
+        radio.disable();
+        self.stop_decryption();
     }
 
     /// Longest payload this side may send now: the effective octets, and as
