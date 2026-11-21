@@ -364,6 +364,8 @@ pub struct Counters {
     pub skipped:         u32,
     /// Receptions the radio wrote into a buffer it was to send from, past
     /// the packet there: it pointed at that buffer when a reception started.
+    /// Counted only by a link layer run with its slot guard
+    /// ([`crate::controller::run`]).
     pub slot_overruns:   u32,
     /// The window widening the anchor of [`Self::drift_us`] was received
     /// with, in microseconds: the room the link layer allowed for the drift

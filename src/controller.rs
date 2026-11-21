@@ -62,8 +62,14 @@ fn start_after_aux(setup: Setup, shared: &Shared) {
 }
 
 /// Runs the link layer forever.
+///
+/// With `SLOT_GUARD` it checks after each connection event whether the radio
+/// received into a buffer it was to send from, and counts it
+/// ([`crate::link::Counters::slot_overruns`]): for a firmware that reads the
+/// count, such as a build with its debug port open. Without it that check is
+/// not built.
 #[inline]
-pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) -> ! {
+pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) -> ! {
     let mut rx = PacketBuffer::ZERO;
     let mut since = None;
     let mut counters = Counters::new();
@@ -125,7 +131,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         let epoch = shared.set_info((central, settings.resolve(central), settings.own), params, answered);
         connection.notify(Event::Connected(epoch), shared);
         since = None;
-        let (ended, stats) = connection.run(radio, clock, &mut rx, shared).await;
+        let (ended, stats) = connection.run::<SLOT_GUARD>(radio, clock, &mut rx, shared).await;
         info!(
             "connection ended: {} events, {} missed, {} crc errors, {} packets",
             stats.events, stats.missed, stats.crc_errors, stats.received

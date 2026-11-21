@@ -1211,8 +1211,11 @@ impl Connection {
     /// Counts a reception the radio wrote into a TX slot past the longest PDU
     /// the slot holds, [`DATA_BUFFER_LEN`] octets, where nothing else writes,
     /// and clears that part again. Its first words suffice: a reception
-    /// fills the buffer from its start.
-    fn check_slots(&mut self) {
+    /// fills the buffer from its start. Nothing without `SLOT_GUARD`.
+    fn check_slots<const SLOT_GUARD: bool>(&mut self) {
+        if !SLOT_GUARD {
+            return;
+        }
         let mut overruns: u32 = 0;
         for slot in [&mut self.slots.0, &mut self.slots.1] {
             for packet in [&mut slot.plain, &mut slot.sealed] {
@@ -2816,9 +2819,10 @@ impl Connection {
     }
 
     /// Runs connection events until the connection ends, exchanging data and
-    /// events with the host through `shared`.
+    /// events with the host through `shared`, and with `SLOT_GUARD` checking
+    /// the TX slots after each event ([`Self::check_slots`]).
     #[inline]
-    pub async fn run(
+    pub async fn run<const SLOT_GUARD: bool>(
         &mut self,
         radio: &mut Radio<'_>,
         clock: &mut Clock<'_>,
@@ -2829,10 +2833,11 @@ impl Connection {
         // The crystal's late restarts count from here, also in the log.
         self.late_start = clock.late();
         self.reported.1 = self.late_start;
-        let (ended, stats) = match select(self.run_events(radio, clock, rx, shared, &entropy), entropy.run()).await {
-            Either::First(result) => result,
-            Either::Second(never) => never,
-        };
+        let (ended, stats) =
+            match select(self.run_events::<SLOT_GUARD>(radio, clock, rx, shared, &entropy), entropy.run()).await {
+                Either::First(result) => result,
+                Either::Second(never) => never,
+            };
         if let Some(end) = ended.link_end() {
             self.publish_counters((clock.late(), clock.lead()), Some(end), shared);
         }
@@ -2840,7 +2845,7 @@ impl Connection {
     }
 
     /// Schedules radio events independently of entropy collection progress.
-    async fn run_events(
+    async fn run_events<const SLOT_GUARD: bool>(
         &mut self,
         radio: &mut Radio<'_>,
         clock: &mut Clock<'_>,
@@ -2949,7 +2954,7 @@ impl Connection {
             } else {
                 self.note_miss(channel, window);
             }
-            self.check_slots();
+            self.check_slots::<SLOT_GUARD>();
             self.listened(heard_before);
             if self.counter == 0 {
                 log_radio(radio);

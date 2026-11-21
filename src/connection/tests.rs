@@ -2158,15 +2158,15 @@ fn a_reception_into_a_tx_slot_is_counted_and_cleared() {
     let shared = Shared::new();
     let mut link = connection();
     link.start_slots(&shared);
-    link.check_slots();
+    link.check_slots::<true>();
     assert_eq!(link.stats.slot_overruns, 0);
     if DATA_BUFFER_LEN < BUFFER_LEN {
         // A long packet received into the sealed buffer of the second slot.
         link.slots.1.sealed.0[..BUFFER_LEN].fill(0xA5);
-        link.check_slots();
+        link.check_slots::<true>();
         assert_eq!(link.stats.slot_overruns, 1);
         assert!(link.slots.1.sealed.0[DATA_BUFFER_LEN..].iter().all(|&byte| byte == 0));
-        link.check_slots();
+        link.check_slots::<true>();
         assert_eq!(link.stats.slot_overruns, 1);
     }
 }
