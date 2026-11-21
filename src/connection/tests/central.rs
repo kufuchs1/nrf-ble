@@ -210,8 +210,7 @@ impl Sim {
         let shared = Shared::new();
         shared.set_connected(true);
         let mut link = connection();
-        link.encryption.tx_on = encrypted;
-        link.encryption.rx_on = encrypted;
+        link.encryption.phase = if encrypted { Phase::Encrypted } else { Phase::Plain };
         link.start_slots(&shared);
         Self {
             link,
@@ -248,7 +247,7 @@ impl Sim {
         self.link.prepare_next(&self.shared);
         self.link.prepare_room(&self.shared);
         assert_eq!(self.link.abort, None);
-        let encrypted = self.link.encryption.rx_on;
+        let encrypted = self.link.encryption.phase.rx_on();
         let mut heard = false;
         for _ in 0..EXCHANGES_MAX {
             if self.random.chance(self.faults.missed) {
@@ -451,7 +450,7 @@ fn only_a_sent_pdu_uses_up_its_packet_counter() {
     let shared = Shared::new();
     shared.set_connected(true);
     let mut link = connection();
-    link.encryption.tx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     link.start_slots(&shared);
     assert_eq!(link.encryption.tx_counter, 0);
     // Prepared again and again before events: the same counter.
@@ -496,7 +495,7 @@ fn the_answer_patches_only_the_header_of_the_pdu_on_the_air() {
     shared.set_connected(true);
     for encrypted in [false, true] {
         let mut link = connection();
-        link.encryption.tx_on = encrypted;
+        link.encryption.phase = if encrypted { Phase::Encrypted } else { Phase::Plain };
         link.start_slots(&shared);
         link.enqueue(Llid::Control, &[OP_PING_RSP]);
         link.prepare_next(&shared);
@@ -583,7 +582,7 @@ fn host_data_queued_during_the_sleep_goes_out_at_that_event() {
     shared.set_connected(true);
     for encrypted in [false, true] {
         let mut link = connection();
-        link.encryption.tx_on = encrypted;
+        link.encryption.phase = if encrypted { Phase::Encrypted } else { Phase::Plain };
         link.start_slots(&shared);
         // Before the sleep, nothing to send.
         link.prepare_next(&shared);

@@ -349,29 +349,53 @@ struct KeyLookup {
     rand: [u8; 8],
 }
 
-/// State of the encryption start procedure.
+/// State of the link encryption and its start and pause procedures. The
+/// phase alone says in which directions packets are encrypted, so the two
+/// directions cannot disagree with the procedure.
+///
+/// The discriminants only keep the checks within the interframe space short.
+/// The phases that receive encrypted are 0 to 2, so [`Self::rx_on`] is one
+/// compare. Those that send encrypted are 1 to 3, and the two idle phases
+/// differ in one bit.
 #[derive(Clone, Copy, Eq)]
 #[derive_const(PartialEq)]
+#[repr(u8)]
 enum Phase {
     /// A validated request waits for its prefetched, single-use random block.
-    AwaitingEntropy(KeyLookup),
+    AwaitingEntropy(KeyLookup) = 7,
     /// The host is asked for the long term key, and whether the key request
     /// event reached it yet.
-    AwaitingKey(KeyLookup, bool),
+    AwaitingKey(KeyLookup, bool) = 8,
     /// Our encrypted pause response was sent; the central's plain one is
     /// expected.
-    AwaitingPauseResponse,
+    AwaitingPauseResponse = 3,
     /// The start request was sent and the peer must authenticate its reply.
-    AwaitingStartResponse,
-    /// No procedure running.
-    Idle,
+    AwaitingStartResponse = 0,
+    /// No procedure running, and the link is encrypted both ways.
+    Encrypted       = 2,
     /// Encryption is paused both ways; the central starts it again with the
     /// new key.
-    Paused,
+    Paused          = 5,
     /// Our pause response is queued, still encrypted.
-    Pausing,
+    Pausing         = 1,
+    /// No procedure running, and the link is not encrypted: it never was,
+    /// or the host had no key for its first start.
+    Plain           = 6,
     /// Encryption is being started.
-    Starting,
+    Starting        = 4,
+}
+
+impl Phase {
+    /// Whether no encryption procedure runs.
+    const fn is_idle(self) -> bool { matches!(self, Self::Encrypted | Self::Plain) }
+
+    /// Whether received packets are encrypted: once our start request was
+    /// sent, until our pause response was sent.
+    const fn rx_on(self) -> bool { matches!(self, Self::AwaitingStartResponse | Self::Encrypted | Self::Pausing) }
+
+    /// Whether sent packets are encrypted, from the next PDU prepared: from
+    /// the central's start response on, until its pause response.
+    const fn tx_on(self) -> bool { matches!(self, Self::AwaitingPauseResponse | Self::Encrypted | Self::Pausing) }
 }
 
 /// A procedure this side starts once.
@@ -401,7 +425,7 @@ struct Encryption {
     armed:      bool,
     /// IV of the session.
     iv:         [u8; 8],
-    /// State of the start procedure.
+    /// State of the encryption and its procedures.
     phase:      Phase,
     /// Whether the start is the first or refreshes the key.
     procedure:  Procedure,
@@ -409,8 +433,6 @@ struct Encryption {
     rx_config:  [u8; CONFIG_LEN],
     /// Packet counter of the next new received packet.
     rx_counter: u64,
-    /// Whether received packets are encrypted.
-    rx_on:      bool,
     /// CCM scratch area.
     scratch:    [u8; SCRATCH_LEN],
     /// Session key diversifier.
@@ -419,8 +441,6 @@ struct Encryption {
     tx_config:  [u8; CONFIG_LEN],
     /// Packet counter of the next new sent packet.
     tx_counter: u64,
-    /// Whether sent packets are encrypted, from the next PDU prepared.
-    tx_on:      bool,
 }
 
 impl Encryption {
@@ -933,7 +953,7 @@ impl Connection {
             self.commit_next();
             return (Some(acked), false);
         }
-        let waits = !self.queue.is_empty() || (self.acl.is_some() && self.encryption.phase == Phase::Idle);
+        let waits = !self.queue.is_empty() || (self.acl.is_some() && self.encryption.phase.is_idle());
         self.commit_empty();
         (Some(acked), waits)
     }
@@ -982,7 +1002,7 @@ impl Connection {
             for_phy_mut(&mut self.power, self.tx_phy).on_packet(rssi);
         }
         if self.seq.received {
-            self.stash(rx, self.encryption.rx_on, shared);
+            self.stash(rx, self.encryption.phase.rx_on(), shared);
         }
         if let Some(acked) = decision.acked {
             self.after_ack(acked);
@@ -1039,7 +1059,7 @@ impl Connection {
     const fn announce_power(&mut self) {
         let level = for_phy_mut(&mut self.power, self.tx_phy).level();
         let supports = self.central_features.is_some_and(const |[_, _, _, _, power, ..]| power & 0x02 != 0);
-        let free = self.encryption.phase == Phase::Idle && self.queue.is_empty();
+        let free = self.encryption.phase.is_idle() && self.queue.is_empty();
         if level == *for_phy_mut(&mut self.announced_power, self.tx_phy)
             || !supports
             || !free
@@ -1123,7 +1143,7 @@ impl Connection {
     /// Prepares the decryption of the next received packet, if the link is
     /// encrypted. Returns false and ends the link if the counter ran out.
     fn arm_decryption(&mut self, rx: &PacketBuffer) -> bool {
-        if !self.encryption.rx_on {
+        if !self.encryption.phase.rx_on() {
             return true;
         }
         if !crypto::set_counter(&mut self.encryption.rx_config, self.encryption.rx_counter) {
@@ -1158,7 +1178,7 @@ impl Connection {
             && self.acl.is_none()
             && self.queue.is_empty()
             && self.terminate.is_none()
-            && self.encryption.phase == Phase::Idle
+            && self.encryption.phase.is_idle()
             && self.encryption_change.is_none()
             && self.notifications.iter().all(Option::is_none)
             && !shared.has_acl_out()
@@ -1185,7 +1205,7 @@ impl Connection {
             && self.ping_request.is_none()
             && elapsed >= due
             && (elapsed >= latest || !self.skips(now, shared))
-            && self.encryption.phase == Phase::Idle
+            && self.encryption.phase.is_idle()
             && self.queue.is_empty()
         {
             self.enqueue(Llid::Control, &[OP_PING_REQ]);
@@ -1226,17 +1246,17 @@ impl Connection {
     /// is a duplicate, or `None` if it ends the link.
     const fn classify(&mut self, header: u8, len: u8, mic_ok: bool, address: u32) -> Option<bool> {
         let llid = header & LLID_MASK;
-        let maximum = ACL_MAX.saturating_add(if self.encryption.rx_on { MIC_LEN } else { 0 });
+        let maximum = ACL_MAX.saturating_add(if self.encryption.phase.rx_on() { MIC_LEN } else { 0 });
         if llid == 0 || usize::from(len) > maximum || (len == 0 && llid != Llid::Continuation.bits()) {
             self.abort = Some(ERROR_INVALID_PARAMETERS);
             return None;
         }
         let duplicate = (header & SN != 0) != self.seq.nesn;
-        if duplicate && self.encryption.rx_on {
+        if duplicate && self.encryption.phase.rx_on() {
             self.last_valid = address;
             return Some(true);
         }
-        if self.encryption.rx_on && len != 0 && (usize::from(len) <= MIC_LEN || !mic_ok) {
+        if self.encryption.phase.rx_on() && len != 0 && (usize::from(len) <= MIC_LEN || !mic_ok) {
             self.abort = Some(ERROR_MIC_FAILURE);
             return None;
         }
@@ -1244,11 +1264,11 @@ impl Connection {
         // data until encryption runs again (Core, Vol 6, Part B, 5.1.3). Data
         // now could be plain text injected into a link the host trusts as
         // encrypted: end the link before acknowledging it.
-        if llid != Llid::Control.bits() && len != 0 && self.encryption.phase != Phase::Idle {
+        if llid != Llid::Control.bits() && len != 0 && !self.encryption.phase.is_idle() {
             self.abort = Some(ERROR_MIC_FAILURE);
             return None;
         }
-        if self.encryption.rx_on && len != 0 && self.payload_timer.is_some() {
+        if self.encryption.phase.rx_on() && len != 0 && self.payload_timer.is_some() {
             self.payload_timer = Some((address, false));
         }
         self.last_valid = address;
@@ -1373,8 +1393,7 @@ impl Connection {
         fits: bool,
         shared: &Shared,
     ) -> Option<Decision> {
-        let mut open =
-            fits && self.encryption.phase == Phase::Idle && self.terminate.is_none() && self.terminated.is_none();
+        let mut open = fits && self.encryption.phase.is_idle() && self.terminate.is_none() && self.terminated.is_none();
         let mut decision = Decision {
             acked:     None,
             central:   None,
@@ -1453,7 +1472,7 @@ impl Connection {
             },
             Some(LtkAnswer::Missing) => {
                 self.enqueue(Llid::Control, &[OP_REJECT_IND, ERROR_KEY_MISSING]);
-                self.encryption.phase = Phase::Idle;
+                self.encryption.phase = Phase::Plain;
                 self.procedure_deadline = None;
                 self.encryption_change = Some((ERROR_KEY_MISSING, false));
             },
@@ -1748,8 +1767,8 @@ impl Connection {
             phy.address_offset_us().saturating_add(octets.saturating_mul(8).checked_div(phy.hci().into()).unwrap_or(0))
         };
         let [_, _, rx_octets, _] = self.length.effective();
-        let answer = packet(self.tx_phy, self.tx_payload_max(), self.encryption.tx_on);
-        let next = packet(self.phy, usize::from(rx_octets), self.encryption.rx_on);
+        let answer = packet(self.tx_phy, self.tx_payload_max(), self.encryption.phase.tx_on());
+        let next = packet(self.phy, usize::from(rx_octets), self.encryption.phase.rx_on());
         answer.saturating_mul(2).saturating_add(next).saturating_add(T_IFS_US.saturating_mul(3))
     }
 
@@ -1760,7 +1779,6 @@ impl Connection {
             && self.tx_kind == TxKind::Control
             && self.current().plain.0[DATA_HEADER_LEN] == OP_START_ENC_REQ
         {
-            self.encryption.rx_on = true;
             self.encryption.phase = Phase::AwaitingStartResponse;
         }
         // After our encrypted pause response the central answers in
@@ -1769,7 +1787,6 @@ impl Connection {
             && self.tx_kind == TxKind::Control
             && self.current().plain.0[DATA_HEADER_LEN] == OP_PAUSE_ENC_RSP
         {
-            self.encryption.rx_on = false;
             self.encryption.phase = Phase::AwaitingPauseResponse;
         }
         if matches!(self.expect, Expect::Anchor) {
@@ -1891,7 +1908,7 @@ impl Connection {
                 (matches!(code, OP_PAUSE_ENC_RSP | OP_TERMINATE_IND), false)
             },
             Phase::Paused => (matches!(code, OP_ENC_REQ | OP_TERMINATE_IND), false),
-            Phase::AwaitingKey(..) | Phase::Idle => (true, true),
+            Phase::AwaitingKey(..) | Phase::Encrypted | Phase::Plain => (true, true),
         };
         if !allowed {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
@@ -1968,8 +1985,7 @@ impl Connection {
         match code {
             OP_ENC_REQ => {
                 let refresh = self.encryption.phase == Phase::Paused;
-                let fresh = self.encryption.phase == Phase::Idle && !self.encryption.rx_on && !self.encryption.tx_on;
-                if !refresh && !fresh {
+                if !refresh && self.encryption.phase != Phase::Plain {
                     self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                     return;
                 }
@@ -1978,12 +1994,11 @@ impl Connection {
                 self.start_encryption(params);
             },
             OP_START_ENC_RSP => {
-                if !encrypted || self.encryption.phase != Phase::AwaitingStartResponse || !self.encryption.rx_on {
+                if !encrypted || self.encryption.phase != Phase::AwaitingStartResponse {
                     self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                     return;
                 }
-                self.encryption.tx_on = true;
-                self.encryption.phase = Phase::Idle;
+                self.encryption.phase = Phase::Encrypted;
                 self.procedure_deadline = None;
                 self.payload_timer = Some((self.last_valid, false));
                 self.enqueue(Llid::Control, &[OP_START_ENC_RSP]);
@@ -1991,8 +2006,7 @@ impl Connection {
                 info!("link encrypted");
             },
             OP_PAUSE_ENC_REQ => {
-                let on = self.encryption.rx_on && self.encryption.tx_on;
-                if !encrypted || !on || self.encryption.phase != Phase::Idle {
+                if !encrypted || self.encryption.phase != Phase::Encrypted {
                     self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                     return;
                 }
@@ -2007,7 +2021,6 @@ impl Connection {
                 }
                 // PDUs prepared from now on stay plain. Only an empty PDU can
                 // be on the air here, and empty PDUs are never sealed.
-                self.encryption.tx_on = false;
                 self.encryption.phase = Phase::Paused;
                 info!("encryption paused for a key refresh");
             },
@@ -2327,16 +2340,14 @@ impl Connection {
             encryption: Encryption {
                 armed:      false,
                 iv:         [0; 8],
-                phase:      Phase::Idle,
+                phase:      Phase::Plain,
                 procedure:  Procedure::First,
                 rx_config:  [0; CONFIG_LEN],
                 rx_counter: 0,
-                rx_on:      false,
                 scratch:    [0; SCRATCH_LEN],
                 skd:        [0; 16],
                 tx_config:  [0; CONFIG_LEN],
                 tx_counter: 0,
-                tx_on:      false,
             },
             encryption_change: None,
             establishment_deadline: Some(start.wrapping_add(interval.saturating_mul(6))),
@@ -2525,7 +2536,7 @@ impl Connection {
     /// event prepares the same PDU, or what came first meanwhile, with the
     /// same counter, as a PDU only uses up its counter once it is sent.
     fn prepare_next(&mut self, shared: &Shared) {
-        let idle = self.encryption.phase == Phase::Idle;
+        let idle = self.encryption.phase.is_idle();
         if self.acl.is_none() && self.queue.is_empty() && idle {
             self.acl = shared.next_acl_out().map(|packet| (packet, 0));
         }
@@ -2561,7 +2572,7 @@ impl Connection {
         slot.plain.0[..DATA_HEADER_LEN].copy_from_slice(&[llid.bits(), len, 0]);
         slot.kind = kind;
         slot.source = source;
-        slot.encrypted = self.encryption.tx_on && len != 0;
+        slot.encrypted = self.encryption.phase.tx_on() && len != 0;
         self.next_ready = kind != TxKind::Empty;
         if !slot.encrypted {
             return;
@@ -2767,7 +2778,7 @@ impl Connection {
         // CCM must not start again at ours.
         crypto::disarm();
         let [header, len, ..] = rx.0;
-        let encrypted = self.encryption.rx_on && len != 0;
+        let encrypted = self.encryption.phase.rx_on() && len != 0;
         let packet = if radio.crc_ok() && (!encrypted || self.encryption.armed) {
             let mic_ok = if encrypted {
                 let Some(valid) = crypto::wait_decrypted() else {
@@ -2784,7 +2795,7 @@ impl Connection {
             // decryption never started (`start_decryption`): not taken,
             // counted as a CRC error, and the central sends it again. Its
             // decryption is not waited for.
-            if self.encryption.rx_on {
+            if self.encryption.phase.rx_on() {
                 crypto::stop();
             }
             None
@@ -2935,7 +2946,7 @@ impl Connection {
             radio.set_phy(self.phy);
             radio.set_tx_power(tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()));
             self.stats.events = self.stats.events.wrapping_add(1);
-            let encrypted = self.encryption.rx_on;
+            let encrypted = self.encryption.phase.rx_on();
             let heard_before = self.listening();
             if let Some(address) = self.exchange(radio, clock, rx, window, shared) {
                 self.exchanged(address);
@@ -3001,7 +3012,7 @@ impl Connection {
                 self.host_queries &= !QUERY_VERSION;
                 shared.complete_query(QUERY_VERSION);
             } else if self.version_request == Request::NotStarted
-                && self.encryption.phase == Phase::Idle
+                && self.encryption.phase.is_idle()
                 && self.queue.is_empty()
             {
                 let mut version = [OP_VERSION_IND, 0, 0, 0, 0, 0];
@@ -3057,7 +3068,7 @@ impl Connection {
     /// armed, once its key stream is complete ([`crypto::start_on_address`]).
     /// A packet whose decryption did not start is taken as not received.
     fn start_decryption(&mut self, radio: &Radio<'_>) {
-        if !self.encryption.rx_on {
+        if !self.encryption.phase.rx_on() {
             return;
         }
         self.encryption.armed = crypto::start_on_address(|| radio.has_address());
@@ -3104,7 +3115,7 @@ impl Connection {
             self.abort = Some(ERROR_RESPONSE_TIMEOUT);
             return;
         }
-        let idle = self.encryption.phase == Phase::Idle
+        let idle = self.encryption.phase.is_idle()
             && self.param_update.is_none()
             && self.phy_update.is_none()
             && self.channel_update.is_none()
@@ -3120,7 +3131,7 @@ impl Connection {
             return;
         }
         let deadline = now.wrapping_add(PROCEDURE_TIMEOUT_US);
-        let encrypted = self.encryption.tx_on;
+        let encrypted = self.encryption.phase.tx_on();
         if (encrypted || self.host_queries & 1 != 0)
             && self.features_request == Request::NotStarted
             && self.central_features.is_none()
@@ -3254,7 +3265,7 @@ impl Connection {
     const fn tx_payload_max(&self) -> usize {
         let [octets, time, ..] = self.length.effective();
         let per_byte = 8_u32.checked_div(u32::from(self.tx_phy.hci())).unwrap_or(8);
-        let mic = if self.encryption.tx_on { MIC_LEN } else { 0 };
+        let mic = if self.encryption.phase.tx_on() { MIC_LEN } else { 0 };
         // Preamble and access address, header and CRC.
         let overhead = self.tx_phy.address_offset_us().checked_div(per_byte).unwrap_or(0).saturating_add(5);
         let by_time = u32::from(time).checked_div(per_byte).unwrap_or(0).saturating_sub(overhead);

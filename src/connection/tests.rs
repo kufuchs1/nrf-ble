@@ -223,7 +223,7 @@ fn unsolicited_start_response_never_enables_encryption() {
     for encrypted in [false, true] {
         let mut link = connection();
         link.handle_control(&[OP_START_ENC_RSP], encrypted);
-        assert!(!link.encryption.tx_on);
+        assert!(link.encryption.phase == Phase::Plain);
         assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
     }
 }
@@ -234,7 +234,6 @@ fn security_notification_survives_host_queue_pressure() {
     fill(&full);
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
-    link.encryption.rx_on = true;
     link.handle_control(&[OP_START_ENC_RSP], true);
     link.process(&PacketBuffer::ZERO, true, &full);
     assert_eq!(link.encryption_change, Some((0, true)));
@@ -249,9 +248,8 @@ fn security_notification_survives_host_queue_pressure() {
 fn start_response_requires_an_encrypted_received_packet() {
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
-    link.encryption.rx_on = true;
     link.handle_control(&[OP_START_ENC_RSP], false);
-    assert!(!link.encryption.tx_on);
+    assert!(link.encryption.phase == Phase::AwaitingStartResponse);
     assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
 }
 
@@ -259,21 +257,19 @@ fn start_response_requires_an_encrypted_received_packet() {
 fn authenticated_start_response_completes_only_the_expected_procedure() {
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
-    link.encryption.rx_on = true;
     link.procedure_deadline = Some(1000);
     link.handle_control(&[OP_START_ENC_RSP], true);
-    assert!(link.encryption.tx_on);
-    assert!(link.encryption.phase == Phase::Idle);
+    assert!(link.encryption.phase == Phase::Encrypted);
     assert_eq!(link.procedure_deadline, None);
     assert_eq!(link.abort, None);
 }
 
 #[test]
 fn repeated_encryption_requests_cannot_reset_session_state() {
-    for phase in [Phase::Starting, Phase::AwaitingStartResponse, Phase::Idle] {
+    let lookup = KeyLookup { ediv: [0; 2], rand: [0; 8] };
+    for phase in [Phase::AwaitingKey(lookup, true), Phase::Starting, Phase::AwaitingStartResponse, Phase::Encrypted] {
         let mut link = connection();
         link.encryption.phase = phase;
-        link.encryption.rx_on = true;
         link.encryption.rx_counter = 42;
         link.handle_control(&[OP_ENC_REQ; 23], true);
         assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
@@ -284,7 +280,7 @@ fn repeated_encryption_requests_cannot_reset_session_state() {
 #[test]
 fn bad_mic_cannot_acknowledge_acl_or_move_sequence_numbers() {
     let mut link = connection();
-    link.encryption.rx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     link.tx_kind = TxKind::Acl;
     let shared = Shared::new();
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &shared), None);
@@ -300,7 +296,7 @@ fn unverified_new_payloads_never_change_receive_sequence_state() {
     for header in 0..=u8::MAX {
         for len in 1..=u8::MAX {
             let mut link = connection();
-            link.encryption.rx_on = true;
+            link.encryption.phase = Phase::Encrypted;
             link.tx_kind = TxKind::Acl;
             let result = link.receive(header, len, false, 999, &shared);
             assert_ne!(result, Some(true), "header={header:#x}, len={len}");
@@ -318,7 +314,7 @@ fn unverified_new_payloads_never_change_receive_sequence_state() {
 #[test]
 fn encrypted_retransmission_acknowledges_tx_without_consuming_rx_nonce() {
     let mut link = connection();
-    link.encryption.rx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     link.seq.nesn = true;
     link.tx_kind = TxKind::Acl;
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &Shared::new()), Some(false));
@@ -334,7 +330,7 @@ fn encrypted_retransmission_acknowledges_tx_without_consuming_rx_nonce() {
 #[test]
 fn new_authenticated_packet_acknowledges_acl() {
     let mut link = connection();
-    link.encryption.rx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     link.tx_kind = TxKind::Acl;
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, true, 999, &Shared::new()), Some(true));
     assert!(link.seq.sn && link.seq.nesn && link.seq.received);
@@ -348,7 +344,7 @@ fn malformed_data_packets_fail_closed() {
     // negotiated length; with a MIC no length field can exceed it.
     for (header, len, encrypted) in [(0, 1, false), (2, 0, false), (3, 0, true), (2, 252, false)] {
         let mut link = connection();
-        link.encryption.rx_on = encrypted;
+        link.encryption.phase = if encrypted { Phase::Encrypted } else { Phase::Plain };
         assert_eq!(link.receive(header, len, true, 999, &Shared::new()), None);
         assert_eq!(link.abort, Some(ERROR_INVALID_PARAMETERS));
         assert!(!link.seq.received && !link.seq.sn && !link.seq.nesn);
@@ -359,7 +355,7 @@ fn malformed_data_packets_fail_closed() {
 fn encrypted_payload_cannot_omit_mic() {
     for len in 1..=4 {
         let mut link = connection();
-        link.encryption.rx_on = true;
+        link.encryption.phase = Phase::Encrypted;
         assert_eq!(link.receive(2, len, true, 999, &Shared::new()), None);
         assert_eq!(link.abort, Some(ERROR_MIC_FAILURE));
     }
@@ -368,7 +364,7 @@ fn encrypted_payload_cannot_omit_mic() {
 #[test]
 fn empty_packets_use_raw_header_instead_of_stale_ccm_output() {
     let mut link = connection();
-    link.encryption.rx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     link.rx_plain.bytes_mut().fill(0xFF);
     let mut rx = PacketBuffer::ZERO;
     rx.0[0] = Llid::Continuation.bits();
@@ -383,7 +379,7 @@ fn empty_packets_use_raw_header_instead_of_stale_ccm_output() {
 #[test]
 fn tx_counter_exhaustion_cannot_wrap() {
     let mut link = connection();
-    link.encryption.tx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     link.encryption.tx_counter = crypto::COUNTER_LIMIT;
     link.enqueue(Llid::Control, &[OP_PING_RSP]);
     link.load_next(&Shared::new());
@@ -402,7 +398,7 @@ fn controls_require_exact_lengths_and_valid_parameters() {
             link.queue.front().copied().map(|queued| queued.data[..2] == [OP_UNKNOWN_RSP, payload[0]]),
             Some(true)
         );
-        assert!(link.channel_update.is_none() && link.encryption.phase == Phase::Idle);
+        assert!(link.channel_update.is_none() && link.encryption.phase == Phase::Plain);
     }
     // Unless an encryption procedure runs, which an answer would block.
     let mut link = connection();
@@ -459,7 +455,7 @@ fn peripheral_latency_is_used_only_without_pending_work() {
     link.queue.clear();
     link.encryption.phase = Phase::Starting;
     assert!(!link.can_skip(now, &shared));
-    link.encryption.phase = Phase::Idle;
+    link.encryption.phase = Phase::Plain;
     assert!(link.can_skip(now, &shared));
     link.phy_update = Some((Phy::M2, 10));
     assert!(!link.can_skip(now, &shared));
@@ -502,8 +498,7 @@ fn central_controls_other_than_finishing_are_refused_while_encryption_starts() {
         for payload in [&[OP_PING_REQ][..], &[OP_VERSION_IND, 9, 0, 0, 0, 0][..], &[0x0A][..]] {
             let mut link = connection();
             link.encryption.phase = phase;
-            link.encryption.rx_on = phase == Phase::AwaitingStartResponse;
-            link.handle_control(payload, link.encryption.rx_on);
+            link.handle_control(payload, phase.rx_on());
             assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
             assert!(link.queue.is_empty());
         }
@@ -522,7 +517,7 @@ fn a_pdu_loaded_in_plain_is_never_sealed_with_an_unassigned_counter() {
     link.load_next(&Shared::new());
     assert!(!link.current().encrypted);
     // Encryption turning on must not change how the loaded PDU is resent.
-    link.encryption.tx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     assert!(!link.current().encrypted);
     assert_eq!(link.encryption.tx_counter, 0);
     link.enqueue(Llid::Control, &[OP_START_ENC_RSP]);
@@ -555,8 +550,7 @@ fn every_packet_to_send_keeps_the_s1_byte_zero() {
 /// A connection with encryption on both ways.
 fn encrypted() -> Connection {
     let mut link = connection();
-    link.encryption.rx_on = true;
-    link.encryption.tx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     link
 }
 
@@ -568,13 +562,43 @@ fn a_key_refresh_pauses_encryption_both_ways() {
     assert!(link.encryption.phase == Phase::Pausing);
     assert_eq!(link.queue.front().copied().map(|queued| queued.data[0]), Some(OP_PAUSE_ENC_RSP));
     // Our pause response went out encrypted; the central answers in plain.
-    link.encryption.rx_on = false;
     link.encryption.phase = Phase::AwaitingPauseResponse;
     link.handle_control(&[OP_PAUSE_ENC_RSP], false);
     assert_eq!(link.abort, None);
-    assert!(!link.encryption.tx_on);
     assert!(link.encryption.phase == Phase::Paused);
     // A refresh now waits for a separate, single-use prefetched block.
+}
+
+#[test]
+fn each_direction_turns_on_and_off_with_the_step_of_its_procedure() {
+    let directions = |link: &Connection| (link.encryption.phase.rx_on(), link.encryption.phase.tx_on());
+    let shared = Shared::new();
+    let mut link = connection();
+    assert_eq!(directions(&link), (false, false));
+    // Our start request goes out in plain; the central's answer to it is
+    // encrypted.
+    link.encryption.phase = Phase::Starting;
+    link.enqueue(Llid::Control, &[OP_START_ENC_REQ]);
+    link.load_next(&shared);
+    assert_eq!(directions(&link), (false, false));
+    link.exchanged(1000);
+    assert!(link.encryption.phase == Phase::AwaitingStartResponse);
+    assert_eq!(directions(&link), (true, false));
+    link.handle_control(&[OP_START_ENC_RSP], true);
+    assert_eq!(directions(&link), (true, true));
+    // Our pause response goes out encrypted; the central's answer to it is
+    // plain.
+    link.handle_control(&[OP_PAUSE_ENC_REQ], true);
+    assert_eq!(directions(&link), (true, true));
+    link.queue.clear();
+    link.enqueue(Llid::Control, &[OP_PAUSE_ENC_RSP]);
+    link.load_next(&shared);
+    link.exchanged(2000);
+    assert!(link.encryption.phase == Phase::AwaitingPauseResponse);
+    assert_eq!(directions(&link), (false, true));
+    link.handle_control(&[OP_PAUSE_ENC_RSP], false);
+    assert_eq!(directions(&link), (false, false));
+    assert_eq!(link.abort, None);
 }
 
 #[test]
@@ -589,7 +613,7 @@ fn a_pause_needs_an_encrypted_request_and_a_plain_answer() {
     link.encryption.phase = Phase::AwaitingPauseResponse;
     link.handle_control(&[OP_PAUSE_ENC_RSP], true);
     assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
-    assert!(link.encryption.tx_on);
+    assert!(link.encryption.phase == Phase::AwaitingPauseResponse);
 }
 
 #[test]
@@ -900,9 +924,12 @@ fn data_while_encryption_starts_or_pauses_ends_the_link_unacknowledged() {
         let mut link = connection();
         link.encryption.phase = phase;
         assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 999, &Shared::new()), Some(true));
+        // Where received packets are encrypted, the opcode comes with its
+        // four octet MIC.
+        let len = if phase.rx_on() { 5 } else { 1 };
         let mut link = connection();
         link.encryption.phase = phase;
-        assert_eq!(link.receive(Llid::Control.bits(), 1, true, 999, &Shared::new()), Some(true));
+        assert_eq!(link.receive(Llid::Control.bits(), len, true, 999, &Shared::new()), Some(true));
         assert_eq!(link.abort, None);
     }
 }
@@ -1181,8 +1208,6 @@ fn encryption_refresh_consumes_a_different_prefetched_block() {
     assert!(worker.as_mut().poll(&mut context).is_pending());
     // Model the encrypted link after its pause handshake completed.
     link.encryption.phase = Phase::Paused;
-    link.encryption.rx_on = false;
-    link.encryption.tx_on = false;
     link.queue.clear();
     link.handle_control(&request, false);
     assert!(link.encryption.procedure == Procedure::Refresh);
@@ -1257,7 +1282,7 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
 fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
     let shared = Shared::new();
     let mut link = connection();
-    link.encryption.rx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     let mut rx = PacketBuffer::ZERO;
     rx.0[0] = Llid::Start.bits();
     rx.0[1] = 5;
@@ -1285,8 +1310,7 @@ fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
         long.length = DataLength::new(LENGTH_MAX);
         long.length.announced_tx = LENGTH_MAX;
         long.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
-        long.encryption.tx_on = true;
-        long.encryption.rx_on = true;
+        long.encryption.phase = Phase::Encrypted;
         assert_eq!(long.exchange_us(), 3 * (24 + 261 * 4) + 450);
     }
     link.phy = Phy::M1;
@@ -1369,7 +1393,7 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     link.length.local_tx = LENGTH_MAX;
     // Encrypted on LE 1M, 2120 us still hold 251 octets with the MIC; a
     // central that receives in 1000 us gets at most 107.
-    link.encryption.tx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     assert_eq!(link.tx_payload_max(), 251);
     link.length.take_peer(&[251, 0, 0xE8, 0x03, 251, 0, 0x48, 0x08]);
     assert_eq!(link.tx_payload_max(), 1000 / 8 - 10 - 4);
@@ -1839,7 +1863,6 @@ fn encrypted_data_is_marked_before_the_host_learns_of_the_encryption() {
     fill(&full);
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
-    link.encryption.rx_on = true;
     link.handle_control(&[OP_START_ENC_RSP], true);
     link.process(&PacketBuffer::ZERO, true, &full);
     // The encryption change waits for room; data arrives meanwhile.
