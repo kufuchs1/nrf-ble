@@ -500,9 +500,25 @@ On the nRF52832 the radio uses the fast ramp-up of 40 µs instead of 140 µs, wh
 turnaround by 100 µs. The radio's own interframe timing works only with the slow ramp-up, so TIMER1 times the 150 µs
 between two packets as in Zephyr's software switch: PPI channel 4 starts it at the end of a packet, and its compare
 enables the radio through PPI channel 5. Pass `TIMER1` to `Radio::new` and keep the `TIMER1` interrupt disabled in the
-NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5; leave them to it. TIMER0 and TIMER1 are shut
-down, not only stopped, between uses, which avoids the standby current of nRF52832 anomaly 78. The nRF51 differs: see
-[nRF51](#nrf51).
+NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5, the fixed channels 20, 21, 25, 26 and 27
+and the channel groups 0 and 1; leave them to it. `nrf_ble::PPI_CHANNELS` and `nrf_ble::PPI_GROUPS` hold them as bit
+masks for the chip built for, so a firmware that uses PPI checks its own channels and groups against them in a const
+assert. TIMER0 and TIMER1 are shut down, not only stopped, between uses, which avoids the standby current of nRF52832
+anomaly 78. The nRF51 differs: see [nRF51](#nrf51).
+
+The link layer also takes Embassy's tokens of its PPI channels and groups, so no Embassy driver can have them:
+`clock::Ppi` for `Clock::new` (channels 0, 1, 20, 21, 26 and 27 and group 1), `clock::CalibrationPpi` for
+`clock::calibrate_rc` (channel 3 and group 0) and `radio::Ppi` for `Radio::new` (channels 4, 5 and 25). `Radio::new`
+takes the `RNG` too, which `rng` drives for the link layer and the host:
+
+```rust
+use nrf_ble::{clock::{self, Clock}, radio::{self, Radio}};
+let radio_ppi = radio::Ppi::new(p.PPI_CH4, p.PPI_CH5, p.PPI_CH25);
+let radio = Radio::new(p.RADIO, p.TIMER1, radio_ppi, p.RNG);
+let clock_ppi = clock::Ppi::new(p.PPI_CH0, p.PPI_CH1, p.PPI_CH20, p.PPI_CH21, p.PPI_CH26, p.PPI_CH27, p.PPI_GROUP1);
+let clock = Clock::new(p.TIMER0, p.RTC0, clock_ppi);
+let calibration = clock::calibrate_rc(p.TEMP, clock::CalibrationPpi::new(p.PPI_CH3, p.PPI_GROUP0));
+```
 
 The high frequency crystal and TIMER0 run only around radio events and RC calibrations. Between events RTC0 keeps the
 time and restarts TIMER0 at an exact tick before the next event. During radio events the CPU sleeps with `WFE` inside
@@ -525,9 +541,10 @@ The link layer counts on 500 ppm for its own sleep clock. Following the nRF52832
 anomaly 192 workaround set, the channel starting it disables itself after the first crystal start event, which may come
 twice (anomaly 201), and the crystal counts as running once it reported its start, without reading `HFCLKSTAT`. The
 channel capturing the timer at an RTC tick disables itself after the first compare event too, which may also come twice
-(anomaly 179). `clock::calibrate_rc` takes the `TEMP` peripheral and is driven by interrupts only: bind and enable
-`TEMP` to `clock::on_temperature_interrupt` and `CLOCK_POWER` to `clock::on_clock_interrupt`, or it waits forever for
-its first temperature. A calibration whose crystal or end does not come within 100 ms is retried at the next interval.
+(anomaly 179). `clock::calibrate_rc` takes the `TEMP` peripheral and its `clock::CalibrationPpi`, and is driven by
+interrupts only: bind and enable `TEMP` to `clock::on_temperature_interrupt` and `CLOCK_POWER` to
+`clock::on_clock_interrupt`, or it waits forever for its first temperature. A calibration whose crystal or end does not
+come within 100 ms is retried at the next interval.
 Dropping the calibration future releases the crystal. A firmware whose radio idles for long (a light sleep without
 advertising or a link) calls `clock::pause_calibration`: the task finishes a calibration under way, then measures no
 temperature and starts no crystal, so the crystal stays off; `clock::resume_calibration` before advertising again
@@ -550,9 +567,12 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   `data-length` does not build for the nRF51), the fast ramp-up, and +3 dBm: the power steps through -20, -16, -12,
   -8, -4, 0 and +4 dBm.
 - **Turnarounds:** the radio's own interframe timing, with the shortcuts from the end of a packet over the disabled
-  state to the next TXEN or RXEN, as Nordic's nRF51 SoftDevices and Zephyr do. `Radio::new` takes only `RADIO`; TIMER1,
-  TIMER2 and the PPI channels 4 and 5 stay free. The link layer uses the programmable PPI channels 0, 1 and 3, and 9 and
-  11 in place of the FORK registers the nRF51 lacks.
+  state to the next TXEN or RXEN, as Nordic's nRF51 SoftDevices and Zephyr do. `Radio::new` takes only `RADIO` and
+  `RNG`; TIMER1, TIMER2 and the PPI channels 4 and 5 stay free. The link layer uses the programmable PPI channels 0, 1
+  and 3, and 9 and 11 in place of the FORK registers the nRF51 lacks, beside the same fixed channels and groups as on
+  the nRF52832; `nrf_ble::PPI_CHANNELS` includes 9 and 11. `clock::Ppi::new` takes the channels 0, 1 and 9 and group
+  1, `clock::CalibrationPpi::new` channels 3 and 11 and group 0. Embassy has no tokens for the nRF51's fixed channels,
+  so only `nrf_ble::PPI_CHANNELS` covers them.
 - **Ramp-up:** about 140 µs. Each receive window opens about 100 µs earlier than on the nRF52832, which costs a little
   more receive current per connection event.
 - **Radio trim:** after powering the radio the link layer copies its BLE 1 Mbit trim values from FICR when FICR asks
@@ -567,7 +587,8 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
   let config = clock::Config::new()
       .high_frequency(HighFrequency::Mhz32)
       .low_frequency(LowFrequency::Crystal { ppm: 50 });
-  let clock = Clock::with_config(p.TIMER0, p.RTC0, config);
+  let ppi = clock::Ppi::new(p.PPI_CH0, p.PPI_CH1, p.PPI_CH9, p.PPI_GROUP1);
+  let clock = Clock::with_config(p.TIMER0, p.RTC0, ppi, config);
   ```
 
   The crystal frequency goes to `CLOCK.XTALFREQ`, whose reset value comes from `UICR.XTALFREQ`. With the RC oscillator
@@ -689,14 +710,16 @@ Everything that makes a device what it is lives in the device's own crate, typic
   directed phase, its connection request answering the undirected advertising (the link layer reports which one it
   answered, `link::Info::directed`, so a late answer to the directed advertising does not count), and later
   reconnections skip that phase (`Mode::skips`); a new pairing directs again. The all-zero key that a central without
-  one may send with its identity address counts as none, and its bond is stored. In pairing mode, and for a bond
-  whose central has no identity address, a directed phase advertises undirected at 20 ms instead, for the same time
-  (`Mode::directs`). With `extended-advertising` as well, which has no high duty cycle directed advertising, the
-  directed phase is low duty cycle directed advertising instead: an `AUX_ADV_IND` with `TargetA` (the central's
-  identity, or the resolvable private address made with its key, `RxAdd` set) every 20 ms plus the random advDelay,
-  connectable only by that central (its identity, or an `InitA` that resolves to it with the bond's key), for the
-  phase's time, at most 1.28 s. It is no faster than undirected advertising at 20 ms, so it only helps a central that
-  connects to directed advertising sooner than to undirected; the target, the bond's bit and the skip are the same.
+  one may send with its identity address counts as none, and its bond is stored. A bond keeps only an identity address
+  (`pdu::IdentityAddress`): a central that pairs from a private address and sends no identity address gets no bond and
+  no `ConnEvent::Bonded`, its link staying encrypted with the pairing's key; a key refresh on that link finds no key and
+  ends it. In pairing mode a directed phase advertises undirected at 20 ms instead, for the same time (`Mode::directs`).
+  With `extended-advertising` as well, which has no high duty cycle directed advertising, the directed phase is low duty
+  cycle directed advertising instead: an `AUX_ADV_IND` with `TargetA` (the central's identity, or the resolvable private
+  address made with its key, `RxAdd` set) every 20 ms plus the random advDelay, connectable only by that central (its
+  identity, or an `InitA` that resolves to it with the bond's key), for the phase's time, at most 1.28 s. It is no
+  faster than undirected advertising at 20 ms, so it only helps a central that connects to directed advertising sooner
+  than to undirected; the target, the bond's bit and the skip are the same.
 
 ```rust
 use embassy_time::Duration;

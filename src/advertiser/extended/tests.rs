@@ -281,8 +281,8 @@ fn an_event_s_pdus_point_to_the_auxiliary_packet_on_its_channel_and_phy() {
     }
     // The auxiliary packet in its buffer, which also takes the request.
     let auxiliary = auxiliary(&settings);
-    assert_eq!(pdus.auxiliary[..auxiliary.as_bytes().len()], *auxiliary.as_bytes());
-    assert_eq!(pdus.auxiliary.len(), 2 + usize::from(crate::chip::ADV_MAXLEN));
+    assert_eq!(pdus.auxiliary.0[..auxiliary.as_bytes().len()], *auxiliary.as_bytes());
+    assert_eq!(pdus.auxiliary.0.len(), 2 + usize::from(crate::chip::ADV_MAXLEN));
     // Another event, another channel in time: CSA #2 over the 37 channels.
     assert!((0..8).any(|counter| Pdus::new(&settings, counter).aux_channel != pdus.aux_channel));
 }
@@ -296,17 +296,17 @@ fn the_event_plan_keeps_its_times_and_budgets_on_every_secondary_phy() {
             // The primaries are a spacing apart on air, each TXEN its LE 1M
             // ramp-up before.
             for index in 0..channels {
-                let on_air = primary_txen(first, index) + tx_ready_us(Phy::M1);
+                let on_air = primary_txen(At(first), index).0 + tx_ready_us(Phy::M1);
                 assert_eq!(on_air, first + u32::try_from(index).unwrap() * PRIMARY_SPACING_US);
                 // Seen from each primary, the auxiliary packet starts 12 us
                 // into the unit its Aux Offset names, on either PHY.
-                let aux_on_air = aux_txen(first, channels, phy) + tx_ready_us(phy);
+                let aux_on_air = aux_txen(At(first), channels, phy).0 + tx_ready_us(phy);
                 assert_eq!(aux_on_air - on_air - u32::from(aux_offset(channels, index)) * UNIT_US, 12);
             }
             // The CPU's time from the last primary's DISABLED to the
             // auxiliary packet's TXEN.
-            let last_end = primary_txen(first, channels - 1) + tx_ready_us(Phy::M1) + PRIMARY_US;
-            let budget = aux_txen(first, channels, phy) - last_end - DISABLE_US;
+            let last_end = primary_txen(At(first), channels - 1).0 + tx_ready_us(Phy::M1) + PRIMARY_US;
+            let budget = aux_txen(At(first), channels, phy).0 - last_end - DISABLE_US;
             assert!(budget >= CPU_SLACK_MIN_US);
             assert_eq!(budget, match (cfg!(feature = "nrf51"), phy) {
                 (true, _) => 180,

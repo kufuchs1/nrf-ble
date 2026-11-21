@@ -175,7 +175,13 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_long_response() {
 #[test]
 fn the_parameter_request_leaves_the_last_place_to_responses() {
     let identity = identity();
-    let bond = Bond::new(Peer::new(CENTRAL_IDENTITY, false), None, [0x77; 16], identity.variant(), &example::DB);
+    let bond = Bond::new(
+        IdentityAddress::valid(Peer::new(CENTRAL_IDENTITY, false)),
+        None,
+        [0x77; 16],
+        identity.variant(),
+        &example::DB,
+    );
     let mut engine = Engine::new(&example::DB, example::CONFIG);
     engine.advertise(false, &identity, Some(bond), Duration::from_secs(20));
     assert!(!engine.has_job(), "no key pair for a reconnection");
@@ -232,12 +238,15 @@ fn pair(
     (epoch, pair_link(engine, device, central_id, at(0)))
 }
 
-/// Pairs the link of `engine` with a Linux central that is to send its
-/// identity keys if `central_id`, at `now`, up to the encryption; returns the
-/// key.
+/// Pairs the link of `engine` with a Linux central at the link's address on
+/// the air that is to send its identity keys if `central_id`, at `now`, up to
+/// the encryption; returns the key.
 fn pair_link(engine: &mut Engine, device: &mut Device, central_id: bool, now: Instant) -> [u8; 16] {
     let epoch = engine.epoch().unwrap();
     let mut central = Central::new(linux_request(central_id, true), local_rpa());
+    if let Some(link) = engine.link.as_ref() {
+        central.address = link.info.peer;
+    }
     receive(engine, device, 6, &central.request, now);
     drain(engine, 4, now);
     receive(engine, device, 6, &central.public_key(), now);
@@ -286,10 +295,47 @@ fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity(
     assert_eq!(engine.take_command(0, at(0)), None);
     assert!(!engine.has_output());
     let Some(ConnEvent::Bonded(bond)) = engine.take_event(epoch) else { panic!("no bond") };
-    assert!(bond.peer == peer);
+    assert!(bond.peer.peer() == peer);
     assert_eq!(bond.peer_irk, None);
     assert_eq!(bond.ltk, ltk);
     assert_eq!(bond.local, identity.variant());
+}
+
+#[test]
+fn a_central_on_a_private_address_without_an_identity_gets_no_bond() {
+    // A resolvable private address changes, so a bond with it would never
+    // find the central again; one stored would not be read back.
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(9);
+    let identity = identity();
+    let rpa = Peer::new([1, 2, 3, 4, 5, 0x45], true);
+    let (epoch, _ltk) = pair(&mut engine, &mut device, &identity, rpa, false);
+    // Our identity keys go out, the central sends none.
+    assert_eq!(drain(&mut engine, 4, at(0)).len(), 2);
+    assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: false }));
+    assert_eq!(engine.take_command(0, at(0)), None);
+    assert_eq!(engine.take_event(epoch), None, "no bond is reported");
+    assert!(engine.bond().is_none());
+    // The link stays, encrypted with the pairing's key.
+    assert_eq!(engine.epoch(), Some(epoch));
+    assert_eq!(engine.security(epoch), Some(Sec::Encrypted));
+}
+
+#[test]
+fn an_all_zero_identity_address_is_no_identity_address() {
+    // The central's identity address is dropped with its key: from a private
+    // address on the air, the pairing makes no bond.
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(9);
+    let identity = identity();
+    let (epoch, _ltk) = pair(&mut engine, &mut device, &identity, Peer::new([1, 2, 3, 4, 5, 0x45], true), true);
+    assert_eq!(drain(&mut engine, 4, at(0)).len(), 2);
+    receive_as(&mut engine, &mut device, 6, &pdu::<17>(IDENTITY_INFORMATION, &[0x5A; 16]), true, at(0));
+    receive_as(&mut engine, &mut device, 6, &[IDENTITY_ADDRESS_INFORMATION, 0x00, 0, 0, 0, 0, 0, 0], true, at(0));
+    assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: false }));
+    assert_eq!(engine.take_command(0, at(0)), None);
+    assert_eq!(engine.take_event(epoch), None, "no bond is reported");
+    assert!(engine.bond().is_none());
 }
 
 #[test]
@@ -309,7 +355,7 @@ fn an_all_zero_key_from_the_central_is_no_key() {
     assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: false }));
     assert_eq!(engine.take_command(0, at(0)), None);
     let Some(ConnEvent::Bonded(bond)) = engine.take_event(epoch) else { panic!("no bond") };
-    assert!(bond.peer == Peer::new(CENTRAL_IDENTITY, false));
+    assert!(bond.peer.peer() == Peer::new(CENTRAL_IDENTITY, false));
     assert_eq!(bond.peer_irk, None);
     assert_eq!(bond.ltk, ltk);
     // It is stored and read back, where a key flagged but all zero is
@@ -365,7 +411,13 @@ fn reconnect(bond: Bond) -> (Engine, Epoch) {
 /// `features`.
 #[cfg(feature = "eatt")]
 fn bond_with_features(features: u8) -> Bond {
-    let mut bond = Bond::new(Peer::new(CENTRAL_IDENTITY, false), None, [0x77; 16], identity().variant(), &example::DB);
+    let mut bond = Bond::new(
+        IdentityAddress::valid(Peer::new(CENTRAL_IDENTITY, false)),
+        None,
+        [0x77; 16],
+        identity().variant(),
+        &example::DB,
+    );
     bond.client_features = features;
     bond
 }

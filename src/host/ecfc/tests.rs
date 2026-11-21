@@ -109,11 +109,11 @@ impl Fixture {
 fn one_source_cid_gets_bearer_0_and_opens_once_answered() {
     let mut fixture = Fixture::new();
     fixture.connect(1, &[0x0040], true);
-    assert!(!fixture.ecfc.is_open(0));
-    assert_eq!(fixture.ecfc.att_mtu(0), None);
+    assert!(!fixture.ecfc.is_open(BearerId::FIRST));
+    assert_eq!(fixture.ecfc.att_mtu(BearerId::FIRST), None);
     assert_eq!(fixture.send_all(), [response(1, 0x00, &[0x0040])]);
-    assert!(fixture.ecfc.is_open(0));
-    assert_eq!(fixture.ecfc.att_mtu(0), Some(65));
+    assert!(fixture.ecfc.is_open(BearerId::FIRST));
+    assert_eq!(fixture.ecfc.att_mtu(BearerId::FIRST), Some(65));
     assert_eq!(fixture.ecfc.bearers[0].peer_cid, 0x0040);
     assert_eq!(fixture.ecfc.bearers[0].tx_credits, 10);
     assert_eq!(fixture.ecfc.bearers[0].rx_credits, RX_CREDITS);
@@ -129,7 +129,7 @@ fn ascending_source_cids_get_the_bearers_in_order_and_zeros_past_the_capacity() 
         let result = if count <= BEARERS { 0x00 } else { 0x04 };
         assert_eq!(fixture.open(7, &scids), [response(7, result, &dcids)], "{count} source CIDs");
         for (bearer, &scid) in scids.iter().enumerate().take(BEARERS) {
-            assert!(fixture.ecfc.is_open(bearer as u8));
+            assert!(fixture.ecfc.is_open(BearerId::valid(bearer as u8)));
             assert_eq!(fixture.ecfc.bearers[bearer].peer_cid, scid);
         }
         // A further request finds the bearers that are left.
@@ -185,7 +185,7 @@ fn invalid_parameters_are_refused_with_as_many_zeros_as_source_cids() {
     let least = [&[0x27, 0x00, 64, 0, 64, 0, 1, 0][..], &valid[8..10]].concat();
     assert_eq!(fixture.command(0x17, 20, &least, true), None);
     assert_eq!(fixture.send_all(), [response(20, 0x00, &[0x0040])]);
-    assert_eq!(fixture.ecfc.att_mtu(0), Some(64));
+    assert_eq!(fixture.ecfc.att_mtu(BearerId::FIRST), Some(64));
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn linux_s_single_requests_after_a_refusal_for_security_are_all_answered() {
         // Each bearer has the source CID of its own request.
         for (bearer, &scid) in scids.iter().enumerate().take(BEARERS) {
             assert_eq!(fixture.ecfc.bearers[bearer].peer_cid, scid);
-            assert!(fixture.ecfc.is_open(bearer as u8));
+            assert!(fixture.ecfc.is_open(BearerId::valid(bearer as u8)));
         }
     }
 }
@@ -334,23 +334,23 @@ fn credits_add_up_ignore_zero_and_other_cids_and_close_the_bearer_above_65535() 
     let mut fixture = Fixture::new();
     assert_eq!(fixture.command(0x17, 1, &request_data(&[0x0050], 1), true), None);
     fixture.send_all();
-    let segmenter = fixture.ecfc.kframe(0, 10).unwrap();
-    assert!(fixture.ecfc.kframe_queued(0, &segmenter));
-    assert_eq!(fixture.ecfc.kframe(0, 10), None);
+    let segmenter = fixture.ecfc.kframe(BearerId::FIRST, 10).unwrap();
+    assert!(fixture.ecfc.kframe_queued(BearerId::FIRST, &segmenter));
+    assert_eq!(fixture.ecfc.kframe(BearerId::FIRST, 10), None);
     for data in [[0x50, 0x00, 0x00, 0x00], [0x51, 0x00, 0x01, 0x00], [0x40, 0x00, 0x01, 0x00]] {
         assert_eq!(fixture.command(0x16, 2, &data, true), None);
-        assert_eq!(fixture.ecfc.kframe(0, 10), None);
+        assert_eq!(fixture.ecfc.kframe(BearerId::FIRST, 10), None);
     }
     // A malformed indication is ignored.
     assert_eq!(fixture.command(0x16, 2, &[0x50, 0x00, 0x01], true), None);
-    assert_eq!(fixture.ecfc.kframe(0, 10), None);
+    assert_eq!(fixture.ecfc.kframe(BearerId::FIRST, 10), None);
     assert_eq!(fixture.command(0x16, 2, &[0x50, 0x00, 0xFF, 0xFF], true), None);
     assert_eq!(fixture.ecfc.bearers[0].tx_credits, 65535);
-    assert!(fixture.ecfc.kframe(0, 10).is_some());
+    assert!(fixture.ecfc.kframe(BearerId::FIRST, 10).is_some());
     // One more is too many: the bearer closes.
     assert_eq!(fixture.command(0x16, 3, &[0x50, 0x00, 0x01, 0x00], true), None);
-    assert!(!fixture.ecfc.is_open(0));
-    assert_eq!(fixture.ecfc.kframe(0, 10), None);
+    assert!(!fixture.ecfc.is_open(BearerId::FIRST));
+    assert_eq!(fixture.ecfc.kframe(BearerId::FIRST, 10), None);
     assert_eq!(fixture.send_all(), [vec![0x06, 1, 0x04, 0x00, 0x50, 0x00, 0x40, 0x00]]);
 }
 
@@ -398,8 +398,10 @@ fn reconfigure_checks_the_cids_then_the_values_then_the_reductions() {
     // A smaller MPS for one channel is allowed, and the next K-frame obeys it.
     assert_eq!(reconfigure(&mut fixture, 600, 64, &[0x0060]), 0x0000);
     assert_eq!((fixture.ecfc.bearers[0].peer_mtu, fixture.ecfc.bearers[0].peer_mps), (600, 64));
-    assert_eq!(fixture.ecfc.att_mtu(0), Some(65));
-    assert_eq!(fixture.ecfc.kframe(0, 65).unwrap().fragment(&[0; 65]).unwrap().bytes()[..6], [64, 0, 0x60, 0, 65, 0]);
+    assert_eq!(fixture.ecfc.att_mtu(BearerId::FIRST), Some(65));
+    assert_eq!(fixture.ecfc.kframe(BearerId::FIRST, 65).unwrap().fragment(&[0; 65]).unwrap().bytes()[..6], [
+        64, 0, 0x60, 0, 65, 0
+    ]);
 }
 
 #[test]
@@ -408,15 +410,15 @@ fn the_central_closes_a_bearer_with_its_cids_and_is_rejected_for_one_not_open() 
     fixture.open(1, &[0x0050]);
     // A wrong source CID is dropped silently.
     assert_eq!(fixture.command(0x06, 2, &[0x40, 0x00, 0x51, 0x00], true), None);
-    assert!(fixture.ecfc.is_open(0));
+    assert!(fixture.ecfc.is_open(BearerId::FIRST));
     assert_eq!(fixture.send_all(), Vec::<Vec<u8>>::new());
     assert_eq!(fixture.command(0x06, 3, &[0x40, 0x00, 0x50, 0x00], true), None);
-    assert!(!fixture.ecfc.is_open(0));
+    assert!(!fixture.ecfc.is_open(BearerId::FIRST));
     // The same request again, before our response went: dropped, not
     // rejected, and answered once.
     assert_eq!(fixture.command(0x06, 3, &[0x40, 0x00, 0x50, 0x00], true), None);
     // It stays taken until our response went.
-    assert_eq!(fixture.ecfc.next_signal(), Some(Signal::Released(0)));
+    assert_eq!(fixture.ecfc.next_signal(), Some(Signal::Released(BearerId::FIRST)));
     fixture.connect(4, &[0x0051], true);
     assert_eq!(fixture.send_all(), [response(4, if BEARERS >= 2 { 0x00 } else { 0x04 }, &expected_dcids(1, 1)), vec![
         0x07, 3, 0x04, 0x00, 0x40, 0x00, 0x50, 0x00
@@ -436,12 +438,12 @@ fn our_close_ends_with_its_response_a_command_reject_or_the_timeout() {
         let mut fixture = Fixture::new();
         fixture.open(1, &[0x0050]);
         // A K-frame longer than our MPS.
-        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &[0; 68], true), None);
-        assert!(!fixture.ecfc.is_open(0));
+        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &[0; 68], true), None);
+        assert!(!fixture.ecfc.is_open(BearerId::FIRST));
         assert_eq!(fixture.send_all(), [vec![0x06, 1, 0x04, 0x00, 0x50, 0x00, 0x40, 0x00]]);
         assert_eq!(fixture.ecfc.deadline(), Some(at(30_000)));
         // Data on it is dropped meanwhile.
-        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &[1, 0, 0x0A], true), None);
+        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &[1, 0, 0x0A], true), None);
         // A response with other CIDs or another identifier is not ours.
         fixture.command(0x07, 1, &[0x51, 0x00, 0x40, 0x00], true);
         fixture.command(0x07, 2, &[0x50, 0x00, 0x40, 0x00], true);
@@ -467,7 +469,7 @@ fn a_command_reject_of_our_close_leaves_the_parameter_request_waiting() {
     let mut fixture = Fixture::new();
     let asked = fixture.signal.request_params(PARAMS).unwrap().bytes()[1];
     fixture.open(1, &[0x0050]);
-    fixture.ecfc.close(&mut fixture.signal, 0);
+    fixture.ecfc.close(&mut fixture.signal, BearerId::FIRST);
     let close = fixture.send_all();
     let ident = close[0][1];
     assert_ne!(ident, asked);
@@ -492,7 +494,7 @@ fn k_frames_take_credits_and_the_credits_come_back_in_steps_of_128() {
     let read = [3, 0, 0x0A, 0x03, 0x00];
     let mut indications = 0;
     for count in 1..=1_000 {
-        let (sdu, encrypted) = fixture.ecfc.receive(&mut fixture.signal, 0, &read, true).unwrap();
+        let (sdu, encrypted) = fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &read, true).unwrap();
         assert_eq!((sdu, encrypted), (&read[2..], true));
         for command in fixture.send_all() {
             assert_eq!(count % 128, 0);
@@ -504,7 +506,7 @@ fn k_frames_take_credits_and_the_credits_come_back_in_steps_of_128() {
     assert_eq!(indications, 7);
     assert_eq!(fixture.ecfc.bearers[0].rx_credits, 256 - 1_000 % 128);
     // A plaintext K-frame gives a plaintext SDU.
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &read, false), Some((&read[2..], false)));
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &read, false), Some((&read[2..], false)));
 }
 
 #[test]
@@ -512,11 +514,11 @@ fn a_k_frame_without_a_credit_closes_the_bearer() {
     let mut fixture = Fixture::new();
     fixture.open(1, &[0x0050]);
     for _ in 0..256 {
-        assert!(fixture.ecfc.receive(&mut fixture.signal, 0, &[1, 0, 0x0A], true).is_some());
+        assert!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &[1, 0, 0x0A], true).is_some());
     }
     // The 0x16 was owed but not sent.
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &[1, 0, 0x0A], true), None);
-    assert!(!fixture.ecfc.is_open(0));
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &[1, 0, 0x0A], true), None);
+    assert!(!fixture.ecfc.is_open(BearerId::FIRST));
     let sent = fixture.send_all();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0][0], 0x06);
@@ -528,29 +530,35 @@ fn a_split_sdu_is_joined_and_k_frames_that_break_the_rules_close_the_bearer() {
     let mut fixture = Fixture::new();
     fixture.open(1, &[0x0050]);
     let first = [&[65, 0][..], &sdu[..30]].concat();
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &first, true), None);
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &sdu[30..], false), Some((&sdu[..], false)));
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &first, true), None);
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &sdu[30..], false), Some((&sdu[..], false)));
     // An SDU longer than our MTU.
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &[66, 0, 0x0A], true), None);
-    assert!(!fixture.ecfc.is_open(0));
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &[66, 0, 0x0A], true), None);
+    assert!(!fixture.ecfc.is_open(BearerId::FIRST));
     for kframe in [&[0_u8][..], &[1, 0, 0x0A, 0x0B][..], &[0; 68][..]] {
         let mut fixture = Fixture::new();
         fixture.open(1, &[0x0050]);
-        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, kframe, true), None);
-        assert!(!fixture.ecfc.is_open(0), "{kframe:?}");
+        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, kframe, true), None);
+        assert!(!fixture.ecfc.is_open(BearerId::FIRST), "{kframe:?}");
     }
     if BEARERS >= 2 {
         // A second split SDU while the first fills the buffer closes its
         // bearer only.
         let mut fixture = Fixture::new();
         fixture.open(1, &[0x0050, 0x0051]);
-        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &first, true), None);
+        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &first, true), None);
         // A whole SDU on the other bearer passes meanwhile.
-        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 1, &[1, 0, 0x0A], true), Some((&[0x0A][..], true)));
-        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 1, &first, true), None);
-        assert!(fixture.ecfc.is_open(0));
-        assert!(!fixture.ecfc.is_open(1));
-        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &sdu[30..], true), Some((&sdu[..], true)));
+        assert_eq!(
+            fixture.ecfc.receive(&mut fixture.signal, BearerId::valid(1), &[1, 0, 0x0A], true),
+            Some((&[0x0A][..], true))
+        );
+        assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::valid(1), &first, true), None);
+        assert!(fixture.ecfc.is_open(BearerId::FIRST));
+        assert!(!fixture.ecfc.is_open(BearerId::valid(1)));
+        assert_eq!(
+            fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &sdu[30..], true),
+            Some((&sdu[..], true))
+        );
     }
 }
 
@@ -560,27 +568,27 @@ fn closing_a_bearer_drops_its_split_sdu() {
     let mut fixture = Fixture::new();
     fixture.open(1, &[0x0050]);
     let first = [&[65, 0][..], &sdu[..30]].concat();
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &first, true), None);
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &first, true), None);
     fixture.command(0x06, 2, &[0x40, 0x00, 0x50, 0x00], true);
     fixture.send_all();
     fixture.open(3, &[0x0051]);
     // The new bearer's first K-frame is a first one, and the buffer is free.
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &first, true), None);
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &sdu[30..], true), Some((&sdu[..], true)));
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &first, true), None);
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &sdu[30..], true), Some((&sdu[..], true)));
 }
 
 #[test]
 fn data_is_dropped_on_a_bearer_that_is_not_open() {
     let mut fixture = Fixture::new();
     let read = [1, 0, 0x0A];
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &read, true), None);
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &read, true), None);
     fixture.connect(1, &[0x0050], false);
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &read, true), None);
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &read, true), None);
     fixture.ecfc.resolve_holds();
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, 0, &read, true), None);
+    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &read, true), None);
     fixture.send_all();
-    assert!(fixture.ecfc.receive(&mut fixture.signal, 0, &read, true).is_some());
-    assert_eq!(fixture.ecfc.receive(&mut fixture.signal, BEARERS as u8, &read, true), None);
+    assert!(fixture.ecfc.receive(&mut fixture.signal, BearerId::FIRST, &read, true).is_some());
+    assert_eq!(BearerId::new(BEARERS), None);
 }
 
 #[test]
@@ -594,17 +602,17 @@ fn an_sdu_goes_out_in_k_frames_of_the_peer_s_mps_one_credit_each() {
         let sdu: Vec<u8> = (100..165).collect();
         let mut joined = Vec::new();
         for (index, &len) in kframes.iter().enumerate() {
-            let Some(mut segmenter) = fixture.ecfc.kframe(0, sdu.len()) else {
+            let Some(mut segmenter) = fixture.ecfc.kframe(BearerId::FIRST, sdu.len()) else {
                 panic!("no credit for K-frame {index} at MPS {mps}");
             };
-            assert_eq!(segmenter.channel(), Channel::Eatt(0));
+            assert_eq!(segmenter.channel(), Channel::Eatt(BearerId::FIRST));
             let mut frame = Vec::new();
             let mut fragments = Vec::new();
             while let Some(fragment) = segmenter.fragment(&sdu) {
                 assert_eq!(fragment.start(), frame.is_empty());
                 if fragment.start() {
                     // The credit goes with the first fragment.
-                    let last = fixture.ecfc.kframe_queued(0, &segmenter);
+                    let last = fixture.ecfc.kframe_queued(BearerId::FIRST, &segmenter);
                     assert_eq!(last, index + 1 == kframes.len());
                 }
                 fragments.push(fragment.bytes().len());
@@ -623,12 +631,12 @@ fn an_sdu_goes_out_in_k_frames_of_the_peer_s_mps_one_credit_each() {
             if len == 67 {
                 assert_eq!(fragments, [27, 27, 17]);
             }
-            assert_eq!(fixture.ecfc.kframe(0, sdu.len()), None, "one credit, one K-frame");
+            assert_eq!(fixture.ecfc.kframe(BearerId::FIRST, sdu.len()), None, "one credit, one K-frame");
             fixture.command(0x16, 2, &[0x50, 0x00, 0x01, 0x00], true);
         }
         assert_eq!(joined, sdu);
         // The next SDU starts with a first K-frame again.
-        let next = fixture.ecfc.kframe(0, 5).unwrap();
+        let next = fixture.ecfc.kframe(BearerId::FIRST, 5).unwrap();
         assert_eq!(next.fragment(&[1, 2, 3, 4, 5]).unwrap().bytes(), [7, 0, 0x50, 0x00, 5, 0, 1, 2, 3, 4, 5]);
     }
 }
@@ -781,7 +789,8 @@ fn fuzzing_commands_and_k_frames_never_panics_and_keeps_the_invariants() {
             5 | 6 => {
                 // A K-frame on a bearer, whole, split or broken.
                 seen.pdus += 1;
-                let bearer = rng.below(BEARERS as u64 + 1) as u8;
+                let number = rng.below(BEARERS as u64 + 1) as u8;
+                let bearer = BearerId::new(usize::from(number));
                 let len = match rng.below(20) {
                     // Whole SDUs mostly, of 1 to 65 octets.
                     0..=15 => 3 + rng.below(65) as usize,
@@ -796,19 +805,21 @@ fn fuzzing_commands_and_k_frames_never_panics_and_keeps_the_invariants() {
                 let encrypted = rng.below(2) == 0;
                 if rng.below(2) == 0 {
                     // Directly.
-                    if let Some((sdu, _)) = fixture.ecfc.receive(&mut fixture.signal, bearer, &kframe, encrypted) {
+                    if let Some(on) = bearer
+                        && let Some((sdu, _)) = fixture.ecfc.receive(&mut fixture.signal, on, &kframe, encrypted)
+                    {
                         assert!(sdu.len() <= 65);
                         seen.sdus += 1;
                     }
                 } else {
                     // Through the reassembly, in fragments of up to 27.
                     let mut frame = (kframe.len() as u16).to_le_bytes().to_vec();
-                    frame.extend_from_slice(&(0x0040 + u16::from(bearer)).to_le_bytes());
+                    frame.extend_from_slice(&(0x0040 + u16::from(number)).to_le_bytes());
                     frame.extend_from_slice(&kframe);
                     for (index, fragment) in frame.chunks(27).enumerate() {
                         if let Some(pdu) = reassembly.push(index == 0, encrypted, fragment) {
                             let Channel::Eatt(on) = pdu.channel else { panic!("{:?}", pdu.channel) };
-                            assert_eq!(on, bearer);
+                            assert_eq!(Some(on), bearer);
                             let payload = pdu.payload.to_vec();
                             if let Some((sdu, _)) =
                                 fixture.ecfc.receive(&mut fixture.signal, on, &payload, pdu.encrypted)
@@ -819,7 +830,7 @@ fn fuzzing_commands_and_k_frames_never_panics_and_keeps_the_invariants() {
                         }
                     }
                     if let Some(on) = reassembly.take_overlong() {
-                        assert_eq!((on, len > 68), (bearer, true));
+                        assert_eq!((Some(on), len > 68), (bearer, true));
                         seen.overlong += 1;
                         fixture.ecfc.close(&mut fixture.signal, on);
                     }
@@ -841,7 +852,7 @@ fn fuzzing_commands_and_k_frames_never_panics_and_keeps_the_invariants() {
                                 .filter(|&cid| cid != 0)
                                 .collect();
                             for (index, dcid) in dcids.iter().enumerate() {
-                                assert!(bearer(*dcid).is_some());
+                                assert!(BearerId::from_cid(*dcid).is_some());
                                 assert!(!dcids[index + 1..].contains(dcid));
                             }
                             seen.opened += dcids.len();
@@ -861,7 +872,7 @@ fn fuzzing_commands_and_k_frames_never_panics_and_keeps_the_invariants() {
             },
             8 => {
                 // An SDU goes out on a bearer.
-                let bearer = rng.below(BEARERS as u64) as u8;
+                let bearer = BearerId::valid(rng.below(BEARERS as u64) as u8);
                 let sdu: Vec<u8> = (0..1 + rng.below(65)).map(|_| rng.next() as u8).collect();
                 if let Some(mut segmenter) = fixture.ecfc.kframe(bearer, sdu.len()) {
                     seen.kframes += 1;
@@ -879,7 +890,7 @@ fn fuzzing_commands_and_k_frames_never_panics_and_keeps_the_invariants() {
             _ => match rng.below(6) {
                 5 if rng.below(8) == 0 => {
                     // A burst of whole SDUs on one bearer, past the top up.
-                    let bearer = rng.below(BEARERS as u64) as u8;
+                    let bearer = BearerId::valid(rng.below(BEARERS as u64) as u8);
                     for _ in 0..130 {
                         seen.pdus += 1;
                         if fixture.ecfc.receive(&mut fixture.signal, bearer, &[1, 0, 0x0A], true).is_some() {
@@ -889,7 +900,11 @@ fn fuzzing_commands_and_k_frames_never_panics_and_keeps_the_invariants() {
                 },
                 0 => fixture.ecfc.resolve_holds(),
                 1 => fixture.ecfc.refuse_holds(rng.below(2) == 0),
-                2 if rng.below(10) == 0 => fixture.ecfc.close(&mut fixture.signal, rng.below(BEARERS as u64 + 1) as u8),
+                2 if rng.below(10) == 0 => {
+                    if let Some(bearer) = BearerId::new(rng.below(BEARERS as u64 + 1) as usize) {
+                        fixture.ecfc.close(&mut fixture.signal, bearer);
+                    }
+                },
                 3 if rng.below(100) == 0 => fixture = Fixture { now: fixture.now, ..Fixture::new() },
                 _ => {
                     if fixture.ecfc.deadline().is_some_and(|deadline| deadline <= fixture.now) {

@@ -93,3 +93,130 @@ pub mod radio;
 pub mod rng;
 /// Sleeping on peripheral events.
 mod sleep;
+
+/// The PPI channels of the link layer on the nRF52832: those of the clock,
+/// the turnaround and the CCM.
+#[cfg(feature = "nrf52832")]
+const LINK_PPI_CHANNELS: [usize; 10] = [
+    clock::PPI_RESUME,
+    clock::PPI_SYNC,
+    clock::PPI_CALIBRATE,
+    radio::PPI_SWITCH_START,
+    radio::PPI_SWITCH_ENABLE,
+    clock::PPI_TXEN,
+    clock::PPI_RXEN,
+    crypto::PPI_CRYPT,
+    clock::PPI_ADDRESS,
+    clock::PPI_END,
+];
+/// The PPI channels of the link layer on the nRF51: those of the clock, the
+/// channels standing in for the FORK of its self-disabling channels, and
+/// the CCM's. The radio times its turnarounds itself.
+#[cfg(feature = "nrf51")]
+const LINK_PPI_CHANNELS: [usize; 10] = [
+    clock::PPI_RESUME,
+    clock::PPI_SYNC,
+    clock::PPI_CALIBRATE,
+    chip::fork_channel(clock::PPI_SYNC),
+    chip::fork_channel(clock::PPI_CALIBRATE),
+    clock::PPI_TXEN,
+    clock::PPI_RXEN,
+    crypto::PPI_CRYPT,
+    clock::PPI_ADDRESS,
+    clock::PPI_END,
+];
+/// The PPI channel groups of the link layer: those of its self-disabling
+/// channels.
+const LINK_PPI_GROUPS: [usize; 2] = [clock::PPI_GROUP_CALIBRATE, clock::PPI_GROUP_SYNC];
+/// Every PPI channel the link layer uses on the selected chip, as a mask
+/// with bit `n` set for channel `n`.
+///
+/// They are programmable channels and fixed channels between TIMER0, RTC0,
+/// the clock, the radio and the CCM, and on the nRF52832 the two
+/// programmable channels of the turnaround timer. On the nRF51 they include
+/// the programmable channels that stand in for the FORK registers it lacks.
+///
+/// The link layer programs these channels and enables and disables them,
+/// some of them within the interframe space. A firmware must not program,
+/// enable, disable or group them. It switches its own channels through
+/// `CHENSET` and `CHENCLR` only, as writing `CHEN` would switch these too.
+/// A firmware that uses PPI checks its channels against this mask at
+/// compile time, for example with
+/// `const _: () = assert!(nrf_ble::PPI_CHANNELS & MY_CHANNELS == 0);`.
+///
+/// The link layer owns the Embassy tokens of the channels that have one
+/// ([`clock::Ppi`], [`clock::CalibrationPpi`] and on the nRF52832
+/// `radio::Ppi`), so no Embassy driver can take them. The fixed channels of
+/// the nRF51 have no tokens, and only this mask covers them.
+pub const PPI_CHANNELS: u32 = ppi_mask(&LINK_PPI_CHANNELS);
+/// Every PPI channel group the link layer uses, as a mask with bit `n` set
+/// for group `n`.
+///
+/// The link layer writes the channels of these groups and triggers their
+/// enable and disable tasks, and owns their Embassy tokens. A firmware must
+/// not use them, and checks its own groups against this mask at compile
+/// time like [`PPI_CHANNELS`].
+pub const PPI_GROUPS: u8 = ppi_mask(&LINK_PPI_GROUPS).strict_cast();
+
+// Each list names every channel or group once: two constants on the same
+// number would leave the mask a bit short of the list.
+const _: () = assert!(
+    PPI_CHANNELS.count_ones() == LINK_PPI_CHANNELS.len().strict_cast(),
+    "two PPI channels of the link layer have the same number"
+);
+const _: () = assert!(
+    PPI_GROUPS.count_ones() == LINK_PPI_GROUPS.len().strict_cast(),
+    "two PPI channel groups of the link layer have the same number"
+);
+
+/// The mask with bit `n` set for each channel or group `n` in `numbers`.
+const fn ppi_mask(numbers: &[usize]) -> u32 {
+    let mut mask = 0;
+    let mut rest = numbers;
+    while let Some((&number, tail)) = rest.split_first() {
+        mask |= 1_u32.strict_shl(number.strict_cast());
+        rest = tail;
+    }
+    mask
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::clock::{CalibrationPpi, Ppi};
+    use embassy_nrf::peripherals;
+
+    /// The token of `$peripheral`, which a test only builds.
+    macro_rules! token {
+        ($peripheral:ident) => {
+            // SAFETY: the test builds the token alone, and nothing else
+            // holds it.
+            unsafe { peripherals::$peripheral::steal() }
+        };
+    }
+
+    /// The token sets check in debug builds that each token is the channel
+    /// or group its constant numbers.
+    #[test]
+    fn ppi_tokens_are_the_channels_programmed() {
+        #[cfg(feature = "nrf52832")]
+        let _clock = Ppi::new(
+            token!(PPI_CH0),
+            token!(PPI_CH1),
+            token!(PPI_CH20),
+            token!(PPI_CH21),
+            token!(PPI_CH26),
+            token!(PPI_CH27),
+            token!(PPI_GROUP1),
+        );
+        #[cfg(feature = "nrf51")]
+        let _clock = Ppi::new(token!(PPI_CH0), token!(PPI_CH1), token!(PPI_CH9), token!(PPI_GROUP1));
+        let _calibration = CalibrationPpi::new(
+            token!(PPI_CH3),
+            #[cfg(feature = "nrf51")]
+            token!(PPI_CH11),
+            token!(PPI_GROUP0),
+        );
+        #[cfg(feature = "nrf52832")]
+        let _radio = crate::radio::Ppi::new(token!(PPI_CH4), token!(PPI_CH5), token!(PPI_CH25));
+    }
+}

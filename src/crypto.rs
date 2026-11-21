@@ -10,10 +10,14 @@
 //! cannot start one of its own in between, and retries with interrupts on, so
 //! a radio event that aborted it is not delayed.
 
-use crate::{chip, radio::Phy, sleep};
+use crate::{
+    chip,
+    pdu::BUFFER_LEN,
+    radio::{PacketBuffer, Phy},
+    sleep,
+};
 use core::{
     hint::black_box,
-    slice,
     sync::atomic::{Ordering, compiler_fence},
 };
 use embassy_nrf::pac::{
@@ -37,7 +41,7 @@ const DIRECTION_OFFSET: usize = 24;
 /// Offset of the IV in a CCM configuration.
 const IV_OFFSET: usize = 25;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
-const PPI_CRYPT: usize = 25;
+pub(crate) const PPI_CRYPT: usize = 25;
 /// Scratch space for every length the CCM may take from a packet.
 pub(crate) const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
 
@@ -51,6 +55,32 @@ const _: () = {
 /// The packet counter is 39 bits; the next bit belongs to the direction.
 pub(crate) const COUNTER_LIMIT: u64 = 1_u64.strict_shl(39);
 
+/// A received PDU as the CCM decrypts it ([`arm_decrypt`]): header, length,
+/// the S1 byte and payload, without the MIC.
+///
+/// A whole [`PacketBuffer`], which takes what the CCM writes for any length
+/// the untrusted length field announces, as that is at most the received
+/// packet. A type of its own, so that it cannot be passed where the CCM
+/// reads or the radio receives.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub(crate) struct Decrypted(PacketBuffer);
+
+impl Decrypted {
+    /// A decrypted PDU of zeros.
+    pub(crate) const ZERO: Self = Self(PacketBuffer::ZERO);
+
+    /// The octets of the PDU.
+    #[inline]
+    #[must_use = "the octets are only borrowed"]
+    pub(crate) const fn bytes(&self) -> &[u8; BUFFER_LEN] { &self.0.0 }
+
+    /// The octets of the PDU, to change.
+    #[inline]
+    #[must_use = "the octets are only borrowed"]
+    pub(crate) const fn bytes_mut(&mut self) -> &mut [u8; BUFFER_LEN] { &mut self.0.0 }
+}
+
 /// Prepares the CCM to decrypt the next received packet from `input` into
 /// `output` while it is received: starts its key stream, which
 /// [`start_on_address`] waits for before the access address may start the
@@ -62,12 +92,12 @@ pub(crate) const COUNTER_LIMIT: u64 = 1_u64.strict_shl(39);
 /// The CCM reads `config` and `input` and writes `output` and `scratch` by
 /// DMA after this returns. All four must stay valid, and the CPU must not
 /// access `output` or `scratch` while the CCM may, until the operation ends,
-/// [`disarm`], [`stop`] or [`disable`]. `input` and `output` must point to
-/// RAM holding [`crate::pdu::BUFFER_LEN`] bytes.
+/// [`disarm`], [`stop`] or [`disable`].
 #[inline]
 pub(crate) unsafe fn arm_decrypt(
     config: &[u8; CONFIG_LEN],
-    (input, output): (*mut u8, *mut u8),
+    input: &PacketBuffer,
+    output: &mut Decrypted,
     scratch: &mut [u8; SCRATCH_LEN],
     phy: Phy,
 ) {
@@ -75,7 +105,7 @@ pub(crate) unsafe fn arm_decrypt(
     CCM.enable().write(|w| w.set_enable(Enable::Disabled));
     CCM.enable().write(|w| w.set_enable(Enable::Enabled));
     chip::ccm_mode(Mode::Decryption, phy);
-    set_pointers(config, input.cast_const(), output, scratch);
+    set_pointers(config, input, &mut output.0, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(false));
     CCM.events_endksgen().write_value(0);
     CCM.events_endcrypt().write_value(0);
@@ -90,10 +120,10 @@ pub(crate) unsafe fn arm_decrypt(
 /// only then lets the radio's access address start the decryption. Returns
 /// false, with the decryption not armed, if `heard` tells that the access
 /// address came first or the key stream took longer than
-/// [`chip::DECRYPT_WAIT`]: the packet then cannot be decrypted, and its MIC
-/// counts as failed.
+/// [`chip::DECRYPT_WAIT`]: the packet then cannot be decrypted and is taken
+/// as not received.
 #[inline]
-#[must_use = "an unarmed decryption fails the packet's MIC"]
+#[must_use = "a packet whose decryption did not start cannot be taken"]
 pub(crate) fn start_on_address(heard: impl Fn() -> bool) -> bool {
     let mut remaining = chip::DECRYPT_WAIT;
     while CCM.events_endksgen().read() == 0 {
@@ -123,22 +153,21 @@ pub(crate) fn start_on_address(heard: impl Fn() -> bool) -> bool {
 /// # Safety
 ///
 /// The CCM reads `config` and `input` and writes `output` and `scratch` by
-/// DMA until this returns. `input` must point to a PDU in RAM and `output`
-/// to RAM with room for it and its MIC, neither accessed meanwhile. No
-/// decryption may be armed.
+/// DMA until this returns. `input` must be in RAM and hold a PDU that with
+/// its MIC fits `output`. No decryption may be armed.
 #[inline]
 pub(crate) unsafe fn seal(
     config: &[u8; CONFIG_LEN],
-    pointers: (*const u8, *mut u8),
+    input: &PacketBuffer,
+    output: &mut PacketBuffer,
     scratch: &mut [u8; SCRATCH_LEN],
     phy: Phy,
 ) -> bool {
     if cfg!(test) {
-        // SAFETY: the caller's guarantees cover the stand-in's.
-        unsafe { seal_stand_in(config, pointers) }
+        seal_stand_in(config, input, output)
     } else {
         // SAFETY: the caller's guarantees are the CCM's.
-        unsafe { seal_ccm(config, pointers, scratch, phy) }
+        unsafe { seal_ccm(config, input, output, scratch, phy) }
     }
 }
 
@@ -150,54 +179,13 @@ pub(crate) unsafe fn seal(
 #[inline]
 unsafe fn seal_ccm(
     config: &[u8; CONFIG_LEN],
-    (input, output): (*const u8, *mut u8),
+    input: &PacketBuffer,
+    output: &mut PacketBuffer,
     scratch: &mut [u8; SCRATCH_LEN],
     phy: Phy,
-) -> bool {
-    // SAFETY: the caller's guarantees are those of `run_now`.
-    unsafe { run_now(Mode::Encryption, config, (input, output), scratch, phy, chip::SEAL_WAIT) }
-}
-
-/// Decrypts the received packet at `input` into `output` again, started by
-/// the CPU, which polls until the CCM is done: a check of a packet whose MIC
-/// failed on the fly. Returns whether its MIC is valid, `None` if the CCM
-/// failed or did not finish in time.
-///
-/// # Safety
-///
-/// As for [`seal`], with `input` pointing to the received packet.
-#[inline]
-pub(crate) unsafe fn decrypt_now(
-    config: &[u8; CONFIG_LEN],
-    pointers: (*const u8, *mut u8),
-    scratch: &mut [u8; SCRATCH_LEN],
-    phy: Phy,
-) -> Option<bool> {
-    // The CCM decrypts at the pace of `phy`'s data rate, as on the fly: up to
-    // about 2 ms for the longest packet on LE 1M.
-    // SAFETY: the caller's guarantees are those of `run_now`.
-    let completed =
-        unsafe { run_now(Mode::Decryption, config, pointers, scratch, phy, chip::SEAL_WAIT.saturating_mul(4)) };
-    completed.then(|| CCM.micstatus().read().micstatus() == Micstatus::CheckPassed)
-}
-
-/// Runs one CCM operation in `mode` now, key stream and then the operation,
-/// and polls until it is done, at most `wait` iterations. Returns false if
-/// the CCM failed or did not finish in time.
-///
-/// # Safety
-///
-/// As for [`seal`].
-unsafe fn run_now(
-    mode: Mode,
-    config: &[u8; CONFIG_LEN],
-    (input, output): (*const u8, *mut u8),
-    scratch: &mut [u8; SCRATCH_LEN],
-    phy: Phy,
-    wait: u32,
 ) -> bool {
     PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
-    chip::ccm_mode(mode, phy);
+    chip::ccm_mode(Mode::Encryption, phy);
     set_pointers(config, input, output, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(true));
     CCM.events_endksgen().write_value(0);
@@ -205,7 +193,7 @@ unsafe fn run_now(
     CCM.events_error().write_value(0);
     compiler_fence(Ordering::SeqCst);
     CCM.tasks_ksgen().write_value(1);
-    let mut remaining = wait;
+    let mut remaining = chip::SEAL_WAIT;
     while CCM.events_endcrypt().read() == 0 && CCM.events_error().read() == 0 && remaining != 0 {
         remaining = remaining.saturating_sub(1);
     }
@@ -221,22 +209,16 @@ unsafe fn run_now(
 /// [`seal`] for the host tests, on the PC, which has no CCM: copies the
 /// header, adds the MIC to the length, flips the payload and puts the low
 /// four octets of the packet counter where the MIC goes, so a test sees
-/// which counter sealed a PDU.
-///
-/// # Safety
-///
-/// `input` points to a PDU and `output` to a distinct buffer with room for
-/// it and its MIC.
-unsafe fn seal_stand_in(config: &[u8; CONFIG_LEN], (input, output): (*const u8, *mut u8)) -> bool {
-    // SAFETY: a PDU starts with its two header octets.
-    let header = unsafe { slice::from_raw_parts(input, 2) };
-    let Some(&length) = header.get(1) else { return false };
+/// which counter sealed a PDU. Returns false if the PDU with its MIC does
+/// not fit `output`.
+fn seal_stand_in(config: &[u8; CONFIG_LEN], input: &PacketBuffer, output: &mut PacketBuffer) -> bool {
+    let Some(&length) = input.0.get(1) else { return false };
+    // The PDU is its header, its length octet's payload and the S1 octet.
     let plain_len = usize::from(length).saturating_add(3);
-    // SAFETY: the PDU is its header, its length octet's payload and the S1
-    // octet.
-    let plain = unsafe { slice::from_raw_parts(input, plain_len) };
-    // SAFETY: `output` has room for the PDU and its MIC, apart from `input`.
-    let sealed = unsafe { slice::from_raw_parts_mut(output, plain_len.saturating_add(4)) };
+    let (Some(plain), Some(sealed)) = (input.0.get(..plain_len), output.0.get_mut(..plain_len.saturating_add(4)))
+    else {
+        return false;
+    };
     let (Some((head, payload)), Some((sealed_head, sealed_rest))) =
         (plain.split_first_chunk::<3>(), sealed.split_first_chunk_mut::<3>())
     else {
@@ -364,11 +346,16 @@ pub(crate) fn set_counter(config: &mut [u8; CONFIG_LEN], counter: u64) -> bool {
 }
 
 /// Sets the configuration, data and scratch pointers.
-fn set_pointers(config: &[u8; CONFIG_LEN], input: *const u8, output: *mut u8, scratch: &mut [u8; SCRATCH_LEN]) {
+fn set_pointers(
+    config: &[u8; CONFIG_LEN],
+    input: &PacketBuffer,
+    output: &mut PacketBuffer,
+    scratch: &mut [u8; SCRATCH_LEN],
+) {
     compiler_fence(Ordering::SeqCst);
     CCM.cnfptr().write_value(config.as_ptr().addr().strict_cast());
-    CCM.inptr().write_value(input.addr().strict_cast());
-    CCM.outptr().write_value(output.addr().strict_cast());
+    CCM.inptr().write_value(input.0.as_ptr().addr().strict_cast());
+    CCM.outptr().write_value(output.0.as_mut_ptr().addr().strict_cast());
     CCM.scratchptr().write_value(scratch.as_mut_ptr().addr().strict_cast());
 }
 

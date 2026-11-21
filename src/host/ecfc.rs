@@ -4,14 +4,15 @@
 //! Part A, 3.4, 4.24 to 4.28 and 10.2) on the SPSM of EATT, 0x0027.
 //!
 //! [`Ecfc`] keeps the [`BEARERS`] enhanced bearers of a link, 1 or with the
-//! features `eatt-bearers-2` to `eatt-bearers-5` up to 5. Bearer `b` has our
-//! CID 0x0040 + `b` ([`crate::host::l2cap::Channel::Eatt`]), an MTU of
-//! [`MTU`] (65, the ATT MTU of [`crate::host::att::ATT_MAX`]), an MPS of
-//! [`MPS`] (67, so a peer that segments by our MPS never splits an SDU of 65
-//! octets), and grants [`RX_CREDITS`] (256) K-frames, topped up again by a Flow
-//! Control Credit Indication once [`TOP_UP`] (128) or fewer are left. Its ATT
-//! MTU is the smaller of 65 and the peer's MTU. The host only answers: it never
-//! asks for a credit based channel or a reconfiguration itself.
+//! features `eatt-bearers-2` to `eatt-bearers-5` up to 5. Bearer `b`
+//! ([`BearerId`]) has our CID 0x0040 + `b`
+//! ([`crate::host::l2cap::Channel::Eatt`]), an MTU of [`MTU`] (65, the ATT
+//! MTU of [`crate::host::att::ATT_MAX`]), an MPS of [`MPS`] (67, so a peer
+//! that segments by our MPS never splits an SDU of 65 octets), and grants
+//! [`RX_CREDITS`] (256) K-frames, topped up again by a Flow Control Credit
+//! Indication once [`TOP_UP`] (128) or fewer are left. Its ATT MTU is the
+//! smaller of 65 and the peer's MTU. The host only answers: it never asks for
+//! a credit based channel or a reconfiguration itself.
 //!
 //! # A Credit Based Connection Request
 //!
@@ -211,25 +212,39 @@ const _: () = assert!(
     "the bearers' CIDs are dynamic, the MTU is the ATT MTU, the MPS holds it whole"
 );
 
+/// One of the [`BEARERS`] enhanced bearers of a link, by its index: bearer
+/// `b` has our CID [`FIRST_CID`] + `b`. Only an index below [`BEARERS`] is
+/// one.
+#[derive(Clone, Copy, Debug, Eq)]
+#[derive_const(PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BearerId(u8);
+
+/// The entry of a connection request that waits for its answer, below
+/// [`PENDING`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PendingId(u8);
+
 /// A command to send, which [`Ecfc::next_signal`] names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Signal {
     /// Our Disconnection Request for this bearer.
-    Close(u8),
+    Close(BearerId),
     /// A Flow Control Credit Indication.
     Credits {
         /// The bearer.
-        bearer:  u8,
+        bearer:  BearerId,
         /// The credits it grants.
         credits: u16,
     },
     /// The Disconnection Response to the central's request for this bearer.
-    Released(u8),
+    Released(BearerId),
     /// The Credit Based Connection Response to the request in this
     /// pending entry.
-    Response(u8),
+    Response(PendingId),
 }
 
 /// The state of one bearer.
@@ -322,6 +337,47 @@ pub struct Ecfc {
     sdu:         SduRx,
 }
 
+impl BearerId {
+    /// Bearer 0.
+    pub(crate) const FIRST: Self = Self(0);
+
+    /// Every bearer, in order.
+    #[inline]
+    pub fn all() -> impl Iterator<Item = Self> + Clone { (0_u8..).take(BEARERS).map(Self) }
+
+    /// Our CID of the bearer.
+    #[inline]
+    #[must_use = "the identifier is only read"]
+    pub const fn cid(self) -> u16 { FIRST_CID.saturating_add(u16::from(self.0)) }
+
+    /// The bearer with our CID `cid`, if any.
+    #[inline]
+    #[must_use = "the bearer is only looked up"]
+    pub const fn from_cid(cid: u16) -> Option<Self> {
+        let Some(index) = cid.checked_sub(FIRST_CID) else { return None };
+        Self::new(usize::from(index))
+    }
+
+    /// The bearer's index in an array of [`BEARERS`] entries.
+    pub(crate) const fn index(self) -> usize { usize::from(self.0) }
+
+    /// The bearer of `index`, if it is below [`BEARERS`].
+    pub(crate) const fn new(index: usize) -> Option<Self> {
+        if index < BEARERS { Some(Self(index.saturating_cast())) } else { None }
+    }
+
+    /// The bearer after this one, bearer 0 after the last.
+    pub(crate) const fn next(self) -> Self { Self::new(self.index().saturating_add(1)).unwrap_or(Self::FIRST) }
+
+    /// The bearer of `index`, which a test gives below [`BEARERS`]; it panics
+    /// otherwise.
+    #[cfg(test)]
+    pub(crate) const fn valid(index: u8) -> Self {
+        assert!(usize::from(index) < BEARERS, "not a bearer");
+        Self(index)
+    }
+}
+
 impl Bearer {
     /// A free bearer.
     const IDLE: Self = Self {
@@ -386,8 +442,8 @@ impl Ecfc {
     /// peer's.
     #[inline]
     #[must_use = "the ATT MTU is only read"]
-    pub fn att_mtu(&self, bearer: u8) -> Option<usize> {
-        let entry = self.bearers.get(usize::from(bearer)).filter(|entry| entry.state == State::Open)?;
+    pub fn att_mtu(&self, bearer: BearerId) -> Option<usize> {
+        let entry = self.bearers.get(bearer.index()).filter(|entry| entry.state == State::Open)?;
         Some(usize::from(entry.peer_mtu.min(MTU)))
     }
 
@@ -395,8 +451,8 @@ impl Ecfc {
     /// takes the next identifier of `signal`: for a K-frame too long for the
     /// reassembly buffer ([`crate::host::l2cap::Reassembly::take_overlong`]).
     #[inline]
-    pub fn close(&mut self, signal: &mut Signalling, bearer: u8) {
-        if let Some(entry) = self.bearers.get_mut(usize::from(bearer))
+    pub fn close(&mut self, signal: &mut Signalling, bearer: BearerId) {
+        if let Some(entry) = self.bearers.get_mut(bearer.index())
             && entry.state == State::Open
         {
             warn!("ecfc: a K-frame too long; the bearer closes");
@@ -495,7 +551,7 @@ impl Ecfc {
         let &[cid0, cid1, credits0, credits1] = data else { return };
         let credits = u16::from_le_bytes([credits0, credits1]);
         let peer_cid = u16::from_le_bytes([cid0, cid1]);
-        let Some((bearer, entry)) = (0_u8..)
+        let Some((bearer, entry)) = BearerId::all()
             .zip(self.bearers.iter_mut())
             .find_map(|(bearer, entry)| {
                 (entry.state == State::Open && entry.peer_cid == peer_cid).then_some((bearer, entry))
@@ -524,8 +580,8 @@ impl Ecfc {
         let &[dcid0, dcid1, scid0, scid1] = data else { return None };
         let dcid = u16::from_le_bytes([dcid0, dcid1]);
         let scid = u16::from_le_bytes([scid0, scid1]);
-        let bearer = bearer(dcid)?;
-        let entry = self.bearers.get_mut(usize::from(bearer))?;
+        let bearer = BearerId::from_cid(dcid)?;
+        let entry = self.bearers.get_mut(bearer.index())?;
         match entry.state {
             State::Open | State::Closing { ident: _, sent: _ } => {
                 if entry.peer_cid == scid {
@@ -548,10 +604,10 @@ impl Ecfc {
         let &[dcid0, dcid1, scid0, scid1] = data else { return };
         let dcid = u16::from_le_bytes([dcid0, dcid1]);
         let scid = u16::from_le_bytes([scid0, scid1]);
-        if let Some(entry) = (0_u8..).zip(self.bearers.iter_mut()).find_map(|(bearer, entry)| {
+        if let Some(entry) = BearerId::all().zip(self.bearers.iter_mut()).find_map(|(bearer, entry)| {
             (matches!(entry.state, State::Closing { ident, sent: _ } if ident == identifier)
                 && entry.peer_cid == dcid
-                && cid(bearer) == scid)
+                && bearer.cid() == scid)
                 .then_some(entry)
         }) {
             *entry = Bearer::IDLE;
@@ -561,26 +617,25 @@ impl Ecfc {
     /// Whether `bearer` is open.
     #[inline]
     #[must_use = "the state is only read"]
-    pub fn is_open(&self, bearer: u8) -> bool {
-        self.bearers.get(usize::from(bearer)).is_some_and(|entry| entry.state == State::Open)
+    pub fn is_open(&self, bearer: BearerId) -> bool {
+        self.bearers.get(bearer.index()).is_some_and(|entry| entry.state == State::Open)
     }
 
     /// The next K-frame of the SDU of `sdu_len` octets that `bearer` sends,
     /// `None` while the bearer is not open or has no credits.
     #[inline]
     #[must_use = "the segmenter is only built"]
-    pub fn kframe(&self, bearer: u8, sdu_len: usize) -> Option<Segmenter> {
+    pub fn kframe(&self, bearer: BearerId, sdu_len: usize) -> Option<Segmenter> {
         let entry =
-            self.bearers.get(usize::from(bearer)).filter(|entry| entry.state == State::Open && entry.tx_credits > 0)?;
+            self.bearers.get(bearer.index()).filter(|entry| entry.state == State::Open && entry.tx_credits > 0)?;
         Segmenter::kframe(Channel::Eatt(bearer), entry.peer_cid, sdu_len, usize::from(entry.sent), entry.peer_mps)
     }
 
     /// Notes that the first fragment of the K-frame `segmenter` of `bearer`
     /// was queued: it takes a credit. Returns whether it is the SDU's last.
     #[inline]
-    pub const fn kframe_queued(&mut self, bearer: u8, segmenter: &Segmenter) -> bool {
-        let (Some(entry), Some((end, total))) = (self.bearers.get_mut(usize::from(bearer)), segmenter.kframe_end())
-        else {
+    pub const fn kframe_queued(&mut self, bearer: BearerId, segmenter: &Segmenter) -> bool {
+        let (Some(entry), Some((end, total))) = (self.bearers.get_mut(bearer.index()), segmenter.kframe_end()) else {
             return false;
         };
         entry.tx_credits = entry.tx_credits.saturating_sub(1);
@@ -608,11 +663,12 @@ impl Ecfc {
     #[inline]
     #[must_use = "the command is only named"]
     pub fn next_signal(&self) -> Option<Signal> {
-        let response = (0_u8..).zip(self.pending.iter()).find(|&(_, entry)| entry.ident != 0 && !entry.held);
+        let response =
+            (0_u8..).map(PendingId).zip(self.pending.iter()).find(|&(_, entry)| entry.ident != 0 && !entry.held);
         if let Some((index, _)) = response {
             return Some(Signal::Response(index));
         }
-        let mut bearers = (0_u8..).zip(self.bearers.iter());
+        let mut bearers = BearerId::all().zip(self.bearers.iter());
         let released = bearers.clone().find(|&(_, entry)| matches!(entry.state, State::Released { ident: _ }));
         let closing =
             bearers.clone().find(|&(_, entry)| matches!(entry.state, State::Closing { ident: _, sent: false }));
@@ -663,11 +719,11 @@ impl Ecfc {
     pub fn receive<'buf>(
         &'buf mut self,
         signal: &mut Signalling,
-        bearer: u8,
+        bearer: BearerId,
         kframe: &'buf [u8],
         encrypted: bool,
     ) -> Option<(&'buf [u8], bool)> {
-        let entry = self.bearers.get_mut(usize::from(bearer)).filter(|entry| entry.state == State::Open)?;
+        let entry = self.bearers.get_mut(bearer.index()).filter(|entry| entry.state == State::Open)?;
         let Some(credits) = entry.rx_credits.checked_sub(1) else {
             warn!("ecfc: a K-frame without a credit; the bearer closes");
             entry.close(signal);
@@ -745,41 +801,41 @@ impl Ecfc {
     pub fn render(&self, signal: Signal, out: &mut [u8]) -> usize {
         match signal {
             Signal::Close(bearer) => {
-                let Some(entry) = self.bearers.get(usize::from(bearer)) else { return 0 };
+                let Some(entry) = self.bearers.get(bearer.index()) else { return 0 };
                 let State::Closing { ident, sent: _ } = entry.state else { return 0 };
                 render_command(out, DISCONNECTION_REQUEST, ident, &[
                     &entry.peer_cid.to_le_bytes(),
-                    &cid(bearer).to_le_bytes(),
+                    &bearer.cid().to_le_bytes(),
                 ])
             },
             Signal::Credits { bearer, credits } => {
-                let Some(entry) = self.bearers.get(usize::from(bearer)).filter(|entry| entry.owed != 0) else {
+                let Some(entry) = self.bearers.get(bearer.index()).filter(|entry| entry.owed != 0) else {
                     return 0;
                 };
                 render_command(out, FLOW_CONTROL_CREDIT_IND, entry.owed, &[
-                    &cid(bearer).to_le_bytes(),
+                    &bearer.cid().to_le_bytes(),
                     &credits.to_le_bytes(),
                 ])
             },
             Signal::Released(bearer) => {
-                let Some(entry) = self.bearers.get(usize::from(bearer)) else { return 0 };
+                let Some(entry) = self.bearers.get(bearer.index()) else { return 0 };
                 let State::Released { ident } = entry.state else { return 0 };
                 render_command(out, DISCONNECTION_RESPONSE, ident, &[
-                    &cid(bearer).to_le_bytes(),
+                    &bearer.cid().to_le_bytes(),
                     &entry.peer_cid.to_le_bytes(),
                 ])
             },
             Signal::Response(index) => {
-                let Some(entry) = self.pending.get(usize::from(index)).filter(|entry| entry.ident != 0) else {
+                let Some(entry) = self.pending.get(usize::from(index.0)).filter(|entry| entry.ident != 0) else {
                     return 0;
                 };
                 let mut dcids: [u8; SCIDS_MAX.strict_mul(2)] = [0; SCIDS_MAX.strict_mul(2)];
                 for (pos, dcid) in (0_u8..).zip(dcids.as_chunks_mut::<2>().0.iter_mut()) {
-                    let answered = (0_u8..)
+                    let answered = BearerId::all()
                         .zip(self.bearers.iter())
                         .find(|&(_, bearer)| bearer.state == State::Answer { ident: entry.ident, pos });
                     if let Some((bearer, _)) = answered {
-                        *dcid = cid(bearer).to_le_bytes();
+                        *dcid = bearer.cid().to_le_bytes();
                     }
                 }
                 render_command(out, CREDIT_BASED_CONNECTION_RESPONSE, entry.ident, &[
@@ -813,7 +869,7 @@ impl Ecfc {
     pub fn signal_sent(&mut self, signal: Signal, now: Instant) {
         match signal {
             Signal::Close(bearer) => {
-                if let Some(entry) = self.bearers.get_mut(usize::from(bearer))
+                if let Some(entry) = self.bearers.get_mut(bearer.index())
                     && let State::Closing { ident, sent: false } = entry.state
                 {
                     entry.state = State::Closing { ident, sent: true };
@@ -821,20 +877,20 @@ impl Ecfc {
                 }
             },
             Signal::Credits { bearer, credits } => {
-                if let Some(entry) = self.bearers.get_mut(usize::from(bearer)) {
+                if let Some(entry) = self.bearers.get_mut(bearer.index()) {
                     entry.rx_credits = entry.rx_credits.saturating_add(credits);
                     entry.owed = 0;
                 }
             },
             Signal::Released(bearer) => {
-                if let Some(entry) = self.bearers.get_mut(usize::from(bearer))
+                if let Some(entry) = self.bearers.get_mut(bearer.index())
                     && matches!(entry.state, State::Released { ident: _ })
                 {
                     *entry = Bearer::IDLE;
                 }
             },
             Signal::Response(index) => {
-                let Some(entry) = self.pending.get_mut(usize::from(index)) else { return };
+                let Some(entry) = self.pending.get_mut(usize::from(index.0)) else { return };
                 for bearer in &mut self.bearers {
                     if matches!(bearer.state, State::Answer { ident, pos: _ } if ident == entry.ident) {
                         bearer.state = State::Open;
@@ -850,16 +906,6 @@ impl Default for Ecfc {
     #[inline]
     fn default() -> Self { Self::new() }
 }
-
-/// The bearer with our CID `cid`, if any.
-#[inline]
-#[must_use = "the bearer is only looked up"]
-pub const fn bearer(cid: u16) -> Option<u8> {
-    if let Some(Channel::Eatt(bearer)) = Channel::from_cid(cid) { Some(bearer) } else { None }
-}
-
-/// Our CID of `bearer`.
-const fn cid(bearer: u8) -> u16 { Channel::Eatt(bearer).cid() }
 
 /// Renders the command with `code`, `identifier` and the data `parts` in
 /// order into `out`, and returns its length.

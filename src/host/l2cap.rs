@@ -32,7 +32,7 @@
 #[cfg(feature = "eatt")]
 use crate::host::{
     att::ATT_MAX,
-    ecfc::{BEARERS, FIRST_CID, MPS},
+    ecfc::{BearerId, MPS},
 };
 use crate::{link::AclIn, pdu::concat_into};
 
@@ -50,9 +50,6 @@ pub const CID_ATT: u16 = 0x0004;
 pub const CID_SIGNALLING: u16 = 0x0005;
 /// Channel identifier of the security manager.
 pub const CID_SECURITY_MANAGER: u16 = 0x0006;
-/// The CID after the last enhanced bearer's.
-#[cfg(feature = "eatt")]
-const END_CID: u16 = FIRST_CID.strict_add(BEARERS.saturating_cast());
 /// Length of the SDU length field of an SDU's first K-frame.
 #[cfg(feature = "eatt")]
 const SDU_LEN_LEN: usize = 2;
@@ -65,10 +62,9 @@ const SDU_LEN_LEN: usize = 2;
 pub enum Channel {
     /// The attribute protocol, CID 4.
     Att,
-    /// The enhanced ATT bearer of this index, below
-    /// [`crate::host::ecfc::BEARERS`]: our CID 0x0040 plus the index.
+    /// This enhanced ATT bearer: our CID 0x0040 plus its index.
     #[cfg(feature = "eatt")]
-    Eatt(u8),
+    Eatt(BearerId),
     /// The security manager, CID 6.
     SecurityManager,
     /// The LE signalling channel, CID 5.
@@ -115,7 +111,7 @@ pub struct Reassembly {
     /// The bearer whose CID a PDU too long for the buffer was dropped on,
     /// until [`Self::take_overlong`].
     #[cfg(feature = "eatt")]
-    overlong:  Option<u8>,
+    overlong:  Option<BearerId>,
 }
 
 /// Joins the K-frames of the enhanced bearers into SDUs, with one buffer for
@@ -131,7 +127,7 @@ pub struct SduRx {
     /// Octets received so far.
     len:       u8,
     /// The bearer whose split SDU the buffer holds, if any.
-    owner:     Option<u8>,
+    owner:     Option<BearerId>,
     /// The split SDU's length, from its first K-frame.
     total:     u8,
 }
@@ -187,7 +183,7 @@ impl Channel {
             Self::SecurityManager => CID_SECURITY_MANAGER,
             Self::Signalling => CID_SIGNALLING,
             #[cfg(feature = "eatt")]
-            Self::Eatt(bearer) => FIRST_CID.saturating_add(u16::from(bearer)),
+            Self::Eatt(bearer) => bearer.cid(),
         }
     }
 
@@ -200,7 +196,11 @@ impl Channel {
             CID_SIGNALLING => Some(Self::Signalling),
             CID_SECURITY_MANAGER => Some(Self::SecurityManager),
             #[cfg(feature = "eatt")]
-            FIRST_CID..END_CID => Some(Self::Eatt(cid.wrapping_sub(FIRST_CID).saturating_cast())),
+            _ => match BearerId::from_cid(cid) {
+                Some(bearer) => Some(Self::Eatt(bearer)),
+                None => None,
+            },
+            #[cfg(not(feature = "eatt"))]
             _ => None,
         }
     }
@@ -295,7 +295,7 @@ impl Reassembly {
     #[cfg(feature = "eatt")]
     #[inline]
     #[must_use = "the report is taken only once"]
-    pub const fn take_overlong(&mut self) -> Option<u8> { self.overlong.take() }
+    pub const fn take_overlong(&mut self) -> Option<BearerId> { self.overlong.take() }
 }
 
 impl Default for Reassembly {
@@ -324,7 +324,7 @@ impl SduRx {
     #[inline]
     pub fn push<'buf>(
         &'buf mut self,
-        bearer: u8,
+        bearer: BearerId,
         kframe: &'buf [u8],
         encrypted: bool,
     ) -> Result<Option<(&'buf [u8], bool)>, Violation> {
@@ -372,7 +372,7 @@ impl SduRx {
     /// Drops the split SDU of `bearer`, if the buffer holds one: the bearer
     /// closed.
     #[inline]
-    pub const fn release(&mut self, bearer: u8) {
+    pub const fn release(&mut self, bearer: BearerId) {
         if let Some(owner) = self.owner
             && owner == bearer
         {

@@ -365,7 +365,7 @@ const BOTH_WAYS: Variant =
 fn a_pairing_distributes_identity_keys_both_ways() {
     let (.., bond) = pair(BOTH_WAYS);
     let identity = bond.identity.expect("the central's identity");
-    assert!(identity.address == Peer::new(CENTRAL_IDENTITY, false));
+    assert!(identity.address.peer() == Peer::new(CENTRAL_IDENTITY, false));
     assert_eq!(identity.irk, CENTRAL_IRK);
 }
 
@@ -829,7 +829,7 @@ fn the_central_s_keys_may_overtake_the_encryption_event() {
     out(&mut responder, at(0));
     let Some(Outcome::Bonded(bond)) = out(&mut responder, at(0)).1 else { panic!("no bond") };
     assert_eq!(bond.ltk, reversed(&central.ltk));
-    assert!(bond.identity.unwrap().address == Peer::new(CENTRAL_IDENTITY, false));
+    assert!(bond.identity.unwrap().address.peer() == Peer::new(CENTRAL_IDENTITY, false));
 }
 
 #[test]
@@ -851,7 +851,7 @@ fn an_identity_address_that_is_not_static_is_dropped_with_its_key() {
     responder.receive(&mut device, &pdu::<17>(IDENTITY_INFORMATION, &CENTRAL_IRK), true, at(0));
     let address = [IDENTITY_ADDRESS_INFORMATION, 0x01, 1, 2, 3, 4, 5, 0xC0];
     let Some(Outcome::Bonded(bond)) = responder.receive(&mut device, &address, true, at(0)) else { panic!("no bond") };
-    assert!(bond.identity.unwrap().address == Peer::new([1, 2, 3, 4, 5, 0xC0], true));
+    assert!(bond.identity.unwrap().address.peer() == Peer::new([1, 2, 3, 4, 5, 0xC0], true));
 }
 
 #[test]
@@ -1112,7 +1112,7 @@ fn debug_output_leaves_the_keys_out() {
     let bond = Bonded {
         #[cfg(feature = "passkey")]
         authenticated: true,
-        identity: Some(Identity { address: Peer::new([1; 6], true), irk: [0xEE; 16] }),
+        identity: Some(Identity { address: IdentityAddress::valid(Peer::new([1; 6], false)), irk: [0xEE; 16] }),
         ltk: [0xDD; 16],
     };
     let written = std::format!("{:?}", Outcome::Bonded(bond));

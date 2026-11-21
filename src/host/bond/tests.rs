@@ -24,7 +24,7 @@ const IRK: [u8; 16] = [0x22; 16];
 /// A bond with `BlueZ`'s public identity and no key of its, on the example
 /// table.
 fn example_bond() -> Bond {
-    Bond::new(Peer::new([1, 2, 3, 4, 5, 6], false), None, LTK, Variant::new(0, 3), &example::DB)
+    Bond::new(IdentityAddress::valid(Peer::new([1, 2, 3, 4, 5, 6], false)), None, LTK, Variant::new(0, 3), &example::DB)
 }
 
 #[test]
@@ -44,7 +44,13 @@ fn the_stored_form_has_the_documented_layout() {
 
 #[test]
 fn every_field_survives_the_round_trip() {
-    let mut bond = Bond::new(Peer::new([9, 8, 7, 6, 5, 0xC4], true), Some(IRK), LTK, Variant::new(2, 255), &CHANGED_DB);
+    let mut bond = Bond::new(
+        IdentityAddress::valid(Peer::new([9, 8, 7, 6, 5, 0xC4], true)),
+        Some(IRK),
+        LTK,
+        Variant::new(2, 255),
+        &CHANGED_DB,
+    );
     bond.authenticated = true;
     bond.cccd = 0b10_01;
     let bytes = bond.to_bytes();
@@ -53,7 +59,7 @@ fn every_field_survives_the_round_trip() {
     assert_eq!(bytes[46..], CHANGED_DB.hash()[..4]);
     let decoded = Bond::from_bytes(&bytes).unwrap();
     assert!(decoded == bond);
-    assert!(decoded.peer == Peer::new([9, 8, 7, 6, 5, 0xC4], true));
+    assert!(decoded.peer.peer() == Peer::new([9, 8, 7, 6, 5, 0xC4], true));
     assert_eq!(decoded.peer_irk, Some(IRK));
     assert_eq!(decoded.ltk, LTK);
     assert_eq!(decoded.local, Variant::new(2, 255));
@@ -97,8 +103,13 @@ fn client_features_are_stored_in_bits_5_to_7() {
         assert_eq!(decoded.client_features, features);
         assert!(decoded == bond);
         // The other flags keep their bits beside them.
-        let mut other =
-            Bond::new(Peer::new([9, 8, 7, 6, 5, 0xC4], true), Some(IRK), LTK, Variant::new(1, 2), &CHANGED_DB);
+        let mut other = Bond::new(
+            IdentityAddress::valid(Peer::new([9, 8, 7, 6, 5, 0xC4], true)),
+            Some(IRK),
+            LTK,
+            Variant::new(1, 2),
+            &CHANGED_DB,
+        );
         other.authenticated = true;
         other.directed_works = false;
         other.client_features = features;
@@ -135,7 +146,7 @@ fn a_record_from_before_client_features_reads_none() {
     record[46..].copy_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4]);
     let decoded = Bond::from_bytes(&record).unwrap();
     assert_eq!(decoded.client_features, 0);
-    assert!(decoded.peer == Peer::new([9, 8, 7, 6, 5, 0xC4], true));
+    assert!(decoded.peer.peer() == Peer::new([9, 8, 7, 6, 5, 0xC4], true));
     assert_eq!(decoded.peer_irk, Some(IRK));
     assert!(decoded.authenticated && !decoded.directed_works);
     assert_eq!(decoded.layout, Some(0xD4C3_B2A1));
@@ -213,7 +224,8 @@ fn the_example_bond_keeps_no_layout() {
 
 #[test]
 fn a_table_with_service_changed_compares_the_layout() {
-    let mut bond = Bond::new(Peer::new([1; 6], false), None, LTK, Variant::new(0, 0), &CHANGED_DB);
+    let mut bond =
+        Bond::new(IdentityAddress::valid(Peer::new([1; 6], false)), None, LTK, Variant::new(0, 0), &CHANGED_DB);
     assert!(bond.layout_known(&CHANGED_DB));
     bond.layout = bond.layout.map(|layout| layout ^ 1);
     assert!(!bond.layout_known(&CHANGED_DB));

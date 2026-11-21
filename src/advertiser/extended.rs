@@ -33,7 +33,7 @@ use super::{Accepted, CHANNELS, LISTEN_US, Settings, Setup};
 use crate::{
     channel::{Hopping, UsedChannels},
     chip,
-    clock::Clock,
+    clock::{At, Clock, Micros},
     pdu::{
         ADV_ACCESS_ADDRESS,
         ADV_CRC_INIT,
@@ -219,7 +219,7 @@ pub struct Counters {
     /// The sampled event's times on air from the last primary and from the
     /// first to the auxiliary packet, until logged.
     #[cfg(feature = "defmt")]
-    timing: Option<(u32, u32)>,
+    timing: Option<(Micros, Micros)>,
 }
 
 impl Counters {
@@ -246,7 +246,7 @@ impl Counters {
         }
         #[cfg(feature = "defmt")]
         if let Some((from_last, from_first)) = self.timing.take() {
-            info!("aux timing: last primary to aux {} us, first to aux {} us", from_last, from_first);
+            info!("aux timing: last primary to aux {} us, first to aux {} us", from_last.0, from_first.0);
         }
     }
 
@@ -392,8 +392,8 @@ where
 /// Arms the radio's start at `at`, with at least [`MIN_LEAD_US`] to go.
 /// Returns false, with the radio disabled, if the start is too close or
 /// past, or raced the arming.
-fn arm(radio: &mut Radio<'_>, clock: &mut Clock<'_>, at: u32) -> bool {
-    if clock.transmit_ahead(at, MIN_LEAD_US) {
+fn arm(radio: &mut Radio<'_>, clock: &mut Clock<'_>, at: At) -> bool {
+    if clock.transmit_ahead(at, Micros(MIN_LEAD_US)) {
         return true;
     }
     radio.disable();
@@ -466,8 +466,8 @@ fn count(counter: &AtomicU32) { counter.store(counter.load(Ordering::Relaxed).wr
 /// primaries whose first starts on air at `first`.
 #[inline]
 #[must_use = "the time is only computed"]
-pub const fn aux_txen(first: u32, channels: usize, phy: Phy) -> u32 {
-    first.wrapping_add(aux_start_us(channels, 0)).wrapping_sub(tx_ready_us(phy))
+pub(crate) const fn aux_txen(first: At, channels: usize, phy: Phy) -> At {
+    first.after(Micros(aux_start_us(channels, 0))).before(Micros(tx_ready_us(phy)))
 }
 
 /// Runs one advertising event on the enabled channels.
@@ -479,12 +479,12 @@ pub const fn aux_txen(first: u32, channels: usize, phy: Phy) -> u32 {
 ///
 /// The radio is disabled and back on LE 1M when it returns.
 #[inline]
-pub fn event(
+pub(crate) fn event(
     radio: &mut Radio<'_>,
     clock: &mut Clock<'_>,
     settings: &Settings,
     counters: &mut Counters,
-) -> (u32, Option<Accepted>) {
+) -> (At, Option<Accepted>) {
     let mut pdus = Pdus::new(settings, counters.events);
     let decoy = aux_connect_rsp(settings.own, NOBODY);
     let mut answer = aux_connect_rsp(settings.own, NOBODY);
@@ -500,10 +500,10 @@ pub fn event(
     if pdus.count == 0 {
         return (started, None);
     }
-    let first = started.wrapping_add(EVENT_LEAD_US).wrapping_add(tx_ready_us(Phy::M1));
+    let first = started.after(Micros(EVENT_LEAD_US)).after(Micros(tx_ready_us(Phy::M1)));
     // The first and the last primary sent, on air, for a sampled event.
     #[cfg(feature = "defmt")]
-    let mut primaries_on_air: Option<(u32, u32)> = None;
+    let mut primaries_on_air: Option<(At, At)> = None;
     for (index, (&channel, pdu)) in pdus.channels.iter().zip(&pdus.primaries).take(pdus.count).enumerate() {
         radio.set_channel(channel);
         // SAFETY: the radio only reads the primary, which lives until the
@@ -517,7 +517,7 @@ pub fn event(
         radio.wait_disabled();
         #[cfg(feature = "defmt")]
         if sampled {
-            let on_air = clock.address_time().wrapping_sub(Phy::M1.address_offset_us());
+            let on_air = clock.address_time().before(Micros(Phy::M1.address_offset_us()));
             primaries_on_air = Some((primaries_on_air.map_or(on_air, |(earliest, _)| earliest), on_air));
         }
     }
@@ -531,11 +531,11 @@ pub fn event(
         radio.wait_end();
         #[cfg(feature = "defmt")]
         if let Some((earliest, latest)) = primaries_on_air.filter(|_| sampled) {
-            let on_air = clock.address_time().wrapping_sub(pdus.phy.address_offset_us());
-            counters.timing = Some((on_air.wrapping_sub(latest), on_air.wrapping_sub(earliest)));
+            let on_air = clock.address_time().before(Micros(pdus.phy.address_offset_us()));
+            counters.timing = Some((on_air.since(latest), on_air.since(earliest)));
         }
         listen(radio, clock, settings, &mut pdus.auxiliary, (&decoy, &mut answer)).map(|(request, end)| Accepted {
-            end,
+            end: end.0,
             request,
             setup: Setup::aux(pdus.phy),
         })
@@ -598,14 +598,14 @@ fn listen(
     settings: &Settings,
     buffer: &mut AuxBuffer,
     (decoy, answer): (&AuxConnectRsp, &mut AuxConnectRsp),
-) -> Option<(ConnectInd, u32)> {
+) -> Option<(ConnectInd, At)> {
     // SAFETY: `buffer` is borrowed for this event; every path out waits
     // until the radio is disabled.
     unsafe { radio.set_buffer(buffer) }
     radio.wait_switched();
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
-    let deadline = clock.end_time().wrapping_add(LISTEN_US);
+    let deadline = clock.end_time().after(Micros(LISTEN_US));
     clock.expire_at(deadline);
     let heard = radio.wait_address(|| clock.expired(deadline));
     clock.stop_expiry();
@@ -699,9 +699,9 @@ pub fn primary(settings: &Settings, aux: AuxPtr) -> ExtPrimary { ext_primary(set
 /// air at `first`: `index` spacings later, less the LE 1M ramp-up.
 #[inline]
 #[must_use = "the time is only computed"]
-pub const fn primary_txen(first: u32, index: usize) -> u32 {
+pub(crate) const fn primary_txen(first: At, index: usize) -> At {
     let spacings: u32 = index.saturating_cast();
-    first.wrapping_add(spacings.saturating_mul(PRIMARY_SPACING_US)).wrapping_sub(tx_ready_us(Phy::M1))
+    first.after(Micros(PRIMARY_SPACING_US).saturating_mul(spacings)).before(Micros(tx_ready_us(Phy::M1)))
 }
 
 /// The enabled primary channels of `channel_map` in order, and how many

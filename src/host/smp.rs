@@ -178,7 +178,7 @@ use crate::{
     crypto::wipe,
     host::Aes,
     link::Info,
-    pdu::{Peer, concat_into},
+    pdu::{IdentityAddress, Peer, concat_into},
 };
 use core::{array::TryFromSliceError, fmt, mem};
 #[cfg(feature = "passkey")]
@@ -284,9 +284,9 @@ pub struct Bonded {
     /// Entry.
     #[cfg(feature = "passkey")]
     pub authenticated: bool,
-    /// The central's identity, if it distributed one that is public or
-    /// static random. Without it the central is known by its address on
-    /// the air.
+    /// The central's identity, if it distributed one whose address is an
+    /// [`IdentityAddress`]. Without it the central is known by its address
+    /// on the air.
     pub identity:      Option<Identity>,
     /// The long term key, least significant octet first, as
     /// [`crate::link::Link::ltk_reply`] takes it.
@@ -310,8 +310,8 @@ enum Dh {
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Identity {
-    /// The identity address: public, or static random.
-    pub address: Peer,
+    /// The identity address.
+    pub address: IdentityAddress,
     /// The identity resolving key, least significant octet first, as
     /// [`crate::link::Link::add_peer`] takes it.
     pub irk:     [u8; 16],
@@ -473,8 +473,8 @@ pub struct Responder {
     /// significant octet first.
     #[cfg(feature = "passkey")]
     peer_confirm:   [u8; 16] = [0; 16],
-    /// The central's identity address, once it arrived.
-    peer_identity:  Option<Peer> = None,
+    /// The central's identity address, once it arrived, if it is one.
+    peer_identity:  Option<IdentityAddress> = None,
     /// The central's identity resolving key, least significant octet
     /// first, once it arrived.
     peer_irk:       [u8; 16] = [0; 16],
@@ -600,8 +600,8 @@ impl fmt::Debug for Identity {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Identity")
-            .field("address", &self.address.address)
-            .field("random", &self.address.random)
+            .field("address", &self.address.peer().address)
+            .field("random", &self.address.peer().random)
             .finish_non_exhaustive()
     }
 }
@@ -899,13 +899,11 @@ impl Responder {
             _ => return Err(Reason::INVALID_PARAMETERS),
         };
         self.received |= ID_ADDRESS;
-        // An identity address is public or static random, with the two most
-        // significant bits set. Linux drops any other, with its key, and so
-        // does the bond: the central is then known by its address on the
-        // air.
-        if !random || a5 & 0xC0 == 0xC0 {
-            self.peer_identity = Some(Peer::new(address, random));
-        } else {
+        // Linux drops an address that is no identity address, with its key,
+        // and so does the bond: the central is then known by its address on
+        // the air, if that is an identity address.
+        self.peer_identity = IdentityAddress::new(Peer::new(address, random));
+        if self.peer_identity.is_none() {
             wipe(&mut self.peer_irk);
         }
         Ok(self.finish())

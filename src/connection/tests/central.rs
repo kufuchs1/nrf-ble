@@ -210,8 +210,7 @@ impl Sim {
         let shared = Shared::new();
         shared.set_connected(true);
         let mut link = connection();
-        link.encryption.tx_on = encrypted;
-        link.encryption.rx_on = encrypted;
+        link.encryption.phase = if encrypted { Phase::Encrypted } else { Phase::Plain };
         link.start_slots(&shared);
         Self {
             link,
@@ -248,7 +247,7 @@ impl Sim {
         self.link.prepare_next(&self.shared);
         self.link.prepare_room(&self.shared);
         assert_eq!(self.link.abort, None);
-        let encrypted = self.link.encryption.rx_on;
+        let encrypted = self.link.encryption.phase.rx_on();
         let mut heard = false;
         for _ in 0..EXCHANGES_MAX {
             if self.random.chance(self.faults.missed) {
@@ -262,16 +261,16 @@ impl Sim {
             let sealed_len = if encrypted && !payload.is_empty() { payload.len() + 4 } else { payload.len() };
             self.rx.0[1] = u8::try_from(sealed_len).unwrap();
             self.rx.0[3..3 + payload.len()].copy_from_slice(&payload);
-            self.link.rx_plain.fill(0);
-            self.link.rx_plain[0] = header;
-            self.link.rx_plain[1] = u8::try_from(payload.len()).unwrap();
-            self.link.rx_plain[3..3 + payload.len()].copy_from_slice(&payload);
+            self.link.rx_plain.bytes_mut().fill(0);
+            self.link.rx_plain.bytes_mut()[0] = header;
+            self.link.rx_plain.bytes_mut()[1] = u8::try_from(payload.len()).unwrap();
+            self.link.rx_plain.bytes_mut()[3..3 + payload.len()].copy_from_slice(&payload);
             // The radio points at the PDU on the air from the access address.
             let latched_slot = self.link.cur;
             let latched = *self.link.current_mut().on_air();
             let crc_ok = !self.random.chance(self.faults.corrupted);
             let packet = crc_ok.then_some((header, self.rx.0[1], true));
-            let decision = self.link.decide(packet, self.time, true, &self.shared).expect("the link goes on");
+            let decision = self.link.decide(packet, At(self.time), true, &self.shared).expect("the link goes on");
             let buffer = self.link.answer_buffer(decision.follow.md).0.as_ptr();
             let on_air = |link: &mut Connection, slot: bool| *link.slot_mut(slot).on_air();
             // Within the interframe space, only the header of the buffer
@@ -290,7 +289,7 @@ impl Sim {
                 (true, Late::Echo) => self.rx.0[..DATA_BUFFER_LEN].to_vec(),
             };
             let rx = self.rx;
-            self.link.after_answer(decision, &rx, (None, late, 0), &self.shared);
+            self.link.after_answer(decision, &rx, (None, late, Micros(0)), &self.shared);
             if chip::PREPARE_IN_EVENT && decision.follow.more && !late && !self.link.next_ready {
                 self.link.prepare_next(&self.shared);
             }
@@ -312,7 +311,7 @@ impl Sim {
             }
         }
         if heard {
-            self.link.exchanged(self.time);
+            self.link.exchanged(At(self.time));
         }
         self.link.process(&self.rx, encrypted, &self.shared);
         assert_eq!(self.link.abort, None);
@@ -451,7 +450,7 @@ fn only_a_sent_pdu_uses_up_its_packet_counter() {
     let shared = Shared::new();
     shared.set_connected(true);
     let mut link = connection();
-    link.encryption.tx_on = true;
+    link.encryption.phase = Phase::Encrypted;
     link.start_slots(&shared);
     assert_eq!(link.encryption.tx_counter, 0);
     // Prepared again and again before events: the same counter.
@@ -496,7 +495,7 @@ fn the_answer_patches_only_the_header_of_the_pdu_on_the_air() {
     shared.set_connected(true);
     for encrypted in [false, true] {
         let mut link = connection();
-        link.encryption.tx_on = encrypted;
+        link.encryption.phase = if encrypted { Phase::Encrypted } else { Phase::Plain };
         link.start_slots(&shared);
         link.enqueue(Llid::Control, &[OP_PING_RSP]);
         link.prepare_next(&shared);
@@ -525,13 +524,13 @@ fn room_is_counted_before_the_event_and_used_up_by_new_packets() {
     assert!(room > 0);
     let mut header = Llid::Start.bits();
     for _ in 0..room {
-        let decision = link.decide(Some((header, 1, true)), 1000, true, &shared).unwrap();
+        let decision = link.decide(Some((header, 1, true)), At(1000), true, &shared).unwrap();
         assert!(link.seq.received && !decision.duplicate);
         link.seq.received = false;
         header ^= SN;
     }
     // The host's queue is full now: the next one comes again.
-    let decision = link.decide(Some((header, 1, true)), 1000, true, &shared).unwrap();
+    let decision = link.decide(Some((header, 1, true)), At(1000), true, &shared).unwrap();
     assert!(!link.seq.received && !decision.duplicate && !decision.follow.more);
 }
 
@@ -547,13 +546,13 @@ fn a_second_acknowledgement_in_an_event_is_answered_with_an_empty_pdu() {
     link.prepare_room(&shared);
     // The first acknowledgement sends the prepared PDU.
     let empty = Llid::Continuation.bits();
-    let first = link.decide(Some((empty | NESN, 0, true)), 1000, true, &shared).unwrap();
-    link.after_answer(first, &PacketBuffer::ZERO, (None, false, 0), &shared);
+    let first = link.decide(Some((empty | NESN, 0, true)), At(1000), true, &shared).unwrap();
+    link.after_answer(first, &PacketBuffer::ZERO, (None, false, Micros(0)), &shared);
     assert!(link.tx_kind == TxKind::Control && !first.fallback);
     assert_eq!(first.follow.md, chip::PREPARE_IN_EVENT);
     // The second, before anything is prepared again, an empty one.
-    let second = link.decide(Some((empty | SN, 0, true)), 1000, true, &shared).unwrap();
-    link.after_answer(second, &PacketBuffer::ZERO, (None, false, 0), &shared);
+    let second = link.decide(Some((empty | SN, 0, true)), At(1000), true, &shared).unwrap();
+    link.after_answer(second, &PacketBuffer::ZERO, (None, false, Micros(0)), &shared);
     assert!(link.tx_kind == TxKind::Empty && second.fallback);
     assert_eq!(link.stats.fallback, 1);
     assert_eq!(link.queue.len(), 1);
@@ -570,9 +569,9 @@ fn a_loss_after_a_late_answer_is_not_the_path() {
     // Our last answer was late: the central did not acknowledge it, as it
     // got the one before.
     link.late_answer = true;
-    let decision = link.decide(Some((Llid::Continuation.bits(), 0, true)), 1000, true, &shared).unwrap();
+    let decision = link.decide(Some((Llid::Continuation.bits(), 0, true)), At(1000), true, &shared).unwrap();
     assert!(decision.nacked);
-    link.after_answer(decision, &PacketBuffer::ZERO, (None, false, 0), &shared);
+    link.after_answer(decision, &PacketBuffer::ZERO, (None, false, Micros(0)), &shared);
     assert_eq!(for_phy_mut(&mut link.power, link.tx_phy).level(), level);
     assert!(!link.late_answer);
 }
@@ -583,7 +582,7 @@ fn host_data_queued_during_the_sleep_goes_out_at_that_event() {
     shared.set_connected(true);
     for encrypted in [false, true] {
         let mut link = connection();
-        link.encryption.tx_on = encrypted;
+        link.encryption.phase = if encrypted { Phase::Encrypted } else { Phase::Plain };
         link.start_slots(&shared);
         // Before the sleep, nothing to send.
         link.prepare_next(&shared);
@@ -593,10 +592,10 @@ fn host_data_queued_during_the_sleep_goes_out_at_that_event() {
         // in time.
         let packet: Vec<u8> = (1..=9).collect();
         assert!(shared.queue_acl_for_test(&packet));
-        assert!(link.prepare_after_wake(1000, 1000 + SETUP_US + PREPARE_AGAIN_US + 1, &shared));
+        assert!(link.prepare_after_wake(At(1000), At(1000 + SETUP_US + PREPARE_AGAIN_US.0 + 1), &shared));
         assert!(link.next_ready);
         // The central's acknowledgement at the event sends it.
-        let decision = link.decide(Some((Llid::Continuation.bits() | NESN, 0, true)), 1000, true, &shared).unwrap();
+        let decision = link.decide(Some((Llid::Continuation.bits() | NESN, 0, true)), At(1000), true, &shared).unwrap();
         assert!(decision.acked.is_some() && !decision.fallback);
         assert!(link.tx_kind == TxKind::Acl);
         assert_eq!(&link.current().plain.0[DATA_HEADER_LEN..DATA_HEADER_LEN + packet.len()], &packet[..]);
@@ -607,7 +606,7 @@ fn host_data_queued_during_the_sleep_goes_out_at_that_event() {
         late.start_slots(&shared);
         late.prepare_next(&shared);
         assert!(shared.queue_acl_for_test(&packet));
-        assert!(!late.prepare_after_wake(1000, 1000 + SETUP_US + PREPARE_AGAIN_US, &shared));
+        assert!(!late.prepare_after_wake(At(1000), At(1000 + SETUP_US + PREPARE_AGAIN_US.0), &shared));
         assert!(!late.next_ready);
         late.prepare_next(&shared);
         assert!(late.next_ready);
@@ -631,8 +630,8 @@ fn resting(latency: u16, timeout: u16) -> Sim {
     link.phy_request = Request::Done;
     link.length_request = Request::Done;
     link.version_request = Request::Done;
-    link.last_valid = sim.time;
-    link.payload_timer = Some((sim.time, false));
+    link.last_valid = At(sim.time);
+    link.payload_timer = Some((At(sim.time), false));
     sim
 }
 
@@ -644,13 +643,13 @@ impl Sim {
     fn rest(&mut self, events: u32) -> Vec<bool> {
         let mut trace = Vec::new();
         for _ in 0..events {
-            if self.link.hold_until.is_some_and(|until| reached(self.time, until)) {
+            if self.link.hold_until.is_some_and(|until| until.reached_by(At(self.time))) {
                 self.link.hold_until = None;
             }
-            self.link.start_procedures(self.time, &self.shared);
+            self.link.start_procedures(At(self.time), &self.shared);
             assert_eq!(self.link.abort, None);
             self.link.apply_instants(&self.shared);
-            let skips = self.link.skips(self.time, &self.shared);
+            let skips = self.link.skips(At(self.time), &self.shared);
             if skips {
                 self.link.skip_to(self.link.counter.wrapping_add(1), &self.shared);
             } else {
@@ -659,7 +658,7 @@ impl Sim {
                 self.link.listened(before);
             }
             trace.push(!skips);
-            self.time = self.time.wrapping_add(self.link.interval);
+            self.time = self.time.wrapping_add(self.link.interval.0);
         }
         trace
     }

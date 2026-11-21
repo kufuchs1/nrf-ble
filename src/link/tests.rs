@@ -181,11 +181,11 @@ fn the_payload_timeout_belongs_to_a_live_link() {
     let shared = Shared::new();
     let link = Link::new(&shared);
     assert_eq!(link.set_payload_timeout(Epoch(1), 100), Err(Error::Gone));
-    assert_eq!(shared.payload_timeout(), u32::from(DEFAULT_PAYLOAD_TIMEOUT) * 10_000);
+    assert_eq!(shared.payload_timeout(), Micros(u32::from(DEFAULT_PAYLOAD_TIMEOUT) * 10_000));
     let epoch = connect(&shared);
     assert_eq!(link.set_payload_timeout(epoch, 0), Err(Error::Invalid));
     assert_eq!(link.set_payload_timeout(epoch, 100), Ok(()));
-    assert_eq!(shared.payload_timeout(), 1_000_000);
+    assert_eq!(shared.payload_timeout(), Micros(1_000_000));
     assert_eq!(link.payload_timeout(epoch), Ok(100));
 }
 
@@ -682,7 +682,7 @@ fn the_next_connection_event_is_known_only_for_its_link_once_planned() {
     assert_eq!(link.next_connection_event(epoch), None);
     let at = Instant::from_secs(10);
     // The radio starts 5 ms after `at`; data is due 331 us before it.
-    shared.set_next_event(at, 5000, 331, 15_000);
+    shared.set_next_event(at, 5000, Micros(331), Micros(15_000));
     let next = link.next_connection_event(epoch).unwrap();
     assert_eq!(next.start, at + Duration::from_micros(5000));
     assert_eq!(next.queue_by, next.start - Duration::from_micros(331));
@@ -705,18 +705,13 @@ fn a_planned_event_converts_to_the_host_time_both_ways() {
     assert_eq!(ahead.start, at + Duration::from_micros(2000));
     assert_eq!(ahead.queue_by, at);
     // An event planned late: its start passed already.
-    let behind = Planned { ahead: 0_u32.wrapping_sub(2000), at, epoch: 0, interval: 7500, lead: 300 }.resolve();
+    let behind = Planned { ahead: -2000, at, epoch: 0, interval: 7500, lead: 300 }.resolve();
     assert_eq!(behind.start, at - Duration::from_micros(2000));
     assert!(behind.queue_by < behind.start);
     // Near the start of the host's time the times stop at it instead of
     // wrapping.
-    let early = Planned {
-        ahead:    0_u32.wrapping_sub(2000),
-        at:       Instant::from_ticks(0),
-        epoch:    0,
-        interval: 7500,
-        lead:     300,
-    };
+    let early =
+        Planned { ahead: -2000, at: Instant::from_ticks(0), epoch: 0, interval: 7500, lead: 300 };
     assert_eq!(early.resolve().start, Instant::from_ticks(0));
     assert_eq!(early.resolve().queue_by, Instant::from_ticks(0));
 }

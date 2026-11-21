@@ -61,10 +61,10 @@
 //! layer tells which advertising a connection request answered
 //! ([`crate::link::Info::directed`]), so a central that answered the directed
 //! advertising just before the phase ended is not taken for one that did not.
-//! Where a directed phase cannot be directed, in pairing mode and for a bond
-//! whose central has no identity address, public or static random, as right
-//! after pairing with a central that sent none (`Mode::directs`), it
-//! advertises undirected at 20 ms instead, for the same time. It is the
+//! Where a directed phase cannot be directed, in pairing mode, which has no
+//! central to target (`Mode::directs`), it advertises undirected at 20 ms
+//! instead, for the same time. A bond always has a target: it keeps only an
+//! identity address ([`crate::pdu::IdentityAddress`]). It is the
 //! firmware's choice, opt-in through the feature and its reconnection
 //! schedule.
 //!
@@ -224,9 +224,6 @@ pub const RPA_TIMEOUT_S: u16 = 900;
 /// Filter policy of [`Mode::Reconnect`]: scan and connection requests only
 /// from the filter accept list.
 const FILTER_BONDED: u8 = 0x03;
-/// The two most significant bits of a static random address.
-#[cfg(feature = "directed-advertising")]
-const STATIC_RANDOM: u8 = 0xC0;
 /// The identity of the resolving list entry that only carries our own key
 /// in [`Mode::Pairing`]: no central has this address.
 const NO_PEER: Peer = Peer::new([0; 6], false);
@@ -418,7 +415,7 @@ impl<'bond> Advertising<'bond> {
         }
         let (central, peer_irk) = match self.mode {
             Mode::Pairing => (None, [0; 16]),
-            Mode::Reconnect(bond) => (Some(bond.peer), bond.peer_irk.unwrap_or_default()),
+            Mode::Reconnect(bond) => (Some(bond.peer.peer()), bond.peer_irk.unwrap_or_default()),
         };
         for call in [
             Call::StopAdvertising,
@@ -788,12 +785,11 @@ impl Control for Link<'_> {
 
 impl Mode<'_> {
     /// Whether the mode advertises `phase` directed: a directed phase in
-    /// [`Self::Reconnect`], for a bond whose central has an identity address,
-    /// public or static random, which directed advertising can target, and
-    /// whose directed advertising has not gone unanswered
-    /// ([`Bond::directed_works`]). With the central's identity resolving key
-    /// in the bond, the link layer targets a resolvable private address made
-    /// with it (see the module documentation). [`crate::host::Host::advertise`]
+    /// [`Self::Reconnect`], for a bond whose directed advertising has not
+    /// gone unanswered ([`Bond::directed_works`]). The target is the bond's
+    /// identity address; with the central's identity resolving key in the
+    /// bond, the link layer targets a resolvable private address made with
+    /// it (see the module documentation). [`crate::host::Host::advertise`]
     /// skips a directed phase of a bond whose directed advertising went
     /// unanswered (`Self::skips`); elsewhere a directed phase advertises
     /// undirected at its interval, 20 ms.
@@ -803,7 +799,7 @@ impl Mode<'_> {
     pub const fn directs(&self, phase: &Phase) -> bool {
         match *self {
             Self::Pairing => false,
-            Self::Reconnect(bond) => phase.directed && bond.directed_works && is_identity(bond.peer),
+            Self::Reconnect(bond) => phase.directed && bond.directed_works,
         }
     }
 
@@ -842,7 +838,7 @@ impl Mode<'_> {
         if let Self::Reconnect(bond) = *self
             && self.directs(phase)
         {
-            return AdvParams { kind: DIRECTED, peer: bond.peer, ..undirected };
+            return AdvParams { kind: DIRECTED, peer: bond.peer.peer(), ..undirected };
         }
         undirected
     }
@@ -921,10 +917,5 @@ impl Schedule {
             .fold(Duration::from_ticks(0), |sum, phase| sum.checked_add(phase.duration).unwrap_or(Duration::MAX))
     }
 }
-
-/// Whether `peer` is an identity address, which directed advertising can
-/// target: public, or static random.
-#[cfg(feature = "directed-advertising")]
-const fn is_identity(peer: Peer) -> bool { !peer.random || peer.address[5] & STATIC_RANDOM == STATIC_RANDOM }
 
 #[cfg(test)] mod tests;

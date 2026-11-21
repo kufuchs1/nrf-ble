@@ -19,7 +19,7 @@ pub mod privacy;
 #[cfg(feature = "extended-advertising")]
 use crate::pdu::Adi;
 use crate::{
-    clock::Clock,
+    clock::{At, Clock},
     crypto,
     pdu::{ConnectInd, Peer},
     radio::{PacketBuffer, Phy, Radio},
@@ -283,17 +283,17 @@ impl Setup {
 /// `rx`.
 #[cfg(not(feature = "extended-advertising"))]
 #[inline]
-pub fn event(
+pub(crate) fn event(
     radio: &mut Radio<'_>,
     clock: &Clock<'_>,
     settings: &Settings,
     _counters: &mut Counters,
     rx: &mut PacketBuffer,
-) -> (u32, Option<Accepted>) {
+) -> (At, Option<Accepted>) {
     let (primary, scan_response) = legacy::pdus(settings);
     let started = clock.now();
     let accepted = legacy::event(radio, clock, settings, (&primary, &scan_response), rx)
-        .map(|(request, end)| Accepted { end, request, setup: Setup::LEGACY });
+        .map(|(request, end)| Accepted { end: end.0, request, setup: Setup::LEGACY });
     (started, accepted)
 }
 
@@ -311,13 +311,13 @@ pub fn event(
 /// advertising channels admit, not into `rx`.
 #[cfg(feature = "extended-advertising")]
 #[inline]
-pub fn event(
+pub(crate) fn event(
     radio: &mut Radio<'_>,
     clock: &mut Clock<'_>,
     settings: &Settings,
     counters: &mut Counters,
     _rx: &mut PacketBuffer,
-) -> (u32, Option<Accepted>) {
+) -> (At, Option<Accepted>) {
     extended::event(radio, clock, settings, counters)
 }
 

@@ -87,14 +87,19 @@
 //!   ([`Engine::advertise`]), so pairing distributes the identity our
 //!   resolvable private address was made from, and builds the bond from the
 //!   pairing's outcome: the central's identity from
-//!   [`crate::host::smp::Bonded::identity`], or its address when it sent none,
-//!   and our variant. It reports [`ConnEvent::Bonded`] only once the central
-//!   acknowledged every fragment sent so far, our Identity Address Information
-//!   among them: the kernel stores its bond only when that PDU arrives, and a
-//!   bond the firmware stored without it would make every reconnection fail.
-//!   The [`crate::host::smp::Bonded`] it gets is `Copy`, so the engine
-//!   overwrites its copy of the keys once the [`Bond`] holds them; the security
-//!   manager overwrites its own Diffie-Hellman key, `MacKey` and long term key.
+//!   [`crate::host::smp::Bonded::identity`], or when it sent none its resolved
+//!   identity or its address on the air, and our variant. A bond keeps only an
+//!   [`IdentityAddress`]: a central that paired from a private address and sent
+//!   no identity address gets no bond, and its link stays encrypted with the
+//!   pairing's key without [`ConnEvent::Bonded`]; a key refresh on that link
+//!   finds no key and ends it. It reports [`ConnEvent::Bonded`] only once the
+//!   central acknowledged every fragment sent so far, our Identity Address
+//!   Information among them: the kernel stores its bond only when that PDU
+//!   arrives, and a bond the firmware stored without it would make every
+//!   reconnection fail. The [`crate::host::smp::Bonded`] it gets is `Copy`, so
+//!   the engine overwrites its copy of the keys once the [`Bond`] holds them;
+//!   the security manager overwrites its own Diffie-Hellman key, `MacKey` and
+//!   long term key.
 //! - It ends the link: [`SECURITY_FAILURE`] when the link is not encrypted
 //!   within the advertising schedule's security deadline (with the feature
 //!   `key-missing`, at once when the central of a reconnection asks for a key
@@ -149,7 +154,7 @@ use crate::host::RequestError;
 #[cfg(feature = "eatt")]
 use crate::host::{
     att::{Bearer, EXECUTE_WRITE_REQUEST, EXECUTE_WRITE_RESPONSE},
-    ecfc::{BEARERS, Ecfc, Signal},
+    ecfc::{BEARERS, BearerId, Ecfc, Signal},
 };
 use crate::{
     crypto::wipe,
@@ -166,6 +171,7 @@ use crate::{
         smp::{self, Job, JobResult, Outcome, Random, Reason, Responder},
     },
     link::{AclIn, ConnectionParams, Epoch, Event, Info, ParamRange},
+    pdu::IdentityAddress,
 };
 use core::mem;
 use embassy_time::{Duration, Instant};
@@ -227,11 +233,6 @@ const EV_PASSKEY: Flags = 0x200;
 /// range of passkeys, as [`smp::NO_PASSKEY`] is.
 #[cfg(feature = "passkey")]
 const REFUSED: u32 = smp::NO_PASSKEY.strict_sub(1);
-
-/// The number of ATT response slots: the fixed channel's, then one for each
-/// enhanced bearer.
-#[cfg(feature = "eatt")]
-const SLOTS: usize = BEARERS.strict_add(1);
 
 /// The events waiting, one `EV_` bit each: eight fit without the optional
 /// events.
@@ -311,6 +312,10 @@ pub struct Engine {
     /// ([`Self::directed_unanswered`]), until the bond notes it.
     #[cfg(feature = "directed-advertising")]
     directed_unanswered: Option<Epoch> = None,
+    /// The ATT responses waiting to be sent on the enhanced bearers, by
+    /// bearer.
+    #[cfg(feature = "eatt")]
+    eatt_responses: [Option<Slot>; BEARERS] = [None; BEARERS],
     /// The credit based channels of the link, its enhanced bearers.
     #[cfg(feature = "eatt")]
     ecfc:          Ecfc = Ecfc::new(),
@@ -323,13 +328,8 @@ pub struct Engine {
     /// which overwrites all of its digits.
     #[cfg(feature = "passkey")]
     passkey_input: u32 = smp::NO_PASSKEY,
-    /// The ATT response waiting to be sent.
-    #[cfg(not(feature = "eatt"))]
+    /// The ATT response waiting to be sent on the fixed channel.
     response:      Option<Slot> = None,
-    /// The ATT responses waiting to be sent: index 0 the fixed channel's,
-    /// `1 + b` enhanced bearer `b`'s.
-    #[cfg(feature = "eatt")]
-    response:      [Option<Slot>; SLOTS] = [None; SLOTS],
     /// The reassembly of received fragments.
     rx:            Reassembly = Reassembly::new(),
     /// Time from a connection until it has to be encrypted.
@@ -339,7 +339,7 @@ pub struct Engine {
     /// The enhanced bearer whose K-frame started last: the bearers take
     /// turns from the one after it.
     #[cfg(feature = "eatt")]
-    served:        u8 = 0,
+    served:        BearerId = BearerId::FIRST,
     /// Our signalling reply waiting to be sent.
     sig_reply:     Option<signal::Command> = None,
     /// Our connection parameter request waiting to be sent.
@@ -402,10 +402,9 @@ enum Inputs {
     /// The Write Response that completes it waits in the response slot.
     #[cfg(not(feature = "eatt"))]
     Answering,
-    /// The Write Response that completes it waits in the response slot of
-    /// this index.
+    /// The Write Response that completes it waits in this response slot.
     #[cfg(feature = "eatt")]
-    Answering(u8),
+    Answering(AttSlot),
     /// Not complete on this link yet.
     Open,
     /// The Write Response that completed it was queued: the next time
@@ -481,16 +480,25 @@ const _: () = assert!(
     "the ATT MTU fits the slot, the payload and the reassembly buffer"
 );
 
+/// An ATT response slot.
+#[cfg(feature = "eatt")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttSlot {
+    /// That of this enhanced bearer, whose response goes in K-frames.
+    Eatt(BearerId),
+    /// The fixed channel's.
+    Fixed,
+}
+
 /// Where the PDU being sent comes from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
     /// The ATT response slot.
     #[cfg(not(feature = "eatt"))]
     Att,
-    /// The ATT response slot of this index: 0 the fixed channel's, `1 + b`
-    /// that of enhanced bearer `b`, which goes in K-frames.
+    /// This ATT response slot.
     #[cfg(feature = "eatt")]
-    Att(u8),
+    Att(AttSlot),
     /// A command of the credit based channels, rendered from their state.
     #[cfg(feature = "eatt")]
     Ecfc(Signal),
@@ -575,11 +583,11 @@ impl Engine {
     }
 
     /// Answers an ATT PDU received `encrypted` or not; with the feature
-    /// `eatt`, on the bearer of the response slot `slot`.
+    /// `eatt`, on the channel of the response slot `slot`.
     fn att_pdu(
         &mut self,
         app: &dyn Handler,
-        #[cfg(feature = "eatt")] slot: u8,
+        #[cfg(feature = "eatt")] slot: AttSlot,
         pdu: &[u8],
         encrypted: bool,
         now: Instant,
@@ -603,18 +611,18 @@ impl Engine {
         #[cfg(not(feature = "eatt"))]
         let answer = self.att.handle(pdu, level, app, &mut out);
         #[cfg(feature = "eatt")]
-        let answer = match slot.checked_sub(1) {
-            Some(bearer) => {
+        let answer = match slot {
+            AttSlot::Eatt(bearer) => {
                 let Some(mtu) = self.ecfc.att_mtu(bearer) else { return };
                 self.att.handle_on(Bearer::Enhanced { mtu }, pdu, level, app, &mut out)
             },
-            None => self.att.handle(pdu, level, app, &mut out),
+            AttSlot::Fixed => self.att.handle(pdu, level, app, &mut out),
         };
         if let Some(len) = answer {
             #[cfg(not(feature = "eatt"))]
             let entry = &mut self.response;
             #[cfg(feature = "eatt")]
-            let Some(entry) = self.response.get_mut(usize::from(slot)) else { return };
+            let Some(entry) = self.slot_mut(slot) else { return };
             if entry.is_none() {
                 *entry = Some(Slot { bytes: out, len: len.saturating_cast() });
                 #[cfg(not(feature = "eatt"))]
@@ -673,7 +681,8 @@ impl Engine {
     const fn bond_key(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
         let bond = self.bond.as_ref()?;
         let info = &self.link.as_ref()?.info;
-        let bonded = info.identity == Some(bond.peer) || info.peer == bond.peer;
+        let peer = bond.peer.peer();
+        let bonded = info.identity == Some(peer) || info.peer == peer;
         (ediv == 0 && rand == [0; 8] && bonded).then_some(bond.ltk)
     }
 
@@ -778,8 +787,9 @@ impl Engine {
     #[cfg(feature = "eatt")]
     fn drop_closed(&mut self) {
         let sending = self.sending.filter(|&(_, segmenter)| segmenter.is_mid_pdu()).map(|(source, _)| source);
-        for (slot, entry) in (0_u8..).zip(self.response.iter_mut()).skip(1) {
-            if entry.is_some() && !self.ecfc.is_open(slot.saturating_sub(1)) && sending != Some(Source::Att(slot)) {
+        for (bearer, entry) in BearerId::all().zip(self.eatt_responses.iter_mut()) {
+            let slot = AttSlot::Eatt(bearer);
+            if entry.is_some() && !self.ecfc.is_open(bearer) && sending != Some(Source::Att(slot)) {
                 *entry = None;
                 if let Some(link) = self.link.as_mut()
                     && link.inputs == Inputs::Answering(slot)
@@ -935,9 +945,10 @@ impl Engine {
     /// link.
     #[cfg(feature = "eatt")]
     const fn forget_responses(&mut self) {
-        self.response = [None; SLOTS];
+        self.response = None;
+        self.eatt_responses = [None; BEARERS];
         self.ecfc = Ecfc::new();
-        self.served = 0;
+        self.served = BearerId::FIRST;
     }
 
     /// Notes that the fragment [`Self::next_fragment`] gave was queued by the
@@ -947,8 +958,7 @@ impl Engine {
         let Some((source, mut segmenter)) = self.sending.take() else { return };
         // The first fragment of a K-frame takes one of the peer's credits.
         #[cfg(feature = "eatt")]
-        if let Source::Att(slot) = source
-            && let Some(bearer) = slot.checked_sub(1)
+        if let Source::Att(AttSlot::Eatt(bearer)) = source
             && !segmenter.is_mid_pdu()
         {
             self.ecfc.kframe_queued(bearer, &segmenter);
@@ -1044,13 +1054,12 @@ impl Engine {
     /// command of the credit based channels.
     #[cfg(feature = "eatt")]
     fn has_response(&self) -> bool {
-        let mut slots = (0_u8..).zip(self.response.iter());
-        let ready = |(slot, entry): (u8, &Option<Slot>)| {
-            entry.is_some_and(|response| {
-                slot.checked_sub(1).is_none_or(|bearer| self.ecfc.kframe(bearer, usize::from(response.len)).is_some())
-            })
+        let ready = |(bearer, entry): (BearerId, &Option<Slot>)| {
+            entry.is_some_and(|response| self.ecfc.kframe(bearer, usize::from(response.len)).is_some())
         };
-        slots.any(ready) || self.ecfc.next_signal().is_some()
+        self.response.is_some()
+            || BearerId::all().zip(self.eatt_responses.iter()).any(ready)
+            || self.ecfc.next_signal().is_some()
     }
 
     /// The link `epoch`'s information, with the parameters it has now.
@@ -1080,7 +1089,8 @@ impl Engine {
     #[cfg(feature = "eatt")]
     const fn is_bonded_central(&self) -> bool {
         let (Some(bond), Some(link)) = (self.bond.as_ref(), self.link.as_ref()) else { return false };
-        link.info.identity == Some(bond.peer) || link.info.peer == bond.peer
+        let peer = bond.peer.peer();
+        link.info.identity == Some(peer) || link.info.peer == peer
     }
 
     /// Whether the client of the link `epoch` enabled notifications of
@@ -1106,7 +1116,7 @@ impl Engine {
     /// `encrypted` or not, at `now`: an SDU it completes is an ATT PDU of the
     /// bearer, which `app` serves.
     #[cfg(feature = "eatt")]
-    fn kframe(&mut self, app: &dyn Handler, bearer: u8, pdu: &[u8], encrypted: bool, now: Instant) {
+    fn kframe(&mut self, app: &dyn Handler, bearer: BearerId, pdu: &[u8], encrypted: bool, now: Instant) {
         let mut sdu: [u8; ATT_MAX] = [0; ATT_MAX];
         let received = self.ecfc.receive(&mut self.signal, bearer, pdu, encrypted).map(|(data, all_encrypted)| {
             let len = data.len().min(ATT_MAX);
@@ -1116,7 +1126,7 @@ impl Engine {
             (len, all_encrypted)
         });
         if let Some((len, all_encrypted)) = received {
-            self.att_pdu(app, bearer.saturating_add(1), sdu.get(..len).unwrap_or_default(), all_encrypted, now);
+            self.att_pdu(app, AttSlot::Eatt(bearer), sdu.get(..len).unwrap_or_default(), all_encrypted, now);
         }
         self.drop_closed();
     }
@@ -1335,7 +1345,7 @@ impl Engine {
             #[cfg(not(feature = "eatt"))]
             Channel::Att => self.att_pdu(app, pdu, encrypted, now),
             #[cfg(feature = "eatt")]
-            Channel::Att => self.att_pdu(app, 0, pdu, encrypted, now),
+            Channel::Att => self.att_pdu(app, AttSlot::Fixed, pdu, encrypted, now),
             Channel::SecurityManager => {
                 let outcome = self.smp.receive(crypto, pdu, encrypted, now);
                 self.outcome(outcome, now);
@@ -1453,10 +1463,26 @@ impl Engine {
                 // A central without a key of its own that sends its identity
                 // address sends an all-zero key, as the Core specification
                 // allows: that is no key, so that the bond is stored and
-                // directed advertising reaches the central.
-                let (peer, irk) = match bonded.identity {
-                    Some(identity) => (identity.address, (identity.irk != [0; 16]).then_some(identity.irk)),
-                    None => (link.info.identity.unwrap_or(link.info.peer), None),
+                // directed advertising reaches the central. A central that
+                // sent no identity address is known by its resolved identity
+                // or its address on the air, if that is an identity address.
+                let known = match bonded.identity {
+                    Some(identity) => Some((identity.address, (identity.irk != [0; 16]).then_some(identity.irk))),
+                    None => link
+                        .info
+                        .identity
+                        .and_then(IdentityAddress::new)
+                        .or_else(|| IdentityAddress::new(link.info.peer))
+                        .map(|peer| (peer, None)),
+                };
+                let Some((peer, irk)) = known else {
+                    // A private address changes: a bond with it would never
+                    // find the central again. The link stays encrypted with
+                    // the pairing's key, and nothing is reported to store.
+                    warn!("pairing: the central has no identity address, so no bond");
+                    wipe(&mut bonded.ltk);
+                    self.events.changed = true;
+                    return;
                 };
                 let mut bond = Bond::new(peer, irk, bonded.ltk, self.variant, self.db);
                 bond.cccd = self.att.subscriptions().bits();
@@ -1507,12 +1533,7 @@ impl Engine {
             #[cfg(not(feature = "eatt"))]
             Source::Att => self.response.map(|slot| (slot.bytes, usize::from(slot.len))),
             #[cfg(feature = "eatt")]
-            Source::Att(slot) => self
-                .response
-                .get(usize::from(slot))
-                .copied()
-                .flatten()
-                .map(|entry| (entry.bytes, usize::from(entry.len))),
+            Source::Att(slot) => self.slot(slot).map(|entry| (entry.bytes, usize::from(entry.len))),
             #[cfg(feature = "eatt")]
             Source::Ecfc(signal) => {
                 // The array of the slot's type, though a command is shorter.
@@ -1584,12 +1605,15 @@ impl Engine {
     /// a K-frame: the response is sent once its last K-frame went, or once its
     /// bearer closed; until then the rest waits in the slot.
     #[cfg(feature = "eatt")]
-    fn response_sent(&mut self, slot: u8, segmenter: &Segmenter, now: Instant) {
-        let open = slot.checked_sub(1).is_none_or(|bearer| self.ecfc.is_open(bearer));
+    fn response_sent(&mut self, slot: AttSlot, segmenter: &Segmenter, now: Instant) {
+        let open = match slot {
+            AttSlot::Eatt(bearer) => self.ecfc.is_open(bearer),
+            AttSlot::Fixed => true,
+        };
         if open && segmenter.kframe_end().is_some_and(|(end, total)| end < total) {
             return;
         }
-        if let Some(entry) = self.response.get_mut(usize::from(slot)) {
+        if let Some(entry) = self.slot_mut(slot) {
             *entry = None;
         }
         if let Some(link) = self.link.as_mut() {
@@ -1642,6 +1666,24 @@ impl Engine {
         Some(level)
     }
 
+    /// The response waiting in the slot `slot`, if any.
+    #[cfg(feature = "eatt")]
+    const fn slot(&self, slot: AttSlot) -> Option<Slot> {
+        match slot {
+            AttSlot::Eatt(bearer) => self.eatt_responses.get(bearer.index()).copied().flatten(),
+            AttSlot::Fixed => self.response,
+        }
+    }
+
+    /// The response slot `slot`.
+    #[cfg(feature = "eatt")]
+    const fn slot_mut(&mut self, slot: AttSlot) -> Option<&mut Option<Slot>> {
+        match slot {
+            AttSlot::Eatt(bearer) => self.eatt_responses.get_mut(bearer.index()),
+            AttSlot::Fixed => Some(&mut self.response),
+        }
+    }
+
     /// The PDU to start, given the `room` in the link layer's queue, with
     /// its payload and its segmenter: in the order the security manager, our
     /// signalling reply, the commands of the credit based channels, the
@@ -1652,16 +1694,18 @@ impl Engine {
     #[cfg(feature = "eatt")]
     fn start(&mut self, room: usize) -> Option<(Source, Payload, Segmenter)> {
         let signal = self.ecfc.next_signal().map(Source::Ecfc);
-        for source in [Some(Source::Smp), Some(Source::Reply), signal, Some(Source::Att(0))].into_iter().flatten() {
+        for source in
+            [Some(Source::Smp), Some(Source::Reply), signal, Some(Source::Att(AttSlot::Fixed))].into_iter().flatten()
+        {
             if let Some(payload) = self.payload(source) {
                 let segmenter = Segmenter::new(source.channel(), payload.len)?;
                 return Some((source, payload, segmenter));
             }
         }
-        for step in 1..=BEARERS {
-            let Some(index) = usize::from(self.served).strict_add(step).checked_rem(BEARERS) else { continue };
-            let bearer = index.saturating_cast::<u8>();
-            let source = Source::Att(bearer.saturating_add(1));
+        let mut bearer = self.served;
+        for _ in 0..BEARERS {
+            bearer = bearer.next();
+            let source = Source::Att(AttSlot::Eatt(bearer));
             if let Some(payload) = self.payload(source)
                 && let Some(segmenter) = self.ecfc.kframe(bearer, payload.len)
             {
@@ -1866,10 +1910,9 @@ impl Source {
             #[cfg(not(feature = "eatt"))]
             Self::Att => Channel::Att,
             #[cfg(feature = "eatt")]
-            Self::Att(slot) => match slot.checked_sub(1) {
-                Some(bearer) => Channel::Eatt(bearer),
-                None => Channel::Att,
-            },
+            Self::Att(AttSlot::Eatt(bearer)) => Channel::Eatt(bearer),
+            #[cfg(feature = "eatt")]
+            Self::Att(AttSlot::Fixed) => Channel::Att,
             #[cfg(feature = "eatt")]
             Self::Ecfc(_) => Channel::Signalling,
             Self::Reply | Self::Request => Channel::Signalling,

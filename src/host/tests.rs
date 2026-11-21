@@ -27,7 +27,7 @@ use super::{
 };
 use crate::{
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Rx},
-    pdu::Peer,
+    pdu::{IdentityAddress, Peer},
 };
 use core::{
     future::{Future, poll_fn},
@@ -422,8 +422,13 @@ fn identity(generation: u8) -> identity::Local {
 /// A bond with the central of the SMP tests, made under `identity`, with
 /// the battery's and the keyboard's notifications on.
 fn bond(identity: &identity::Local) -> Bond {
-    let mut bond =
-        Bond::new(Peer::new(CENTRAL_IDENTITY, false), Some(CENTRAL_IRK), [0x5C; 16], identity.variant(), &example::DB);
+    let mut bond = Bond::new(
+        IdentityAddress::valid(Peer::new(CENTRAL_IDENTITY, false)),
+        Some(CENTRAL_IRK),
+        [0x5C; 16],
+        identity.variant(),
+        &example::DB,
+    );
     bond.cccd = 0b0101;
     bond
 }
@@ -558,7 +563,7 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
 
     assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
     let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
-    assert!(bond.peer == Peer::new(CENTRAL_IDENTITY, false));
+    assert!(bond.peer.peer() == Peer::new(CENTRAL_IDENTITY, false));
     assert_eq!(bond.peer_irk, Some(CENTRAL_IRK));
     assert_eq!(bond.ltk, ltk);
     assert_eq!(bond.local, identity.variant());
@@ -686,11 +691,11 @@ macro_rules! reconnected {
         $tasks.step();
         assert!(poll(advertise.as_mut()).is_pending());
         let calls = $link.calls();
-        assert!(calls.contains(&Seen::AcceptListAdd(bond.peer)));
+        assert!(calls.contains(&Seen::AcceptListAdd(bond.peer.peer())));
         assert_eq!(calls.last(), Some(&Seen::Advertise(32, 3)));
         // The central connects from a private address the link layer
         // resolved.
-        $link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+        $link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
         $tasks.step();
         let $conn = ready(advertise.as_mut()).unwrap();
         assert_eq!($link.calls(), [Seen::Hold(true)]);
@@ -717,9 +722,9 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
     assert!(poll(advertise.as_mut()).is_pending());
     assert_eq!(multiplications.get(), 0, "a reconnection never makes a key pair");
     let calls = link.calls();
-    assert!(calls.contains(&Seen::AcceptListAdd(bond.peer)));
+    assert!(calls.contains(&Seen::AcceptListAdd(bond.peer.peer())));
     assert_eq!(calls.last(), Some(&Seen::Advertise(32, 3)));
-    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     assert_eq!(link.calls(), [Seen::Hold(true)]);
@@ -800,7 +805,7 @@ fn only_the_bonded_central_gets_the_bond_s_key() {
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x13));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
-    link.connect(bond.peer, None, local_rpa());
+    link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
     let _conn = ready(advertise.as_mut()).unwrap();
     link.calls();
@@ -953,7 +958,7 @@ fn a_link_not_encrypted_in_time_ends_with_an_authentication_failure() {
     let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
-    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     link.calls();
@@ -1090,7 +1095,7 @@ fn a_pairing_request_while_reconnecting_is_refused_and_ends_the_link() {
     let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
-    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     link.calls();
@@ -1172,7 +1177,7 @@ fn a_bond_is_reported_only_once_the_central_has_our_identity() {
             link.ack();
             tasks.step();
             let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
-            assert!(bond.peer == Peer::new(CENTRAL_ADDRESS, false));
+            assert!(bond.peer.peer() == Peer::new(CENTRAL_ADDRESS, false));
         } else {
             // The link ends first: the central may never have learned our
             // identity, and nothing is to be stored.
@@ -1456,7 +1461,7 @@ fn a_reconnection_advertises_directed_to_the_bonded_central_first() {
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
-    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     link.advance(1_279);
     assert!(poll(advertise.as_mut()).is_pending());
     assert!(link.calls().is_empty());
@@ -1472,9 +1477,9 @@ fn a_reconnection_advertises_directed_to_the_bonded_central_first() {
     // The central connects during the directed phase of the next call.
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
-    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     link.advance(10);
-    link.connect(bond.peer, None, local_rpa());
+    link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
     let _conn = ready(advertise.as_mut()).unwrap();
     assert_eq!(multiplications.get(), 0);
@@ -1503,7 +1508,7 @@ fn reconnect_after_directed(bond: &Bond, phase: usize) -> Option<Bond> {
     tasks.step();
     // Directed to its identity: the link layer puts a private address made
     // with the key of its resolving list entry on air.
-    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     if phase > 0 {
         link.advance(1_279);
         link.event(Event::AdvertisingTimeout);
@@ -1518,7 +1523,7 @@ fn reconnect_after_directed(bond: &Bond, phase: usize) -> Option<Bond> {
         assert_eq!(link.calls(), [Seen::Advertise(80, 3)]);
     }
     link.advance(10);
-    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
@@ -1557,7 +1562,7 @@ fn a_central_that_connects_right_after_an_unanswered_directed_phase_is_no_longer
     // reports the bond to store with directed advertising off.
     let updated = reconnect_after_directed(&bond, 1).unwrap();
     assert!(!updated.directed_works);
-    assert!(updated.ltk == bond.ltk && updated.peer == bond.peer && updated.cccd == bond.cccd);
+    assert!(updated.ltk == bond.ltk && updated.peer.peer() == bond.peer.peer() && updated.cccd == bond.cccd);
     let stored = Bond::from_bytes(&updated.to_bytes()).unwrap();
     assert!(!stored.directed_works);
     // Its next reconnection skips the directed phase: it starts with the
@@ -1581,7 +1586,7 @@ fn a_central_that_connects_right_after_an_unanswered_directed_phase_is_no_longer
     assert_eq!(link.calls(), [Seen::Advertise(80, 3)]);
     // It connects then: no directed phase ran, and there is nothing to
     // report.
-    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(stored.peer), local_rpa());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(stored.peer.peer()), local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
@@ -1607,9 +1612,9 @@ fn a_late_answer_to_the_directed_phase_keeps_directed_advertising() {
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
-    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     link.advance(1_279);
-    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     link.advance(2);
     // The link layer refuses the next phase: it is connected.
     assert!(poll(advertise.as_mut()).is_pending());
@@ -1650,8 +1655,8 @@ fn reconnect_after_two_directed(second: bool) -> Option<Bond> {
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
-    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
-    let mut expected = [Seen::Directed(bond.peer), Seen::Advertise(32, 3)].into_iter();
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
+    let mut expected = [Seen::Directed(bond.peer.peer()), Seen::Advertise(32, 3)].into_iter();
     for _ in 0..if second { 1 } else { 2 } {
         link.advance(1_279);
         link.event(Event::AdvertisingTimeout);
@@ -1661,7 +1666,7 @@ fn reconnect_after_two_directed(second: bool) -> Option<Bond> {
         assert_eq!(link.calls(), [expected.next().unwrap()]);
     }
     link.advance(10);
-    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
@@ -1713,7 +1718,7 @@ fn an_unanswered_directed_phase_needs_the_bond_s_key_to_count() {
     link.advance(1_281);
     assert!(poll(advertise.as_mut()).is_pending());
     link.calls();
-    link.connect(bond.peer, None, local_rpa());
+    link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     link.event(Event::LtkRequest { ediv: 0, rand: [1; 8] });
@@ -1838,9 +1843,9 @@ fn a_reconnection_targets_a_private_address_of_the_central_s_key_until_it_goes_u
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
-    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     let directed = on_air(&link);
-    assert!(directed.kind.is_directed() && directed.peer == bond.peer);
+    assert!(directed.kind.is_directed() && directed.peer == bond.peer.peer());
     // Low duty cycle at the phase's 20 ms with extended advertising; the
     // link layer's 3.75 ms of high duty cycle without.
     #[cfg(feature = "extended-advertising")]
@@ -1875,7 +1880,7 @@ fn a_reconnection_targets_a_private_address_of_the_central_s_key_until_it_goes_u
     // as Linux initiates, or from its identity (device privacy mode); not
     // from another key's or another device's address.
     assert!(accepts(&directed, rpa(CENTRAL_IRK, [0x12, 0x34, 0x56])));
-    assert!(accepts(&directed, bond.peer));
+    assert!(accepts(&directed, bond.peer.peer()));
     assert!(!accepts(&directed, rpa([0x77; 16], [0x12, 0x34, 0x56])));
     assert!(!accepts(&directed, Peer::new([9; 6], false)));
     // The central does not answer. The phase ends after 1.28 s (and the link
@@ -1909,7 +1914,7 @@ fn a_reconnection_targets_a_private_address_of_the_central_s_key_until_it_goes_u
     // bond's key: the host reports the bond to store, directed advertising
     // off.
     link.advance(10);
-    link.connect(rpa(CENTRAL_IRK, [0x12, 0x34, 0x56]), Some(bond.peer), local_rpa());
+    link.connect(rpa(CENTRAL_IRK, [0x12, 0x34, 0x56]), Some(bond.peer.peer()), local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     assert!(conn.info().is_some_and(|info| !info.directed));
@@ -1959,13 +1964,13 @@ fn a_reconnection_targets_the_identity_of_a_central_without_a_key() {
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
-    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer)));
+    assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     let directed = on_air(&link);
     let (header, adv_a, target_a) = directed_pdu(&directed);
     // TxAdd for our private address, no RxAdd: the public identity.
     assert_eq!(header & 0xC0, 0x40);
-    assert!(resolves(identity.irk(), adv_a) && target_a == CENTRAL_IDENTITY && directed.target == bond.peer);
-    assert!(accepts(&directed, bond.peer));
+    assert!(resolves(identity.irk(), adv_a) && target_a == CENTRAL_IDENTITY && directed.target == bond.peer.peer());
+    assert!(accepts(&directed, bond.peer.peer()));
     assert!(!accepts(&directed, Peer::new([9; 6], false)));
     // No random bytes for the target: only our own address took a draw.
     assert_eq!(link.draws.get(), 1);
@@ -1997,7 +2002,7 @@ fn disconnected_comes_after_every_other_event_of_its_link() {
     let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
-    link.connect(bond.peer, None, local_rpa());
+    link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
     let next = ready(advertise.as_mut()).unwrap();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x08));
@@ -2202,7 +2207,7 @@ fn the_end_of_the_link_clears_a_pending_parameter_request() {
     let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
-    link.connect(bond.peer, None, local_rpa());
+    link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
     let next = ready(advertise.as_mut()).unwrap();
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
@@ -2259,7 +2264,7 @@ fn a_reconnection_without_the_bond_s_key_ends_at_once() {
     let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
-    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+    link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
     let conn = ready(advertise.as_mut()).unwrap();
     link.calls();
@@ -2484,7 +2489,7 @@ fn a_reconnection_is_authenticated_only_with_an_authenticated_bond() {
         tasks!(host, tasks, multiplications);
         let identity = identity(1);
         let mut bond = Bond::new(
-            Peer::new(CENTRAL_IDENTITY, false),
+            IdentityAddress::valid(Peer::new(CENTRAL_IDENTITY, false)),
             Some(CENTRAL_IRK),
             [0x5C; 16],
             identity.variant(),
@@ -2495,7 +2500,7 @@ fn a_reconnection_is_authenticated_only_with_an_authenticated_bond() {
         let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
         let mut advertise = pin!(host.advertise(&advertising, &identity));
         assert!(poll(advertise.as_mut()).is_pending());
-        link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer), local_rpa());
+        link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
         tasks.step();
         let conn = ready(advertise.as_mut()).unwrap();
         link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
