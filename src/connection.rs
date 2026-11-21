@@ -50,7 +50,6 @@ use crate::{
     },
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
     radio::{Phy, RX_READY_US, Radio, TURNAROUND_IN_ANSWER, Turnaround},
-    sleep,
 };
 use core::{iter, mem};
 use embassy_futures::select::{Either, select};
@@ -1664,24 +1663,8 @@ impl Connection {
     /// exchange fits before the next event (Core, Vol 6, Part B, 4.5.6).
     /// Returns the access address time of the first packet, which sets the
     /// anchor even for a packet with a CRC error or a retransmission (Core,
-    /// Vol 6, Part B, 4.5.5). On an encrypted link the CPU stays awake
-    /// meanwhile ([`sleep::stay_awake`]).
+    /// Vol 6, Part B, 4.5.5).
     fn exchange(
-        &mut self,
-        radio: &mut Radio<'_>,
-        clock: &mut Clock<'_>,
-        rx: &mut [u8; BUFFER_LEN],
-        window: (u32, u32),
-        shared: &Shared,
-    ) -> Option<u32> {
-        sleep::stay_awake(self.encryption.rx_on);
-        let anchor = self.exchange_packets(radio, clock, rx, window, shared);
-        sleep::stay_awake(false);
-        anchor
-    }
-
-    /// [`Self::exchange`] with the CPU's sleep decided.
-    fn exchange_packets(
         &mut self,
         radio: &mut Radio<'_>,
         clock: &mut Clock<'_>,
@@ -1744,6 +1727,16 @@ impl Connection {
                 if !TURNAROUND_IN_ANSWER {
                     radio.wait_switched();
                     radio.set_turnaround(if more { Turnaround::Receive } else { Turnaround::None });
+                }
+                // Our answer took its buffer when it started: the reception
+                // after it gets `rx` now, not once our answer ended. A CPU
+                // held up by the preparation below would otherwise leave the
+                // radio pointing at the slot it sent, which it would receive
+                // into: a central's packet there fails its MIC, as the CCM
+                // reads `rx`, and noise with a long length overruns the slot.
+                if more && radio.wait_tx_started(chip::DECRYPT_WAIT) {
+                    // SAFETY: as for `prepare` above.
+                    unsafe { radio.set_buffer(rx.as_mut_ptr()) }
                 }
                 // While ours goes out, the next PDU, into the slot the radio
                 // does not send: not after a late answer, which sends it.

@@ -92,12 +92,6 @@ pub(crate) unsafe fn arm_decrypt(
 /// address came first or the key stream took longer than
 /// [`chip::DECRYPT_WAIT`]: the packet then cannot be decrypted, and its MIC
 /// counts as failed.
-///
-/// The CPU does not sleep between the start of the key stream and its end,
-/// nor until the access address while the caller keeps it awake
-/// ([`sleep::stay_awake`]): on the nRF52832, a DMA transfer that starts
-/// as the CPU goes idle and the 64 MHz clock stops can be corrupted (anomaly
-/// 109).
 #[inline]
 #[must_use = "an unarmed decryption fails the packet's MIC"]
 pub(crate) fn start_on_address(heard: impl Fn() -> bool) -> bool {
