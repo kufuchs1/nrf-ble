@@ -25,7 +25,8 @@
 //! and the parameter request's own is kept, so that only its response matches
 //! it.
 
-#[cfg(feature = "eatt")] use crate::host::ecfc;
+#[cfg(feature = "eatt")]
+use crate::host::ecfc::BearerId;
 use crate::{link::ParamRange, pdu::concat_into};
 
 /// Code of a Command Reject.
@@ -192,7 +193,7 @@ impl Signalling {
                 _,
             ) => true,
             (DISCONNECTION_REQUEST, &[dcid0, dcid1, _, _]) => {
-                ecfc::bearer(u16::from_le_bytes([dcid0, dcid1])).is_some()
+                BearerId::from_cid(u16::from_le_bytes([dcid0, dcid1])).is_some()
             },
             (COMMAND_REJECT, _) => !self.pending || identifier != self.asked(),
             _ => false,

@@ -245,11 +245,14 @@ fn a_close_drops_a_response_waiting_for_credits() {
     // configuration.
     sim.kernel.request_on(On::Chan(0x0040), &enable(example::MOUSE));
     sim.pump();
-    assert!(sim.engine.response[1].is_some());
-    assert_eq!(sim.engine.link.as_ref().map(|link| link.inputs), Some(Inputs::Answering(1)));
+    assert!(sim.engine.eatt_responses[0].is_some());
+    assert_eq!(
+        sim.engine.link.as_ref().map(|link| link.inputs),
+        Some(Inputs::Answering(AttSlot::Eatt(BearerId::FIRST)))
+    );
     sim.kernel.close(0x0040);
     sim.pump();
-    assert!(sim.engine.response.iter().all(Option::is_none));
+    assert!(sim.engine.response.is_none() && sim.engine.eatt_responses.iter().all(Option::is_none));
     assert_eq!(sim.engine.link.as_ref().map(|link| link.inputs), Some(Inputs::Open));
     assert!(sim.kernel.chans.is_empty() && !sim.engine.has_output());
     // A new channel on the same CID, with credits: no stale response.
@@ -518,7 +521,7 @@ fn without_credits_a_response_waits_and_cid_4_goes_on() {
     sim.pump();
     assert_eq!(sim.kernel.responses.iter().map(|(on, ..)| *on).collect::<Vec<_>>(), [On::Chan(0x0040), On::Fixed]);
     assert!(!sim.engine.has_output(), "nothing the link layer's room would let go");
-    assert!(sim.engine.response[1].is_some());
+    assert!(sim.engine.eatt_responses[0].is_some());
     sim.kernel.give_credits(0x0040, 1);
     sim.pump();
     assert_eq!(sim.kernel.responses.len(), 3);
@@ -552,7 +555,7 @@ fn a_close_in_the_middle_of_a_kframe_finishes_it() {
         sim.kernel.receive(fragment);
     }
     assert_eq!(sim.kernel.dropped, 1);
-    assert!(sim.engine.response.iter().all(Option::is_none));
+    assert!(sim.engine.response.is_none() && sim.engine.eatt_responses.iter().all(Option::is_none));
     assert!(!sim.engine.has_output());
     assert_eq!(sim.kernel.chans.len(), 0);
     // The bearer is free again.
@@ -575,7 +578,7 @@ fn a_kframe_too_long_closes_the_bearer() {
     assert_eq!(close[0], 0x06);
     assert_eq!(close[4..], [0x40, 0, 0x40, 0]);
     assert_eq!(sim.kernel.chans.len(), 0);
-    assert!(!sim.engine.ecfc.is_open(0));
+    assert!(!sim.engine.ecfc.is_open(BearerId::FIRST));
     sim.kernel.connect_eatt(2);
     sim.pump();
     assert_eq!(sim.bound(), [(0x0040, 0x0040)]);
@@ -623,12 +626,12 @@ fn the_link_s_end_resets_the_bearers() {
     // A request still to be answered.
     sim.kernel.send_request(0x80, &[0x0050]);
     sim.deliver();
-    assert!(sim.engine.response.iter().skip(1).all(Option::is_some));
+    assert!(sim.engine.eatt_responses.iter().all(Option::is_some));
     sim.engine.on_event(&Event::Disconnected(0x13), sim.at());
-    assert!(sim.engine.response.iter().all(Option::is_none));
+    assert!(sim.engine.response.is_none() && sim.engine.eatt_responses.iter().all(Option::is_none));
     assert_eq!(sim.engine.ecfc.deadline(), None);
-    assert!((0..BEARERS).all(|bearer| !sim.engine.ecfc.is_open(bearer as u8)));
-    assert_eq!((sim.engine.served, sim.engine.sending), (0, None));
+    assert!(BearerId::all().all(|bearer| !sim.engine.ecfc.is_open(bearer)));
+    assert_eq!((sim.engine.served, sim.engine.sending), (BearerId::FIRST, None));
     let mut sim = Sim::reconnect(sim.engine, bond_with_features(0x07), Kernel::spec());
     sim.kernel.connect_eatt(BEARERS + 1);
     sim.pump();
