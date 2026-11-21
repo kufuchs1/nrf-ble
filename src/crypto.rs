@@ -41,7 +41,7 @@ const DIRECTION_OFFSET: usize = 24;
 /// Offset of the IV in a CCM configuration.
 const IV_OFFSET: usize = 25;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
-const PPI_CRYPT: usize = 25;
+pub(crate) const PPI_CRYPT: usize = 25;
 /// Scratch space for every length the CCM may take from a packet.
 pub(crate) const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
 

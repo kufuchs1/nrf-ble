@@ -25,6 +25,9 @@ use embassy_nrf::{
     },
     peripherals::RADIO,
 };
+/// The PPI channels of the turnaround, for [`crate::PPI_CHANNELS`].
+#[cfg(feature = "nrf52832")]
+pub(crate) use switch::{PPI_SWITCH_ENABLE, PPI_SWITCH_START};
 
 /// Base address length in bytes.
 const BASE_ADDRESS_LEN: u8 = 3;

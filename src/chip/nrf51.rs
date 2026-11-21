@@ -175,7 +175,7 @@ pub fn disable_channel(channel: usize) {
 pub const fn fast_ramp_up() {}
 
 /// The programmable channel standing in for the FORK of `channel`.
-const fn fork_channel(channel: usize) -> usize { channel.wrapping_add(FORK_OFFSET) }
+pub const fn fork_channel(channel: usize) -> usize { channel.wrapping_add(FORK_OFFSET) }
 
 /// Whether the channels standing in for the FORK of the channels `forked`
 /// are programmable channels, distinct from each other and from every

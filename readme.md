@@ -500,9 +500,11 @@ On the nRF52832 the radio uses the fast ramp-up of 40 µs instead of 140 µs, wh
 turnaround by 100 µs. The radio's own interframe timing works only with the slow ramp-up, so TIMER1 times the 150 µs
 between two packets as in Zephyr's software switch: PPI channel 4 starts it at the end of a packet, and its compare
 enables the radio through PPI channel 5. Pass `TIMER1` to `Radio::new` and keep the `TIMER1` interrupt disabled in the
-NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5; leave them to it. TIMER0 and TIMER1 are shut
-down, not only stopped, between uses, which avoids the standby current of nRF52832 anomaly 78. The nRF51 differs: see
-[nRF51](#nrf51).
+NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5, the fixed channels 20, 21, 25, 26 and 27
+and the channel groups 0 and 1; leave them to it. `nrf_ble::PPI_CHANNELS` and `nrf_ble::PPI_GROUPS` hold them as bit
+masks for the chip built for, so a firmware that uses PPI checks its own channels and groups against them in a const
+assert. TIMER0 and TIMER1 are shut down, not only stopped, between uses, which avoids the standby current of nRF52832
+anomaly 78. The nRF51 differs: see [nRF51](#nrf51).
 
 The high frequency crystal and TIMER0 run only around radio events and RC calibrations. Between events RTC0 keeps the
 time and restarts TIMER0 at an exact tick before the next event. During radio events the CPU sleeps with `WFE` inside
@@ -552,7 +554,8 @@ nrf-pac's build script with "Multiple nrfxx Cargo features enabled", as both chi
 - **Turnarounds:** the radio's own interframe timing, with the shortcuts from the end of a packet over the disabled
   state to the next TXEN or RXEN, as Nordic's nRF51 SoftDevices and Zephyr do. `Radio::new` takes only `RADIO`; TIMER1,
   TIMER2 and the PPI channels 4 and 5 stay free. The link layer uses the programmable PPI channels 0, 1 and 3, and 9 and
-  11 in place of the FORK registers the nRF51 lacks.
+  11 in place of the FORK registers the nRF51 lacks, beside the same fixed channels and groups as on the nRF52832;
+  `nrf_ble::PPI_CHANNELS` includes 9 and 11.
 - **Ramp-up:** about 140 µs. Each receive window opens about 100 µs earlier than on the nRF52832, which costs a little
   more receive current per connection event.
 - **Radio trim:** after powering the radio the link layer copies its BLE 1 Mbit trim values from FICR when FICR asks

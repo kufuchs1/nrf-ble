@@ -50,16 +50,16 @@ const CC_START: usize = 0;
 const CALIBRATION_TIMEOUT: Duration = Duration::from_millis(100);
 /// Programmable PPI channel: CLOCK HFCLKSTARTED to CLOCK CAL, while a
 /// calibration waits for the crystal.
-const PPI_CALIBRATE: usize = 3;
+pub(crate) const PPI_CALIBRATE: usize = 3;
 /// PPI channel group of [`PPI_CALIBRATE`] alone, which its first event
 /// disables: HFCLKSTARTED may come twice (nRF52832 anomaly 201), and the
 /// second would start the calibration again.
-const PPI_GROUP_CALIBRATE: usize = 0;
+pub(crate) const PPI_GROUP_CALIBRATE: usize = 0;
 /// PPI channel group of [`PPI_SYNC`] alone, which its first event disables:
 /// RTC0 may generate a compare event twice while the CPU reads the RTC
 /// (nRF52832 anomaly 179), and the second capture would overwrite the time
 /// taken at the first.
-const PPI_GROUP_SYNC: usize = 1;
+pub(crate) const PPI_GROUP_SYNC: usize = 1;
 /// Wakes the calibration when the clock interrupt reports it done.
 static CALIBRATION_DONE: AtomicWaker = AtomicWaker::new();
 /// Whether the firmware paused the calibration ([`pause_calibration`]).
@@ -90,17 +90,17 @@ const RESUME_EARLY_US: u32 = 100;
 #[cfg(any(test, feature = "event-timing"))]
 pub(crate) const RESTART_EARLY_US: u32 = 31;
 /// Fixed PPI channel: TIMER0 COMPARE0 to RADIO TXEN.
-const PPI_TXEN: usize = 20;
+pub(crate) const PPI_TXEN: usize = 20;
 /// Fixed PPI channel: TIMER0 COMPARE0 to RADIO RXEN.
-const PPI_RXEN: usize = 21;
+pub(crate) const PPI_RXEN: usize = 21;
 /// Fixed PPI channel: RADIO ADDRESS to TIMER0 CAPTURE1.
-const PPI_ADDRESS: usize = 26;
+pub(crate) const PPI_ADDRESS: usize = 26;
 /// Fixed PPI channel: RADIO END to TIMER0 CAPTURE2.
-const PPI_END: usize = 27;
+pub(crate) const PPI_END: usize = 27;
 /// PPI channel: RTC0 COMPARE0 to TIMER0 START.
-const PPI_RESUME: usize = 0;
+pub(crate) const PPI_RESUME: usize = 0;
 /// PPI channel: RTC0 COMPARE1 to TIMER0 CAPTURE3.
-const PPI_SYNC: usize = 1;
+pub(crate) const PPI_SYNC: usize = 1;
 /// Prescaler for 1 MHz from the 16 MHz timer clock.
 const PRESCALER_1MHZ: u8 = 4;
 /// RTC0 compare register restarting TIMER0.
