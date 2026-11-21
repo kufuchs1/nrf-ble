@@ -427,7 +427,8 @@ pub enum ConnEvent {
     /// the stored one.
     BondUpdated(Bond),
     /// A pairing made this bond, which the firmware stores: reported once
-    /// the central acknowledged our identity keys.
+    /// the central acknowledged our identity keys. A pairing whose central
+    /// has no identity address makes none ([`crate::pdu::IdentityAddress`]).
     Bonded(Bond),
     /// The link ended, with the reason; 0 if it is no longer known.
     Disconnected(u8),

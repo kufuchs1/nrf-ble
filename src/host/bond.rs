@@ -48,7 +48,7 @@ use crate::{
         gatt::{Db, Subscriptions},
         identity::Variant,
     },
-    pdu::{Peer, concat_into},
+    pdu::{IdentityAddress, Peer, concat_into},
 };
 
 /// Octets of a stored bond.
@@ -111,7 +111,7 @@ pub struct Bond {
     /// The long term key, least significant octet first.
     pub ltk:             [u8; 16],
     /// The central's identity address and its type.
-    pub peer:            Peer,
+    pub peer:            IdentityAddress,
     /// The central's identity resolving key, least significant octet first,
     /// if it sent one. `BlueZ` sends one only with host privacy on.
     pub peer_irk:        Option<[u8; 16]>,
@@ -121,9 +121,9 @@ impl Bond {
     /// The bond as stored, `bytes`, or `None` for another version, erased
     /// flash or a record whose fields contradict each other: a key or layout
     /// given without its flag, an identity resolving key flagged but zero, a
-    /// zero long term key or address, or a random identity address that is
-    /// not static. Every bit of the flags octet has a meaning, so the flags
-    /// alone never refuse a record.
+    /// zero long term key, or an address that is no [`IdentityAddress`].
+    /// Every bit of the flags octet has a meaning, so the flags alone never
+    /// refuse a record.
     #[inline]
     #[must_use = "the bond is only decoded"]
     pub const fn from_bytes(bytes: &[u8; BOND_LEN]) -> Option<Self> {
@@ -137,7 +137,7 @@ impl Bond {
         if version != BOND_VERSION {
             return None;
         }
-        let peer = Peer::new(address, flags & FLAG_RANDOM != 0);
+        let peer = IdentityAddress::new(Peer::new(address, flags & FLAG_RANDOM != 0))?;
         let peer_irk = match (flags & FLAG_IRK != 0, irk_octets == [0; 16]) {
             (true, false) => Some(irk_octets),
             (false, true) => None,
@@ -149,7 +149,7 @@ impl Bond {
             (false, true) => None,
             (false, false) => return None,
         };
-        if ltk == [0; 16] || !is_identity(peer) {
+        if ltk == [0; 16] {
             return None;
         }
         Some(Self {
@@ -177,7 +177,7 @@ impl Bond {
     /// Service Changed characteristic.
     #[inline]
     #[must_use = "the bond is only built"]
-    pub fn new(peer: Peer, peer_irk: Option<[u8; 16]>, ltk: [u8; 16], local: Variant, db: &Db) -> Self {
+    pub fn new(peer: IdentityAddress, peer_irk: Option<[u8; 16]>, ltk: [u8; 16], local: Variant, db: &Db) -> Self {
         Self {
             authenticated: false,
             cccd: 0,
@@ -212,7 +212,7 @@ impl Bond {
     pub fn to_bytes(&self) -> [u8; BOND_LEN] {
         let mut flags = (self.client_features & CLIENT_FEATURES).unbounded_shl(CLIENT_FEATURES_SHIFT);
         for (set, flag) in [
-            (self.peer.random, FLAG_RANDOM),
+            (self.peer.peer().random, FLAG_RANDOM),
             (self.peer_irk.is_some(), FLAG_IRK),
             (self.authenticated, FLAG_AUTHENTICATED),
             (self.layout.is_some(), FLAG_LAYOUT),
@@ -225,7 +225,7 @@ impl Bond {
         let mut bytes = [0; BOND_LEN];
         concat_into(&mut bytes, &[
             &[BOND_VERSION, flags],
-            &self.peer.address,
+            &self.peer.peer().address,
             &self.peer_irk.unwrap_or_default(),
             &self.ltk,
             &self.local.bits().to_le_bytes(),
@@ -245,10 +245,6 @@ impl Drop for Bond {
         }
     }
 }
-
-/// Whether `peer` can be an identity address: a public address, or a static
-/// random one (two most significant bits set), and not zero.
-const fn is_identity(peer: Peer) -> bool { peer.address != [0; 6] && (!peer.random || peer.address[5] & 0xC0 == 0xC0) }
 
 /// The layout a bond with `db` keeps: the first four octets of its hash,
 /// least significant octet first, for a table with the Service Changed

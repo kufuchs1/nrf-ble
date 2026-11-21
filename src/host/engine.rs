@@ -87,14 +87,18 @@
 //!   ([`Engine::advertise`]), so pairing distributes the identity our
 //!   resolvable private address was made from, and builds the bond from the
 //!   pairing's outcome: the central's identity from
-//!   [`crate::host::smp::Bonded::identity`], or its address when it sent none,
-//!   and our variant. It reports [`ConnEvent::Bonded`] only once the central
-//!   acknowledged every fragment sent so far, our Identity Address Information
-//!   among them: the kernel stores its bond only when that PDU arrives, and a
-//!   bond the firmware stored without it would make every reconnection fail.
-//!   The [`crate::host::smp::Bonded`] it gets is `Copy`, so the engine
-//!   overwrites its copy of the keys once the [`Bond`] holds them; the security
-//!   manager overwrites its own Diffie-Hellman key, `MacKey` and long term key.
+//!   [`crate::host::smp::Bonded::identity`], or when it sent none its resolved
+//!   identity or its address on the air, and our variant. A bond keeps only an
+//!   [`IdentityAddress`]: a central that paired from a private address and sent
+//!   no identity address gets no bond, and its link stays encrypted with the
+//!   pairing's key without [`ConnEvent::Bonded`]. It reports
+//!   [`ConnEvent::Bonded`] only once the central acknowledged every fragment
+//!   sent so far, our Identity Address Information among them: the kernel
+//!   stores its bond only when that PDU arrives, and a bond the firmware stored
+//!   without it would make every reconnection fail. The
+//!   [`crate::host::smp::Bonded`] it gets is `Copy`, so the engine overwrites
+//!   its copy of the keys once the [`Bond`] holds them; the security manager
+//!   overwrites its own Diffie-Hellman key, `MacKey` and long term key.
 //! - It ends the link: [`SECURITY_FAILURE`] when the link is not encrypted
 //!   within the advertising schedule's security deadline (with the feature
 //!   `key-missing`, at once when the central of a reconnection asks for a key
@@ -166,6 +170,7 @@ use crate::{
         smp::{self, Job, JobResult, Outcome, Random, Reason, Responder},
     },
     link::{AclIn, ConnectionParams, Epoch, Event, Info, ParamRange},
+    pdu::IdentityAddress,
 };
 use core::mem;
 use embassy_time::{Duration, Instant};
@@ -673,7 +678,8 @@ impl Engine {
     const fn bond_key(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
         let bond = self.bond.as_ref()?;
         let info = &self.link.as_ref()?.info;
-        let bonded = info.identity == Some(bond.peer) || info.peer == bond.peer;
+        let peer = bond.peer.peer();
+        let bonded = info.identity == Some(peer) || info.peer == peer;
         (ediv == 0 && rand == [0; 8] && bonded).then_some(bond.ltk)
     }
 
@@ -1080,7 +1086,8 @@ impl Engine {
     #[cfg(feature = "eatt")]
     const fn is_bonded_central(&self) -> bool {
         let (Some(bond), Some(link)) = (self.bond.as_ref(), self.link.as_ref()) else { return false };
-        link.info.identity == Some(bond.peer) || link.info.peer == bond.peer
+        let peer = bond.peer.peer();
+        link.info.identity == Some(peer) || link.info.peer == peer
     }
 
     /// Whether the client of the link `epoch` enabled notifications of
@@ -1453,10 +1460,26 @@ impl Engine {
                 // A central without a key of its own that sends its identity
                 // address sends an all-zero key, as the Core specification
                 // allows: that is no key, so that the bond is stored and
-                // directed advertising reaches the central.
-                let (peer, irk) = match bonded.identity {
-                    Some(identity) => (identity.address, (identity.irk != [0; 16]).then_some(identity.irk)),
-                    None => (link.info.identity.unwrap_or(link.info.peer), None),
+                // directed advertising reaches the central. A central that
+                // sent no identity address is known by its resolved identity
+                // or its address on the air, if that is an identity address.
+                let known = match bonded.identity {
+                    Some(identity) => Some((identity.address, (identity.irk != [0; 16]).then_some(identity.irk))),
+                    None => link
+                        .info
+                        .identity
+                        .and_then(IdentityAddress::new)
+                        .or_else(|| IdentityAddress::new(link.info.peer))
+                        .map(|peer| (peer, None)),
+                };
+                let Some((peer, irk)) = known else {
+                    // A private address changes: a bond with it would never
+                    // find the central again. The link stays encrypted with
+                    // the pairing's key, and nothing is reported to store.
+                    warn!("pairing: the central has no identity address, so no bond");
+                    wipe(&mut bonded.ltk);
+                    self.events.changed = true;
+                    return;
                 };
                 let mut bond = Bond::new(peer, irk, bonded.ltk, self.variant, self.db);
                 bond.cccd = self.att.subscriptions().bits();

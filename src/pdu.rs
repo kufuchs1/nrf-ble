@@ -68,6 +68,9 @@ const _: () = {
 const RX_ADD_RANDOM: u8 = 0x80;
 /// Header bit marking the sender address as random.
 const TX_ADD_RANDOM: u8 = 0x40;
+/// The two most significant bits of a static random address, in its most
+/// significant octet.
+const STATIC_RANDOM: u8 = 0xC0;
 /// Length of the ADI field.
 #[cfg(feature = "extended-advertising")]
 const ADI_LEN: usize = 2;
@@ -218,6 +221,43 @@ impl Peer {
     #[inline]
     #[must_use = "the address is only built"]
     pub const fn new(address: [u8; ADDRESS_LEN], random: bool) -> Self { Self { address, random } }
+}
+
+/// An identity address: a [`Peer`] that is a public address, or a static
+/// random one (the two most significant bits set), and not zero.
+///
+/// A bond keeps only such an address: a resolvable or non-resolvable private
+/// address changes, so a bond with it would not find the central again.
+#[derive(Clone, Copy, Eq)]
+#[derive_const(PartialEq)]
+pub struct IdentityAddress(Peer);
+
+impl IdentityAddress {
+    /// `peer` as an identity address, or `None` if it is zero, or random
+    /// but not static.
+    #[inline]
+    #[must_use = "the address is only checked"]
+    pub const fn new(peer: Peer) -> Option<Self> {
+        let [.., top] = peer.address;
+        if peer.address == [0; ADDRESS_LEN] || (peer.random && top & STATIC_RANDOM != STATIC_RANDOM) {
+            None
+        } else {
+            Some(Self(peer))
+        }
+    }
+
+    /// The address with its type.
+    #[inline]
+    #[must_use = "the address is only read"]
+    pub const fn peer(self) -> Peer { self.0 }
+
+    /// `peer`, which a test gives as an identity address; it panics if it is
+    /// none.
+    #[cfg(test)]
+    pub(crate) const fn valid(peer: Peer) -> Self {
+        assert!(Self::new(peer).is_some(), "not an identity address");
+        Self(peer)
+    }
 }
 
 /// An advertising channel PDU as the radio sends it: header, then payload,

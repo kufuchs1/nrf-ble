@@ -9,6 +9,7 @@ use crate::{
         test_aes::Software,
     },
     link::Shared,
+    pdu::IdentityAddress,
 };
 use core::cell::RefCell;
 
@@ -110,7 +111,9 @@ fn identity(generation: u8) -> identity::Local {
 
 /// A bond with [`CENTRAL`] under our identity of generation 1, with the
 /// central's key if `irk`.
-fn bond(irk: bool) -> Bond { Bond::new(CENTRAL, irk.then_some(CENTRAL_IRK), [0x44; 16], Variant::new(0, 1), &DB) }
+fn bond(irk: bool) -> Bond {
+    Bond::new(IdentityAddress::valid(CENTRAL), irk.then_some(CENTRAL_IRK), [0x44; 16], Variant::new(0, 1), &DB)
+}
 
 #[test]
 fn structures_are_written_with_their_length_and_type() {
@@ -495,18 +498,12 @@ fn a_directed_phase_targets_the_bonded_central_s_identity_only_when_reconnecting
     assert!(!pairing.mode().directs(&phase));
     let params = pairing.mode().params(&phase);
     assert!(params.kind == Kind::ConnectableUndirected && params.interval == 32 && params.filter_policy == 0);
-    // A static random identity can be targeted. A central that sent no
-    // identity address keeps the address it paired from in the bond until
-    // the bond is stored (`Bond::from_bytes` refuses it): a private one,
-    // which cannot be targeted, so it gets undirected advertising, from the
-    // accept list only.
+    // A static random identity can be targeted. A private address, which
+    // cannot be, is no identity address, so no bond holds one.
     let mut bond = bond;
-    bond.peer = Peer::new([1, 2, 3, 4, 5, 0xC6], true);
+    bond.peer = IdentityAddress::valid(Peer::new([1, 2, 3, 4, 5, 0xC6], true));
     assert!(Mode::Reconnect(&bond).directs(&phase));
-    bond.peer = Peer::new([1, 2, 3, 4, 5, 0x46], true);
-    assert!(!Mode::Reconnect(&bond).directs(&phase));
-    let params = Mode::Reconnect(&bond).params(&phase);
-    assert!(params.kind == Kind::ConnectableUndirected && params.interval == 32 && params.filter_policy == 0x03);
+    assert!(IdentityAddress::new(Peer::new([1, 2, 3, 4, 5, 0x46], true)).is_none());
     // An undirected phase stays undirected.
     assert!(Mode::Reconnect(&bond).params(&example::PHASES[0]).kind == Kind::ConnectableUndirected);
 }
