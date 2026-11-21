@@ -333,55 +333,78 @@ impl End {
 #[non_exhaustive]
 pub struct Counters {
     /// Packets received with a CRC error.
-    pub crc_errors:      u32,
+    pub crc_errors:       u32,
     /// The time the crystal currently gets to start before an event, in
     /// microseconds: it grows by 100 us after each late start and shrinks by
     /// 2 us after each early one, within the chip's bounds.
-    pub crystal_lead_us: u32,
+    pub crystal_lead_us:  u32,
+    /// Decryptions the CCM did not finish, or ended with an error.
+    pub decrypt_timeouts: u32,
     /// The largest deviation of the central's anchor from where the link
     /// layer expected it, in microseconds, positive for a late anchor: the
     /// sum of both sleep clocks' drift, which [`Self::widening_us`] has to
     /// cover. Only anchors heard count.
-    pub drift_us:        i32,
+    pub drift_us:         i32,
     /// How the link ended, `None` while it runs.
-    pub end:             Option<End>,
+    pub end:              Option<End>,
     /// Connection events the link layer listened at.
-    pub events:          u32,
+    pub events:           u32,
+    /// Decryptions not started as the key stream was not complete by the
+    /// access address, or not in time.
+    pub keystream_late:   u32,
     /// Times the crystal was not running when the link layer needed it: at
     /// the clock's restart before an event, despite
     /// [`Self::crystal_lead_us`], or stopped while in use.
-    pub late_crystal:    u32,
+    pub late_crystal:     u32,
+    /// Encrypted packets with a payload whose MIC was checked.
+    pub mic_checked:      u32,
+    /// Packets whose MIC failed once and that the central was asked to send
+    /// again; a second failure with the same packet counter ends the link.
+    pub mic_retries:      u32,
     /// Events the link layer listened at without hearing the central.
-    pub missed:          u32,
+    pub missed:           u32,
     /// New data PDUs received.
-    pub received:        u32,
+    pub received:         u32,
+    /// Packets whose MIC failed on the fly and again when the CPU had the CCM
+    /// decrypt them after the event: the packet in RAM differs from what was
+    /// sent.
+    pub recheck_failed:   u32,
+    /// Packets whose MIC failed on the fly and passed when decrypted again
+    /// after the event: the decryption with the radio was corrupted.
+    pub recheck_passed:   u32,
     /// Packets the central sent again that the link layer had taken: the
     /// central missed its answer, or the answer came late.
-    pub retransmissions: u32,
+    pub retransmissions:  u32,
     /// Events not listened at: skipped with the peripheral latency, passed
     /// during a flash operation, or passed while a crystal that had stopped
     /// started again.
-    pub skipped:         u32,
+    pub skipped:          u32,
     /// The window widening the anchor of [`Self::drift_us`] was received
     /// with, in microseconds: the room the link layer allowed for the drift
     /// at that event.
-    pub widening_us:     u32,
+    pub widening_us:      u32,
 }
 
 impl Counters {
     /// No link yet, or a new one before its first report.
     const NONE: Self = Self {
-        crc_errors:      0,
-        crystal_lead_us: 0,
-        drift_us:        0,
-        end:             None,
-        events:          0,
-        late_crystal:    0,
-        missed:          0,
-        received:        0,
-        retransmissions: 0,
-        skipped:         0,
-        widening_us:     0,
+        crc_errors:       0,
+        crystal_lead_us:  0,
+        decrypt_timeouts: 0,
+        drift_us:         0,
+        end:              None,
+        events:           0,
+        keystream_late:   0,
+        late_crystal:     0,
+        mic_checked:      0,
+        mic_retries:      0,
+        missed:           0,
+        received:         0,
+        recheck_failed:   0,
+        recheck_passed:   0,
+        retransmissions:  0,
+        skipped:          0,
+        widening_us:      0,
     };
 }
 

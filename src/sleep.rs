@@ -14,12 +14,19 @@
 //! that comes in between still wakes it. Only the short waits for an RTC0
 //! compare a few ticks ahead use [`until_tick`], whose RTC0 TICK backstop
 //! ends a wait whose compare was written too late.
+//!
+//! While [`stay_awake`] holds, the waits poll instead: during an encrypted
+//! reception, where the CCM's DMA must not start as the CPU goes idle.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use cortex_m::{asm, peripheral::SCB};
 use embassy_nrf::{
     interrupt::{self, InterruptExt as _},
     pac::RTC0 as RTC,
 };
+
+/// Whether the waits poll instead of sleeping ([`stay_awake`]).
+static AWAKE: AtomicBool = AtomicBool::new(false);
 
 /// Bit of SCB SCR that turns a newly pending interrupt into a wake event.
 const SEVONPEND: u32 = 1_u32.strict_shl(4);
@@ -68,10 +75,21 @@ where
         if ready() {
             break;
         }
-        asm::wfe();
+        if !AWAKE.load(Ordering::Relaxed) {
+            asm::wfe();
+        }
     }
     clear();
 }
+
+/// Keeps the CPU awake in the waits while `awake` holds, until called again
+/// with false: from the start of a decryption's key stream until the end of
+/// the packet, on the nRF52832 a DMA transfer that starts as the CPU
+/// goes idle and its 64 MHz clock stops can be corrupted (anomaly 109),
+/// which a debugger's constant clocks hide. It costs the CPU's current for
+/// the receive window and the packets of encrypted events.
+#[inline]
+pub fn stay_awake(awake: bool) { AWAKE.store(awake, Ordering::Relaxed); }
 
 /// Sleeps until `ready` holds. `ready` must only depend on events whose
 /// interrupt is enabled in their peripheral and disabled in the NVIC; one

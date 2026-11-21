@@ -284,11 +284,41 @@ fn bad_mic_cannot_acknowledge_acl_or_move_sequence_numbers() {
     link.encryption.rx_on = true;
     link.tx_kind = TxKind::Acl;
     let shared = Shared::new();
+    // The first failure is refused: nothing taken or acknowledged, and the
+    // packet is checked again after the event.
+    assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &shared), Some(true));
+    assert_eq!(link.abort, None);
+    assert!(link.mic.unverified);
+    assert_eq!(link.encryption.mic_retry, Some(0));
+    assert!(!link.seq.sn && !link.seq.nesn && !link.seq.received);
+    assert_eq!(link.completed, 0);
+    assert_eq!(link.last_valid, 100);
+    assert_eq!((link.stats.mic_checked, link.stats.mic_retries), (1, 1));
+    // A second failure with the same packet counter ends the link.
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &shared), None);
     assert_eq!(link.abort, Some(ERROR_MIC_FAILURE));
     assert!(!link.seq.sn && !link.seq.nesn && !link.seq.received);
     assert_eq!(link.completed, 0);
     assert_eq!(link.last_valid, 100);
+}
+
+#[test]
+fn a_packet_whose_mic_failed_once_is_taken_when_it_passes_again() {
+    let mut link = connection();
+    link.encryption.rx_on = true;
+    link.tx_kind = TxKind::Acl;
+    let shared = Shared::new();
+    assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &shared), Some(true));
+    assert!(!link.seq.received && link.completed == 0);
+    // The central's retransmission, with the same sequence number and packet
+    // counter, passes: taken and acknowledging ours.
+    assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, true, 1999, &shared), Some(true));
+    assert_eq!(link.abort, None);
+    assert!(!link.mic.unverified);
+    assert!(link.seq.sn && link.seq.nesn && link.seq.received);
+    assert_eq!(link.completed, 1);
+    assert_eq!(link.last_valid, 1999);
+    assert_eq!((link.stats.mic_checked, link.stats.mic_retries), (2, 1));
 }
 
 #[test]
@@ -300,7 +330,11 @@ fn unverified_new_payloads_never_change_receive_sequence_state() {
             link.encryption.rx_on = true;
             link.tx_kind = TxKind::Acl;
             let result = link.receive(header, len, false, 999, &shared);
-            assert_ne!(result, Some(true), "header={header:#x}, len={len}");
+            if result == Some(true) {
+                // A new payload whose MIC failed for the first time: refused,
+                // not taken, and acknowledging nothing.
+                assert!(link.mic.unverified && link.abort.is_none(), "header={header:#x}, len={len}");
+            }
             assert!(!link.seq.nesn && !link.seq.received);
             let acknowledged = result == Some(false) && header & NESN != 0;
             assert_eq!(link.seq.sn, acknowledged);
