@@ -278,7 +278,8 @@ Against a build without the feature (flash of a firmware's release build; static
   crate keeps them: the long term key of `ltk_reply` once the link layer derived the session key from it, or when the
   link ends or on a reset if it never did; the session key, IVs and CCM state when the link ends; the identity
   resolving keys of the resolving list when the host removes them or on a reset, and the link layer task's copy of the
-  list after each advertising event and before a link runs. A copy the compiler makes on the stack is out of reach.
+  list after each advertising event, before the sleep to the next one, and before a link runs. A copy the compiler
+  makes on the stack is out of reach.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
   the new key without a disconnection. From the central's `LL_ENC_REQ` or `LL_PAUSE_ENC_REQ` until the procedure has
   finished, for a first start as for a refresh and also while the host looks up the key, the central may send only

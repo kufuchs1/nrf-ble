@@ -26,8 +26,9 @@ const HIGH_DUTY_INTERVAL_US: Micros = Micros(3750);
 
 /// The link layer task's copy of the advertising settings for one pass of
 /// its loop. The identity resolving keys of the copy are overwritten when it
-/// is dropped: at the end of the pass, or before a connection runs, as the
-/// host's resolving list keeps them.
+/// is dropped: after the advertising event, before the sleep to the next
+/// one, or before a connection runs, as the host's resolving list keeps
+/// them.
 struct Taken<'settings>(&'settings mut Settings);
 
 impl Deref for Taken<'_> {
@@ -120,13 +121,17 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         counters.log();
         let Some(Accepted { end, request, setup }) = event else {
             let next = started.after(interval(&settings).await);
+            let high_duty = settings.kind.is_high_duty();
+            // The sleep, up to an advertising interval, needs no key of the
+            // resolving list; the next pass takes the host's again.
+            drop(settings);
             // The sleep returns `SETUP_US` early, for a radio start the timer
             // triggers; advertising starts when it returns, so it sleeps that
             // much longer to keep the advertising interval. High duty cycle
             // directed advertising keeps the early start instead: its events
             // must be at most 3.75 ms apart, which the loop's own time would
             // otherwise exceed.
-            let wake = if settings.kind.is_high_duty() { next } else { next.after(SETUP) };
+            let wake = if high_duty { next } else { next.after(SETUP) };
             if !clock.sleep_until(wake, shared.changed()).await {
                 since = None;
             }
