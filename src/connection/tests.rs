@@ -1126,6 +1126,37 @@ fn a_parameter_request_during_another_instant_is_a_transaction_collision() {
     );
 }
 
+#[test]
+fn a_retained_update_event_holds_off_only_an_update_of_its_kind() {
+    let params = Event::ParamsUpdated { params: ConnectionParams::new(12, 0, 600), status: 0 };
+    let phy = Event::PhyUpdated { rx: 1, status: 0, tx: 1 };
+    let channel_map = [OP_CHANNEL_MAP_IND, 0x0F, 0xF0, 0x00, 0xFF, 0x01, 10, 0];
+    let phy_update = [OP_PHY_UPDATE_IND, 1, 1, 10, 0];
+    for retained in [params, phy] {
+        // A channel map update waits for no event.
+        let mut link = connection();
+        link.notifications[0] = Some(retained);
+        link.handle_control(&channel_map, false);
+        assert_eq!(link.abort, None);
+        assert!(link.channel_update.is_some());
+        // A connection update and a parameter request wait for the event of
+        // an earlier connection update, a PHY update for that of a PHY
+        // update.
+        let mut update = connection();
+        update.notifications[0] = Some(retained);
+        update.handle_control(&update_to(24), false);
+        assert_eq!(update.abort.is_some(), retained.is_params_update());
+        let mut request = connection();
+        request.notifications[0] = Some(retained);
+        request.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), false);
+        assert_eq!(request.remote_request.is_none(), retained.is_params_update());
+        let mut phys = connection();
+        phys.notifications[0] = Some(retained);
+        phys.handle_control(&phy_update, false);
+        assert_eq!(phys.abort.is_some(), retained.is_phy_update());
+    }
+}
+
 /// A connection update PDU to `interval` with the current latency and
 /// timeout at instant 10.
 fn update_to(interval: u8) -> [u8; 12] { [OP_CONNECTION_UPDATE_IND, 1, 0, 0, interval, 0, 0, 0, 0x58, 2, 10, 0] }

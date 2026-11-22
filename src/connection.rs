@@ -422,6 +422,19 @@ enum Request {
     Requested(At),
 }
 
+/// The host event of an earlier update that a procedure with an instant
+/// waits for while it is retained ([`Connection::instant_busy`]).
+#[derive(Clone, Copy)]
+enum Retained {
+    /// None: a channel map update tells the host nothing.
+    Nothing,
+    /// [`Event::ParamsUpdated`], for a connection update or a connection
+    /// parameter request.
+    ParamsUpdate,
+    /// [`Event::PhyUpdated`], for a PHY update.
+    PhyUpdate,
+}
+
 /// Kind of encryption start.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Procedure {
@@ -2012,8 +2025,7 @@ impl Connection {
                         self.abort = Some(ERROR_INVALID_PARAMETERS);
                     } else if !future_instant(self.counter, instant) {
                         self.abort = Some(ERROR_INSTANT_PASSED);
-                    } else if self.channel_update.is_some() || self.param_update.is_some() || self.phy_update.is_some()
-                    {
+                    } else if self.instant_busy(Retained::Nothing) {
                         self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                     } else {
                         self.channel_update = Some((UsedChannels::new(map), instant));
@@ -2130,11 +2142,7 @@ impl Connection {
                 };
                 if !future_instant(self.counter, update.instant) {
                     self.abort = Some(ERROR_INSTANT_PASSED);
-                } else if self.param_update.is_some()
-                    || self.phy_update.is_some()
-                    || self.channel_update.is_some()
-                    || self.notifications.iter().flatten().any(Event::is_params_update)
-                {
+                } else if self.instant_busy(Retained::ParamsUpdate) {
                     self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                 } else {
                     // The update answers a request of the host; the host
@@ -2156,11 +2164,7 @@ impl Connection {
                         OP_CONNECTION_PARAM_REQ,
                         ERROR_INVALID_PARAMETERS,
                     ]);
-                } else if self.param_update.is_some()
-                    || self.phy_update.is_some()
-                    || self.channel_update.is_some()
-                    || self.notifications.iter().flatten().any(Event::is_params_update)
-                {
+                } else if self.instant_busy(Retained::ParamsUpdate) {
                     self.enqueue(Llid::Control, &[
                         OP_REJECT_EXT_IND,
                         OP_CONNECTION_PARAM_REQ,
@@ -2218,11 +2222,7 @@ impl Connection {
         let instant = u16::from_le_bytes([instant0, instant1]);
         if !future_instant(self.counter, instant) {
             self.abort = Some(ERROR_INSTANT_PASSED);
-        } else if self.phy_update.is_some()
-            || self.param_update.is_some()
-            || self.channel_update.is_some()
-            || self.notifications.iter().flatten().any(Event::is_phy_update)
-        {
+        } else if self.instant_busy(Retained::PhyUpdate) {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
         } else if phy != self.phy || other != self.tx_phy {
             self.next_tx_phy = other;
@@ -2333,6 +2333,26 @@ impl Connection {
         if self.hold_until.is_none_or(const |current| current.reached_by(until)) {
             self.hold_until = Some(until);
         }
+    }
+
+    /// Whether a procedure with an instant the central starts collides with
+    /// one that is pending (Core, Vol 6, Part B, 5.3): a channel map,
+    /// connection or PHY update waits for its instant, or, as `retained`
+    /// says, the host has yet to receive the event of an earlier update of
+    /// the new one's kind, which a connection or PHY update waits for so that
+    /// the host learns of each update before the next one. A channel map
+    /// update tells the host nothing and waits for no event. The callers
+    /// differ only in that and in their answer: a connection, PHY or channel
+    /// map update ends the link, a connection parameter request is rejected.
+    fn instant_busy(&self, retained: Retained) -> bool {
+        self.channel_update.is_some()
+            || self.param_update.is_some()
+            || self.phy_update.is_some()
+            || self.notifications.iter().flatten().any(|event| match retained {
+                Retained::Nothing => false,
+                Retained::ParamsUpdate => event.is_params_update(),
+                Retained::PhyUpdate => event.is_phy_update(),
+            })
     }
 
     /// Event to listen at after skipping from the current one: as many as
