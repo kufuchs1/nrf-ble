@@ -377,6 +377,7 @@ use crate::{
         bond::Bond,
         engine::{Command, Engine},
         gatt::{AttError, Char, Db, Handler, Sec},
+        l2cap::Fragment,
         smp::{Random, Reason},
     },
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Link, Rx},
@@ -875,15 +876,7 @@ where
     /// Why it cannot be sent: never [`NotifyError::Busy`].
     #[inline]
     pub async fn notify(&self, characteristic: Char, data: &[u8]) -> Result<(), NotifyError> {
-        let _turn = self.host.notifier.lock().await;
-        loop {
-            match self.host.send_notification(self.epoch, characteristic, data) {
-                Err(NotifyError::Busy) => {},
-                result => return result,
-            }
-            self.host.wake.signal(());
-            self.host.room.wait().await;
-        }
+        self.notify_with(|| self.host.send_notification(self.epoch, characteristic, data)).await
     }
 
     /// Notifies `values`, each a characteristic and its value, in one
@@ -900,9 +893,19 @@ where
     #[cfg(feature = "eatt")]
     #[inline]
     pub async fn notify_multiple(&self, values: &[(Char, &[u8])]) -> Result<(), NotifyError> {
+        self.notify_with(|| self.host.send_multiple(self.epoch, values)).await
+    }
+
+    /// Tries `send` until it finds room, in the notifiers' turn, waiting for
+    /// room in between: the body of [`Self::notify`] and
+    /// [`Self::notify_multiple`].
+    async fn notify_with<F>(&self, mut send: F) -> Result<(), NotifyError>
+    where
+        F: FnMut() -> Result<(), NotifyError>,
+    {
         let _turn = self.host.notifier.lock().await;
         loop {
-            match self.host.send_multiple(self.epoch, values) {
+            match send() {
                 Err(NotifyError::Busy) => {},
                 result => return result,
             }
@@ -1306,31 +1309,25 @@ where
     /// notification.
     #[cfg(feature = "eatt")]
     fn send_multiple(&self, epoch: Epoch, values: &[(Char, &[u8])]) -> Result<(), NotifyError> {
-        self.with(|state| {
-            let result = state.engine.notification_multiple(epoch, values).and_then(|fragment| {
-                if self.port.queue_room() < 2 || self.port.fragments_in_flight(epoch) >= state.engine.notify_depth() {
-                    return Err(NotifyError::Busy);
-                }
-                self.port.send_fragment(epoch, fragment.start(), fragment.bytes()).map_err(|error| match error {
-                    link::Error::Full => NotifyError::Busy,
-                    link::Error::Disallowed
-                    | link::Error::Gone
-                    | link::Error::Invalid
-                    | link::Error::Unsupported
-                    | link::Error::UnsupportedRemote => NotifyError::Disconnected,
-                })
-            });
-            if result == Err(NotifyError::Busy) {
-                state.notify_waiting = true;
-            }
-            result
-        })
+        self.send_now(epoch, |engine| engine.notification_multiple(epoch, values))
     }
 
     /// Sends a notification on the link `epoch` if there is room now.
     fn send_notification(&self, epoch: Epoch, characteristic: Char, data: &[u8]) -> Result<(), NotifyError> {
+        self.send_now(epoch, |engine| engine.notification(epoch, characteristic, data))
+    }
+
+    /// Queues the fragment `take` takes from the engine on the link
+    /// `epoch` if there is room now: two free places in the link layer's
+    /// queue and fewer fragments in flight than the engine's notification
+    /// depth. Without room the run task wakes the notifier once room
+    /// returns.
+    fn send_now<F>(&self, epoch: Epoch, take: F) -> Result<(), NotifyError>
+    where
+        F: FnOnce(&Engine) -> Result<Fragment, NotifyError>,
+    {
         self.with(|state| {
-            let result = state.engine.notification(epoch, characteristic, data).and_then(|fragment| {
+            let result = take(&state.engine).and_then(|fragment| {
                 if self.port.queue_room() < 2 || self.port.fragments_in_flight(epoch) >= state.engine.notify_depth() {
                     return Err(NotifyError::Busy);
                 }

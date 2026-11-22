@@ -168,7 +168,7 @@ use crate::{
         Aes,
         ConnEvent,
         NotifyError,
-        att::{ATT_MAX, MTU, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
+        att::{ATT_MAX, MTU, NotifyError as AttNotifyError, Server, WRITE_COMMAND, WRITE_REQUEST, WRITE_RESPONSE},
         bond::Bond,
         gatt::{CCCD_MAX, Char, Db, Handler, Sec},
         identity::{self, Variant},
@@ -1140,6 +1140,18 @@ impl Engine {
         self.drop_closed();
     }
 
+    /// The security of the link: encrypted once it is with a key the host
+    /// gave, raised with the feature `passkey` ([`Self::security`]).
+    const fn level(&self) -> Sec {
+        let encrypted = self.link.as_ref().is_some_and(const |link| link.encrypted);
+        let encryption = if encrypted { Sec::Encrypted } else { Sec::Open };
+        #[cfg(feature = "passkey")]
+        let level = self.raised(encryption);
+        #[cfg(not(feature = "passkey"))]
+        let level = encryption;
+        level
+    }
+
     /// Answers the link layer's long term key request.
     fn ltk_request(&mut self, ediv: u16, rand: [u8; 8]) {
         #[cfg(not(feature = "passkey"))]
@@ -1266,23 +1278,7 @@ impl Engine {
     /// link layer's queue is the caller's to check.
     #[inline]
     pub fn notification(&self, epoch: Epoch, characteristic: Char, data: &[u8]) -> Result<Fragment, NotifyError> {
-        let link = self
-            .link
-            .as_ref()
-            .filter(|link| link.info.epoch == epoch && !link.fate.closing && link.ending.is_none())
-            .ok_or(NotifyError::Disconnected)?;
-        let encryption = if link.encrypted { Sec::Encrypted } else { Sec::Open };
-        #[cfg(feature = "passkey")]
-        let level = self.raised(encryption);
-        #[cfg(not(feature = "passkey"))]
-        let level = encryption;
-        let mut out: [u8; MTU] = [0; MTU];
-        let len = self.att.notify(characteristic, data, level, &mut out).map_err(NotifyError::from)?;
-        if self.sending.is_some_and(|(_, segmenter)| segmenter.is_mid_pdu()) {
-            return Err(NotifyError::Busy);
-        }
-        let bytes = out.get(..len).ok_or(NotifyError::TooLong)?;
-        Segmenter::new(Channel::Att, len).and_then(|segmenter| segmenter.fragment(bytes)).ok_or(NotifyError::TooLong)
+        self.notify_fragment(epoch, |att, level, out| att.notify(characteristic, data, level, out))
     }
 
     /// The Multiple Handle Value Notification of `values`, each a
@@ -1298,23 +1294,7 @@ impl Engine {
     #[cfg(feature = "eatt")]
     #[inline]
     pub fn notification_multiple(&self, epoch: Epoch, values: &[(Char, &[u8])]) -> Result<Fragment, NotifyError> {
-        let link = self
-            .link
-            .as_ref()
-            .filter(|link| link.info.epoch == epoch && !link.fate.closing && link.ending.is_none())
-            .ok_or(NotifyError::Disconnected)?;
-        let encryption = if link.encrypted { Sec::Encrypted } else { Sec::Open };
-        #[cfg(feature = "passkey")]
-        let level = self.raised(encryption);
-        #[cfg(not(feature = "passkey"))]
-        let level = encryption;
-        let mut out: [u8; MTU] = [0; MTU];
-        let len = self.att.notify_multiple(values, level, &mut out).map_err(NotifyError::from)?;
-        if self.sending.is_some_and(|(_, segmenter)| segmenter.is_mid_pdu()) {
-            return Err(NotifyError::Busy);
-        }
-        let bytes = out.get(..len).ok_or(NotifyError::TooLong)?;
-        Segmenter::new(Channel::Att, len).and_then(|segmenter| segmenter.fragment(bytes)).ok_or(NotifyError::TooLong)
+        self.notify_fragment(epoch, |att, level, out| att.notify_multiple(values, level, out))
     }
 
     /// How many fragments of the link may be in flight for a notification to
@@ -1322,6 +1302,26 @@ impl Engine {
     #[inline]
     #[must_use = "the depth is only read"]
     pub const fn notify_depth(&self) -> usize { usize::from(self.config.notify_depth.max(1)) }
+
+    /// The PDU `render` writes from the ATT server with the security of the
+    /// link `epoch`, a notification, as the one fragment it fits: the body
+    /// of [`Self::notification`] and [`Self::notification_multiple`].
+    fn notify_fragment<R>(&self, epoch: Epoch, render: R) -> Result<Fragment, NotifyError>
+    where
+        R: FnOnce(&Server, Sec, &mut [u8; MTU]) -> Result<usize, AttNotifyError>,
+    {
+        self.link
+            .as_ref()
+            .filter(|link| link.info.epoch == epoch && !link.fate.closing && link.ending.is_none())
+            .ok_or(NotifyError::Disconnected)?;
+        let mut out: [u8; MTU] = [0; MTU];
+        let len = render(&self.att, self.level(), &mut out).map_err(NotifyError::from)?;
+        if self.sending.is_some_and(|(_, segmenter)| segmenter.is_mid_pdu()) {
+            return Err(NotifyError::Busy);
+        }
+        let bytes = out.get(..len).ok_or(NotifyError::TooLong)?;
+        Segmenter::new(Channel::Att, len).and_then(|segmenter| segmenter.fragment(bytes)).ok_or(NotifyError::TooLong)
+    }
 
     /// Takes a fragment the link layer received, at `now`, with `crypto` for
     /// the security manager and `app` for the dynamic values.
@@ -1669,13 +1669,7 @@ impl Engine {
     #[inline]
     #[must_use = "the security is only read"]
     pub fn security(&self, epoch: Epoch) -> Option<Sec> {
-        let link = self.link.as_ref().filter(|link| link.info.epoch == epoch)?;
-        let encryption = if link.encrypted { Sec::Encrypted } else { Sec::Open };
-        #[cfg(feature = "passkey")]
-        let level = self.raised(encryption);
-        #[cfg(not(feature = "passkey"))]
-        let level = encryption;
-        Some(level)
+        self.link.as_ref().filter(|link| link.info.epoch == epoch).map(|_| self.level())
     }
 
     /// The response waiting in the slot `slot`, if any.
