@@ -2,7 +2,7 @@
 
 extern crate std;
 
-use super::*;
+use super::{encryption::KeyLookup, *};
 use crate::{
     link::{Epoch, Link, ParamRange},
     pdu::BUFFER_LEN,

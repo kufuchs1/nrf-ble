@@ -1,8 +1,16 @@
 //! Link encryption: the state of the encryption and of its start and pause
-//! procedures (Core, Vol 6, Part B, 5.1.3 and 5.1.4). The steps of the
-//! procedures stay with the connection, whose methods live in one file.
+//! procedures (Core, Vol 6, Part B, 5.1.3 and 5.1.4), which PDUs of the
+//! central each phase takes, and the steps that only change that state: the
+//! central's request taken, our half of the session key diversifier and IV,
+//! the session key. The steps that queue PDUs, set deadlines or tell the host
+//! stay with the connection (`Connection::handle_encryption` and
+//! `Connection::drive_encryption`), whose methods live in one file.
 
-use crate::crypto::{self, CONFIG_LEN, SCRATCH_LEN};
+use super::{OP_ENC_REQ, OP_ENC_RSP, OP_PAUSE_ENC_RSP, OP_START_ENC_RSP, OP_TERMINATE_IND, entropy::Material};
+use crate::{
+    crypto::{self, CONFIG_LEN, SCRATCH_LEN},
+    pdu::field,
+};
 
 /// The central's encryption request as the host looks up the key by it.
 #[derive(Clone, Copy, Eq)]
@@ -60,6 +68,25 @@ impl Phase {
         matches!(self, Self::AwaitingEntropy(_) | Self::AwaitingKey(..) | Self::Encrypted | Self::Paused | Self::Plain)
     }
 
+    /// Which control PDUs of the central this phase takes, as `(allowed,
+    /// can_answer)`: whether the PDU `code` is allowed, and whether a PDU of
+    /// the wrong length may be answered as unknown. While encryption starts
+    /// or pauses, the central may only take the procedure on or end the link
+    /// (Core, Vol 6, Part B, 5.1.3), for the first start as for a key
+    /// refresh, also while the host looks up the key. Any other answer would
+    /// be queued in front of the next step.
+    pub(super) const fn control_rule(self, code: u8) -> (bool, bool) {
+        match self {
+            Self::AwaitingEntropy(_) | Self::AwaitingKey(..) => (code == OP_TERMINATE_IND, false),
+            Self::Starting | Self::AwaitingStartResponse => {
+                (matches!(code, OP_START_ENC_RSP | OP_TERMINATE_IND), false)
+            },
+            Self::Pausing | Self::AwaitingPauseResponse => (matches!(code, OP_PAUSE_ENC_RSP | OP_TERMINATE_IND), false),
+            Self::Paused => (matches!(code, OP_ENC_REQ | OP_TERMINATE_IND), false),
+            Self::Encrypted | Self::Plain => (true, true),
+        }
+    }
+
     /// Whether no encryption procedure runs.
     pub(super) const fn is_idle(self) -> bool { matches!(self, Self::Encrypted | Self::Plain) }
 
@@ -111,6 +138,54 @@ pub(super) struct Encryption {
 }
 
 impl Encryption {
+    /// Takes our half of the session key diversifier and IV from one
+    /// complete prefetched block, `material`, and asks the host for the key
+    /// of `lookup` next. Returns our `LL_ENC_RSP` with that half. No hardware
+    /// RNG work runs here.
+    pub(super) const fn respond(&mut self, lookup: KeyLookup, material: &Material) -> [u8; 13] {
+        let mut response: [u8; 13] = [0; 13];
+        response[0] = OP_ENC_RSP;
+        response[1..].copy_from_slice(material.bytes());
+        self.skd[8..].copy_from_slice(&material.bytes()[..8]);
+        self.iv[4..].copy_from_slice(&material.bytes()[8..]);
+        self.phase = Phase::AwaitingKey(lookup, false);
+        response
+    }
+
+    /// Takes the long term key `ltk` for the session and overwrites it: the
+    /// session key from it and the session key diversifier, the CCM
+    /// configurations of both ways with the IV, and both packet counters from
+    /// zero. Returns false if the AES failed.
+    pub(super) fn set_key(&mut self, ltk: &mut [u8; 16]) -> bool {
+        let session = crypto::session_key(*ltk, self.skd);
+        crypto::wipe(ltk);
+        let Some(mut key) = session else { return false };
+        self.rx_config = crypto::config(key, self.iv, true);
+        self.tx_config = crypto::config(key, self.iv, false);
+        crypto::wipe(&mut key);
+        self.rx_counter = 0;
+        self.tx_counter = 0;
+        true
+    }
+
+    /// Takes the parameters of the central's `LL_ENC_REQ`: its half of the
+    /// session key diversifier and IV, and the EDIV and Rand the host looks
+    /// the key up by once our half is drawn. Returns false, changing
+    /// nothing, if they are too short.
+    pub(super) fn start(&mut self, params: &[u8]) -> bool {
+        let (Some(rand), Some(ediv), Some(central_skd), Some(central_iv)) =
+            (field::<8>(params, 0), field::<2>(params, 8), field::<8>(params, 10), field::<4>(params, 18))
+        else {
+            return false;
+        };
+        crypto::wipe(&mut self.skd);
+        crypto::wipe(&mut self.iv);
+        self.skd[..8].copy_from_slice(&central_skd);
+        self.iv[..4].copy_from_slice(&central_iv);
+        self.phase = Phase::AwaitingEntropy(KeyLookup { ediv, rand });
+        true
+    }
+
     /// Forgets the keys, the IVs and the session key diversifier of the
     /// link.
     pub(super) fn wipe(&mut self) {

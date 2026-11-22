@@ -45,7 +45,7 @@ use crate::{
 };
 use core::{iter, mem};
 use embassy_futures::select::{Either, select};
-use encryption::{Encryption, KeyLookup, Phase, Procedure};
+use encryption::{Encryption, Phase, Procedure};
 use entropy::Prefetch;
 use transmit::Ring;
 
@@ -1388,7 +1388,8 @@ impl Connection {
     fn drive_encryption(&mut self, shared: &Shared, entropy: &Prefetch) {
         if let Phase::AwaitingEntropy(lookup) = self.encryption.phase {
             let Some(material) = entropy.take() else { return };
-            self.finish_encryption_request(lookup, &material);
+            let response = self.encryption.respond(lookup, &material);
+            self.enqueue(Llid::Control, &response);
         }
         let Phase::AwaitingKey(lookup, requested) = self.encryption.phase else { return };
         if !requested {
@@ -1402,17 +1403,10 @@ impl Connection {
         let mut answer = shared.take_ltk();
         match answer.as_mut() {
             Some(&mut LtkAnswer::Key(ref mut ltk)) => {
-                let session = crypto::session_key(*ltk, self.encryption.skd);
-                crypto::wipe(ltk);
-                let Some(mut key) = session else {
+                if !self.encryption.set_key(ltk) {
                     self.abort = Some(ERROR_HARDWARE_FAILURE);
                     return;
-                };
-                self.encryption.rx_config = crypto::config(key, self.encryption.iv, true);
-                self.encryption.tx_config = crypto::config(key, self.encryption.iv, false);
-                crypto::wipe(&mut key);
-                self.encryption.rx_counter = 0;
-                self.encryption.tx_counter = 0;
+                }
                 crypto::enable();
                 self.enqueue(Llid::Control, &[OP_START_ENC_REQ]);
                 self.encryption.phase = Phase::Starting;
@@ -1802,17 +1796,6 @@ impl Connection {
         radio.set_phy(Phy::M1);
     }
 
-    /// Consumes one complete prefetched block; no hardware RNG work runs here.
-    const fn finish_encryption_request(&mut self, lookup: KeyLookup, material: &entropy::Material) {
-        let mut response: [u8; 13] = [0; 13];
-        response[0] = OP_ENC_RSP;
-        response[1..].copy_from_slice(material.bytes());
-        self.encryption.skd[8..].copy_from_slice(&material.bytes()[..8]);
-        self.encryption.iv[4..].copy_from_slice(&material.bytes()[8..]);
-        self.enqueue(Llid::Control, &response);
-        self.encryption.phase = Phase::AwaitingKey(lookup, false);
-    }
-
     /// First event from `from` up to `last` whose radio start is after
     /// `time`, or `last`. Starts move by at most one interval per event, so
     /// the whole intervals in between are passed at once.
@@ -1874,20 +1857,8 @@ impl Connection {
     fn handle_control(&mut self, payload: &[u8], encrypted: bool) {
         let Some((&code, params)) = payload.split_first() else { return };
         // While encryption starts or pauses, the central may only take the
-        // procedure on or end the link (Core, Vol 6, Part B, 5.1.3), for the
-        // first start as for a key refresh, also while the host looks up the
-        // key. Any other answer would be queued in front of the next step.
-        let (allowed, can_answer) = match self.encryption.phase {
-            Phase::AwaitingEntropy(_) | Phase::AwaitingKey(..) => (code == OP_TERMINATE_IND, false),
-            Phase::Starting | Phase::AwaitingStartResponse => {
-                (matches!(code, OP_START_ENC_RSP | OP_TERMINATE_IND), false)
-            },
-            Phase::Pausing | Phase::AwaitingPauseResponse => {
-                (matches!(code, OP_PAUSE_ENC_RSP | OP_TERMINATE_IND), false)
-            },
-            Phase::Paused => (matches!(code, OP_ENC_REQ | OP_TERMINATE_IND), false),
-            Phase::Encrypted | Phase::Plain => (true, true),
-        };
+        // procedure on or end the link (`Phase::control_rule`).
+        let (allowed, can_answer) = self.encryption.phase.control_rule(code);
         if !allowed {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
             return;
@@ -1968,7 +1939,11 @@ impl Connection {
                 }
                 self.encryption.procedure = if refresh { Procedure::Refresh } else { Procedure::First };
                 self.procedure_deadline = Some(self.last_valid.after(PROCEDURE_TIMEOUT_US));
-                self.start_encryption(params);
+                // Answered with our half once its entropy is ready
+                // (`drive_encryption`), which then asks the host for the key.
+                if !self.encryption.start(params) {
+                    self.enqueue(Llid::Control, &[OP_REJECT_IND, ERROR_UNSUPPORTED_FEATURE]);
+                }
             },
             OP_START_ENC_RSP => {
                 if !encrypted || self.encryption.phase != Phase::AwaitingStartResponse {
@@ -3069,22 +3044,6 @@ impl Connection {
             return;
         }
         self.encryption.armed = crypto::start_on_address(|| radio.has_address());
-    }
-
-    /// Answers an encryption request: sends the peripheral's session key
-    /// diversifier and IV and asks the host for the long term key.
-    fn start_encryption(&mut self, params: &[u8]) {
-        let (Some(rand), Some(ediv), Some(central_skd), Some(central_iv)) =
-            (field::<8>(params, 0), field::<2>(params, 8), field::<8>(params, 10), field::<4>(params, 18))
-        else {
-            self.enqueue(Llid::Control, &[OP_REJECT_IND, ERROR_UNSUPPORTED_FEATURE]);
-            return;
-        };
-        crypto::wipe(&mut self.encryption.skd);
-        crypto::wipe(&mut self.encryption.iv);
-        self.encryption.skd[..8].copy_from_slice(&central_skd);
-        self.encryption.iv[..4].copy_from_slice(&central_iv);
-        self.encryption.phase = Phase::AwaitingEntropy(KeyLookup { ediv, rand });
     }
 
     /// Starts the procedures of this side while no other runs: once the link
