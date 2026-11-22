@@ -97,8 +97,10 @@
 //! - A new key pair after a pairing that used ours ended without a bond, while
 //!   the engine is pairable: it runs while the failed link ends, so the next
 //!   pairable call advertises at once and its pairing computes only the
-//!   Diffie-Hellman key. Never during a pairing; a pairing that starts before
-//!   it is done waits for it.
+//!   Diffie-Hellman key (its Pairing Request gets Repeated Attempts until the
+//!   waiting interval of the failure is over; see [`smp`], "Repeated
+//!   attempts"). Never during a pairing; a pairing that starts before it is
+//!   done waits for it.
 //!
 //! A reconnection computes nothing, so a device that wakes from System OFF
 //! and reconnects gets its LTK reply at once; neither does the link after a
