@@ -1387,6 +1387,39 @@ fn entropy_wait_preserves_response_deadline_and_accepts_termination() {
 }
 
 #[test]
+fn while_the_host_looks_up_the_key_only_a_termination_is_accepted() {
+    let lookup = KeyLookup { ediv: [0; 2], rand: [0; 8] };
+    for procedure in [Procedure::First, Procedure::Refresh] {
+        for requested in [false, true] {
+            // A plain connection update, which would move the timing of a
+            // link that waits for its key: not applied, and the link ends.
+            let mut updated = connection();
+            updated.encryption.procedure = procedure;
+            updated.encryption.phase = Phase::AwaitingKey(lookup, requested);
+            updated.handle_control(&update_to(24), false);
+            assert_eq!(updated.abort, Some(ERROR_PDU_NOT_ALLOWED));
+            assert!(updated.param_update.is_none());
+            assert!(updated.queue.is_empty());
+            // Other PDUs alike, unknown ones and those of a wrong length too:
+            // no answer goes in front of our start request.
+            for payload in [&[OP_PING_REQ][..], &[OP_FEATURE_REQ, 0][..], &[0xF0][..], &[OP_TERMINATE_IND][..]] {
+                let mut refused = connection();
+                refused.encryption.phase = Phase::AwaitingKey(lookup, requested);
+                refused.handle_control(payload, false);
+                assert!(refused.abort.is_some());
+                assert!(refused.queue.is_empty());
+            }
+            // The central may end the link.
+            let mut ending = connection();
+            ending.encryption.phase = Phase::AwaitingKey(lookup, requested);
+            ending.handle_control(&[OP_TERMINATE_IND, 0x13], false);
+            assert_eq!(ending.abort, None);
+            assert_eq!(ending.terminated, Some(0x13));
+        }
+    }
+}
+
+#[test]
 fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_end() {
     let shared = Shared::new();
     let mut link = connection();

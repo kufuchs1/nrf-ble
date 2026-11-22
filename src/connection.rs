@@ -1965,10 +1965,11 @@ impl Connection {
     fn handle_control(&mut self, payload: &[u8], encrypted: bool) {
         let Some((&code, params)) = payload.split_first() else { return };
         // While encryption starts or pauses, the central may only take the
-        // procedure on or end the link (Core, Vol 6, Part B, 5.1.3). Any
-        // other answer would be queued in front of the next step.
+        // procedure on or end the link (Core, Vol 6, Part B, 5.1.3), for the
+        // first start as for a key refresh, also while the host looks up the
+        // key. Any other answer would be queued in front of the next step.
         let (allowed, can_answer) = match self.encryption.phase {
-            Phase::AwaitingEntropy(_) => (code == OP_TERMINATE_IND, false),
+            Phase::AwaitingEntropy(_) | Phase::AwaitingKey(..) => (code == OP_TERMINATE_IND, false),
             Phase::Starting | Phase::AwaitingStartResponse => {
                 (matches!(code, OP_START_ENC_RSP | OP_TERMINATE_IND), false)
             },
@@ -1976,7 +1977,7 @@ impl Connection {
                 (matches!(code, OP_PAUSE_ENC_RSP | OP_TERMINATE_IND), false)
             },
             Phase::Paused => (matches!(code, OP_ENC_REQ | OP_TERMINATE_IND), false),
-            Phase::AwaitingKey(..) | Phase::Encrypted | Phase::Plain => (true, true),
+            Phase::Encrypted | Phase::Plain => (true, true),
         };
         if !allowed {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);

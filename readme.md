@@ -266,14 +266,17 @@ Against a build without the feature (flash of a firmware's release build; static
   `Link::request_params` the host makes while it answers is part of that answer: it leaves an own request of the host
   alone and completes when the central's procedure ends, with the update or with the reason it ended. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
-  is answered as unknown.
+  is answered as unknown, except while encryption starts or pauses (see below), when it ends the link.
 - **Link end:** the host reads every packet the link acknowledged before it gets `Event::Disconnected`; requests of
   the host for a link that ended cannot reach the next one, and every link starts with the default authenticated
   payload timeout.
 - **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets. Keys the host gave, and the keys
   of a link, are overwritten once they are no longer needed.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
-  the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
+  the new key without a disconnection. From the central's `LL_ENC_REQ` or `LL_PAUSE_ENC_REQ` until the procedure has
+  finished, for a first start as for a refresh and also while the host looks up the key, the central may send only
+  the procedure's next PDU or `LL_TERMINATE_IND` (Core, Vol 6, Part B, 5.1.3): any other PDU, data or control, ends
+  the link unanswered. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
   or as long as the host sets: after three quarters of that time without one, the link layer pings the central at
   the next connection event it listens to anyway, so the ping breaks no run of skipped events; at the latest when
   twice the longest run of events (the latency plus one) is left of the time, and at once for a time too short for
