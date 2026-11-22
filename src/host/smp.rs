@@ -74,8 +74,8 @@
 //! extends an interval; nor does a pairing that the end of its link cut,
 //! which shows the central nothing a failure would. So a user who mistyped a
 //! passkey pairs again after 2 s, about the time the central takes to start the
-//! next attempt, while a central guessing passkeys gets one try a minute after
-//! six failures.
+//! next attempt, while a central guessing passkeys gets about one try a minute
+//! after six failures, and as few by waiting for the quiet time.
 //!
 //! # The timer
 //!
@@ -109,7 +109,9 @@
 //!   link), while Pairing Requests are taken, as soon as no job waits or runs
 //!   and no pairing is under way. The engine ends a link whose pairing failed,
 //!   and the next attempt follows on a new link, so the refill runs while the
-//!   link ends and the next pairable advertising starts at once. After a bond
+//!   link ends and the next pairable advertising starts at once; its Pairing
+//!   Request gets Repeated Attempts until the waiting interval of the failure
+//!   is over ([repeated attempts](self#repeated-attempts)). After a bond
 //!   nothing is computed: the link is in use (the central discovers the table,
 //!   the application sends its input), and the next pairing needs pairable
 //!   advertising again, which makes the key pair before it advertises.
