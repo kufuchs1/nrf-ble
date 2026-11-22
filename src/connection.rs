@@ -1494,10 +1494,13 @@ impl Connection {
             }
             return;
         }
-        match shared.take_ltk() {
-            Some(LtkAnswer::Key(mut ltk)) => {
-                let session = crypto::session_key(ltk, self.encryption.skd);
-                crypto::wipe(&mut ltk);
+        // Taken into one place, which is overwritten after the key derived
+        // the session key.
+        let mut answer = shared.take_ltk();
+        match answer.as_mut() {
+            Some(&mut LtkAnswer::Key(ref mut ltk)) => {
+                let session = crypto::session_key(*ltk, self.encryption.skd);
+                crypto::wipe(ltk);
                 let Some(mut key) = session else {
                     self.abort = Some(ERROR_HARDWARE_FAILURE);
                     return;
@@ -1511,11 +1514,11 @@ impl Connection {
                 self.enqueue(Llid::Control, &[OP_START_ENC_REQ]);
                 self.encryption.phase = Phase::Starting;
             },
-            Some(LtkAnswer::Missing) if self.encryption.procedure == Procedure::Refresh => {
+            Some(&mut LtkAnswer::Missing) if self.encryption.procedure == Procedure::Refresh => {
                 // The link stays paused without a key: end it.
                 self.abort = Some(ERROR_KEY_MISSING);
             },
-            Some(LtkAnswer::Missing) => {
+            Some(&mut LtkAnswer::Missing) => {
                 self.enqueue(Llid::Control, &[OP_REJECT_IND, ERROR_KEY_MISSING]);
                 self.encryption.phase = Phase::Plain;
                 self.procedure_deadline = None;

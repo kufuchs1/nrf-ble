@@ -273,8 +273,12 @@ Against a build without the feature (flash of a firmware's release build; static
   gets `Event::Disconnected`; requests of
   the host for a link that ended cannot reach the next one, and every link starts with the default authenticated
   payload timeout.
-- **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets. Keys the host gave, and the keys
-  of a link, are overwritten once they are no longer needed.
+- **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets.
+- **Keys:** keys the host gave, and the keys of a link, are overwritten once they are no longer needed, where the
+  crate keeps them: the long term key of `ltk_reply` once the link layer derived the session key from it, or when the
+  link ends or on a reset if it never did; the session key, IVs and CCM state when the link ends; the identity
+  resolving keys of the resolving list when the host removes them or on a reset, and the link layer task's copy of the
+  list after each advertising event and before a link runs. A copy the compiler makes on the stack is out of reach.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
   the new key without a disconnection. From the central's `LL_ENC_REQ` or `LL_PAUSE_ENC_REQ` until the procedure has
   finished, for a first start as for a refresh and also while the host looks up the key, the central may send only
