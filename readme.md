@@ -38,8 +38,8 @@ What it holds:
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
   feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
-- L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer that is overwritten after each PDU, as
-  are the engine's copy of the PDU and the run task's received fragment, fragmenting on demand), LE signalling
+- L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer that is overwritten after each PDU, a dropped one
+  too, as   are the engine's copy of the PDU and the run task's received fragment, fragmenting on demand), LE signalling
   (`host::signal`: the connection parameter update request and command rejects), with the feature `eatt` the credit
   based channels of the enhanced ATT bearers (`host::ecfc`), the ATT server at MTU 23, or up to 65 with the feature
   `att-mtu` (`host::att`; with `eatt` also Read Multiple Variable Length, Prepare and Execute Write and Multiple Handle

@@ -1287,6 +1287,12 @@ impl Engine {
             }
             (pdu.channel, pdu.encrypted, len)
         }) else {
+            // A dropped PDU, or one on a CID we do not serve, may hold keys
+            // as well: its octets are overwritten. A PDU still being received
+            // keeps them.
+            if !self.rx.receiving() {
+                self.rx.wipe();
+            }
             // A K-frame too long for the buffer closes its bearer.
             #[cfg(feature = "eatt")]
             if let Some(bearer) = self.rx.take_overlong() {
