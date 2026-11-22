@@ -686,10 +686,7 @@ impl Engine {
     /// `rand`: only EDIV 0 and Rand 0, and only for the bonded central.
     const fn bond_key(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
         let bond = self.bond.as_ref()?;
-        let info = &self.link.as_ref()?.info;
-        let peer = bond.peer.peer();
-        let bonded = info.identity == Some(peer) || info.peer == peer;
-        (ediv == 0 && rand == [0; 8] && bonded).then_some(bond.ltk)
+        (ediv == 0 && rand == [0; 8] && self.is_bonded_central()).then_some(bond.ltk)
     }
 
     /// Returns the link that arrived for the advertising call that waits, or
@@ -1095,7 +1092,6 @@ impl Engine {
     /// Whether the central of the link is the bonded one, by its resolved
     /// identity or its address on the air: the one [`Self::bond_key`] gives
     /// the key.
-    #[cfg(feature = "eatt")]
     const fn is_bonded_central(&self) -> bool {
         let (Some(bond), Some(link)) = (self.bond.as_ref(), self.link.as_ref()) else { return false };
         let peer = bond.peer.peer();
