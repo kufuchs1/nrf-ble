@@ -262,10 +262,10 @@ fn security_notification_survives_host_queue_pressure() {
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
     link.handle_control(&[OP_START_ENC_RSP], true);
-    link.process(&PacketBuffer::ZERO, true, &full);
+    link.process(&full);
     assert_eq!(link.encryption_change, Some((0, true)));
     let available = Shared::new();
-    link.process(&PacketBuffer::ZERO, true, &available);
+    link.process(&available);
     assert_eq!(link.encryption_change, None);
     assert_eq!(available.take_event(), Some(Event::Encryption { on: true, refresh: false, status: 0 }));
     assert_eq!(queued(&available), 0);
@@ -397,7 +397,8 @@ fn empty_packets_use_raw_header_instead_of_stale_ccm_output() {
     rx.0[0] = Llid::Continuation.bits();
     let shared = Shared::new();
     assert_eq!(link.receive(rx.0[0], 0, true, 999, &shared), Some(true));
-    link.process(&rx, true, &shared);
+    link.stash(&rx, true, &shared);
+    link.process(&shared);
     assert_eq!(link.encryption.rx_counter, 0);
     assert_eq!(link.abort, None);
     assert_eq!(link.stats.received, 1);
@@ -1505,7 +1506,7 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
     rx.0[0] = Llid::Continuation.bits();
     rx.0[1] = 0;
     link.stash(&rx, false, &shared);
-    link.process(&rx, false, &shared);
+    link.process(&shared);
     assert_eq!(
         shared.take_acl_in().map(|acl| (acl.payload()[0], acl.start(), acl.encrypted())),
         Some((0xA1, true, false))
@@ -1530,7 +1531,7 @@ fn receive_long_control(link: &mut Connection, opcode: u8, shared: &Shared) {
     rx.0[DATA_HEADER_LEN + 1..DATA_HEADER_LEN + 40].fill(0x11);
     assert_eq!(link.receive(rx.0[0], 40, true, 999, shared), Some(true));
     link.stash(&rx, false, shared);
-    link.process(&rx, false, shared);
+    link.process(shared);
 }
 
 #[cfg(feature = "data-length")]
@@ -2203,7 +2204,7 @@ fn encrypted_data_is_marked_before_the_host_learns_of_the_encryption() {
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
     link.handle_control(&[OP_START_ENC_RSP], true);
-    link.process(&PacketBuffer::ZERO, true, &full);
+    link.process(&full);
     // The encryption change waits for room; data arrives meanwhile.
     assert_eq!(link.encryption_change, Some((0, true)));
     let mut rx = PacketBuffer::ZERO;
@@ -2249,7 +2250,7 @@ fn acknowledged_host_packets_are_counted_for_the_host() {
     assert!(link.tx_kind == TxKind::Acl);
     assert_eq!(link_api.in_flight(epoch), 1);
     assert_eq!(link.acknowledge(NESN, &shared), Some(()));
-    link.process(&PacketBuffer::ZERO, false, &shared);
+    link.process(&shared);
     assert_eq!(link_api.in_flight(epoch), 0);
     assert_eq!(link_api.acked(), 1);
 }

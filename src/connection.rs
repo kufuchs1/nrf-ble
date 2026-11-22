@@ -2723,13 +2723,11 @@ impl Connection {
     /// which data length extension lets a central send, comes cut to it: the
     /// length then matches no PDU this side knows, so it is answered as one
     /// of the wrong length or an unknown one, not dropped after its
-    /// acknowledgement.
+    /// acknowledgement. Each new packet was stashed by the answer that took
+    /// it ([`Self::after_answer`]).
     #[inline(never)]
-    fn process(&mut self, rx: &PacketBuffer, encrypted: bool, shared: &Shared) {
+    fn process(&mut self, shared: &Shared) {
         self.flush_notifications(shared);
-        if self.seq.received {
-            self.stash(rx, encrypted, shared);
-        }
         while let Some(held) = self.pending.front_mut() {
             let mut packet = *held;
             crypto::wipe(&mut held.bytes);
@@ -3055,7 +3053,6 @@ impl Connection {
             radio.set_phy(self.phy);
             radio.set_tx_power(tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()));
             self.stats.events = self.stats.events.wrapping_add(1);
-            let encrypted = self.encryption.phase.rx_on();
             let heard_before = self.listening();
             if let Some(address) = self.exchange(radio, clock, rx, window, shared) {
                 self.exchanged(address);
@@ -3067,7 +3064,7 @@ impl Connection {
             if self.counter == 0 {
                 log_radio(radio);
             }
-            self.process(rx, encrypted, shared);
+            self.process(shared);
             if let Some(ended) = self.ended(clock.now()) {
                 break ended;
             }
