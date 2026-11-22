@@ -31,7 +31,10 @@ What it holds:
   already encrypted (a central that pairs again, or one that replaces a Just Works key with Passkey Entry) ends with
   the key refresh to the pairing's key as a first pairing ends with the encryption; only an encryption with the pairing's
   own key ends it, so a refresh with the bond's key that the central started before our `DHKey` check leaves the pairing
-  waiting until its 30 s timer ends the link, and gives no bond and no authenticated level. The P-256 multiplications are
+  waiting until its 30 s timer ends the link, and gives no bond and no authenticated level. After a failed pairing a
+  Pairing Request gets Repeated Attempts (0x09) for a waiting interval that outlives the link: 2 s after the first
+  failure, doubled with each further one up to 60 s, back to 2 s after 60 s without one past the interval, and ended by
+  a bond (see `host::smp`). The P-256 multiplications are
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
   feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
@@ -478,7 +481,8 @@ So the multiplications run only where a pairing needs them:
 - The Diffie-Hellman key, once our public key and confirm value are queued; with Passkey Entry, while the user types.
 - A new key pair after a pairing that used ours ended without a bond (failed by either side, timed out or cut by the
   end of the link), while the engine is pairable, from 32 fresh octets of the RNG as for any key pair. The engine ends
-  a link whose pairing failed, so this runs while that link ends, and the next pairable call advertises at once. Never
+  a link whose pairing failed, so this runs while that link ends, and the next pairable call advertises at once (its
+  Pairing Request answered with Repeated Attempts until the waiting interval of the failure is over). Never
   during a pairing; a pairing that starts before it is done waits for it.
 
 Nothing else is computed. A reconnection computes nothing, so a device that wakes from System OFF and reconnects gets

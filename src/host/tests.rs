@@ -1007,6 +1007,8 @@ fn a_pairing_that_stalls_times_out_and_a_failed_one_ends_once_flushed() {
     link.disconnect_link(0x16);
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x16));
+    // The waiting interval of Repeated Attempts passes.
+    link.advance(2_000);
 
     // A central whose request lacks Secure Connections: our Pairing Failed
     // goes out, and the link ends once it was acknowledged.
@@ -1082,6 +1084,45 @@ fn a_pairing_failed_from_the_central_ends_the_link_at_once() {
     assert!(smp(link, &mut tasks, &[0x05, 0x08], false).is_empty());
     assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
     assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::UNSPECIFIED));
+    assert_eq!(multiplications.get(), 1);
+}
+
+#[test]
+fn a_pairing_request_soon_after_a_failed_pairing_gets_repeated_attempts() {
+    let host = host(Unclaimed::Keep);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let local = local_rpa();
+    let central = Central::new(linux_request(true, true), local);
+    // The first attempt fails, the user mistyped; the second, 1.5 s later on
+    // a new link, comes within the waiting interval; the third after it.
+    for (attempt, answer) in [(0_u8, 0x02_u8), (1, 0x05), (2, 0x02)] {
+        let mut advertise = pin!(host.advertise(&advertising, &identity));
+        assert!(poll(advertise.as_mut()).is_pending());
+        tasks.step();
+        assert!(poll(advertise.as_mut()).is_pending());
+        link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
+        tasks.step();
+        let conn = ready(advertise.as_mut()).unwrap();
+        link.calls();
+        let response = smp(link, &mut tasks, &central.request, false);
+        assert_eq!(response[0][0], answer, "attempt {attempt}");
+        if answer == 0x02 {
+            assert!(smp(link, &mut tasks, &[0x05, 0x04], false).is_empty());
+            assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::CONFIRM_VALUE_FAILED));
+        } else {
+            assert_eq!(response, [vec![0x05, 0x09]]);
+            tasks.step();
+            assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::REPEATED_ATTEMPTS));
+        }
+        assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
+        link.disconnect_link(0x16);
+        tasks.step();
+        assert_eq!(next!(conn), ConnEvent::Disconnected(0x16));
+        link.advance(if attempt == 0 { 1_500 } else { 500 });
+    }
     assert_eq!(multiplications.get(), 1);
 }
 
@@ -2531,6 +2572,8 @@ fn a_passkey_refused_by_the_user_fails_the_pairing_and_ends_the_link() {
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x16));
     assert_eq!(conn.enter_passkey(Some(1)), Err(PasskeyError::Gone));
+    // The waiting interval of Repeated Attempts passes.
+    link.advance(2_000);
 
     // A central without input or output is refused at its request.
     let mut advertise = pin!(host.advertise(&advertising, &identity));
@@ -2633,10 +2676,16 @@ fn a_just_works_key_stays_unauthenticated_when_a_passkey_pairing_starts_on_its_l
     assert_eq!(link.deliver().len(), 2);
     assert_eq!(conn.security(), Some(Sec::Encrypted));
     // In place of its identity keys, a Pairing Request, which fails the
-    // pairing under way; then one claiming a display, which starts Passkey
+    // pairing under way; then one claiming a display, refused with Repeated
+    // Attempts within the waiting interval, and after it starting Passkey
     // Entry on the link still encrypted with the Just Works key.
     let display = Central::new(request_with_io(0x04), local);
     assert_eq!(smp(link, &mut tasks, &display.request, true), [vec![0x05, 0x08]]);
+    assert_eq!(smp(link, &mut tasks, &display.request, true), [vec![0x05, 0x09]]);
+    link.advance(2_000);
+    tasks.step();
+    // The connection parameter request that went out meanwhile.
+    link.deliver();
     assert_eq!(smp(link, &mut tasks, &display.request, true), [vec![0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]]);
     // The key of the link is still that of Just Works.
     assert_eq!(conn.security(), Some(Sec::Encrypted));
@@ -2799,6 +2848,8 @@ fn a_failed_pairing_is_followed_by_a_new_key_pair_and_a_bond_by_none() {
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x05));
     link.calls();
+    // The waiting interval of Repeated Attempts passes.
+    link.advance(2_000);
 
     // The next pairable call advertises at once, and its pairing computes
     // only the Diffie-Hellman key, with a public key never shown before.

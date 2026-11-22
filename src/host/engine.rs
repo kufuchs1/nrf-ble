@@ -836,7 +836,7 @@ impl Engine {
     /// ([`Responder::encryption_changed`]): the security manager knows
     /// whether its key went to the link layer.
     fn encryption(&mut self, on: bool, refresh: bool, now: Instant) {
-        let outcome = self.smp.encryption_changed(on);
+        let outcome = self.smp.encryption_changed(on, now);
         if let Some(link) = self.link.as_mut()
             && let Some(key) = link.key
         {
@@ -1117,7 +1117,7 @@ impl Engine {
     where
         C: Aes + Random,
     {
-        let outcome = self.smp.job_done(crypto, result);
+        let outcome = self.smp.job_done(crypto, result, now);
         self.outcome(outcome, now);
     }
 
