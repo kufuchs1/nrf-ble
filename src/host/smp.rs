@@ -117,7 +117,10 @@
 //! `MacKey` once both check values are computed, and the long term key once the
 //! pairing ends: handed over in [`Bonded`], or failed. The private key is
 //! [`ecc::KeyPair`]'s to overwrite, when the Diffie-Hellman job drops it, or
-//! the end of its pairing does.
+//! the end of its pairing does. The PDUs that carry the central's keys and
+//! values are overwritten once handled: the engine's copy and the L2CAP
+//! reassembly buffer by the engine, the link layer's fragment by the host's
+//! run task.
 //!
 //! # Byte order
 //!
@@ -178,6 +181,8 @@ pub mod ecc;
 pub mod toolbox;
 
 #[cfg(feature = "passkey")]
+use crate::crypto::forget;
+#[cfg(feature = "passkey")]
 use crate::host::PasskeyError;
 use crate::{
     crypto::wipe,
@@ -186,11 +191,6 @@ use crate::{
     pdu::{IdentityAddress, Peer, concat_into},
 };
 use core::{array::TryFromSliceError, fmt, mem};
-#[cfg(feature = "passkey")]
-use core::{
-    hint::black_box,
-    sync::atomic::{Ordering, compiler_fence},
-};
 use ecc::{KEY_LEN, KeyError, KeyPair, PUBLIC_KEY_LEN, check_public_key};
 use embassy_time::{Duration, Instant};
 use toolbox::{address, f4, f5, f6};
@@ -1556,17 +1556,6 @@ fn flip_coordinates(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] {
         coordinate.reverse();
     }
     out
-}
-
-/// Overwrites a passkey with `blank`, out of the range of passkeys, once it
-/// is no longer needed, so its digits do not outlive their use in RAM, as
-/// [`wipe`] does with key material.
-#[cfg(feature = "passkey")]
-pub(crate) fn forget(passkey: &mut u32, blank: u32) {
-    *passkey = blank;
-    // Keeps the compiler from dropping the store.
-    black_box(passkey);
-    compiler_fence(Ordering::SeqCst);
 }
 
 /// `value` in the other byte order.

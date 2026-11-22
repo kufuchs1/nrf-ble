@@ -428,6 +428,17 @@ pub(crate) fn wipe(bytes: &mut [u8]) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Overwrites `value` with `blank` once it is no longer needed, as [`wipe`]
+/// overwrites octets: a passkey with one out of the range of passkeys, a
+/// received fragment with an empty one.
+#[inline]
+pub(crate) fn forget<T>(value: &mut T, blank: T) {
+    *value = blank;
+    // Keeps the compiler from dropping the store.
+    black_box(value);
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Waits for the decryption of the received packet and returns whether its
 /// MIC is valid. `None` means a hardware error or an incomplete transfer.
 #[inline]

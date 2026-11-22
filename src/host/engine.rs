@@ -152,6 +152,8 @@
 //! without the feature `att-mtu`, an ATT MTU above 23.
 
 #[cfg(feature = "passkey")]
+use crate::crypto::forget;
+#[cfg(feature = "passkey")]
 use crate::host::PasskeyError;
 #[cfg(feature = "param-requests")]
 use crate::host::RequestError;
@@ -771,7 +773,7 @@ impl Engine {
         self.sig_reply = None;
         self.sig_req = None;
         #[cfg(feature = "passkey")]
-        smp::forget(&mut self.passkey_input, smp::NO_PASSKEY);
+        forget(&mut self.passkey_input, smp::NO_PASSKEY);
         self.commands.disconnect = None;
         if let Some(entry) = self.commands.ltk.as_mut()
             && let Some(key) = entry.1.as_mut()
@@ -1383,7 +1385,10 @@ impl Engine {
             #[cfg(feature = "eatt")]
             Channel::Eatt(bearer) => self.kframe(app, bearer, pdu, encrypted, now),
         }
+        // The PDU may hold the central's keys or values of its pairing: the
+        // copy and the reassembly buffer are overwritten.
         wipe(&mut buffer);
+        self.rx.wipe();
     }
 
     /// Takes an event of the link layer at `now`, but for
@@ -1856,7 +1861,7 @@ impl Engine {
         if typed == smp::NO_PASSKEY {
             return;
         }
-        smp::forget(&mut self.passkey_input, smp::NO_PASSKEY);
+        forget(&mut self.passkey_input, smp::NO_PASSKEY);
         let passkey = (typed != REFUSED).then_some(typed);
         let outcome = self.smp.passkey(crypto, passkey, now).unwrap_or_default();
         self.outcome(outcome, now);

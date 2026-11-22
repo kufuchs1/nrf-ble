@@ -370,7 +370,7 @@ pub mod signal;
 pub mod smp;
 
 use crate::{
-    crypto::{encrypt_block, wipe},
+    crypto::{encrypt_block, forget, wipe},
     host::{
         adv::{Advertising, Call, Control, Mode},
         att::NotifyError as AttNotifyError,
@@ -1287,7 +1287,11 @@ where
             };
             let woken = select4(self.port.receive(&mut acl), timer, room_changed, self.wake.wait()).await;
             match woken {
-                Either4::First(rx) => self.receive(rx, &acl, app, crypto),
+                Either4::First(rx) => {
+                    self.receive(rx, &acl, app, crypto);
+                    // It may have carried keys of a pairing.
+                    forget(&mut acl, AclIn::EMPTY);
+                },
                 Either4::Third(()) => {
                     self.with(|state| state.notify_waiting = false);
                     self.room.signal(());

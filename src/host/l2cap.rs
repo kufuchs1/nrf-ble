@@ -10,6 +10,8 @@
 //! 0x0040 + `ecfc::BEARERS` − 1 for the enhanced bearers (`Channel::Eatt`);
 //! any other CID is dropped.
 //! The PDU is encrypted only if each of its fragments was received encrypted.
+//! Its owner overwrites the buffer once it took a complete PDU
+//! ([`Reassembly::wipe`]), which also clears what a dropped PDU left there.
 //! With `eatt`, a PDU too long for the buffer on a bearer's CID is reported
 //! (`Reassembly::take_overlong`): it is a K-frame longer than the bearer's
 //! MPS, on which the channel has to be closed.
@@ -34,7 +36,7 @@ use crate::host::{
     att::ATT_MAX,
     ecfc::{BearerId, MPS},
 };
-use crate::{link::AclIn, pdu::concat_into};
+use crate::{crypto::wipe, link::AclIn, pdu::concat_into};
 
 /// Length of the basic L2CAP header: payload length and channel identifier.
 pub const HEADER_LEN: usize = 4;
@@ -219,6 +221,10 @@ impl Fragment {
 }
 
 impl Reassembly {
+    /// The buffer, for the tests of its wiping.
+    #[cfg(test)]
+    pub(crate) const fn buffer(&self) -> &[u8; RX_MAX] { &self.buffer }
+
     /// Drops the PDU being received.
     const fn drop_pdu(&mut self) -> Option<Pdu<'_>> {
         self.active = false;
@@ -296,6 +302,16 @@ impl Reassembly {
     #[inline]
     #[must_use = "the report is taken only once"]
     pub const fn take_overlong(&mut self) -> Option<BearerId> { self.overlong.take() }
+
+    /// Overwrites the buffer, once the PDU it completed was taken: it may
+    /// hold the keys of a pairing, as may the rest of a dropped PDU. A PDU
+    /// being received is dropped.
+    #[inline]
+    pub fn wipe(&mut self) {
+        wipe(&mut self.buffer);
+        self.active = false;
+        self.len = 0;
+    }
 }
 
 impl Default for Reassembly {

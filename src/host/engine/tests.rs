@@ -173,6 +173,21 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_long_response() {
 }
 
 #[test]
+fn a_received_pdu_leaves_no_copy_in_the_reassembly_buffer() {
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(9);
+    let identity = identity();
+    engine.advertise(true, &identity, None, Duration::from_secs(60));
+    engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
+    let central = Central::new(linux_request(true, true), local_rpa());
+    receive(&mut engine, &mut device, 6, &central.request, at(0));
+    assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
+    // The central's public key, in three fragments.
+    receive(&mut engine, &mut device, 6, &central.public_key(), at(0));
+    assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
+}
+
+#[test]
 fn the_parameter_request_leaves_the_last_place_to_responses() {
     let identity = identity();
     let bond = Bond::new(

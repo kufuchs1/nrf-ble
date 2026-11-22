@@ -32,6 +32,24 @@ fn a_public_key_is_joined_from_27_27_and_15_octets() {
 }
 
 #[test]
+fn wiping_overwrites_the_buffer_and_drops_a_pdu_being_received() {
+    let frame = public_key_frame();
+    let mut reassembly = Reassembly::new();
+    reassembly.push(true, true, &frame[..27]);
+    reassembly.push(false, true, &frame[27..54]);
+    assert!(reassembly.push(false, true, &frame[54..]).is_some());
+    assert_ne!(reassembly.buffer(), &[0; RX_MAX]);
+    reassembly.wipe();
+    assert_eq!(reassembly.buffer(), &[0; RX_MAX]);
+    // A PDU part received is dropped with the octets.
+    reassembly.push(true, true, &frame[..27]);
+    reassembly.wipe();
+    assert_eq!(reassembly.buffer(), &[0; RX_MAX]);
+    assert_eq!(reassembly.push(false, true, &frame[27..54]), None);
+    assert_eq!(reassembly.buffer(), &[0; RX_MAX]);
+}
+
+#[test]
 fn the_buffer_holds_the_largest_pdu_and_no_more() {
     assert_eq!(RX_MAX, 72);
     let mut reassembly = Reassembly::new();
