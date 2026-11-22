@@ -267,7 +267,10 @@ Against a build without the feature (flash of a firmware's release build; static
   alone and completes when the central's procedure ends, with the update or with the reason it ended. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
   is answered as unknown, except while encryption starts or pauses (see below), when it ends the link.
-- **Link end:** the host reads every packet the link acknowledged before it gets `Event::Disconnected`; requests of
+- **Link end:** a link whose central sends nothing in its first six connection intervals ends with Connection Failed
+  to be Established (0x3E); the supervision timeout runs from the central's first packet on, also where it is shorter
+  than those six intervals (Core, Vol 6, Part B, 4.5.2). The host reads every packet the link acknowledged before it
+  gets `Event::Disconnected`; requests of
   the host for a link that ended cannot reach the next one, and every link starts with the default authenticated
   payload timeout.
 - **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets. Keys the host gave, and the keys

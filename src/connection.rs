@@ -1660,6 +1660,9 @@ impl Connection {
 
     /// Determines timeouts without allowing received traffic to postpone a
     /// pending local disconnect or the initial connection establishment.
+    /// Until the central's first packet only the establishment deadline of
+    /// six intervals applies; the supervision timeout runs from that packet
+    /// on (Core, Vol 6, Part B, 4.5.2), and may be shorter.
     const fn ended(&self, now: At) -> Option<Ended> {
         if let Some(reason) = self.abort {
             return Some(Ended::Error(reason));
@@ -1676,8 +1679,8 @@ impl Connection {
         if let Some(reason) = self.terminated {
             return Some(Ended::Terminated(reason));
         }
-        if self.establishment_deadline.is_some_and(const |deadline| deadline.reached_by(now)) {
-            return Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH));
+        if let Some(deadline) = self.establishment_deadline {
+            return if deadline.reached_by(now) { Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH)) } else { None };
         }
         if self.last_valid.after(self.timeout).reached_by(now) {
             return Some(Ended::Lost);
@@ -2465,8 +2468,9 @@ impl Connection {
     }
 
     /// Earliest time at which the loop top acts without a packet or a host
-    /// wakeup: supervision, procedure and reply deadlines, and the ping
-    /// point and expiry of the authenticated payload timeout.
+    /// wakeup: supervision (once established, see [`Self::ended`]),
+    /// establishment, procedure and reply deadlines, and the ping point and
+    /// expiry of the authenticated payload timeout.
     fn next_deadline(&self, now: At, shared: &Shared) -> At {
         let requests = [self.features_request, self.phy_request, self.length_request, self.version_request]
             .into_iter()
@@ -2479,7 +2483,7 @@ impl Connection {
             ping.into_iter().chain(iter::once(last.after(timeout)))
         });
         [
-            Some(self.last_valid.after(self.timeout)),
+            self.establishment_deadline.is_none().then(|| self.last_valid.after(self.timeout)),
             self.procedure_deadline,
             self.terminate_deadline,
             self.establishment_deadline,

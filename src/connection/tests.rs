@@ -210,6 +210,30 @@ fn first_valid_packet_replaces_the_short_establishment_deadline() {
 }
 
 #[test]
+fn before_the_first_packet_only_the_establishment_deadline_ends_the_link() {
+    let shared = Shared::new();
+    let mut link = connection();
+    // A supervision timeout of two intervals, shorter than the six
+    // intervals the central has for its first packet.
+    link.timeout = link.interval.saturating_mul(2);
+    let supervision = link.last_valid.after(link.timeout);
+    let deadline = link.establishment_deadline.unwrap_or(At::ZERO);
+    assert!(supervision.ahead_of(deadline).is_none());
+    assert!(link.ended(supervision).is_none());
+    assert!(link.ended(deadline.before(Micros(1))).is_none());
+    assert!(matches!(link.ended(deadline), Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH))));
+    // A batch of skipped events would not stop at the supervision timeout
+    // either.
+    assert_eq!(link.next_deadline(link.last_valid, &shared), deadline);
+    // From the first packet on the supervision timeout runs.
+    let first = deadline.before(Micros(1000));
+    assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, first.0, &shared), Some(true));
+    assert_eq!(link.next_deadline(first, &shared), first.after(link.timeout));
+    assert!(link.ended(first.after(link.timeout).before(Micros(1))).is_none());
+    assert!(matches!(link.ended(first.after(link.timeout)), Some(Ended::Lost)));
+}
+
+#[test]
 fn encryption_deadline_is_not_refreshed_by_received_traffic() {
     let mut link = connection();
     link.establishment_deadline = None;
