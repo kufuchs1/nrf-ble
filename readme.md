@@ -248,7 +248,9 @@ Against a build without the feature (flash of a firmware's release build; static
   error of the link layer, with the code), until the next link starts or a reset: connection events, skipped and
   missed events, CRC errors, packets received, retransmissions, late crystal starts with the crystal's current lead,
   and the largest anchor drift with the window widening it came with. The link layer copies them under the lock every
-  10 s and when the link ends, from the counters of its statistics log, so a firmware can keep them without a log.
+  10 s, at the first connection event it listens at once that time passed (an interval after that event if a long run
+  of skipped events made it later), and when the link ends, from the counters of its statistics log, so a firmware can
+  keep them without a log.
 
 ## What it does
 
@@ -346,7 +348,10 @@ Against a build without the feature (flash of a firmware's release build; static
   resumes after that event, as Zephyr's peripheral does: a lost anchor is found again one interval later rather than
   after the whole latency, so a supervision timeout of a few latencies holds, such as 1 s at 15 ms and a latency of
   30 across a fade of half a second. The receive window widens with the time since the last anchor, up to half the
-  interval less the interframe space.
+  interval less the interframe space. A run of skipped events is one sleep, which with the longest latency the
+  specification allows lasts almost half the supervision timeout, up to 16 s: the radio's progress deadline
+  (`health::checkpoint`, 10 s around each event) is armed before it for the planned sleep and 10 s more, so that
+  `health::healthy` stays true while the link sleeps as planned, and a sleep that does not end still turns it false.
 
 ## Crypto for the host
 

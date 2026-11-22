@@ -168,6 +168,10 @@ const OP_PHY_UPDATE_IND: u8 = 0x18;
 const PREFERRED_PHYS: u8 = if chip::PHY_2M { 0x02 } else { 0x01 };
 /// Interval of the connection statistics log.
 const REPORT_INTERVAL_US: Micros = Micros(10_000_000);
+/// Time the radio executor gets to make progress around a connection event
+/// before [`health::healthy`] turns false, in seconds, on top of a planned
+/// sleep through skipped events ([`progress_seconds`]).
+const PROGRESS_SECONDS: u32 = 10;
 /// No received anchor yet since the last report: no deviation, no widening.
 const NO_DRIFT: (i32, Micros) = (0, Micros::ZERO);
 /// Header bit: more data follows.
@@ -1188,6 +1192,16 @@ impl Connection {
         // decryption with `wait_decrypted`, `stop` or `disarm`.
         unsafe { crypto::arm_decrypt(config, rx, &mut self.rx_plain, scratch, self.phy) }
         true
+    }
+
+    /// Radio start at which one sleep at `now` for the whole run of skipped
+    /// events from the current one ends: where the event-by-event loop would
+    /// last have woken, at the start of the last skipped event, or of the
+    /// first one at or after a deadline the loop top acts on.
+    fn batch_until(&self, now: At, shared: &Shared) -> At {
+        let last = self.listen_counter().wrapping_sub(1);
+        let deadline = self.next_deadline(now, shared);
+        self.enable_at(self.first_after(self.counter, last, deadline.before(Micros(1))))
     }
 
     /// Whether the current event can pass without listening: nothing to send
@@ -2750,8 +2764,9 @@ impl Connection {
     }
 
     /// Logs the counters since the last call and tells the host the link's
-    /// counters, with the crystal's restarts as the clock counts them.
-    fn report(&mut self, crystal: CrystalStats, shared: &Shared) {
+    /// counters, with the crystal's restarts as the clock counts them, at
+    /// `now`.
+    fn report(&mut self, now: At, crystal: CrystalStats, shared: &Shared) {
         let (last, last_late) = self.reported;
         info!(
             "10 s: {} events, {} skipped, {} missed, {} crc errors, {} packets, {} late crystal (lead {} us), {} dBm, drift {} of +-{} us",
@@ -2786,7 +2801,7 @@ impl Connection {
         self.peaks = Peaks::default();
         self.drift = NO_DRIFT;
         self.reported = (self.stats, crystal.late);
-        self.report_at = self.report_at.after(REPORT_INTERVAL_US);
+        self.report_at = next_report(self.report_at, now);
     }
 
     /// Reports a connection parameter request of the host that ended without
@@ -2920,11 +2935,11 @@ impl Connection {
                 break Ended::Reset;
             }
             self.flush_notifications(shared);
-            health::checkpoint(10);
+            health::checkpoint(PROGRESS_SECONDS);
             // Flash runs between two events, with the radio parked.
             if maintenance::pending() {
                 maintenance::service(clock, radio).await;
-                health::checkpoint(10);
+                health::checkpoint(PROGRESS_SECONDS);
             }
             if let Some(ended) = self.ended(clock.now()) {
                 break ended;
@@ -2950,15 +2965,16 @@ impl Connection {
                 // of the last skipped event, or of the first one at or after
                 // a deadline the loop top acts on.
                 let listen = self.listen_counter();
-                let last = listen.wrapping_sub(1);
-                let deadline = self.next_deadline(clock.now(), shared);
-                let stop = self.first_after(self.counter, last, deadline.before(Micros(1)));
-                let until = self.enable_at(stop);
+                let until = self.batch_until(clock.now(), shared);
                 #[cfg(feature = "event-timing")]
                 self.publish_event(clock, self.enable_at(listen), shared);
+                // The sleep may last up to half the supervision timeout, 16 s:
+                // the progress deadline covers it, and a sleep that does not
+                // end turns the health false that much later.
+                health::checkpoint(progress_seconds(until.ahead_of(clock.now()).unwrap_or(Micros::ZERO)));
                 let woken = select(shared.wakeup(), maintenance::requested());
                 let timed_out = clock.idle_until(until, woken).await;
-                health::checkpoint(10);
+                health::checkpoint(PROGRESS_SECONDS);
                 // The RTC1 alarm may end the sleep up to a tick before `until`
                 // on this clock.
                 let now = clock.now();
@@ -3023,8 +3039,9 @@ impl Connection {
             if let Some(ended) = self.ended(clock.now()) {
                 break ended;
             }
-            if self.report_at.reached_by(clock.now()) {
-                self.report(clock.crystal(), shared);
+            let now = clock.now();
+            if self.report_at.reached_by(now) {
+                self.report(now, clock.crystal(), shared);
             }
             self.counter = self.counter.wrapping_add(1);
         };
@@ -3415,6 +3432,26 @@ const fn queue_lead(crystal_lead: Micros) -> Micros {
     let wake = SETUP.saturating_add(PREPARE_AGAIN_US);
     crystal.max(wake)
 }
+
+/// Time of the statistics log after the one due at `due`, at `now`: one
+/// interval later, or one interval after `now` if that passed already. A
+/// listened event after a long run of skipped events can come more than an
+/// interval after the due time, and a log that only moved on by an interval
+/// would fall further behind with each, until the wrapping clock took it as
+/// ahead after 36 minutes and the log and the host's counters stopped.
+const fn next_report(due: At, now: At) -> At {
+    let next = due.after(REPORT_INTERVAL_US);
+    if next.reached_by(now) { now.after(REPORT_INTERVAL_US) } else { next }
+}
+
+/// The progress deadline in seconds ([`health::checkpoint`]) before a sleep
+/// of `sleep` through skipped events: the sleep in whole seconds, rounded up,
+/// and [`PROGRESS_SECONDS`] after it. With a peripheral latency the sleep
+/// lasts up to half the supervision timeout, 16 s, longer than the usual
+/// deadline, which would otherwise pass while the link sleeps as planned and
+/// stop the firmware's watchdog feed. A sleep that does not end still turns
+/// the health false, once the deadline passed.
+const fn progress_seconds(sleep: Micros) -> u32 { sleep.0.div_ceil(1_000_000).saturating_add(PROGRESS_SECONDS) }
 
 /// Parses the parameters of a connection update.
 const fn parse_update(bytes: &[u8]) -> Option<Update> {

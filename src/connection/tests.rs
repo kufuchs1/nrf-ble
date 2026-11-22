@@ -1927,6 +1927,63 @@ fn a_ping_point_or_a_reply_deadline_ends_a_batch_early() {
 }
 
 #[test]
+fn the_progress_deadline_covers_the_longest_sleep_the_latency_allows() {
+    let shared = Shared::new();
+    let mut link = latent(false);
+    // 400 ms, latency 38 and 32 s: 39 intervals of 15.6 s are within half
+    // the supervision timeout, as the specification asks.
+    link.interval = Micros(400_000);
+    link.latency = 38;
+    link.timeout = Micros(32_000_000);
+    let now = link.enable_at(link.counter).before(Micros(1000));
+    assert!(link.skips(now, &shared));
+    // One sleep up to the start of the last skipped event, 37 intervals
+    // on: longer than the usual progress deadline.
+    let until = link.batch_until(now, &shared);
+    assert_eq!(until, link.enable_at(1037));
+    let sleep = until.ahead_of(now).unwrap_or_default();
+    assert!(sleep > Micros(PROGRESS_SECONDS * 1_000_000));
+    // The deadline before it covers the sleep and the usual deadline after
+    // it, in whole seconds.
+    let seconds = progress_seconds(sleep);
+    assert_eq!(seconds, 15 + PROGRESS_SECONDS);
+    assert!(Micros(seconds * 1_000_000) >= sleep.saturating_add(Micros(PROGRESS_SECONDS * 1_000_000)));
+    assert_eq!(progress_seconds(Micros::ZERO), PROGRESS_SECONDS);
+    assert_eq!(progress_seconds(Micros(1)), PROGRESS_SECONDS + 1);
+    assert_eq!(progress_seconds(Micros(u32::MAX)), 4295 + PROGRESS_SECONDS);
+}
+
+#[test]
+fn the_statistics_log_keeps_its_pace_after_long_sleeps() {
+    let shared = Shared::new();
+    let mut link = connection();
+    let due = link.report_at;
+    // Logged on time: the next one interval later.
+    link.report(due, CrystalStats { late: 0, lead: Micros(900) }, &shared);
+    assert_eq!(link.report_at, due.after(REPORT_INTERVAL_US));
+    // Logged at an event 16 s after it was due, after a long run of
+    // skipped events: the next one an interval after that, not 4 s before
+    // it, where it would fall behind by 6 s with each such sleep.
+    let late = link.report_at.after(Micros(16_000_000));
+    link.report(late, CrystalStats { late: 0, lead: Micros(900) }, &shared);
+    assert_eq!(link.report_at, late.after(REPORT_INTERVAL_US));
+    // So many sleeps never leave it far enough behind that the wrapping
+    // clock takes it as ahead.
+    let mut now = link.report_at;
+    for _ in 0..1000_u16 {
+        now = now.after(Micros(16_000_000));
+        assert!(link.report_at.reached_by(now));
+        let reported = link.report_at;
+        link.report(now, CrystalStats { late: 0, lead: Micros(900) }, &shared);
+        assert!(link.report_at.ahead_of(now).is_some() && link.report_at != reported);
+    }
+    // Logged less than an interval late: one interval on from the due
+    // time; a whole interval late: one interval on from then.
+    assert_eq!(next_report(At(100), At(100 + REPORT_INTERVAL_US.0 - 1)), At(100 + REPORT_INTERVAL_US.0));
+    assert_eq!(next_report(At(100), At(100 + REPORT_INTERVAL_US.0)), At(100 + 2 * REPORT_INTERVAL_US.0));
+}
+
+#[test]
 fn a_host_wakeup_inside_a_batch_listens_at_the_first_event_still_ahead() {
     let link = latent(false);
     let listen = link.listen_counter();
@@ -2300,7 +2357,7 @@ fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ende
     link.stats.received = 40;
     link.stats.retx = 2;
     link.drift = (-40, Micros(60));
-    link.report(CrystalStats { late: 9, lead: Micros(900) }, &shared);
+    link.report(link.report_at, CrystalStats { late: 9, lead: Micros(900) }, &shared);
     let reported = counters.counters();
     assert_eq!(
         (reported.events, reported.skipped, reported.missed, reported.crc_errors, reported.received),
@@ -2312,7 +2369,7 @@ fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ende
     // largest of the link.
     assert_eq!(link.drift, NO_DRIFT);
     link.drift = (25, Micros(50));
-    link.report(CrystalStats { late: 9, lead: Micros(898) }, &shared);
+    link.report(link.report_at, CrystalStats { late: 9, lead: Micros(898) }, &shared);
     assert_eq!((counters.counters().drift_us, counters.counters().widening_us), (-40, 60));
     // The end counts the drift since the last report too.
     link.drift = (70, Micros(80));
