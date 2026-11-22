@@ -765,6 +765,7 @@ fn the_pairing_times_out_30_s_after_the_last_pdu_queued() {
 fn the_timer_runs_until_the_identity_keys_complete() {
     let (mut responder, mut device, _) = pair_up_to_encryption(BOTH_WAYS);
     assert_eq!(responder.deadline(), Some(at(START + 30_070)));
+    assert!(responder.ltk_request(0, [0; 8]).is_some());
     assert_eq!(responder.encryption_changed(true), None);
     out(&mut responder, at(START + 80));
     out(&mut responder, at(START + 90));
@@ -803,6 +804,7 @@ fn the_central_s_keys_must_come_encrypted_and_in_order() {
     ];
     for (pdus, encrypted, reason) in attempts {
         let (mut responder, mut device, _) = pair_up_to_encryption(BOTH_WAYS);
+        assert!(responder.ltk_request(0, [0; 8]).is_some());
         assert_eq!(responder.encryption_changed(true), None);
         let (last, first) = pdus.split_last().unwrap();
         for pdu in first {
@@ -818,10 +820,48 @@ fn the_central_s_keys_must_come_encrypted_and_in_order() {
 }
 
 #[test]
+fn only_the_encryption_with_the_pairing_s_key_completes_it() {
+    let info = pdu::<17>(IDENTITY_INFORMATION, &CENTRAL_IRK);
+    let mut address = [IDENTITY_ADDRESS_INFORMATION, 0x00, 0, 0, 0, 0, 0, 0];
+    address[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    for ending in 0_u8..3 {
+        // The link is encrypted with another key, the bond's, whose request
+        // came before our DHKey check: the pairing waits for its own key.
+        let (mut responder, mut device, central) = pair_up_to_encryption(BOTH_WAYS);
+        assert_eq!(responder.encryption_changed(true), None);
+        assert!(!responder.has_output(), "none of our identity keys");
+        assert!(responder.is_pairing());
+        match ending {
+            0 => {
+                // The central's keys on that link fail the pairing.
+                let outcome = responder.receive(&mut device, &info, true, at(START + 80));
+                assert_eq!(outcome, Some(Outcome::Failed { by_central: false, reason: Reason::UNSPECIFIED }));
+            },
+            1 => {
+                // Without them the timer ends the pairing.
+                assert_eq!(responder.deadline(), Some(at(START + 30_070)));
+                assert_eq!(responder.on_time(at(START + 30_070)), Some(Outcome::TimedOut));
+            },
+            _ => {
+                // A refresh with the pairing's key afterwards completes it.
+                assert_eq!(responder.ltk_request(0, [0; 8]), Some(reversed(&central.ltk)));
+                assert_eq!(responder.encryption_changed(true), None);
+                out(&mut responder, at(START + 80));
+                out(&mut responder, at(START + 80));
+                assert_eq!(responder.receive(&mut device, &info, true, at(START + 90)), None);
+                let outcome = responder.receive(&mut device, &address, true, at(START + 90));
+                assert!(matches!(outcome, Some(Outcome::Bonded(_))));
+            },
+        }
+    }
+}
+
+#[test]
 fn the_central_s_keys_may_overtake_the_encryption_event() {
     let (mut responder, mut device, central) = pair_up_to_encryption(BOTH_WAYS);
     let mut address = [IDENTITY_ADDRESS_INFORMATION, 0x00, 0, 0, 0, 0, 0, 0];
     address[2..].copy_from_slice(&CENTRAL_IDENTITY);
+    assert!(responder.ltk_request(0, [0; 8]).is_some());
     assert_eq!(responder.receive(&mut device, &pdu::<17>(IDENTITY_INFORMATION, &CENTRAL_IRK), true, at(0)), None);
     assert_eq!(responder.receive(&mut device, &address, true, at(0)), None);
     // The bond waits for the encryption and our own keys.
@@ -836,6 +876,7 @@ fn the_central_s_keys_may_overtake_the_encryption_event() {
 fn an_identity_address_that_is_not_static_is_dropped_with_its_key() {
     for (kind, top) in [(0x01, 0x40), (0x01, 0x00), (0x01, 0x80)] {
         let (mut responder, mut device, _) = pair_up_to_encryption(Variant { our_id: false, ..BOTH_WAYS });
+        assert!(responder.ltk_request(0, [0; 8]).is_some());
         assert_eq!(responder.encryption_changed(true), None);
         responder.receive(&mut device, &pdu::<17>(IDENTITY_INFORMATION, &CENTRAL_IRK), true, at(0));
         let address = [IDENTITY_ADDRESS_INFORMATION, kind, 1, 2, 3, 4, 5, top];
@@ -847,6 +888,7 @@ fn an_identity_address_that_is_not_static_is_dropped_with_its_key() {
     }
     // A static random identity is kept.
     let (mut responder, mut device, _) = pair_up_to_encryption(Variant { our_id: false, ..BOTH_WAYS });
+    assert!(responder.ltk_request(0, [0; 8]).is_some());
     responder.encryption_changed(true);
     responder.receive(&mut device, &pdu::<17>(IDENTITY_INFORMATION, &CENTRAL_IRK), true, at(0));
     let address = [IDENTITY_ADDRESS_INFORMATION, 0x01, 1, 2, 3, 4, 5, 0xC0];
@@ -1368,6 +1410,7 @@ fn a_central_without_input_or_output_is_refused_or_pairs_just_works() {
     responder.receive(&mut device, &central.check(), false, at(0));
     assert_eq!(out(&mut responder, at(0)).0.bytes(), &central.expected_check());
     assert!(!responder.is_authenticating());
+    assert!(responder.ltk_request(0, [0; 8]).is_some());
     responder.encryption_changed(true);
     out(&mut responder, at(0));
     out(&mut responder, at(0));

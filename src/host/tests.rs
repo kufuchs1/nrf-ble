@@ -1276,6 +1276,74 @@ fn a_pairing_on_a_link_encrypted_with_the_bond_s_key_completes_with_the_key_refr
 }
 
 #[test]
+fn a_refresh_with_the_bond_s_key_never_completes_a_pairing_on_its_link() {
+    for keys in [false, true] {
+        let host = host(Unclaimed::Keep);
+        let link = host.port();
+        tasks!(host, tasks, multiplications);
+        let identity = identity(1);
+        let advertising = example::advertising(Mode::Pairing, None).unwrap();
+        let mut advertise = pin!(host.advertise(&advertising, &identity));
+        assert!(poll(advertise.as_mut()).is_pending());
+        tasks.step();
+        assert!(poll(advertise.as_mut()).is_pending());
+        // The central resolves to the identity it distributes, so the bond's
+        // key is given to it.
+        link.connect(Peer::new(CENTRAL_ADDRESS, false), Some(Peer::new(CENTRAL_IDENTITY, false)), local_rpa());
+        tasks.step();
+        let conn = ready(advertise.as_mut()).unwrap();
+        link.calls();
+        let first = pair_just_works(link, &mut tasks, false);
+        link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+        link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+        tasks.step();
+        assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
+        exchange_identities(link, &mut tasks, &identity);
+        assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
+        assert!(matches!(next!(conn), ConnEvent::Bonded(_)));
+
+        // The central pairs again on the link and starts a key refresh before
+        // our DHKey check: no key of the pairing yet, so the bond's.
+        let mut central = Central::new(linux_request(true, true), local_rpa());
+        assert_eq!(smp(link, &mut tasks, &central.request, true).len(), 1);
+        let answer = smp(link, &mut tasks, &central.public_key(), true);
+        central.take_public_key(&answer[0]);
+        central.take_confirm(&answer[1]);
+        let random = smp(link, &mut tasks, &central.random(), true);
+        central.take_random(&random[0]);
+        link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+        tasks.step();
+        assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
+        let check = central.check();
+        assert_eq!(smp(link, &mut tasks, &check, true), [central.expected_check().to_vec()]);
+        // The refresh completes after our check, with the bond's key: the
+        // pairing goes on waiting for its own.
+        link.event(Event::Encryption { on: true, refresh: true, status: 0 });
+        tasks.step();
+        assert!(link.deliver().is_empty(), "none of our identity keys");
+        assert!(poll(pin!(conn.next())).is_pending(), "no bond");
+        if keys {
+            // The central's keys on that link fail the pairing.
+            assert_eq!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true), [vec![0x05, 0x08]]);
+            tasks.step();
+            assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
+            assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::UNSPECIFIED));
+        } else {
+            // The pairing's timer ends the link.
+            link.advance(30_000);
+            tasks.step();
+            assert!(link.calls().contains(&Seen::Disconnect(0x13)));
+        }
+        while let Poll::Ready(event) = poll(pin!(conn.next())) {
+            assert!(!matches!(event, ConnEvent::Bonded(_) | ConnEvent::BondUpdated(_)), "no bond");
+        }
+        // A key pair and a Diffie-Hellman key per pairing, and the refill
+        // after the failed one.
+        assert_eq!(multiplications.get(), 5);
+    }
+}
+
+#[test]
 fn a_call_waits_for_a_link_the_run_task_has_not_taken_yet() {
     let host = host(Unclaimed::Keep);
     let link = host.port();
@@ -2576,6 +2644,89 @@ fn a_just_works_key_stays_unauthenticated_when_a_passkey_pairing_starts_on_its_l
     // The failed pairing ends the link; no report goes out meanwhile.
     assert!(conn.try_notify(keyboard::KEYS, &[0; 8]).is_err());
     assert!(multiplications.get() >= 1);
+}
+
+#[cfg(feature = "passkey")]
+#[test]
+fn a_refresh_with_a_just_works_bond_s_key_is_never_raised_by_a_passkey_pairing() {
+    use super::{
+        gatt::Sec,
+        smp::{IoCapability, Security, tests::request_with_io},
+    };
+    let config = Config::new(Some(example::PARAMS), Unclaimed::Keep)
+        .with_security(Security::new(IoCapability::KeyboardOnly, false));
+    let host = Host::new(MockLink::new(), &keyboard::DB, config);
+    let link = host.port();
+    tasks!(host, tasks, multiplications);
+    let identity = identity(1);
+    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let mut advertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(advertise.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(advertise.as_mut()).is_pending());
+    let local = local_rpa();
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), Some(Peer::new(CENTRAL_IDENTITY, false)), local);
+    tasks.step();
+    let conn = ready(advertise.as_mut()).unwrap();
+    link.calls();
+    // A Just Works bond first, from a central without input or output.
+    let mut central = Central::new(request_with_io(0x03), local);
+    central.io_cap_b = [0x0D, 0x00, 0x02];
+    smp(link, &mut tasks, &central.request, false);
+    let answer = smp(link, &mut tasks, &central.public_key(), false);
+    central.take_public_key(&answer[0]);
+    central.take_confirm(&answer[1]);
+    let random = smp(link, &mut tasks, &central.random(), false);
+    central.take_random(&random[0]);
+    let check = central.check();
+    assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
+    let mut first = central.ltk;
+    first.reverse();
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
+    exchange_identities(link, &mut tasks, &identity);
+    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
+    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
+    assert!(!bond.authenticated);
+    assert_eq!(conn.security(), Some(Sec::Encrypted));
+
+    // Passkey Entry on the same link, with a key refresh started before our
+    // DHKey check and so with the Just Works bond's key.
+    let passkey = 271_828;
+    let mut display = Central::new(request_with_io(0x04), local).with_passkey(passkey);
+    smp(link, &mut tasks, &display.request, true);
+    let key = smp(link, &mut tasks, &display.public_key(), true);
+    display.take_public_key(&key[0]);
+    assert_eq!(next!(conn), ConnEvent::PasskeyRequested);
+    assert_eq!(conn.enter_passkey(Some(passkey)), Ok(()));
+    let mut confirm = link.send_and_deliver(&display.round_confirm(0, passkey), &mut tasks);
+    for round in 0..20 {
+        display.take_confirm(&confirm.remove(0).1);
+        let nonce = smp(link, &mut tasks, &display.random(), true);
+        display.take_round_random(&nonce[0], round, passkey);
+        if round < 19 {
+            confirm = link.send_and_deliver(&display.round_confirm(round + 1, passkey), &mut tasks);
+        }
+    }
+    link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+    tasks.step();
+    assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
+    let display_check = display.check();
+    assert_eq!(smp(link, &mut tasks, &display_check, true), [display.expected_check().to_vec()]);
+    link.event(Event::Encryption { on: true, refresh: true, status: 0 });
+    tasks.step();
+    // Still the Just Works key: not authenticated, no new bond, and the
+    // report that needs authentication is refused.
+    assert!(link.deliver().is_empty(), "none of our identity keys");
+    assert_eq!(conn.security(), Some(Sec::Encrypted));
+    assert_eq!(request(link, &mut tasks, &[0x0A, 0x03, 0x00]), [0x01, 0x0A, 0x03, 0x00, 0x05]);
+    assert_eq!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true), [vec![0x05, 0x08]]);
+    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::UNSPECIFIED));
+    assert!(poll(pin!(conn.next())).is_pending(), "no bond");
+    assert_eq!(conn.security(), Some(Sec::Encrypted));
+    assert_eq!(multiplications.get(), 5);
 }
 
 #[cfg(feature = "passkey")]

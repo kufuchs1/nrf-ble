@@ -64,7 +64,11 @@
 //! - It answers a long term key request with EDIV 0 and Rand 0 only: with the
 //!   key of the pairing under way, or with the bond's if the central is the
 //!   bonded one, by its resolved identity or its identity address on the air.
-//!   Any other request gets the negative reply.
+//!   Any other request gets the negative reply. Only an encryption with the
+//!   pairing's key completes a pairing: one with the bond's, asked for before
+//!   our `DHKey` check of a pairing on the bonded link, leaves the pairing
+//!   waiting until its timer ends it, so no bond and no authenticated level is
+//!   ever given to a link encrypted with an older key.
 //! - It gives the ATT server, for each request, the security the request was
 //!   received with: encrypted only if each of its fragments was received
 //!   encrypted ([`crate::link::AclIn::encrypted`]) on a link whose key the
@@ -825,7 +829,10 @@ impl Engine {
     /// Takes the encryption of the link, as the link layer reports it. A key
     /// refresh goes to the security manager too: a pairing on a link already
     /// encrypted ends with one, the encryption paused and started again with
-    /// the pairing's key. Outside a pairing it ignores the event.
+    /// the pairing's key. Outside a pairing it ignores the event, and so it
+    /// does an encryption with the bond's key during a pairing
+    /// ([`Responder::encryption_changed`]): the security manager knows
+    /// whether its key went to the link layer.
     fn encryption(&mut self, on: bool, refresh: bool, now: Instant) {
         let outcome = self.smp.encryption_changed(on);
         if let Some(link) = self.link.as_mut()

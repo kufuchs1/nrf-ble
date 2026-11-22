@@ -33,6 +33,11 @@
 //! 5. The central encrypts the link with the long term key, which
 //!    [`Responder::ltk_request`] gives least significant octet first, as
 //!    [`crate::link::Link::ltk_reply`] takes it, for EDIV 0 and Rand 0 only.
+//!    Only that encryption completes the pairing: one with another key, the
+//!    bond's on a link that pairs again when the central's key refresh asked
+//!    for its key before our `DHKey` check, leaves the pairing waiting for its
+//!    own, and the timer ends it if that never comes; the central's identity
+//!    keys on such a link fail it.
 //! 6. Once the link is encrypted, our identity resolving key and static random
 //!    identity address (Identity Information and Identity Address Information),
 //!    then the central's, if it offered them, which `BlueZ` sends only after it
@@ -547,8 +552,11 @@ enum State {
     #[cfg(feature = "passkey")]
     Confirm(u8),
     /// Eb is queued: waiting for the central to encrypt the link with the
-    /// long term key.
-    Encryption,
+    /// long term key; with whether that key went to the link layer
+    /// ([`Responder::ltk_request`]). Only an encryption with it completes
+    /// the pairing, and only a PDU received encrypted after it carries the
+    /// central's identity keys.
+    Encryption(bool),
     /// No pairing on the link.
     Idle,
     /// Passkey Entry: the central's first confirm value arrived before the
@@ -787,13 +795,24 @@ impl Responder {
     /// failed, which fails the pairing. A first encryption and a key refresh
     /// alike: a pairing on a link already encrypted ends with a refresh to
     /// its key. Outside the pairing's encryption step it changes nothing.
+    ///
+    /// Only an encryption with the pairing's own key completes the pairing:
+    /// one whose key request [`Self::ltk_request`] answered. A central that
+    /// encrypts with another key in that step, the bond's on a link that is
+    /// paired again, its refresh started before our `DHKey` check, leaves
+    /// the pairing waiting for its own key, and the timer ends it if that
+    /// never comes. The link is then not encrypted with the key the bond
+    /// would hold, and a Passkey Entry pairing would raise a link encrypted
+    /// with a Just Works key to authenticated.
     #[inline]
     pub fn encryption_changed(&mut self, on: bool) -> Option<Outcome> {
-        if self.state != State::Encryption {
-            return None;
-        }
+        let State::Encryption(keyed) = self.state else { return None };
         if !on {
             return self.fail(Reason::UNSPECIFIED, true);
+        }
+        if !keyed {
+            warn!("smp: the link is encrypted with another key than the pairing's");
+            return None;
         }
         self.state = State::Keys;
         if self.resp_dist != 0 {
@@ -996,11 +1015,23 @@ impl Responder {
     /// The long term key for the link layer's request with `ediv` and
     /// `rand`, least significant octet first: the key of the pairing under
     /// way, for EDIV 0 and Rand 0 only, from our `DHKey` check on. Otherwise
-    /// `None`, and the bond's key is the engine's to give.
+    /// `None`, and the bond's key is the engine's to give. A key given is
+    /// noted: only the encryption with it completes the pairing
+    /// ([`Self::encryption_changed`]).
     #[inline]
-    #[must_use = "the key is only read"]
-    pub const fn ltk_request(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
-        (ediv == 0 && rand == [0; 8] && matches!(self.state, State::Encryption | State::Keys)).then_some(self.ltk)
+    #[must_use = "the key goes to the link layer"]
+    pub const fn ltk_request(&mut self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
+        if ediv != 0 || rand != [0; 8] {
+            return None;
+        }
+        if matches!(self.state, State::Encryption(_)) {
+            self.state = State::Encryption(true);
+        } else if self.state != State::Keys {
+            return None;
+        } else {
+            // The identity keys are under way: the key is the same.
+        }
+        Some(self.ltk)
     }
 
     /// A security manager without a key pair, pairing or identity: give it
@@ -1419,10 +1450,12 @@ impl Responder {
     }
 
     /// Whether the central's identity keys are taken now: offered, after
-    /// our `DHKey` check and received encrypted. They may overtake the
-    /// encryption event, but never the encryption.
+    /// our `DHKey` check and received encrypted, once the pairing's key went
+    /// to the link layer. They may overtake the encryption event, but never
+    /// the encryption with that key: on a link encrypted with another key
+    /// they fail the pairing.
     const fn takes_keys(&self, encrypted: bool) -> bool {
-        encrypted && self.init_dist != 0 && matches!(self.state, State::Encryption | State::Keys)
+        encrypted && self.init_dist != 0 && matches!(self.state, State::Encryption(true) | State::Keys)
     }
 
     /// Verifies the central's `DHKey` check with the Diffie-Hellman key, and
@@ -1456,7 +1489,7 @@ impl Responder {
         self.ltk = reversed(&ltk);
         wipe(&mut ltk);
         self.pending |= OUT_CHECK;
-        self.state = State::Encryption;
+        self.state = State::Encryption(false);
         Ok(None)
     }
 

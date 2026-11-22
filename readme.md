@@ -29,7 +29,9 @@ What it holds:
 - The security manager (`host::smp::Responder`): LE Secure Connections Just Works pairing as responder, with bonding and
   the identity keys both ways, as a state machine without input or output of its own. A pairing on a link that is
   already encrypted (a central that pairs again, or one that replaces a Just Works key with Passkey Entry) ends with
-  the key refresh to the pairing's key as a first pairing ends with the encryption. The P-256 multiplications are
+  the key refresh to the pairing's key as a first pairing ends with the encryption; only an encryption with the pairing's
+  own key ends it, so a refresh with the bond's key that the central started before our `DHKey` check leaves the pairing
+  waiting until its 30 s timer ends the link, and gives no bond and no authenticated level. The P-256 multiplications are
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
   feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
