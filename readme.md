@@ -22,18 +22,24 @@ What it holds:
   connection parameter requests and replies, data length, PHY, authenticated payload timeout, RSSI and the central's
   features and version.
 - The host's AES seam (`host::Aes`, the hardware ECB behind `host::Ecb`, software AES in the tests).
-- The cryptography of pairing: f4, f5, f6, g2 and ah in `host::smp::toolbox`, over the AES-CMAC of the RustCrypto
+- The cryptography of pairing: f4, f5 and f6 in `host::smp::toolbox`, over the AES-CMAC of the RustCrypto
   `cmac` crate, and P-256 key generation, Diffie-Hellman and public key checks in `host::smp::ecc`, from the RustCrypto
   `p256` crate behind the crate nrf-ble-p256 of this repository (`p256/`; see
   [Cryptography of pairing](#cryptography-of-pairing)).
 - The security manager (`host::smp::Responder`): LE Secure Connections Just Works pairing as responder, with bonding and
   the identity keys both ways, as a state machine without input or output of its own. A pairing on a link that is
   already encrypted (a central that pairs again, or one that replaces a Just Works key with Passkey Entry) ends with
-  the key refresh to the pairing's key as a first pairing ends with the encryption. The P-256 multiplications are
+  the key refresh to the pairing's key as a first pairing ends with the encryption; only an encryption with the pairing's
+  own key ends it, so a refresh with the bond's key that the central started before our `DHKey` check leaves the pairing
+  waiting until its 30 s timer ends the link, and gives no bond and no authenticated level. After a failed pairing a
+  Pairing Request gets Repeated Attempts (0x09) for a waiting interval that outlives the link: 2 s after the first
+  failure, doubled with each further one up to 60 s, back to 2 s after 60 s without one past the interval, and ended by
+  a bond (see `host::smp`). The P-256 multiplications are
   jobs it hands out for a task of their own; the 30 s timer is a deadline the engine drives. It is tested against a
   reference central built from the toolbox, octet for octet, with every refusal, failure and the timeout. With the
   feature `passkey` it is also a keyboard's Passkey Entry responder (see [Optional features](#optional-features)).
-- L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer, fragmenting on demand), LE signalling
+- L2CAP (`host::l2cap`: the fixed channels, reassembly into one 72 octet buffer that is overwritten after each PDU, a dropped one
+  too, as   are the engine's copy of the PDU and the run task's received fragment, fragmenting on demand), LE signalling
   (`host::signal`: the connection parameter update request and command rejects), with the feature `eatt` the credit
   based channels of the enhanced ATT bearers (`host::ecfc`), the ATT server at MTU 23, or up to 65 with the feature
   `att-mtu` (`host::att`; with `eatt` also Read Multiple Variable Length, Prepare and Execute Write and Multiple Handle
@@ -117,7 +123,7 @@ Each is off by default, so a device without it builds exactly as without the fea
   it (`authenticated` in `gatt!`), which `Host::new` refuses with a configuration that cannot pair with Passkey Entry.
   Keypress Notifications are never asked for; those of a central are ignored. It is tested against the reference
   central with known passkeys, end to end through the host, with every failure, the timer and the toolbox's sample
-  data of f4, f5, f6 and g2.
+  data of f4, f5 and f6.
 - **`directed-advertising`**: a reconnection schedule may start with `Phase::directed(adv::DIRECTED_MAX)`, high duty
   cycle directed advertising to the bonded central, to a resolvable private address made with its key if it sent one
   (see [A device](#a-device)), or with `extended-advertising` low duty cycle directed advertising every 20 ms. Each
@@ -147,8 +153,8 @@ Each is off by default, so a device without it builds exactly as without the fea
   517, so in its first discovery after pairing a Read or Read Blob Response carries up to 64 octets of a value, a Find
   Information Response up to 15 entries of 16-bit UUIDs and a Read By Type Response up to 9 characteristic declarations,
   each in up to three link layer fragments: a Report Map of 167 octets takes 3 reads instead of 8. A reconnection with
-  a cached table reads little and gains little. Notifications and indications stay within 20 octets and one fragment,
-  and a dynamic value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets.
+  a cached table reads little and gains little. Notifications stay within 20 octets and one fragment, and a dynamic
+  value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets.
   `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Runs on the mouse: BlueZ's Exchange MTU of 517
   gets 65.
 - **`eatt`** (implies `att-mtu`): Enhanced ATT as responder. A central opens enhanced bearers with L2CAP's Enhanced
@@ -248,7 +254,9 @@ Against a build without the feature (flash of a firmware's release build; static
   error of the link layer, with the code), until the next link starts or a reset: connection events, skipped and
   missed events, CRC errors, packets received, retransmissions, late crystal starts with the crystal's current lead,
   and the largest anchor drift with the window widening it came with. The link layer copies them under the lock every
-  10 s and when the link ends, from the counters of its statistics log, so a firmware can keep them without a log.
+  10 s, at the first connection event it listens at once that time passed (an interval after that event if a long run
+  of skipped events made it later), and when the link ends, from the counters of its statistics log, so a firmware can
+  keep them without a log.
 
 ## What it does
 
@@ -264,14 +272,25 @@ Against a build without the feature (flash of a firmware's release build; static
   `Link::request_params` the host makes while it answers is part of that answer: it leaves an own request of the host
   alone and completes when the central's procedure ends, with the update or with the reason it ended. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
-  is answered as unknown.
-- **Link end:** the host reads every packet the link acknowledged before it gets `Event::Disconnected`; requests of
+  is answered as unknown, except while encryption starts or pauses (see below), when it ends the link.
+- **Link end:** a link whose central sends nothing in its first six connection intervals ends with Connection Failed
+  to be Established (0x3E); the supervision timeout runs from the central's first packet on, also where it is shorter
+  than those six intervals (Core, Vol 6, Part B, 4.5.2). The host reads every packet the link acknowledged before it
+  gets `Event::Disconnected`; requests of
   the host for a link that ended cannot reach the next one, and every link starts with the default authenticated
   payload timeout.
-- **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets. Keys the host gave, and the keys
-  of a link, are overwritten once they are no longer needed.
+- **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets.
+- **Keys:** keys the host gave, and the keys of a link, are overwritten once they are no longer needed, where the
+  crate keeps them: the long term key of `ltk_reply` once the link layer derived the session key from it, or when the
+  link ends or on a reset if it never did; the session key, IVs and CCM state when the link ends; the identity
+  resolving keys of the resolving list when the host removes them or on a reset, and the link layer task's copy of the
+  list after each advertising event, before the sleep to the next one, and before a link runs. A copy the compiler
+  makes on the stack is out of reach.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
-  the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
+  the new key without a disconnection. From the central's `LL_ENC_REQ` or `LL_PAUSE_ENC_REQ` until the procedure has
+  finished, for a first start as for a refresh and also while the host looks up the key, the central may send only
+  the procedure's next PDU or `LL_TERMINATE_IND` (Core, Vol 6, Part B, 5.1.3): any other PDU, data or control, ends
+  the link unanswered. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
   or as long as the host sets: after three quarters of that time without one, the link layer pings the central at
   the next connection event it listens to anyway, so the ping breaks no run of skipped events; at the latest when
   twice the longest run of events (the latency plus one) is left of the time, and at once for a time too short for
@@ -288,7 +307,8 @@ Against a build without the feature (flash of a firmware's release build; static
   (`Link::set_suggested_length`), and then asks the central itself; a longer length only takes effect once the central
   was told and answered, or acknowledged our answer. The host learns the effective lengths from `Event::DataLength`. The
   host's fragments hold up to 251 octets and are sent in fragments as long as the central
-  receives, within its time on the air. The CCM runs in extended length mode and generates its key stream when it is
+  receives, within its time on the air. A control PDU longer than 27 octets, longer than any this side knows, is
+  answered as one of the wrong length. The CCM runs in extended length mode and generates its key stream when it is
   armed, as in Zephyr, instead of at radio READY.
 - **LE 2M PHY** (nRF52832 only) when the central supports it, which halves the airtime of every packet: the link layer
   asks for it once the link is encrypted and answers the central's own request. Both directions use the same PHY, as the
@@ -346,7 +366,10 @@ Against a build without the feature (flash of a firmware's release build; static
   resumes after that event, as Zephyr's peripheral does: a lost anchor is found again one interval later rather than
   after the whole latency, so a supervision timeout of a few latencies holds, such as 1 s at 15 ms and a latency of
   30 across a fade of half a second. The receive window widens with the time since the last anchor, up to half the
-  interval less the interframe space.
+  interval less the interframe space. A run of skipped events is one sleep, which with the longest latency the
+  specification allows lasts almost half the supervision timeout, up to 16 s: the radio's progress deadline
+  (`health::checkpoint`, 10 s around each event) is armed before it for the planned sleep and 10 s more, so that
+  `health::healthy` stays true while the link sleeps as planned, and a sleep that does not end still turns it false.
 
 ## Crypto for the host
 
@@ -360,8 +383,9 @@ The CPU sleeps until the ECB ends, woken by its pending interrupt; keep the `ECB
 
 No cryptographic algorithm of pairing is our own: P-256 is the RustCrypto `p256` crate, AES-CMAC the RustCrypto `cmac`
 crate, AES the hardware ECB (the `aes` crate in the host tests). What stays ours is what the Core specification
-writes on top of them, and the drivers: the formulas of f4, f5, f6, g2 and ah (which key, which message, which octets
-of the result; volume 3, part H, section 2.2), the byte order of the PDUs, the protocol checks of the central's key,
+writes on top of them, and the drivers: the formulas of f4, f5, f6 and of ah, the address hash of resolvable private
+addresses in [`crypto`](src/crypto.rs) (which key, which message, which octets of the result; volume 3, part H,
+section 2.2), the byte order of the PDUs, the protocol checks of the central's key,
 and the ECB, CCM and RNG drivers ([`crypto`](src/crypto.rs), [`rng`](src/rng.rs)).
 
 P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomputed-tables`, through nrf-ble-p256):
@@ -421,8 +445,8 @@ AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 with `zeroize`): the CMAC of RFC 44
 adapter that implements the block cipher traits of the `cipher` crate for one key and hands each block to
 `host::Aes::encrypt`, the hardware ECB in the firmware. The crate overwrites its chaining value and pending block when
 dropped, the adapter its copy of the key. The host tests check the adapter against FIPS 197, the CMAC against the four
-examples of RFC 4493 with every split of the message, and f4, f5 (with its key T), f6, g2 and ah against the sample
-data of volume 3, part H, appendix D; P-256 against the debug key pair and data sets 1 and 2 of volume 2, part G,
+examples of RFC 4493 with every split of the message, and f4, f5 (with its key T), f6 and ah against the sample data
+of volume 3, part H, appendix D; P-256 against the debug key pair and data sets 1 and 2 of volume 2, part G,
 section 7.1.2, with the hook, the wiping and every refusal of the central's key (debug, own, negated, off the curve, a
 coordinate not below the field prime). nrf-ble-p256's own tests (`cargo test -p nrf-ble-p256`) check its API against
 the same data sets both ways, edge scalars and 64 seeded random scalar pairs against `p256` used directly, and the
@@ -475,7 +499,8 @@ So the multiplications run only where a pairing needs them:
 - The Diffie-Hellman key, once our public key and confirm value are queued; with Passkey Entry, while the user types.
 - A new key pair after a pairing that used ours ended without a bond (failed by either side, timed out or cut by the
   end of the link), while the engine is pairable, from 32 fresh octets of the RNG as for any key pair. The engine ends
-  a link whose pairing failed, so this runs while that link ends, and the next pairable call advertises at once. Never
+  a link whose pairing failed, so this runs while that link ends, and the next pairable call advertises at once (its
+  Pairing Request answered with Repeated Attempts until the waiting interval of the failure is over). Never
   during a pairing; a pairing that starts before it is done waits for it.
 
 Nothing else is computed. A reconnection computes nothing, so a device that wakes from System OFF and reconnects gets

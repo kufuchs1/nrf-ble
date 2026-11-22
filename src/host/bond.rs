@@ -167,7 +167,8 @@ impl Bond {
 
     /// Whether the central knows the table's current layout: always for a
     /// table without the Service Changed characteristic, which keeps none.
-    /// Otherwise the host is to indicate Service Changed.
+    /// Otherwise the central would need the Service Changed indication,
+    /// which the host does not send.
     #[inline]
     #[must_use = "the comparison is only computed"]
     pub fn layout_known(&self, db: &Db) -> bool { layout(db).is_none_or(|current| self.layout == Some(current)) }

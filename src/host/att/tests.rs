@@ -137,7 +137,6 @@ fn exchange(server: &mut Server, app: &App, request: &[u8], level: Sec) -> Optio
     let len = server.handle(request, level, app, &mut out);
     assert_eq!(twin_len, len, "request {request:02X?}");
     assert_eq!(twin.subscriptions(), server.subscriptions(), "request {request:02X?}");
-    assert_eq!(twin.is_indicating(), server.is_indicating(), "request {request:02X?}");
     #[cfg(feature = "att-mtu")]
     assert_eq!(twin.mtu, server.mtu, "request {request:02X?}");
     #[cfg(feature = "eatt")]
@@ -794,9 +793,6 @@ fn notifications_need_a_subscription_and_fit_the_mtu() {
     assert!(server.notify(KEYBOARD, &[0; 8], Sec::Encrypted, &mut out).is_ok());
     assert!(server.notify(KEYBOARD, &[0; 20], Sec::Encrypted, &mut out).is_ok());
     assert_eq!(server.notify(KEYBOARD, &[0; 21], Sec::Encrypted, &mut out), Err(NotifyError::TooLong));
-    // Only notifications were enabled.
-    assert_eq!(server.indicate(KEYBOARD, &[0; 8], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
-    assert_eq!(server.service_changed(Sec::Encrypted, &mut out), None);
 }
 
 /// A 128-bit UUID of a service in the tests.
@@ -825,30 +821,14 @@ crate::gatt! {
 }
 
 #[test]
-fn service_changed_is_indicated_only_after_this_links_configuration_write() {
+fn a_confirmation_is_ignored() {
     let app = App::new();
     let mut server = Server::new(&TEST_DB);
-    let mut out = [0_u8; MTU];
     assert_eq!(TEST_DB.service_changed(), Some(CHANGED));
-    assert_eq!(CHANGED.handle(), 3);
-    // Restored from a bond only: not written on this link.
-    server.restore(crate::host::gatt::Subscriptions::from_bits(0b10));
-    assert_eq!(server.service_changed(Sec::Encrypted, &mut out), None);
+    // No indication is sent, Service Changed's included: a confirmation
+    // gets no answer, and no error either.
     golden(&mut server, &app, &[0x12, 0x04, 0x00, 0x02, 0x00], &[0x13]);
-    let len = server.service_changed(Sec::Encrypted, &mut out).unwrap();
-    assert_eq!(&out[..len], &[0x1D, 0x03, 0x00, 0x01, 0x00, 0xFF, 0xFF]);
-    assert!(server.is_indicating());
-    // One at a time, until the confirmation.
-    assert_eq!(server.service_changed(Sec::Encrypted, &mut out), None);
-    assert_eq!(server.indicate(CHANGED, &[0; 4], Sec::Encrypted, &mut out), Err(NotifyError::Pending));
     assert!(exchange(&mut server, &app, &[0x1E], Sec::Encrypted).is_none());
-    assert!(!server.is_indicating());
-    assert!(server.service_changed(Sec::Encrypted, &mut out).is_some());
-    server.cancel_indication();
-    assert!(!server.is_indicating());
-    // Turned off on this link: nothing more.
-    golden(&mut server, &app, &[0x12, 0x04, 0x00, 0x00, 0x00], &[0x13]);
-    assert_eq!(server.service_changed(Sec::Encrypted, &mut out), None);
 }
 
 #[test]
@@ -954,13 +934,11 @@ fn notify_and_indicate_only_values_keep_their_security() {
     // As a bond restores them: every descriptor with both bits.
     server.restore(crate::host::gatt::Subscriptions::from_bits(0b11_1111));
     assert_eq!(server.notify(SECRET_NOTIFY, &[1; 8], Sec::Open, &mut out), Err(NotifyError::Insecure));
-    assert_eq!(server.indicate(SECRET_INDICATE, &[1], Sec::Open, &mut out), Err(NotifyError::Insecure));
-    assert!(!server.is_indicating());
     assert!(server.notify(OPEN_NOTIFY, &[1; 8], Sec::Open, &mut out).is_ok());
     let len = server.notify(SECRET_NOTIFY, &[1; 8], Sec::Encrypted, &mut out).unwrap();
     assert_eq!(&out[..len], &[0x1B, 0x03, 0x00, 1, 1, 1, 1, 1, 1, 1, 1]);
-    let len = server.indicate(SECRET_INDICATE, &[1], Sec::Encrypted, &mut out).unwrap();
-    assert_eq!(&out[..len], &[0x1D, 0x06, 0x00, 1]);
+    // An indicate-only value is never notified.
+    assert_eq!(server.notify(SECRET_INDICATE, &[1], Sec::Encrypted, &mut out), Err(NotifyError::NotSubscribed));
     // Their configuration descriptors need the same.
     let response = exchange(&mut server, &app, &[0x0A, 0x04, 0x00], Sec::Open).unwrap();
     assert_eq!(*response, [0x01, 0x0A, 0x04, 0x00, 0x0F]);

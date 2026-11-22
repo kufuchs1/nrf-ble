@@ -33,6 +33,11 @@
 //! 5. The central encrypts the link with the long term key, which
 //!    [`Responder::ltk_request`] gives least significant octet first, as
 //!    [`crate::link::Link::ltk_reply`] takes it, for EDIV 0 and Rand 0 only.
+//!    Only that encryption completes the pairing: one with another key, the
+//!    bond's on a link that pairs again when the central's key refresh asked
+//!    for its key before our `DHKey` check, leaves the pairing waiting for its
+//!    own, and the timer ends it if that never comes; the central's identity
+//!    keys on such a link fail it.
 //! 6. Once the link is encrypted, our identity resolving key and static random
 //!    identity address (Identity Information and Identity Address Information),
 //!    then the central's, if it offered them, which `BlueZ` sends only after it
@@ -52,6 +57,25 @@
 //! central ends the pairing and is never answered. A failed pairing reports
 //! [`Outcome::Failed`]; the engine disconnects once the Pairing Failed went
 //! out.
+//!
+//! # Repeated attempts
+//!
+//! A pairing that failed, by either side or by its timer, starts a waiting
+//! interval (Core specification, volume 3, part H, section 2.3.6), in which
+//! a Pairing Request gets Repeated Attempts (0x09): [`RETRY_WAIT`] (2 s)
+//! after the first failure, doubled with each further one up to
+//! [`RETRY_WAIT_MAX`] (60 s, from the sixth on). A failure [`RETRY_QUIET`]
+//! (60 s) or more after the end of the last interval waits 2 s again, and a
+//! bond ends the intervals. The state outlives the link, as the key pair
+//! slot does: the engine ends a link whose pairing failed, and the next
+//! attempt comes on a new one. It is global rather than by central, as a
+//! central that pairs from a resolvable private address has a new one at
+//! each attempt. A refused request is no attempt: it neither starts nor
+//! extends an interval; nor does a pairing that the end of its link cut,
+//! which shows the central nothing a failure would. So a user who mistyped a
+//! passkey pairs again after 2 s, about the time the central takes to start the
+//! next attempt, while a central guessing passkeys gets about one try a minute
+//! after six failures, and as few by waiting for the quiet time.
 //!
 //! # The timer
 //!
@@ -85,7 +109,9 @@
 //!   link), while Pairing Requests are taken, as soon as no job waits or runs
 //!   and no pairing is under way. The engine ends a link whose pairing failed,
 //!   and the next attempt follows on a new link, so the refill runs while the
-//!   link ends and the next pairable advertising starts at once. After a bond
+//!   link ends and the next pairable advertising starts at once; its Pairing
+//!   Request gets Repeated Attempts until the waiting interval of the failure
+//!   is over ([repeated attempts](self#repeated-attempts)). After a bond
 //!   nothing is computed: the link is in use (the central discovers the table,
 //!   the application sends its input), and the next pairing needs pairable
 //!   advertising again, which makes the key pair before it advertises.
@@ -112,7 +138,10 @@
 //! `MacKey` once both check values are computed, and the long term key once the
 //! pairing ends: handed over in [`Bonded`], or failed. The private key is
 //! [`ecc::KeyPair`]'s to overwrite, when the Diffie-Hellman job drops it, or
-//! the end of its pairing does.
+//! the end of its pairing does. The PDUs that carry the central's keys and
+//! values are overwritten once handled: the engine's copy and the L2CAP
+//! reassembly buffer by the engine, the link layer's fragment by the host's
+//! run task.
 //!
 //! # Byte order
 //!
@@ -169,9 +198,11 @@
 /// P-256: the key pair, the check of the central's public key and the
 /// Diffie-Hellman key.
 pub mod ecc;
-/// The cryptographic functions of pairing: f4, f5, f6, g2 and ah.
+/// The cryptographic functions of pairing: f4, f5 and f6.
 pub mod toolbox;
 
+#[cfg(feature = "passkey")]
+use crate::crypto::forget;
 #[cfg(feature = "passkey")]
 use crate::host::PasskeyError;
 use crate::{
@@ -181,11 +212,6 @@ use crate::{
     pdu::{IdentityAddress, Peer, concat_into},
 };
 use core::{array::TryFromSliceError, fmt, mem};
-#[cfg(feature = "passkey")]
-use core::{
-    hint::black_box,
-    sync::atomic::{Ordering, compiler_fence},
-};
 use ecc::{KEY_LEN, KeyError, KeyPair, PUBLIC_KEY_LEN, check_public_key};
 use embassy_time::{Duration, Instant};
 use toolbox::{address, f4, f5, f6};
@@ -222,6 +248,20 @@ pub const KEYPRESS_NOTIFICATION: u8 = 0x0E;
 pub const PDU_MAX: usize = 1_usize.strict_add(PUBLIC_KEY_LEN);
 /// The time a pairing has from the last PDU the security manager queued.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
+/// Repeated Attempts: the waiting interval after a failed pairing.
+///
+/// A Pairing Request in it gets Pairing Failed with Repeated Attempts
+/// (0x09). It doubles with each further failure, up to [`RETRY_WAIT_MAX`].
+pub const RETRY_WAIT: Duration = Duration::from_secs(2);
+/// The longest waiting interval of Repeated Attempts, reached after the
+/// sixth failure in a row.
+pub const RETRY_WAIT_MAX: Duration = Duration::from_secs(60);
+/// The time without a failed pairing after the waiting interval from which
+/// the next failure waits [`RETRY_WAIT`] again.
+pub const RETRY_QUIET: Duration = Duration::from_secs(60);
+/// The doublings of [`RETRY_WAIT`] that reach [`RETRY_WAIT_MAX`]: 2 s to
+/// 64 s, capped at 60 s.
+const RETRY_DOUBLINGS: u8 = 5;
 /// IO capability: no input and no output, which makes pairing Just Works.
 pub const NO_INPUT_NO_OUTPUT: u8 = 0x03;
 /// IO capability: a keyboard without a display.
@@ -494,6 +534,13 @@ pub struct Responder {
     refill:         bool = false,
     /// Our identity keys the pairing distributes: 0 or [`KEY_DIST_ID`].
     resp_dist:      u8 = 0,
+    /// Repeated Attempts: the failed pairings in a row, less one, up to
+    /// [`RETRY_DOUBLINGS`]: the doublings of the waiting interval.
+    /// Kept across links, as the next attempt comes on a new one.
+    retries:        u8 = 0,
+    /// Repeated Attempts: the end of the waiting interval after the last
+    /// failed pairing, until a pairing bonds. Kept across links.
+    retry:          Option<Instant> = None,
     /// The job being run, with its number.
     running:        Option<(Task, u8)> = None,
     /// What our side of pairing protects against.
@@ -547,8 +594,11 @@ enum State {
     #[cfg(feature = "passkey")]
     Confirm(u8),
     /// Eb is queued: waiting for the central to encrypt the link with the
-    /// long term key.
-    Encryption,
+    /// long term key; with whether that key went to the link layer
+    /// ([`Responder::ltk_request`]). Only an encryption with it completes
+    /// the pairing, and only a PDU received encrypted after it carries the
+    /// central's identity keys.
+    Encryption(bool),
     /// No pairing on the link.
     Idle,
     /// Passkey Entry: the central's first confirm value arrived before the
@@ -782,18 +832,29 @@ impl Responder {
         self.latched = 0;
     }
 
-    /// Takes the encryption of the link, after the long term key went to
-    /// the link layer: `on` once it is encrypted, not `on` if encryption
-    /// failed, which fails the pairing. A first encryption and a key refresh
-    /// alike: a pairing on a link already encrypted ends with a refresh to
-    /// its key. Outside the pairing's encryption step it changes nothing.
+    /// Takes the encryption of the link at `now`, after the long term key
+    /// went to the link layer: `on` once it is encrypted, not `on` if
+    /// encryption failed, which fails the pairing. A first encryption and a key
+    /// refresh alike: a pairing on a link already encrypted ends with a refresh
+    /// to its key. Outside the pairing's encryption step it changes nothing.
+    ///
+    /// Only an encryption with the pairing's own key completes the pairing:
+    /// one whose key request [`Self::ltk_request`] answered. A central that
+    /// encrypts with another key in that step, the bond's on a link that is
+    /// paired again, its refresh started before our `DHKey` check, leaves
+    /// the pairing waiting for its own key, and the timer ends it if that
+    /// never comes. The link is then not encrypted with the key the bond
+    /// would hold, and a Passkey Entry pairing would raise a link encrypted
+    /// with a Just Works key to authenticated.
     #[inline]
-    pub fn encryption_changed(&mut self, on: bool) -> Option<Outcome> {
-        if self.state != State::Encryption {
-            return None;
-        }
+    pub fn encryption_changed(&mut self, on: bool, now: Instant) -> Option<Outcome> {
+        let State::Encryption(keyed) = self.state else { return None };
         if !on {
-            return self.fail(Reason::UNSPECIFIED, true);
+            return self.fail(Reason::UNSPECIFIED, true, now);
+        }
+        if !keyed {
+            warn!("smp: the link is encrypted with another key than the pairing's");
+            return None;
         }
         self.state = State::Keys;
         if self.resp_dist != 0 {
@@ -833,10 +894,15 @@ impl Responder {
         }
     }
 
-    /// Fails the pairing for `reason`: our Pairing Failed follows the PDU
-    /// being sent, and replaces the others. `report` it as the outcome if a
-    /// pairing ends, or a request is refused.
-    fn fail(&mut self, reason: Reason, report: bool) -> Option<Outcome> {
+    /// Fails the pairing for `reason` at `now`: our Pairing Failed follows
+    /// the PDU being sent, and replaces the others. `report` it as the
+    /// outcome if a pairing ends, or a request is refused. A pairing that
+    /// was under way starts the waiting interval of Repeated Attempts; a
+    /// refused request does not.
+    fn fail(&mut self, reason: Reason, report: bool, now: Instant) -> Option<Outcome> {
+        if self.is_pairing() {
+            self.retry_later(now);
+        }
         self.end();
         self.pending = (self.pending & self.latched) | OUT_FAILED;
         self.reason = reason;
@@ -862,6 +928,9 @@ impl Responder {
         // No refill after a bond: the link is in use, and the next pairing
         // needs pairable advertising again, which makes its key pair first.
         self.refill = false;
+        // Nor any waiting for the next.
+        self.retry = None;
+        self.retries = 0;
         self.end();
         Some(Outcome::Bonded(bonded))
     }
@@ -938,11 +1007,11 @@ impl Responder {
     #[must_use = "the state is only read"]
     pub const fn is_pairing(&self) -> bool { !matches!(self.state, State::Idle | State::TimedOut) }
 
-    /// Takes the result of a job from [`Job::run`]. A result whose pairing
-    /// ended is dropped; a key pair goes into the empty slot, for the next
-    /// pairing (or the one under way, if it waits for it).
+    /// Takes the result of a job from [`Job::run`], at `now`. A result whose
+    /// pairing ended is dropped; a key pair goes into the empty slot, for the
+    /// next pairing (or the one under way, if it waits for it).
     #[inline]
-    pub fn job_done<C>(&mut self, crypto: &mut C, result: JobResult) -> Option<Outcome>
+    pub fn job_done<C>(&mut self, crypto: &mut C, result: JobResult, now: Instant) -> Option<Outcome>
     where
         C: Aes + Random,
     {
@@ -978,7 +1047,7 @@ impl Responder {
                 answer
             },
         };
-        self.settle(answer)
+        self.settle(answer, now)
     }
 
     /// Whether both public keys are known, so the Diffie-Hellman key may be
@@ -996,11 +1065,23 @@ impl Responder {
     /// The long term key for the link layer's request with `ediv` and
     /// `rand`, least significant octet first: the key of the pairing under
     /// way, for EDIV 0 and Rand 0 only, from our `DHKey` check on. Otherwise
-    /// `None`, and the bond's key is the engine's to give.
+    /// `None`, and the bond's key is the engine's to give. A key given is
+    /// noted: only the encryption with it completes the pairing
+    /// ([`Self::encryption_changed`]).
     #[inline]
-    #[must_use = "the key is only read"]
-    pub const fn ltk_request(&self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
-        (ediv == 0 && rand == [0; 8] && matches!(self.state, State::Encryption | State::Keys)).then_some(self.ltk)
+    #[must_use = "the key goes to the link layer"]
+    pub const fn ltk_request(&mut self, ediv: u16, rand: [u8; 8]) -> Option<[u8; 16]> {
+        if ediv != 0 || rand != [0; 8] {
+            return None;
+        }
+        if matches!(self.state, State::Encryption(_)) {
+            self.state = State::Encryption(true);
+        } else if self.state != State::Keys {
+            return None;
+        } else {
+            // The identity keys are under way: the key is the same.
+        }
+        Some(self.ltk)
     }
 
     /// A security manager without a key pair, pairing or identity: give it
@@ -1043,12 +1124,14 @@ impl Responder {
         }
     }
 
-    /// Takes the time, `now`: past the deadline the pairing times out.
+    /// Takes the time, `now`: past the deadline the pairing times out, which
+    /// starts the waiting interval of Repeated Attempts.
     #[inline]
     pub fn on_time(&mut self, now: Instant) -> Option<Outcome> {
         if self.deadline.is_none_or(|deadline| now < deadline) {
             return None;
         }
+        self.retry_later(now);
         self.end();
         self.state = State::TimedOut;
         self.pending &= self.latched;
@@ -1080,11 +1163,13 @@ impl Responder {
         Ok(None)
     }
 
-    /// Takes the central's Pairing Failed: the pairing ends, unanswered.
-    fn pairing_failed(&mut self, params: &[u8]) -> Option<Outcome> {
+    /// Takes the central's Pairing Failed, at `now`: the pairing ends,
+    /// unanswered, and the waiting interval of Repeated Attempts starts.
+    fn pairing_failed(&mut self, params: &[u8], now: Instant) -> Option<Outcome> {
         if !self.is_pairing() {
             return None;
         }
+        self.retry_later(now);
         self.end();
         self.pending &= self.latched;
         let reason = params.first().map_or(Reason::UNSPECIFIED, |&code| Reason(code));
@@ -1101,6 +1186,9 @@ impl Responder {
         };
         if !self.pairable {
             return Err(Reason::PAIRING_NOT_SUPPORTED);
+        }
+        if self.retry.is_some_and(|until| now < until) {
+            return Err(Reason::REPEATED_ATTEMPTS);
         }
         if io > IO_CAPABILITY_MAX || oob > 1 || !(KEY_SIZE_MIN..=KEY_SIZE).contains(&key_size) {
             return Err(Reason::INVALID_PARAMETERS);
@@ -1167,7 +1255,7 @@ impl Responder {
         if !self.awaits_passkey() {
             return Err(PasskeyError::NotWaiting);
         }
-        let Some(value) = passkey else { return Ok(self.fail(Reason::PASSKEY_ENTRY_FAILED, true)) };
+        let Some(value) = passkey else { return Ok(self.fail(Reason::PASSKEY_ENTRY_FAILED, true, now)) };
         if value > PASSKEY_MAX {
             return Err(PasskeyError::Invalid);
         }
@@ -1320,7 +1408,7 @@ impl Responder {
             PAIRING_DHKEY_CHECK => self.dhkey_check(&*crypto, params),
             IDENTITY_INFORMATION => self.identity_information(params, encrypted),
             IDENTITY_ADDRESS_INFORMATION => self.identity_address(params, encrypted),
-            PAIRING_FAILED => return self.pairing_failed(params),
+            PAIRING_FAILED => return self.pairing_failed(params, now),
             PAIRING_RESPONSE
             | PAIRING_CONFIRM
             | ENCRYPTION_INFORMATION
@@ -1330,7 +1418,7 @@ impl Responder {
             | KEYPRESS_NOTIFICATION => Err(Reason::UNSPECIFIED),
             _ => Err(Reason::COMMAND_NOT_SUPPORTED),
         };
-        answer.unwrap_or_else(|reason| self.fail(reason, report))
+        answer.unwrap_or_else(|reason| self.fail(reason, report, now))
     }
 
     /// Whether the crypto task is to fill the key pair slot now, in idle
@@ -1347,6 +1435,20 @@ impl Responder {
             && self.job.is_none()
             && self.running.is_none()
             && !self.is_pairing()
+    }
+
+    /// Starts the waiting interval of Repeated Attempts (Core specification,
+    /// volume 3, part H, section 2.3.6) for a pairing that failed at `now`:
+    /// [`RETRY_WAIT`], doubled for each failure in a row up to
+    /// [`RETRY_WAIT_MAX`]. A failure [`RETRY_QUIET`] or more after the end of
+    /// the last interval counts as the first again.
+    fn retry_later(&mut self, now: Instant) {
+        let quiet =
+            self.retry.is_none_or(|until| now.checked_duration_since(until).is_some_and(|since| since >= RETRY_QUIET));
+        self.retries = if quiet { 0 } else { self.retries.saturating_add(1).min(RETRY_DOUBLINGS) };
+        let ticks = RETRY_WAIT.as_ticks().checked_shl(u32::from(self.retries)).unwrap_or(u64::MAX);
+        let wait = Duration::from_ticks(ticks).min(RETRY_WAIT_MAX);
+        self.retry = Some(now.checked_add(wait).unwrap_or(Instant::MAX));
     }
 
     /// Queues our confirm value of `round` of Passkey Entry, with a fresh
@@ -1384,9 +1486,9 @@ impl Responder {
     #[inline]
     pub const fn set_pairable(&mut self, pairable: bool) { self.pairable = pairable; }
 
-    /// Fails the pairing with the reason of a failed step.
-    fn settle(&mut self, answer: Result<Option<Outcome>, Reason>) -> Option<Outcome> {
-        answer.unwrap_or_else(|reason| self.fail(reason, true))
+    /// Fails the pairing with the reason of a failed step, at `now`.
+    fn settle(&mut self, answer: Result<Option<Outcome>, Reason>, now: Instant) -> Option<Outcome> {
+        answer.unwrap_or_else(|reason| self.fail(reason, true, now))
     }
 
     /// The next job for the crypto task, if one waits: one a pairing asked
@@ -1419,10 +1521,12 @@ impl Responder {
     }
 
     /// Whether the central's identity keys are taken now: offered, after
-    /// our `DHKey` check and received encrypted. They may overtake the
-    /// encryption event, but never the encryption.
+    /// our `DHKey` check and received encrypted, once the pairing's key went
+    /// to the link layer. They may overtake the encryption event, but never
+    /// the encryption with that key: on a link encrypted with another key
+    /// they fail the pairing.
     const fn takes_keys(&self, encrypted: bool) -> bool {
-        encrypted && self.init_dist != 0 && matches!(self.state, State::Encryption | State::Keys)
+        encrypted && self.init_dist != 0 && matches!(self.state, State::Encryption(true) | State::Keys)
     }
 
     /// Verifies the central's `DHKey` check with the Diffie-Hellman key, and
@@ -1456,7 +1560,7 @@ impl Responder {
         self.ltk = reversed(&ltk);
         wipe(&mut ltk);
         self.pending |= OUT_CHECK;
-        self.state = State::Encryption;
+        self.state = State::Encryption(false);
         Ok(None)
     }
 
@@ -1523,17 +1627,6 @@ fn flip_coordinates(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] {
         coordinate.reverse();
     }
     out
-}
-
-/// Overwrites a passkey with `blank`, out of the range of passkeys, once it
-/// is no longer needed, so its digits do not outlive their use in RAM, as
-/// [`wipe`] does with key material.
-#[cfg(feature = "passkey")]
-pub(crate) fn forget(passkey: &mut u32, blank: u32) {
-    *passkey = blank;
-    // Keeps the compiler from dropping the store.
-    black_box(passkey);
-    compiler_fence(Ordering::SeqCst);
 }
 
 /// `value` in the other byte order.

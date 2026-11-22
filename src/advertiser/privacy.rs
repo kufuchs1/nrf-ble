@@ -94,7 +94,10 @@ impl ResolvingList {
     #[inline]
     pub fn add(&mut self, identity: Peer, irk: [u8; 16]) -> bool { self.add_keys(identity, irk, [0; 16]) }
 
-    /// Stores both keys, preserving the per-peer privacy mode.
+    /// Adds `identity` with its key and our local key for it, or replaces
+    /// its entry, overwriting the old keys. The peer starts with network
+    /// privacy, also where its entry had device privacy, until
+    /// [`Self::set_mode`] changes it. Returns false if the list is full.
     #[inline]
     pub fn add_keys(&mut self, identity: Peer, irk: [u8; 16], local: [u8; 16]) -> bool {
         self.remove(identity);

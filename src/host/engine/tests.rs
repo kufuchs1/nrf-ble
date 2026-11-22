@@ -173,6 +173,45 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_long_response() {
 }
 
 #[test]
+fn a_received_pdu_leaves_no_copy_in_the_reassembly_buffer() {
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(9);
+    let identity = identity();
+    engine.advertise(true, &identity, None, Duration::from_secs(60));
+    engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
+    let central = Central::new(linux_request(true, true), local_rpa());
+    receive(&mut engine, &mut device, 6, &central.request, at(0));
+    assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
+    // The central's public key, in three fragments.
+    receive(&mut engine, &mut device, 6, &central.public_key(), at(0));
+    assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
+}
+
+#[test]
+fn a_dropped_pdu_leaves_no_copy_in_the_reassembly_buffer() {
+    let mut engine = Engine::new(&example::DB, example::CONFIG);
+    let mut device = Device(9);
+    let identity = identity();
+    engine.advertise(true, &identity, None, Duration::from_secs(60));
+    engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
+    // A PDU on a CID the host does not serve.
+    receive(&mut engine, &mut device, 7, &[0x5A; 40], at(0));
+    assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
+    // A PDU with more octets than its header announces.
+    let mut overlong = std::vec![2, 0, 6, 0];
+    overlong.extend_from_slice(&[0x5A; 20]);
+    engine.on_acl(&mut device, &App, &AclIn::for_test(true, false, &overlong), at(0));
+    assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
+    // A PDU still being received keeps its octets.
+    engine.on_acl(&mut device, &App, &AclIn::for_test(true, false, &[40, 0, 6, 0, 0x5A]), at(0));
+    assert_ne!(engine.rx.buffer(), &[0; RX_MAX]);
+    // A continuation without a start leaves none.
+    engine.on_acl(&mut device, &App, &AclIn::for_test(true, false, &[1, 0, 7, 0, 0x5A]), at(0));
+    engine.on_acl(&mut device, &App, &AclIn::for_test(false, false, &[0x5A; 3]), at(0));
+    assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
+}
+
+#[test]
 fn the_parameter_request_leaves_the_last_place_to_responses() {
     let identity = identity();
     let bond = Bond::new(

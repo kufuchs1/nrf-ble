@@ -19,12 +19,11 @@
 //! Supported Features (`Value::ServerFeatures`).
 //!
 //! The Service Changed characteristic (0x2A05) is optional, and a table that
-//! never changes its layout needs none. Where it is present, the server builds
-//! its indication only once that link has written its client characteristic
-//! configuration, as `BlueZ` registers its handler only then. The engine does
-//! not send indications yet: asking for this one only after the Write Response
-//! went out, and timing its confirmation, are still to be done for a table that
-//! has the characteristic.
+//! never changes its layout needs none. The host sends no indications, this
+//! one included: a table that has the characteristic would need its
+//! indication sent only once the link wrote its client characteristic
+//! configuration and the Write Response to that write went out, as `BlueZ`
+//! registers its handler only then, and its confirmation timed.
 //!
 //! Read By Group Type reports the real end handle of the last service, never
 //! 0xFFFF: `BlueZ` keeps a cached service whose start handle, UUID and number

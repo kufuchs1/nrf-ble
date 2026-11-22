@@ -738,6 +738,14 @@ struct HostState {
     epoch:            u32,
     /// What the host learns about the current link.
     info:             Option<Info>,
+    /// The host's answer to the link's key request until the link layer
+    /// takes it: whether it gave a key, which is then in [`Self::ltk_key`].
+    ltk_answer:       Option<bool>,
+    /// The key of [`Self::ltk_answer`], zero otherwise: a place of its own,
+    /// overwritten once the link layer took the key or the link ended
+    /// ([`Self::forget_ltk`]), where a signal's or an option's slot would
+    /// keep the octets.
+    ltk_key:          [u8; 16],
     /// An LTK request waits for the host's answer.
     ltk_pending:      bool,
     /// Connection updates the host asked for while it answered a central's
@@ -790,10 +798,18 @@ impl HostState {
         self.private_address = None;
     }
 
-    /// Overwrites every identity resolving key before it is dropped.
+    /// Overwrites every identity resolving key and a long term key not yet
+    /// taken before they are dropped.
     fn forget_keys(&mut self) {
         self.forget_address();
+        self.forget_ltk();
         self.adv.resolving.clear();
+    }
+
+    /// Forgets the host's answer to a key request and overwrites its key.
+    fn forget_ltk(&mut self) {
+        self.ltk_answer = None;
+        crypto::wipe(&mut self.ltk_key);
     }
 
     /// The state after power-on or a reset, in the generation `epoch`.
@@ -807,6 +823,8 @@ impl HostState {
             counters: Counters::NONE,
             epoch,
             info: None,
+            ltk_answer: None,
+            ltk_key: [0; 16],
             ltk_pending: false,
             merged_updates: 0,
             #[cfg(feature = "event-timing")]
@@ -845,8 +863,6 @@ pub struct Shared {
     hold_latency:    AtomicBool = AtomicBool::new(false),
     /// The host decides on a central's connection parameter requests.
     host_decides:    AtomicBool = AtomicBool::new(false),
-    /// Long term key from the host, `None` if it has none.
-    ltk:             Signal<CriticalSectionRawMutex, Option<[u8; 16]>> = Signal::new(),
     /// Connection parameters the host asks the central for.
     param_request:   Signal<CriticalSectionRawMutex, [u16; 4]> = Signal::new(),
     /// The host's answer to a central's connection parameter request: the
@@ -1095,8 +1111,9 @@ impl Shared {
     /// outside radio events.
     pub(crate) fn refresh_private_address(&self) {
         let enabled = self.state.lock(|cell| cell.borrow().adv_enabled);
-        let Some(key) = self.private_key().filter(|_| enabled) else { return };
+        let Some(mut key) = self.private_key().filter(|_| enabled) else { return };
         let address = self.own_address(Some(key));
+        crypto::wipe(&mut key);
         self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             if state.adv_enabled && state.adv.private && state.adv.own != address {
@@ -1185,6 +1202,9 @@ impl Shared {
             let changed = state.connected != connected;
             if changed {
                 state.epoch = state.epoch.wrapping_add(1);
+                // A key for the link that ended, or for a link before this
+                // one, is overwritten.
+                state.forget_ltk();
                 state.ltk_pending = false;
                 state.remote_features = 0;
                 state.queries = 0;
@@ -1209,7 +1229,6 @@ impl Shared {
             // Requests of the host for the link that ended, or for a link
             // before this one.
             self.disconnect.reset();
-            self.ltk.reset();
             self.param_request.reset();
             self.parameter_reply.reset();
             self.data_length.reset();
@@ -1308,9 +1327,19 @@ impl Shared {
     pub(crate) fn take_event(&self) -> Option<Event> { self.events.try_receive().ok() }
 
     /// Takes the host's answer to a long term key request, `None` while
-    /// none came.
+    /// none came. The answer kept here is overwritten; the copy returned is
+    /// the caller's to wipe.
     pub(crate) fn take_ltk(&self) -> Option<LtkAnswer> {
-        self.ltk.try_take().map(|key| key.map_or(LtkAnswer::Missing, LtkAnswer::Key))
+        self.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            let answer = match state.ltk_answer {
+                Some(true) => Some(LtkAnswer::Key(state.ltk_key)),
+                Some(false) => Some(LtkAnswer::Missing),
+                None => None,
+            };
+            state.forget_ltk();
+            answer
+        })
     }
 
     /// Takes the number of connection updates that were part of the host's
@@ -1510,12 +1539,18 @@ impl<'shared> Link<'shared> {
         }
         // The key and the address come outside the critical section; the
         // address is cached, so advertising keeps it until it expires.
-        let key = params.private.then(|| {
-            self.shared
-                .state
-                .lock(|cell| cell.borrow().adv.resolving.local_key(params.kind.is_directed().then_some(params.peer)))
-        });
-        let addresses = on_air(key.flatten());
+        let mut key = params
+            .private
+            .then(|| {
+                self.shared.state.lock(|cell| {
+                    cell.borrow().adv.resolving.local_key(params.kind.is_directed().then_some(params.peer))
+                })
+            })
+            .flatten();
+        let addresses = on_air(key);
+        if let Some(octets) = key.as_mut() {
+            crypto::wipe(octets);
+        }
         let result = self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             if state.connected {
@@ -1664,17 +1699,25 @@ impl<'shared> Link<'shared> {
     /// [`Error::Gone`] if the link ended, which needs no further action,
     /// [`Error::Disallowed`] if no request waits for an answer.
     #[inline]
-    pub fn ltk_reply(&self, epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), Error> {
-        self.shared.state.lock(|cell| {
+    pub fn ltk_reply(&self, epoch: Epoch, mut key: Option<[u8; 16]>) -> Result<(), Error> {
+        let result = self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             state.current(epoch)?;
             if !state.ltk_pending {
                 return Err(Error::Disallowed);
             }
             state.ltk_pending = false;
-            self.shared.ltk.signal(key);
+            state.ltk_answer = Some(key.is_some());
+            state.ltk_key = key.unwrap_or_default();
             Ok(())
-        })?;
+        });
+        // The argument's copy; the caller's own is the caller's to wipe.
+        if let Some(octets) = key.as_mut() {
+            crypto::wipe(octets);
+        }
+        result?;
+        // The link layer polls for the answer before each event: the wakeup
+        // makes it look at once.
         self.shared.wakeup.signal(());
         Ok(())
     }

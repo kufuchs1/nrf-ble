@@ -1,10 +1,13 @@
-//! The cryptographic functions of the security manager: f4, f5, f6, g2 and
-//! ah.
+//! The cryptographic functions of the security manager: f4, f5 and f6.
+//!
+//! Numeric comparison, whose g2 this would hold, is not supported; ah, which
+//! makes and resolves resolvable private addresses, is the crate's address
+//! hash in [`crate::crypto`], which the link layer uses too.
 //!
 //! They are written from the Core specification, volume 3, part H, section
 //! 2.2.
 //!
-//! The AES-CMAC under f4, f5, f6 and g2 is that of the RustCrypto `cmac`
+//! The AES-CMAC under f4, f5 and f6 is that of the RustCrypto `cmac`
 //! crate (RFC 4493), not our own: [`cmac()`] hands it the [`Aes`] of the
 //! firmware, the hardware ECB, as its block cipher, through an adapter that
 //! implements the block cipher traits of the `cipher` crate for one key
@@ -23,7 +26,7 @@
 //!
 //! The CMAC is fed the message piece by piece, so no message is assembled on
 //! the stack. A CMAC takes one AES block for its subkeys and one for each 16
-//! octets of its message: 6 for f4, f6 and g2, and 13 for f5, which runs
+//! octets of its message: 6 for f4 and f6, and 13 for f5, which runs
 //! three CMACs.
 //!
 //! The `cmac` crate, with its `zeroize` feature, overwrites its chaining
@@ -185,23 +188,6 @@ pub const fn address(peer: Peer) -> [u8; 7] {
     [u8::from(peer.random), address5, address4, address3, address2, address1, address0]
 }
 
-/// The random address hash function ah (section 2.2.2): the least
-/// significant 24 bits of AES-128 with `key` of `prand` padded with zeros.
-///
-/// `key` is an identity resolving key; `prand` and the hash are most
-/// significant octet first.
-#[inline]
-#[must_use = "the hash is only computed"]
-pub fn ah<A>(aes: &A, key: &[u8; 16], prand: [u8; 3]) -> [u8; 3]
-where
-    A: Aes,
-{
-    let mut block = [0; 16];
-    block[13..].copy_from_slice(&prand);
-    let [.., hash0, hash1, hash2] = aes.encrypt(*key, block);
-    [hash0, hash1, hash2]
-}
-
 /// The AES-CMAC (RFC 4493) with `key` of the message made of `parts` in
 /// order, most significant octet first, from the `cmac` crate over `aes`.
 #[inline]
@@ -279,22 +265,6 @@ where
     A: Aes,
 {
     cmac(aes, *w, &[nonces.0, nonces.1, r_value, &io_cap, addresses.0, addresses.1])
-}
-
-/// The numeric comparison value generation function g2 (section 2.2.9): the
-/// least significant 32 bits of AES-CMAC with `key` of U || V || `y`.
-///
-/// U and V, `u_x` and `v_x`, are the X coordinates of the two public keys,
-/// `key` and `y` the two nonces; the six digits shown are the value modulo
-/// 1 000 000.
-#[inline]
-#[must_use = "the value is only computed"]
-pub fn g2<A>(aes: &A, u_x: &[u8; 32], v_x: &[u8; 32], key: &[u8; 16], y: &[u8; 16]) -> u32
-where
-    A: Aes,
-{
-    let [.., mac0, mac1, mac2, mac3] = cmac(aes, *key, &[u_x, v_x, y]);
-    u32::from_be_bytes([mac0, mac1, mac2, mac3])
 }
 
 #[cfg(test)] pub(crate) mod tests;

@@ -149,3 +149,14 @@ fn undirected_advertising_resolves_the_accept_list_the_same_way() {
     settings.filter_policy = 0;
     assert!(accepts(&settings, rpa([0x77; 16], [0x12, 0x34, 0x56])));
 }
+
+#[test]
+fn new_keys_for_a_listed_peer_start_it_in_network_privacy() {
+    let mut list = directed().resolving;
+    assert!(list.accepts_identity(CENTRAL));
+    // Replaced keys: the entry starts again in network privacy.
+    assert!(list.add_keys(CENTRAL, SAMPLE_IRK, LOCAL_IRK));
+    assert!(!list.accepts_identity(CENTRAL));
+    assert!(list.set_mode(CENTRAL, true));
+    assert!(list.accepts_identity(CENTRAL));
+}

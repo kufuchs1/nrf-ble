@@ -97,8 +97,10 @@
 //! - A new key pair after a pairing that used ours ended without a bond, while
 //!   the engine is pairable: it runs while the failed link ends, so the next
 //!   pairable call advertises at once and its pairing computes only the
-//!   Diffie-Hellman key. Never during a pairing; a pairing that starts before
-//!   it is done waits for it.
+//!   Diffie-Hellman key (its Pairing Request gets Repeated Attempts until the
+//!   waiting interval of the failure is over; see [`smp`], "Repeated
+//!   attempts"). Never during a pairing; a pairing that starts before it is
+//!   done waits for it.
 //!
 //! A reconnection computes nothing, so a device that wakes from System OFF
 //! and reconnects gets its LTK reply at once; neither does the link after a
@@ -348,7 +350,7 @@
 
 /// Connectable advertising and the advertising data writer.
 pub mod adv;
-/// The attribute protocol: requests, responses, notifications, indications.
+/// The attribute protocol: requests, responses and notifications.
 pub mod att;
 /// The bond with the one central and its stored form.
 pub mod bond;
@@ -370,13 +372,14 @@ pub mod signal;
 pub mod smp;
 
 use crate::{
-    crypto::{encrypt_block, wipe},
+    crypto::{encrypt_block, forget, wipe},
     host::{
         adv::{Advertising, Call, Control, Mode},
         att::NotifyError as AttNotifyError,
         bond::Bond,
         engine::{Command, Engine},
         gatt::{AttError, Char, Db, Handler, Sec},
+        l2cap::Fragment,
         smp::{Random, Reason},
     },
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Link, Rx},
@@ -736,7 +739,6 @@ const impl From<AttNotifyError> for NotifyError {
         match error {
             AttNotifyError::Insecure => Self::Insecure,
             AttNotifyError::NotSubscribed => Self::NotSubscribed,
-            AttNotifyError::Pending => Self::Busy,
             AttNotifyError::TooLong => Self::TooLong,
             #[cfg(feature = "eatt")]
             AttNotifyError::Unsupported => Self::Unsupported,
@@ -875,15 +877,7 @@ where
     /// Why it cannot be sent: never [`NotifyError::Busy`].
     #[inline]
     pub async fn notify(&self, characteristic: Char, data: &[u8]) -> Result<(), NotifyError> {
-        let _turn = self.host.notifier.lock().await;
-        loop {
-            match self.host.send_notification(self.epoch, characteristic, data) {
-                Err(NotifyError::Busy) => {},
-                result => return result,
-            }
-            self.host.wake.signal(());
-            self.host.room.wait().await;
-        }
+        self.notify_with(|| self.host.send_notification(self.epoch, characteristic, data)).await
     }
 
     /// Notifies `values`, each a characteristic and its value, in one
@@ -900,9 +894,19 @@ where
     #[cfg(feature = "eatt")]
     #[inline]
     pub async fn notify_multiple(&self, values: &[(Char, &[u8])]) -> Result<(), NotifyError> {
+        self.notify_with(|| self.host.send_multiple(self.epoch, values)).await
+    }
+
+    /// Tries `send` until it finds room, in the notifiers' turn, waiting for
+    /// room in between: the body of [`Self::notify`] and
+    /// [`Self::notify_multiple`].
+    async fn notify_with<F>(&self, mut send: F) -> Result<(), NotifyError>
+    where
+        F: FnMut() -> Result<(), NotifyError>,
+    {
         let _turn = self.host.notifier.lock().await;
         loop {
-            match self.host.send_multiple(self.epoch, values) {
+            match send() {
                 Err(NotifyError::Busy) => {},
                 result => return result,
             }
@@ -1221,8 +1225,10 @@ where
     pub const fn port(&self) -> &P { &self.port }
 
     /// Takes what the link layer gave, a fragment in `acl`, with `crypto`
-    /// for the security manager and `app` for the dynamic values.
-    fn receive<C>(&self, rx: Rx, acl: &AclIn, app: &dyn Handler, crypto: &mut C)
+    /// for the security manager and `app` for the dynamic values, and then
+    /// overwrites `acl` with an empty fragment: it may have carried keys of
+    /// a pairing.
+    fn receive<C>(&self, rx: Rx, acl: &mut AclIn, app: &dyn Handler, crypto: &mut C)
     where
         C: Aes + Random,
     {
@@ -1243,6 +1249,7 @@ where
                 matches!(event, Event::Disconnected(_))
             },
         });
+        forget(acl, AclIn::EMPTY);
         if arrived {
             // A link for the advertising call; or one that ended, whose
             // notifier learns it.
@@ -1287,7 +1294,7 @@ where
             };
             let woken = select4(self.port.receive(&mut acl), timer, room_changed, self.wake.wait()).await;
             match woken {
-                Either4::First(rx) => self.receive(rx, &acl, app, crypto),
+                Either4::First(rx) => self.receive(rx, &mut acl, app, crypto),
                 Either4::Third(()) => {
                     self.with(|state| state.notify_waiting = false);
                     self.room.signal(());
@@ -1302,31 +1309,25 @@ where
     /// notification.
     #[cfg(feature = "eatt")]
     fn send_multiple(&self, epoch: Epoch, values: &[(Char, &[u8])]) -> Result<(), NotifyError> {
-        self.with(|state| {
-            let result = state.engine.notification_multiple(epoch, values).and_then(|fragment| {
-                if self.port.queue_room() < 2 || self.port.fragments_in_flight(epoch) >= state.engine.notify_depth() {
-                    return Err(NotifyError::Busy);
-                }
-                self.port.send_fragment(epoch, fragment.start(), fragment.bytes()).map_err(|error| match error {
-                    link::Error::Full => NotifyError::Busy,
-                    link::Error::Disallowed
-                    | link::Error::Gone
-                    | link::Error::Invalid
-                    | link::Error::Unsupported
-                    | link::Error::UnsupportedRemote => NotifyError::Disconnected,
-                })
-            });
-            if result == Err(NotifyError::Busy) {
-                state.notify_waiting = true;
-            }
-            result
-        })
+        self.send_now(epoch, |engine| engine.notification_multiple(epoch, values))
     }
 
     /// Sends a notification on the link `epoch` if there is room now.
     fn send_notification(&self, epoch: Epoch, characteristic: Char, data: &[u8]) -> Result<(), NotifyError> {
+        self.send_now(epoch, |engine| engine.notification(epoch, characteristic, data))
+    }
+
+    /// Queues the fragment `take` takes from the engine on the link
+    /// `epoch` if there is room now: two free places in the link layer's
+    /// queue and fewer fragments in flight than the engine's notification
+    /// depth. Without room the run task wakes the notifier once room
+    /// returns.
+    fn send_now<F>(&self, epoch: Epoch, take: F) -> Result<(), NotifyError>
+    where
+        F: FnOnce(&Engine) -> Result<Fragment, NotifyError>,
+    {
         self.with(|state| {
-            let result = state.engine.notification(epoch, characteristic, data).and_then(|fragment| {
+            let result = take(&state.engine).and_then(|fragment| {
                 if self.port.queue_room() < 2 || self.port.fragments_in_flight(epoch) >= state.engine.notify_depth() {
                     return Err(NotifyError::Busy);
                 }

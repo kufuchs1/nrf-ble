@@ -340,6 +340,31 @@ fn a_key_reply_for_a_link_that_ended_has_no_effect_on_the_next() {
 }
 
 #[test]
+fn the_link_layer_s_copy_of_a_key_reply_is_overwritten_once_taken_or_the_link_ends() {
+    let key = |shared: &Shared| shared.state.lock(|cell| cell.borrow().ltk_key);
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    let epoch = connect(&shared);
+    assert!(shared.request_ltk([0; 8], [0; 2]));
+    assert_eq!(link.ltk_reply(epoch, Some([0xAA; 16])), Ok(()));
+    assert_eq!(key(&shared), [0xAA; 16]);
+    assert_eq!(shared.take_ltk(), Some(LtkAnswer::Key([0xAA; 16])));
+    assert_eq!(key(&shared), [0; 16]);
+    // A key the link layer never took: when the link ends, and on a reset.
+    assert!(shared.request_ltk([0; 8], [0; 2]));
+    assert_eq!(link.ltk_reply(epoch, Some([0xBB; 16])), Ok(()));
+    shared.set_connected(false);
+    assert_eq!(key(&shared), [0; 16]);
+    assert!(shared.take_ltk().is_none());
+    let next = connect(&shared);
+    assert!(shared.request_ltk([0; 8], [0; 2]));
+    assert_eq!(link.ltk_reply(next, Some([0xCC; 16])), Ok(()));
+    shared.state.lock(|cell| cell.borrow_mut().forget_keys());
+    assert_eq!(key(&shared), [0; 16]);
+    assert!(shared.take_ltk().is_none());
+}
+
+#[test]
 fn a_full_event_queue_does_not_authorize_an_unsolicited_key_reply() {
     let shared = Shared::new();
     let link = Link::new(&shared);
@@ -431,7 +456,9 @@ fn disconnect_drops_outgoing_data_and_requests_but_keeps_received_data() {
     let epoch = connect(&shared);
     assert!(shared.push_acl_in(Llid::Start, &[1, 2, 3], true));
     link.try_send(epoch, true, &[0]).unwrap();
-    shared.ltk.signal(Some([0xAA; 16]));
+    assert!(shared.request_ltk([0; 8], [0; 2]));
+    assert_eq!(shared.take_event(), Some(Event::LtkRequest { ediv: 0, rand: [0; 8] }));
+    assert_eq!(link.ltk_reply(epoch, Some([0xAA; 16])), Ok(()));
     shared.disconnect.signal(0x13);
     shared.data_length.signal([251, 2120]);
     shared.state.lock(|cell| cell.borrow_mut().payload_timeout = 100);

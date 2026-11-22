@@ -2,7 +2,7 @@
 
 extern crate std;
 
-use super::*;
+use super::{encryption::KeyLookup, *};
 use crate::{
     link::{Epoch, Link, ParamRange},
     pdu::BUFFER_LEN,
@@ -210,6 +210,30 @@ fn first_valid_packet_replaces_the_short_establishment_deadline() {
 }
 
 #[test]
+fn before_the_first_packet_only_the_establishment_deadline_ends_the_link() {
+    let shared = Shared::new();
+    let mut link = connection();
+    // A supervision timeout of two intervals, shorter than the six
+    // intervals the central has for its first packet.
+    link.timeout = link.interval.saturating_mul(2);
+    let supervision = link.last_valid.after(link.timeout);
+    let deadline = link.establishment_deadline.unwrap_or(At::ZERO);
+    assert!(supervision.ahead_of(deadline).is_none());
+    assert!(link.ended(supervision).is_none());
+    assert!(link.ended(deadline.before(Micros(1))).is_none());
+    assert!(matches!(link.ended(deadline), Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH))));
+    // A batch of skipped events would not stop at the supervision timeout
+    // either.
+    assert_eq!(link.next_deadline(link.last_valid, &shared), deadline);
+    // From the first packet on the supervision timeout runs.
+    let first = deadline.before(Micros(1000));
+    assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, first.0, &shared), Some(true));
+    assert_eq!(link.next_deadline(first, &shared), first.after(link.timeout));
+    assert!(link.ended(first.after(link.timeout).before(Micros(1))).is_none());
+    assert!(matches!(link.ended(first.after(link.timeout)), Some(Ended::Lost)));
+}
+
+#[test]
 fn encryption_deadline_is_not_refreshed_by_received_traffic() {
     let mut link = connection();
     link.establishment_deadline = None;
@@ -238,10 +262,10 @@ fn security_notification_survives_host_queue_pressure() {
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
     link.handle_control(&[OP_START_ENC_RSP], true);
-    link.process(&PacketBuffer::ZERO, true, &full);
+    link.process(&full);
     assert_eq!(link.encryption_change, Some((0, true)));
     let available = Shared::new();
-    link.process(&PacketBuffer::ZERO, true, &available);
+    link.process(&available);
     assert_eq!(link.encryption_change, None);
     assert_eq!(available.take_event(), Some(Event::Encryption { on: true, refresh: false, status: 0 }));
     assert_eq!(queued(&available), 0);
@@ -373,7 +397,8 @@ fn empty_packets_use_raw_header_instead_of_stale_ccm_output() {
     rx.0[0] = Llid::Continuation.bits();
     let shared = Shared::new();
     assert_eq!(link.receive(rx.0[0], 0, true, 999, &shared), Some(true));
-    link.process(&rx, true, &shared);
+    link.stash(&rx, true, &shared);
+    link.process(&shared);
     assert_eq!(link.encryption.rx_counter, 0);
     assert_eq!(link.abort, None);
     assert_eq!(link.stats.received, 1);
@@ -1102,6 +1127,37 @@ fn a_parameter_request_during_another_instant_is_a_transaction_collision() {
     );
 }
 
+#[test]
+fn a_retained_update_event_holds_off_only_an_update_of_its_kind() {
+    let params = Event::ParamsUpdated { params: ConnectionParams::new(12, 0, 600), status: 0 };
+    let phy = Event::PhyUpdated { rx: 1, status: 0, tx: 1 };
+    let channel_map = [OP_CHANNEL_MAP_IND, 0x0F, 0xF0, 0x00, 0xFF, 0x01, 10, 0];
+    let phy_update = [OP_PHY_UPDATE_IND, 1, 1, 10, 0];
+    for retained in [params, phy] {
+        // A channel map update waits for no event.
+        let mut link = connection();
+        link.notifications[0] = Some(retained);
+        link.handle_control(&channel_map, false);
+        assert_eq!(link.abort, None);
+        assert!(link.channel_update.is_some());
+        // A connection update and a parameter request wait for the event of
+        // an earlier connection update, a PHY update for that of a PHY
+        // update.
+        let mut update = connection();
+        update.notifications[0] = Some(retained);
+        update.handle_control(&update_to(24), false);
+        assert_eq!(update.abort.is_some(), retained.is_params_update());
+        let mut request = connection();
+        request.notifications[0] = Some(retained);
+        request.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), false);
+        assert_eq!(request.remote_request.is_none(), retained.is_params_update());
+        let mut phys = connection();
+        phys.notifications[0] = Some(retained);
+        phys.handle_control(&phy_update, false);
+        assert_eq!(phys.abort.is_some(), retained.is_phy_update());
+    }
+}
+
 /// A connection update PDU to `interval` with the current latency and
 /// timeout at instant 10.
 fn update_to(interval: u8) -> [u8; 12] { [OP_CONNECTION_UPDATE_IND, 1, 0, 0, interval, 0, 0, 0, 0x58, 2, 10, 0] }
@@ -1387,6 +1443,39 @@ fn entropy_wait_preserves_response_deadline_and_accepts_termination() {
 }
 
 #[test]
+fn while_the_host_looks_up_the_key_only_a_termination_is_accepted() {
+    let lookup = KeyLookup { ediv: [0; 2], rand: [0; 8] };
+    for procedure in [Procedure::First, Procedure::Refresh] {
+        for requested in [false, true] {
+            // A plain connection update, which would move the timing of a
+            // link that waits for its key: not applied, and the link ends.
+            let mut updated = connection();
+            updated.encryption.procedure = procedure;
+            updated.encryption.phase = Phase::AwaitingKey(lookup, requested);
+            updated.handle_control(&update_to(24), false);
+            assert_eq!(updated.abort, Some(ERROR_PDU_NOT_ALLOWED));
+            assert!(updated.param_update.is_none());
+            assert!(updated.queue.is_empty());
+            // Other PDUs alike, unknown ones and those of a wrong length too:
+            // no answer goes in front of our start request.
+            for payload in [&[OP_PING_REQ][..], &[OP_FEATURE_REQ, 0][..], &[0xF0][..], &[OP_TERMINATE_IND][..]] {
+                let mut refused = connection();
+                refused.encryption.phase = Phase::AwaitingKey(lookup, requested);
+                refused.handle_control(payload, false);
+                assert!(refused.abort.is_some());
+                assert!(refused.queue.is_empty());
+            }
+            // The central may end the link.
+            let mut ending = connection();
+            ending.encryption.phase = Phase::AwaitingKey(lookup, requested);
+            ending.handle_control(&[OP_TERMINATE_IND, 0x13], false);
+            assert_eq!(ending.abort, None);
+            assert_eq!(ending.terminated, Some(0x13));
+        }
+    }
+}
+
+#[test]
 fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_end() {
     let shared = Shared::new();
     let mut link = connection();
@@ -1417,7 +1506,7 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
     rx.0[0] = Llid::Continuation.bits();
     rx.0[1] = 0;
     link.stash(&rx, false, &shared);
-    link.process(&rx, false, &shared);
+    link.process(&shared);
     assert_eq!(
         shared.take_acl_in().map(|acl| (acl.payload()[0], acl.start(), acl.encrypted())),
         Some((0xA1, true, false))
@@ -1429,6 +1518,47 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
     assert_eq!(link.queue.front().copied().map(|queued| queued.data[0]), Some(OP_PING_RSP));
     assert_eq!(link.stats.received, 4);
     assert!(link.pending.is_empty());
+}
+
+/// Receives a control PDU of 40 octets with the opcode `opcode` on `link`
+/// and processes it after the event.
+#[cfg(feature = "data-length")]
+fn receive_long_control(link: &mut Connection, opcode: u8, shared: &Shared) {
+    let mut rx = PacketBuffer::ZERO;
+    rx.0[0] = Llid::Control.bits();
+    rx.0[1] = 40;
+    rx.0[DATA_HEADER_LEN] = opcode;
+    rx.0[DATA_HEADER_LEN + 1..DATA_HEADER_LEN + 40].fill(0x11);
+    assert_eq!(link.receive(rx.0[0], 40, true, 999, shared), Some(true));
+    link.stash(&rx, false, shared);
+    link.process(shared);
+}
+
+#[cfg(feature = "data-length")]
+#[test]
+fn a_control_pdu_longer_than_27_octets_is_answered_after_its_acknowledgement() {
+    let shared = Shared::new();
+    // An unknown one, and a known one of the wrong length: answered as
+    // unknown, and nothing of the known one is taken.
+    for opcode in [0xF0, OP_FEATURE_REQ, OP_CONNECTION_PARAM_REQ, OP_TERMINATE_IND] {
+        let mut link = connection();
+        receive_long_control(&mut link, opcode, &shared);
+        assert_eq!(link.abort, None);
+        assert_eq!(link.queue.front().copied().map(|queued| queued.data[..2] == [OP_UNKNOWN_RSP, opcode]), Some(true));
+        assert_eq!(link.queue.len(), 1);
+        assert!(link.central_features.is_none() && link.remote_request.is_none() && link.terminated.is_none());
+    }
+    // While encryption pauses, where an answer would get in the way: a PDU
+    // the procedure allows ends the link as one of the wrong length, any
+    // other as not allowed.
+    for (opcode, error) in [(OP_ENC_REQ, ERROR_INVALID_PARAMETERS), (OP_PING_REQ, ERROR_PDU_NOT_ALLOWED)] {
+        let mut link = connection();
+        link.encryption.phase = Phase::Paused;
+        receive_long_control(&mut link, opcode, &shared);
+        assert_eq!(link.abort, Some(error));
+        assert!(link.queue.is_empty());
+        assert!(link.encryption.phase == Phase::Paused);
+    }
 }
 
 #[test]
@@ -1927,6 +2057,64 @@ fn a_ping_point_or_a_reply_deadline_ends_a_batch_early() {
 }
 
 #[test]
+fn the_progress_deadline_covers_the_longest_sleep_the_latency_allows() {
+    let shared = Shared::new();
+    let mut link = latent(false);
+    // 400 ms, latency 38 and 32 s: 39 intervals of 15.6 s are within half
+    // the supervision timeout, as the specification asks.
+    link.interval = Micros(400_000);
+    link.latency = 38;
+    link.timeout = Micros(32_000_000);
+    let now = link.enable_at(link.counter).before(Micros(1000));
+    assert!(link.skips(now, &shared));
+    // One sleep up to the start of the last skipped event, 37 intervals
+    // on: longer than the usual progress deadline.
+    let (until, seconds) = link.batch_sleep(now, &shared);
+    assert_eq!(until, link.batch_until(now, &shared));
+    assert_eq!(until, link.enable_at(1037));
+    let sleep = until.ahead_of(now).unwrap_or_default();
+    assert!(sleep > Micros(PROGRESS_SECONDS * 1_000_000));
+    // The deadline the loop arms before it covers the sleep and the usual
+    // deadline after it, in whole seconds.
+    assert_eq!(seconds, progress_seconds(sleep));
+    assert_eq!(seconds, 15 + PROGRESS_SECONDS);
+    assert!(Micros(seconds * 1_000_000) >= sleep.saturating_add(Micros(PROGRESS_SECONDS * 1_000_000)));
+    assert_eq!(progress_seconds(Micros::ZERO), PROGRESS_SECONDS);
+    assert_eq!(progress_seconds(Micros(1)), PROGRESS_SECONDS + 1);
+    assert_eq!(progress_seconds(Micros(u32::MAX)), 4295 + PROGRESS_SECONDS);
+}
+
+#[test]
+fn the_statistics_log_keeps_its_pace_after_long_sleeps() {
+    let shared = Shared::new();
+    let mut link = connection();
+    let due = link.report_at;
+    // Logged on time: the next one interval later.
+    link.report(due, CrystalStats { late: 0, lead: Micros(900) }, &shared);
+    assert_eq!(link.report_at, due.after(REPORT_INTERVAL_US));
+    // Logged at an event 16 s after it was due, after a long run of
+    // skipped events: the next one an interval after that, not 4 s before
+    // it, where it would fall behind by 6 s with each such sleep.
+    let late = link.report_at.after(Micros(16_000_000));
+    link.report(late, CrystalStats { late: 0, lead: Micros(900) }, &shared);
+    assert_eq!(link.report_at, late.after(REPORT_INTERVAL_US));
+    // So many sleeps never leave it far enough behind that the wrapping
+    // clock takes it as ahead.
+    let mut now = link.report_at;
+    for _ in 0..1000_u16 {
+        now = now.after(Micros(16_000_000));
+        assert!(link.report_at.reached_by(now));
+        let reported = link.report_at;
+        link.report(now, CrystalStats { late: 0, lead: Micros(900) }, &shared);
+        assert!(link.report_at.ahead_of(now).is_some() && link.report_at != reported);
+    }
+    // Logged less than an interval late: one interval on from the due
+    // time; a whole interval late: one interval on from then.
+    assert_eq!(next_report(At(100), At(100 + REPORT_INTERVAL_US.0 - 1)), At(100 + REPORT_INTERVAL_US.0));
+    assert_eq!(next_report(At(100), At(100 + REPORT_INTERVAL_US.0)), At(100 + 2 * REPORT_INTERVAL_US.0));
+}
+
+#[test]
 fn a_host_wakeup_inside_a_batch_listens_at_the_first_event_still_ahead() {
     let link = latent(false);
     let listen = link.listen_counter();
@@ -2017,7 +2205,7 @@ fn encrypted_data_is_marked_before_the_host_learns_of_the_encryption() {
     let mut link = connection();
     link.encryption.phase = Phase::AwaitingStartResponse;
     link.handle_control(&[OP_START_ENC_RSP], true);
-    link.process(&PacketBuffer::ZERO, true, &full);
+    link.process(&full);
     // The encryption change waits for room; data arrives meanwhile.
     assert_eq!(link.encryption_change, Some((0, true)));
     let mut rx = PacketBuffer::ZERO;
@@ -2063,7 +2251,7 @@ fn acknowledged_host_packets_are_counted_for_the_host() {
     assert!(link.tx_kind == TxKind::Acl);
     assert_eq!(link_api.in_flight(epoch), 1);
     assert_eq!(link.acknowledge(NESN, &shared), Some(()));
-    link.process(&PacketBuffer::ZERO, false, &shared);
+    link.process(&shared);
     assert_eq!(link_api.in_flight(epoch), 0);
     assert_eq!(link_api.acked(), 1);
 }
@@ -2300,7 +2488,7 @@ fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ende
     link.stats.received = 40;
     link.stats.retx = 2;
     link.drift = (-40, Micros(60));
-    link.report(CrystalStats { late: 9, lead: Micros(900) }, &shared);
+    link.report(link.report_at, CrystalStats { late: 9, lead: Micros(900) }, &shared);
     let reported = counters.counters();
     assert_eq!(
         (reported.events, reported.skipped, reported.missed, reported.crc_errors, reported.received),
@@ -2312,7 +2500,7 @@ fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ende
     // largest of the link.
     assert_eq!(link.drift, NO_DRIFT);
     link.drift = (25, Micros(50));
-    link.report(CrystalStats { late: 9, lead: Micros(898) }, &shared);
+    link.report(link.report_at, CrystalStats { late: 9, lead: Micros(898) }, &shared);
     assert_eq!((counters.counters().drift_us, counters.counters().widening_us), (-40, 60));
     // The end counts the drift since the last report too.
     link.drift = (70, Micros(80));
