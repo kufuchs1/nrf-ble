@@ -1097,6 +1097,14 @@ impl Connection {
         true
     }
 
+    /// The sleep at `now` through the run of skipped events: its end
+    /// ([`Self::batch_until`]) and the progress deadline to arm before it,
+    /// in seconds ([`progress_seconds`]).
+    fn batch_sleep(&self, now: At, shared: &Shared) -> (At, u32) {
+        let until = self.batch_until(now, shared);
+        (until, progress_seconds(until.ahead_of(now).unwrap_or(Micros::ZERO)))
+    }
+
     /// Radio start at which one sleep at `now` for the whole run of skipped
     /// events from the current one ends: where the event-by-event loop would
     /// last have woken, at the start of the last skipped event, or of the
@@ -2860,13 +2868,13 @@ impl Connection {
                 // of the last skipped event, or of the first one at or after
                 // a deadline the loop top acts on.
                 let listen = self.listen_counter();
-                let until = self.batch_until(clock.now(), shared);
+                let (until, progress) = self.batch_sleep(clock.now(), shared);
                 #[cfg(feature = "event-timing")]
                 self.publish_event(clock, self.enable_at(listen), shared);
                 // The sleep may last up to half the supervision timeout, 16 s:
                 // the progress deadline covers it, and a sleep that does not
                 // end turns the health false that much later.
-                health::checkpoint(progress_seconds(until.ahead_of(clock.now()).unwrap_or(Micros::ZERO)));
+                health::checkpoint(progress);
                 let woken = select(shared.wakeup(), maintenance::requested());
                 let timed_out = clock.idle_until(until, woken).await;
                 health::checkpoint(PROGRESS_SECONDS);

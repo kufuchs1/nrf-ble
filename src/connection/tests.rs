@@ -2069,13 +2069,14 @@ fn the_progress_deadline_covers_the_longest_sleep_the_latency_allows() {
     assert!(link.skips(now, &shared));
     // One sleep up to the start of the last skipped event, 37 intervals
     // on: longer than the usual progress deadline.
-    let until = link.batch_until(now, &shared);
+    let (until, seconds) = link.batch_sleep(now, &shared);
+    assert_eq!(until, link.batch_until(now, &shared));
     assert_eq!(until, link.enable_at(1037));
     let sleep = until.ahead_of(now).unwrap_or_default();
     assert!(sleep > Micros(PROGRESS_SECONDS * 1_000_000));
-    // The deadline before it covers the sleep and the usual deadline after
-    // it, in whole seconds.
-    let seconds = progress_seconds(sleep);
+    // The deadline the loop arms before it covers the sleep and the usual
+    // deadline after it, in whole seconds.
+    assert_eq!(seconds, progress_seconds(sleep));
     assert_eq!(seconds, 15 + PROGRESS_SECONDS);
     assert!(Micros(seconds * 1_000_000) >= sleep.saturating_add(Micros(PROGRESS_SECONDS * 1_000_000)));
     assert_eq!(progress_seconds(Micros::ZERO), PROGRESS_SECONDS);
