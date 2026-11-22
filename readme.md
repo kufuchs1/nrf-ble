@@ -22,7 +22,7 @@ What it holds:
   connection parameter requests and replies, data length, PHY, authenticated payload timeout, RSSI and the central's
   features and version.
 - The host's AES seam (`host::Aes`, the hardware ECB behind `host::Ecb`, software AES in the tests).
-- The cryptography of pairing: f4, f5, f6, g2 and ah in `host::smp::toolbox`, over the AES-CMAC of the RustCrypto
+- The cryptography of pairing: f4, f5 and f6 in `host::smp::toolbox`, over the AES-CMAC of the RustCrypto
   `cmac` crate, and P-256 key generation, Diffie-Hellman and public key checks in `host::smp::ecc`, from the RustCrypto
   `p256` crate behind the crate nrf-ble-p256 of this repository (`p256/`; see
   [Cryptography of pairing](#cryptography-of-pairing)).
@@ -123,7 +123,7 @@ Each is off by default, so a device without it builds exactly as without the fea
   it (`authenticated` in `gatt!`), which `Host::new` refuses with a configuration that cannot pair with Passkey Entry.
   Keypress Notifications are never asked for; those of a central are ignored. It is tested against the reference
   central with known passkeys, end to end through the host, with every failure, the timer and the toolbox's sample
-  data of f4, f5, f6 and g2.
+  data of f4, f5 and f6.
 - **`directed-advertising`**: a reconnection schedule may start with `Phase::directed(adv::DIRECTED_MAX)`, high duty
   cycle directed advertising to the bonded central, to a resolvable private address made with its key if it sent one
   (see [A device](#a-device)), or with `extended-advertising` low duty cycle directed advertising every 20 ms. Each
@@ -366,8 +366,9 @@ The CPU sleeps until the ECB ends, woken by its pending interrupt; keep the `ECB
 
 No cryptographic algorithm of pairing is our own: P-256 is the RustCrypto `p256` crate, AES-CMAC the RustCrypto `cmac`
 crate, AES the hardware ECB (the `aes` crate in the host tests). What stays ours is what the Core specification
-writes on top of them, and the drivers: the formulas of f4, f5, f6, g2 and ah (which key, which message, which octets
-of the result; volume 3, part H, section 2.2), the byte order of the PDUs, the protocol checks of the central's key,
+writes on top of them, and the drivers: the formulas of f4, f5, f6 and of ah, the address hash of resolvable private
+addresses in [`crypto`](src/crypto.rs) (which key, which message, which octets of the result; volume 3, part H,
+section 2.2), the byte order of the PDUs, the protocol checks of the central's key,
 and the ECB, CCM and RNG drivers ([`crypto`](src/crypto.rs), [`rng`](src/rng.rs)).
 
 P-256 (`host::smp::ecc`, `p256` with `arithmetic` and `ecdh`, without `precomputed-tables`, through nrf-ble-p256):
@@ -427,8 +428,8 @@ AES-CMAC (`host::smp::toolbox`, `cmac` 0.8.0 with `zeroize`): the CMAC of RFC 44
 adapter that implements the block cipher traits of the `cipher` crate for one key and hands each block to
 `host::Aes::encrypt`, the hardware ECB in the firmware. The crate overwrites its chaining value and pending block when
 dropped, the adapter its copy of the key. The host tests check the adapter against FIPS 197, the CMAC against the four
-examples of RFC 4493 with every split of the message, and f4, f5 (with its key T), f6, g2 and ah against the sample
-data of volume 3, part H, appendix D; P-256 against the debug key pair and data sets 1 and 2 of volume 2, part G,
+examples of RFC 4493 with every split of the message, and f4, f5 (with its key T), f6 and ah against the sample data
+of volume 3, part H, appendix D; P-256 against the debug key pair and data sets 1 and 2 of volume 2, part G,
 section 7.1.2, with the hook, the wiping and every refusal of the central's key (debug, own, negated, off the curve, a
 coordinate not below the field prime). nrf-ble-p256's own tests (`cargo test -p nrf-ble-p256`) check its API against
 the same data sets both ways, edge scalars and 64 seeded random scalar pairs against `p256` used directly, and the

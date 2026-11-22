@@ -7,6 +7,7 @@ extern crate std;
 
 use super::*;
 use crate::{
+    crypto::resolvable_address_with,
     host::{smp::toolbox::tests::hex, test_aes::Software},
     link::{ConnectionParams, Epoch},
 };
@@ -195,9 +196,8 @@ fn info(peer: Peer, local: Peer) -> Info {
 /// A resolvable private address of our identity resolving key, as the link
 /// layer advertises with: B of a pairing with privacy.
 pub(crate) fn local_rpa() -> Peer {
-    let prand = [0x48, 0x12, 0x34];
-    let hash = toolbox::ah(&Software, &reversed(&OUR_IRK), prand);
-    Peer::new([hash[2], hash[1], hash[0], prand[2], prand[1], prand[0]], true)
+    let address = resolvable_address_with(OUR_IRK, [0x34, 0x12, 0x48], |key, block| Software.encrypt(key, block));
+    Peer::new(address, true)
 }
 
 /// The next PDU, queued whole at `now`, and the outcome that gives.

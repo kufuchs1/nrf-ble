@@ -196,7 +196,7 @@
 /// P-256: the key pair, the check of the central's public key and the
 /// Diffie-Hellman key.
 pub mod ecc;
-/// The cryptographic functions of pairing: f4, f5, f6, g2 and ah.
+/// The cryptographic functions of pairing: f4, f5 and f6.
 pub mod toolbox;
 
 #[cfg(feature = "passkey")]

@@ -180,18 +180,3 @@ fn f6_matches_the_sample_data() {
     );
     assert_eq!(check, hex("e3c47398 9cd0e8c5 d26c0b09 da958f61"));
 }
-
-/// Appendix D.5.
-#[test]
-fn g2_matches_the_sample_data() {
-    let value = g2(&Software, &hex(SAMPLE_U), &hex(SAMPLE_V), &hex(SAMPLE_N1), &hex(SAMPLE_N2));
-    assert_eq!(value, 0x2F9E_D5BA);
-    assert_eq!(value % 1_000_000, 938_554);
-}
-
-/// Appendix D.7.
-#[test]
-fn ah_matches_the_sample_data() {
-    let hash = ah(&Software, &hex("ec0234a3 57c8ad05 341010a6 0a397d9b"), hex("708194"));
-    assert_eq!(hash, hex("0dfbaa"));
-}
