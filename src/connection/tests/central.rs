@@ -313,7 +313,10 @@ impl Sim {
         if heard {
             self.link.exchanged(At(self.time));
         }
-        self.link.process(&self.rx, encrypted, &self.shared);
+        // The answer stashed every packet it took: nothing is left for after
+        // the event.
+        assert!(!self.link.seq.received);
+        self.link.process(&self.shared);
         assert_eq!(self.link.abort, None);
         self.link.counter = self.link.counter.wrapping_add(1);
         self.link.stats.events += 1;

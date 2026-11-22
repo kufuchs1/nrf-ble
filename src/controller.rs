@@ -13,6 +13,7 @@ use crate::{
     radio::{PacketBuffer, Radio},
     rng,
 };
+use core::ops::Deref;
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant};
 
@@ -22,6 +23,23 @@ const ADV_DELAY_MAX_US: u32 = 10_000;
 const HIGH_DUTY_DURATION: Duration = Duration::from_millis(1280);
 /// Interval of high duty cycle directed advertising events.
 const HIGH_DUTY_INTERVAL_US: Micros = Micros(3750);
+
+/// The link layer task's copy of the advertising settings for one pass of
+/// its loop. The identity resolving keys of the copy are overwritten when it
+/// is dropped: after the advertising event, before the sleep to the next
+/// one, or before a connection runs, as the host's resolving list keeps
+/// them.
+struct Taken<'settings>(&'settings mut Settings);
+
+impl Deref for Taken<'_> {
+    type Target = Settings;
+
+    fn deref(&self) -> &Settings { self.0 }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) { self.0.resolving.clear(); }
+}
 
 /// Ends high duty cycle directed advertising after its time. `since` is
 /// when the advertising was enabled. Returns true if it ended.
@@ -84,10 +102,11 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         }
         shared.refresh_private_address();
         #[cfg(not(feature = "extended-advertising"))]
-        let current = shared.advertising();
+        let mut current = shared.advertising();
         #[cfg(feature = "extended-advertising")]
-        let current = shared.renewed_advertising().await;
-        let Some(settings) = current else {
+        let mut current = shared.renewed_advertising().await;
+        // Used in place, so the one copy with the keys is the one wiped.
+        let Some(settings) = current.as_mut().map(Taken) else {
             since = None;
             clock.pause();
             health::suspend();
@@ -102,13 +121,17 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         counters.log();
         let Some(Accepted { end, request, setup }) = event else {
             let next = started.after(interval(&settings).await);
+            let high_duty = settings.kind.is_high_duty();
+            // The sleep, up to an advertising interval, needs no key of the
+            // resolving list; the next pass takes the host's again.
+            drop(settings);
             // The sleep returns `SETUP_US` early, for a radio start the timer
             // triggers; advertising starts when it returns, so it sleeps that
             // much longer to keep the advertising interval. High duty cycle
             // directed advertising keeps the early start instead: its events
             // must be at most 3.75 ms apart, which the loop's own time would
             // otherwise exceed.
-            let wake = if settings.kind.is_high_duty() { next } else { next.after(SETUP) };
+            let wake = if high_duty { next } else { next.after(SETUP) };
             if !clock.sleep_until(wake, shared.changed()).await {
                 since = None;
             }
@@ -129,6 +152,8 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         let params = ConnectionParams::new(request.interval, request.latency, request.timeout);
         let answered = (request.sca, settings.kind.is_directed());
         let epoch = shared.set_info((central, settings.resolve(central), settings.own), params, answered);
+        // The link needs no key of the resolving list.
+        drop(settings);
         connection.notify(Event::Connected(epoch), shared);
         since = None;
         let (ended, stats) = connection.run::<SLOT_GUARD>(radio, clock, &mut rx, shared).await;
@@ -167,3 +192,5 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         }
     }
 }
+
+#[cfg(test)] mod tests;

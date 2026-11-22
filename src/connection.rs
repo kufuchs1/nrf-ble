@@ -1,6 +1,9 @@
 //! Peripheral side of a connection: connection events, acknowledgement, link
 //! encryption and the LL control procedures a central starts.
 
+/// The state of the link encryption and of its start and pause procedures.
+mod encryption;
+
 /// Async, single-use encryption response entropy.
 mod entropy;
 
@@ -42,6 +45,7 @@ use crate::{
 };
 use core::{iter, mem};
 use embassy_futures::select::{Either, select};
+use encryption::{Encryption, Phase, Procedure};
 use entropy::Prefetch;
 use transmit::Ring;
 
@@ -168,6 +172,10 @@ const OP_PHY_UPDATE_IND: u8 = 0x18;
 const PREFERRED_PHYS: u8 = if chip::PHY_2M { 0x02 } else { 0x01 };
 /// Interval of the connection statistics log.
 const REPORT_INTERVAL_US: Micros = Micros(10_000_000);
+/// Time the radio executor gets to make progress around a connection event
+/// before [`health::healthy`] turns false, in seconds, on top of a planned
+/// sleep through skipped events ([`progress_seconds`]).
+const PROGRESS_SECONDS: u32 = 10;
 /// No received anchor yet since the last report: no deviation, no widening.
 const NO_DRIFT: (i32, Micros) = (0, Micros::ZERO);
 /// Header bit: more data follows.
@@ -339,74 +347,6 @@ impl Stats {
     }
 }
 
-/// The central's encryption request as the host looks up the key by it.
-#[derive(Clone, Copy, Eq)]
-#[derive_const(PartialEq)]
-struct KeyLookup {
-    /// Central encrypted diversifier.
-    ediv: [u8; 2],
-    /// Central random number.
-    rand: [u8; 8],
-}
-
-/// State of the link encryption and its start and pause procedures. The
-/// phase alone says in which directions packets are encrypted, so the two
-/// directions cannot disagree with the procedure.
-///
-/// The discriminants only keep the checks within the interframe space short.
-/// The phases that receive encrypted are 0 to 2, so [`Self::rx_on`] is one
-/// compare. Those that send encrypted are 1 to 3, and the two idle phases
-/// differ in one bit.
-#[derive(Clone, Copy, Eq)]
-#[derive_const(PartialEq)]
-#[repr(u8)]
-enum Phase {
-    /// A validated request waits for its prefetched, single-use random block.
-    AwaitingEntropy(KeyLookup) = 7,
-    /// The host is asked for the long term key, and whether the key request
-    /// event reached it yet.
-    AwaitingKey(KeyLookup, bool) = 8,
-    /// Our encrypted pause response was sent; the central's plain one is
-    /// expected.
-    AwaitingPauseResponse = 3,
-    /// The start request was sent and the peer must authenticate its reply.
-    AwaitingStartResponse = 0,
-    /// No procedure running, and the link is encrypted both ways.
-    Encrypted       = 2,
-    /// Encryption is paused both ways; the central starts it again with the
-    /// new key.
-    Paused          = 5,
-    /// Our pause response is queued, still encrypted.
-    Pausing         = 1,
-    /// No procedure running, and the link is not encrypted: it never was,
-    /// or the host had no key for its first start.
-    Plain           = 6,
-    /// Encryption is being started.
-    Starting        = 4,
-}
-
-impl Phase {
-    /// Whether a PDU queued now goes out as the central reads it: no
-    /// procedure runs, or one that has not yet queued the PDU after which the
-    /// central reads ours differently, our `LL_START_ENC_REQ` or
-    /// `LL_PAUSE_ENC_RSP`. Behind either a PDU would go out plain to a
-    /// central that decrypts it, or encrypted to one that no longer does.
-    const fn consistent(self) -> bool {
-        matches!(self, Self::AwaitingEntropy(_) | Self::AwaitingKey(..) | Self::Encrypted | Self::Paused | Self::Plain)
-    }
-
-    /// Whether no encryption procedure runs.
-    const fn is_idle(self) -> bool { matches!(self, Self::Encrypted | Self::Plain) }
-
-    /// Whether received packets are encrypted: once our start request was
-    /// sent, until our pause response was sent.
-    const fn rx_on(self) -> bool { matches!(self, Self::AwaitingStartResponse | Self::Encrypted | Self::Pausing) }
-
-    /// Whether sent packets are encrypted, from the next PDU prepared: from
-    /// the central's start response on, until its pause response.
-    const fn tx_on(self) -> bool { matches!(self, Self::AwaitingPauseResponse | Self::Encrypted | Self::Pausing) }
-}
-
 /// A procedure this side starts once.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Request {
@@ -418,13 +358,17 @@ enum Request {
     Requested(At),
 }
 
-/// Kind of encryption start.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Procedure {
-    /// The first start of the connection.
-    First,
-    /// A key refresh after a pause.
-    Refresh,
+/// The host event of an earlier update that a procedure with an instant
+/// waits for while it is retained ([`Connection::instant_busy`]).
+#[derive(Clone, Copy)]
+enum Retained {
+    /// None: a channel map update tells the host nothing.
+    Nothing,
+    /// [`Event::ParamsUpdated`], for a connection update or a connection
+    /// parameter request.
+    ParamsUpdate,
+    /// [`Event::PhyUpdated`], for a PHY update.
+    PhyUpdate,
 }
 
 /// How far the termination the host asked for got.
@@ -438,43 +382,6 @@ enum Termination {
     /// Not queued yet: an encryption procedure keeps it back
     /// ([`Phase::consistent`]).
     Waiting,
-}
-
-/// Link encryption state.
-struct Encryption {
-    /// Whether the decryption of the packet under way was started on its
-    /// access address ([`crypto::start_on_address`]).
-    armed:      bool,
-    /// IV of the session.
-    iv:         [u8; 8],
-    /// State of the encryption and its procedures.
-    phase:      Phase,
-    /// Whether the start is the first or refreshes the key.
-    procedure:  Procedure,
-    /// CCM configuration for received packets.
-    rx_config:  [u8; CONFIG_LEN],
-    /// Packet counter of the next new received packet.
-    rx_counter: u64,
-    /// CCM scratch area.
-    scratch:    [u8; SCRATCH_LEN],
-    /// Session key diversifier.
-    skd:        [u8; 16],
-    /// CCM configuration for sent packets.
-    tx_config:  [u8; CONFIG_LEN],
-    /// Packet counter of the next new sent packet.
-    tx_counter: u64,
-}
-
-impl Encryption {
-    /// Forgets the keys, the IVs and the session key diversifier of the
-    /// link.
-    fn wipe(&mut self) {
-        crypto::wipe(&mut self.iv);
-        crypto::wipe(&mut self.rx_config);
-        crypto::wipe(&mut self.scratch);
-        crypto::wipe(&mut self.skd);
-        crypto::wipe(&mut self.tx_config);
-    }
 }
 
 /// Where the next packet from the central is expected.
@@ -1190,6 +1097,24 @@ impl Connection {
         true
     }
 
+    /// The sleep at `now` through the run of skipped events: its end
+    /// ([`Self::batch_until`]) and the progress deadline to arm before it,
+    /// in seconds ([`progress_seconds`]).
+    fn batch_sleep(&self, now: At, shared: &Shared) -> (At, u32) {
+        let until = self.batch_until(now, shared);
+        (until, progress_seconds(until.ahead_of(now).unwrap_or(Micros::ZERO)))
+    }
+
+    /// Radio start at which one sleep at `now` for the whole run of skipped
+    /// events from the current one ends: where the event-by-event loop would
+    /// last have woken, at the start of the last skipped event, or of the
+    /// first one at or after a deadline the loop top acts on.
+    fn batch_until(&self, now: At, shared: &Shared) -> At {
+        let last = self.listen_counter().wrapping_sub(1);
+        let deadline = self.next_deadline(now, shared);
+        self.enable_at(self.first_after(self.counter, last, deadline.before(Micros(1))))
+    }
+
     /// Whether the current event can pass without listening: nothing to send
     /// or acknowledge and no procedure running. As in Zephyr, latency also
     /// stops while a connection or PHY update waits for its instant, so the
@@ -1471,7 +1396,8 @@ impl Connection {
     fn drive_encryption(&mut self, shared: &Shared, entropy: &Prefetch) {
         if let Phase::AwaitingEntropy(lookup) = self.encryption.phase {
             let Some(material) = entropy.take() else { return };
-            self.finish_encryption_request(lookup, &material);
+            let response = self.encryption.respond(lookup, &material);
+            self.enqueue(Llid::Control, &response);
         }
         let Phase::AwaitingKey(lookup, requested) = self.encryption.phase else { return };
         if !requested {
@@ -1480,28 +1406,24 @@ impl Connection {
             }
             return;
         }
-        match shared.take_ltk() {
-            Some(LtkAnswer::Key(mut ltk)) => {
-                let session = crypto::session_key(ltk, self.encryption.skd);
-                crypto::wipe(&mut ltk);
-                let Some(mut key) = session else {
+        // Taken into one place, which is overwritten after the key derived
+        // the session key.
+        let mut answer = shared.take_ltk();
+        match answer.as_mut() {
+            Some(&mut LtkAnswer::Key(ref mut ltk)) => {
+                if !self.encryption.set_key(ltk) {
                     self.abort = Some(ERROR_HARDWARE_FAILURE);
                     return;
-                };
-                self.encryption.rx_config = crypto::config(key, self.encryption.iv, true);
-                self.encryption.tx_config = crypto::config(key, self.encryption.iv, false);
-                crypto::wipe(&mut key);
-                self.encryption.rx_counter = 0;
-                self.encryption.tx_counter = 0;
+                }
                 crypto::enable();
                 self.enqueue(Llid::Control, &[OP_START_ENC_REQ]);
                 self.encryption.phase = Phase::Starting;
             },
-            Some(LtkAnswer::Missing) if self.encryption.procedure == Procedure::Refresh => {
+            Some(&mut LtkAnswer::Missing) if self.encryption.procedure == Procedure::Refresh => {
                 // The link stays paused without a key: end it.
                 self.abort = Some(ERROR_KEY_MISSING);
             },
-            Some(LtkAnswer::Missing) => {
+            Some(&mut LtkAnswer::Missing) => {
                 self.enqueue(Llid::Control, &[OP_REJECT_IND, ERROR_KEY_MISSING]);
                 self.encryption.phase = Phase::Plain;
                 self.procedure_deadline = None;
@@ -1646,6 +1568,9 @@ impl Connection {
 
     /// Determines timeouts without allowing received traffic to postpone a
     /// pending local disconnect or the initial connection establishment.
+    /// Until the central's first packet only the establishment deadline of
+    /// six intervals applies; the supervision timeout runs from that packet
+    /// on (Core, Vol 6, Part B, 4.5.2), and may be shorter.
     const fn ended(&self, now: At) -> Option<Ended> {
         if let Some(reason) = self.abort {
             return Some(Ended::Error(reason));
@@ -1662,8 +1587,8 @@ impl Connection {
         if let Some(reason) = self.terminated {
             return Some(Ended::Terminated(reason));
         }
-        if self.establishment_deadline.is_some_and(const |deadline| deadline.reached_by(now)) {
-            return Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH));
+        if let Some(deadline) = self.establishment_deadline {
+            return if deadline.reached_by(now) { Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH)) } else { None };
         }
         if self.last_valid.after(self.timeout).reached_by(now) {
             return Some(Ended::Lost);
@@ -1879,17 +1804,6 @@ impl Connection {
         radio.set_phy(Phy::M1);
     }
 
-    /// Consumes one complete prefetched block; no hardware RNG work runs here.
-    const fn finish_encryption_request(&mut self, lookup: KeyLookup, material: &entropy::Material) {
-        let mut response: [u8; 13] = [0; 13];
-        response[0] = OP_ENC_RSP;
-        response[1..].copy_from_slice(material.bytes());
-        self.encryption.skd[8..].copy_from_slice(&material.bytes()[..8]);
-        self.encryption.iv[4..].copy_from_slice(&material.bytes()[8..]);
-        self.enqueue(Llid::Control, &response);
-        self.encryption.phase = Phase::AwaitingKey(lookup, false);
-    }
-
     /// First event from `from` up to `last` whose radio start is after
     /// `time`, or `last`. Starts move by at most one interval per event, so
     /// the whole intervals in between are passed at once.
@@ -1951,19 +1865,8 @@ impl Connection {
     fn handle_control(&mut self, payload: &[u8], encrypted: bool) {
         let Some((&code, params)) = payload.split_first() else { return };
         // While encryption starts or pauses, the central may only take the
-        // procedure on or end the link (Core, Vol 6, Part B, 5.1.3). Any
-        // other answer would be queued in front of the next step.
-        let (allowed, can_answer) = match self.encryption.phase {
-            Phase::AwaitingEntropy(_) => (code == OP_TERMINATE_IND, false),
-            Phase::Starting | Phase::AwaitingStartResponse => {
-                (matches!(code, OP_START_ENC_RSP | OP_TERMINATE_IND), false)
-            },
-            Phase::Pausing | Phase::AwaitingPauseResponse => {
-                (matches!(code, OP_PAUSE_ENC_RSP | OP_TERMINATE_IND), false)
-            },
-            Phase::Paused => (matches!(code, OP_ENC_REQ | OP_TERMINATE_IND), false),
-            Phase::AwaitingKey(..) | Phase::Encrypted | Phase::Plain => (true, true),
-        };
+        // procedure on or end the link (`Phase::control_rule`).
+        let (allowed, can_answer) = self.encryption.phase.control_rule(code);
         if !allowed {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
             return;
@@ -1991,8 +1894,7 @@ impl Connection {
                         self.abort = Some(ERROR_INVALID_PARAMETERS);
                     } else if !future_instant(self.counter, instant) {
                         self.abort = Some(ERROR_INSTANT_PASSED);
-                    } else if self.channel_update.is_some() || self.param_update.is_some() || self.phy_update.is_some()
-                    {
+                    } else if self.instant_busy(Retained::Nothing) {
                         self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                     } else {
                         self.channel_update = Some((UsedChannels::new(map), instant));
@@ -2045,7 +1947,11 @@ impl Connection {
                 }
                 self.encryption.procedure = if refresh { Procedure::Refresh } else { Procedure::First };
                 self.procedure_deadline = Some(self.last_valid.after(PROCEDURE_TIMEOUT_US));
-                self.start_encryption(params);
+                // Answered with our half once its entropy is ready
+                // (`drive_encryption`), which then asks the host for the key.
+                if !self.encryption.start(params) {
+                    self.enqueue(Llid::Control, &[OP_REJECT_IND, ERROR_UNSUPPORTED_FEATURE]);
+                }
             },
             OP_START_ENC_RSP => {
                 if !encrypted || self.encryption.phase != Phase::AwaitingStartResponse {
@@ -2109,11 +2015,7 @@ impl Connection {
                 };
                 if !future_instant(self.counter, update.instant) {
                     self.abort = Some(ERROR_INSTANT_PASSED);
-                } else if self.param_update.is_some()
-                    || self.phy_update.is_some()
-                    || self.channel_update.is_some()
-                    || self.notifications.iter().flatten().any(Event::is_params_update)
-                {
+                } else if self.instant_busy(Retained::ParamsUpdate) {
                     self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                 } else {
                     // The update answers a request of the host; the host
@@ -2135,11 +2037,7 @@ impl Connection {
                         OP_CONNECTION_PARAM_REQ,
                         ERROR_INVALID_PARAMETERS,
                     ]);
-                } else if self.param_update.is_some()
-                    || self.phy_update.is_some()
-                    || self.channel_update.is_some()
-                    || self.notifications.iter().flatten().any(Event::is_params_update)
-                {
+                } else if self.instant_busy(Retained::ParamsUpdate) {
                     self.enqueue(Llid::Control, &[
                         OP_REJECT_EXT_IND,
                         OP_CONNECTION_PARAM_REQ,
@@ -2197,11 +2095,7 @@ impl Connection {
         let instant = u16::from_le_bytes([instant0, instant1]);
         if !future_instant(self.counter, instant) {
             self.abort = Some(ERROR_INSTANT_PASSED);
-        } else if self.phy_update.is_some()
-            || self.param_update.is_some()
-            || self.channel_update.is_some()
-            || self.notifications.iter().flatten().any(Event::is_phy_update)
-        {
+        } else if self.instant_busy(Retained::PhyUpdate) {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
         } else if phy != self.phy || other != self.tx_phy {
             self.next_tx_phy = other;
@@ -2312,6 +2206,26 @@ impl Connection {
         if self.hold_until.is_none_or(const |current| current.reached_by(until)) {
             self.hold_until = Some(until);
         }
+    }
+
+    /// Whether a procedure with an instant the central starts collides with
+    /// one that is pending (Core, Vol 6, Part B, 5.3): a channel map,
+    /// connection or PHY update waits for its instant, or, as `retained`
+    /// says, the host has yet to receive the event of an earlier update of
+    /// the new one's kind, which a connection or PHY update waits for so that
+    /// the host learns of each update before the next one. A channel map
+    /// update tells the host nothing and waits for no event. The callers
+    /// differ only in that and in their answer: a connection, PHY or channel
+    /// map update ends the link, a connection parameter request is rejected.
+    fn instant_busy(&self, retained: Retained) -> bool {
+        self.channel_update.is_some()
+            || self.param_update.is_some()
+            || self.phy_update.is_some()
+            || self.notifications.iter().flatten().any(|event| match retained {
+                Retained::Nothing => false,
+                Retained::ParamsUpdate => event.is_params_update(),
+                Retained::PhyUpdate => event.is_phy_update(),
+            })
     }
 
     /// Event to listen at after skipping from the current one: as many as
@@ -2450,8 +2364,9 @@ impl Connection {
     }
 
     /// Earliest time at which the loop top acts without a packet or a host
-    /// wakeup: supervision, procedure and reply deadlines, and the ping
-    /// point and expiry of the authenticated payload timeout.
+    /// wakeup: supervision (once established, see [`Self::ended`]),
+    /// establishment, procedure and reply deadlines, and the ping point and
+    /// expiry of the authenticated payload timeout.
     fn next_deadline(&self, now: At, shared: &Shared) -> At {
         let requests = [self.features_request, self.phy_request, self.length_request, self.version_request]
             .into_iter()
@@ -2464,7 +2379,7 @@ impl Connection {
             ping.into_iter().chain(iter::once(last.after(timeout)))
         });
         [
-            Some(self.last_valid.after(self.timeout)),
+            self.establishment_deadline.is_none().then(|| self.last_valid.after(self.timeout)),
             self.procedure_deadline,
             self.terminate_deadline,
             self.establishment_deadline,
@@ -2677,19 +2592,21 @@ impl Connection {
     }
 
     /// Handles the control PDUs received in the event, in order, and reports
-    /// acknowledged ACL data.
+    /// acknowledged ACL data. A control PDU longer than a [`Pending`] holds,
+    /// which data length extension lets a central send, comes cut to it: the
+    /// length then matches no PDU this side knows, so it is answered as one
+    /// of the wrong length or an unknown one, not dropped after its
+    /// acknowledgement. Each new packet was stashed by the answer that took
+    /// it ([`Self::after_answer`]).
     #[inline(never)]
-    fn process(&mut self, rx: &PacketBuffer, encrypted: bool, shared: &Shared) {
+    fn process(&mut self, shared: &Shared) {
         self.flush_notifications(shared);
-        if self.seq.received {
-            self.stash(rx, encrypted, shared);
-        }
         while let Some(held) = self.pending.front_mut() {
             let mut packet = *held;
             crypto::wipe(&mut held.bytes);
             self.pending.drop_front();
             let [header, length, ..] = packet.bytes;
-            let len = usize::from(length);
+            let len = usize::from(length).min(CONTROL_PAYLOAD_MAX);
             match packet.bytes.get(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(len)) {
                 Some(payload) if header & LLID_MASK == Llid::Control.bits() => {
                     self.handle_control(payload, packet.encrypted);
@@ -2750,8 +2667,9 @@ impl Connection {
     }
 
     /// Logs the counters since the last call and tells the host the link's
-    /// counters, with the crystal's restarts as the clock counts them.
-    fn report(&mut self, crystal: CrystalStats, shared: &Shared) {
+    /// counters, with the crystal's restarts as the clock counts them, at
+    /// `now`.
+    fn report(&mut self, now: At, crystal: CrystalStats, shared: &Shared) {
         let (last, last_late) = self.reported;
         info!(
             "10 s: {} events, {} skipped, {} missed, {} crc errors, {} packets, {} late crystal (lead {} us), {} dBm, drift {} of +-{} us",
@@ -2786,7 +2704,7 @@ impl Connection {
         self.peaks = Peaks::default();
         self.drift = NO_DRIFT;
         self.reported = (self.stats, crystal.late);
-        self.report_at = self.report_at.after(REPORT_INTERVAL_US);
+        self.report_at = next_report(self.report_at, now);
     }
 
     /// Reports a connection parameter request of the host that ended without
@@ -2920,11 +2838,11 @@ impl Connection {
                 break Ended::Reset;
             }
             self.flush_notifications(shared);
-            health::checkpoint(10);
+            health::checkpoint(PROGRESS_SECONDS);
             // Flash runs between two events, with the radio parked.
             if maintenance::pending() {
                 maintenance::service(clock, radio).await;
-                health::checkpoint(10);
+                health::checkpoint(PROGRESS_SECONDS);
             }
             if let Some(ended) = self.ended(clock.now()) {
                 break ended;
@@ -2950,15 +2868,16 @@ impl Connection {
                 // of the last skipped event, or of the first one at or after
                 // a deadline the loop top acts on.
                 let listen = self.listen_counter();
-                let last = listen.wrapping_sub(1);
-                let deadline = self.next_deadline(clock.now(), shared);
-                let stop = self.first_after(self.counter, last, deadline.before(Micros(1)));
-                let until = self.enable_at(stop);
+                let (until, progress) = self.batch_sleep(clock.now(), shared);
                 #[cfg(feature = "event-timing")]
                 self.publish_event(clock, self.enable_at(listen), shared);
+                // The sleep may last up to half the supervision timeout, 16 s:
+                // the progress deadline covers it, and a sleep that does not
+                // end turns the health false that much later.
+                health::checkpoint(progress);
                 let woken = select(shared.wakeup(), maintenance::requested());
                 let timed_out = clock.idle_until(until, woken).await;
-                health::checkpoint(10);
+                health::checkpoint(PROGRESS_SECONDS);
                 // The RTC1 alarm may end the sleep up to a tick before `until`
                 // on this clock.
                 let now = clock.now();
@@ -3007,7 +2926,6 @@ impl Connection {
             radio.set_phy(self.phy);
             radio.set_tx_power(tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()));
             self.stats.events = self.stats.events.wrapping_add(1);
-            let encrypted = self.encryption.phase.rx_on();
             let heard_before = self.listening();
             if let Some(address) = self.exchange(radio, clock, rx, window, shared) {
                 self.exchanged(address);
@@ -3019,12 +2937,13 @@ impl Connection {
             if self.counter == 0 {
                 log_radio(radio);
             }
-            self.process(rx, encrypted, shared);
+            self.process(shared);
             if let Some(ended) = self.ended(clock.now()) {
                 break ended;
             }
-            if self.report_at.reached_by(clock.now()) {
-                self.report(clock.crystal(), shared);
+            let now = clock.now();
+            if self.report_at.reached_by(now) {
+                self.report(now, clock.crystal(), shared);
             }
             self.counter = self.counter.wrapping_add(1);
         };
@@ -3133,22 +3052,6 @@ impl Connection {
             return;
         }
         self.encryption.armed = crypto::start_on_address(|| radio.has_address());
-    }
-
-    /// Answers an encryption request: sends the peripheral's session key
-    /// diversifier and IV and asks the host for the long term key.
-    fn start_encryption(&mut self, params: &[u8]) {
-        let (Some(rand), Some(ediv), Some(central_skd), Some(central_iv)) =
-            (field::<8>(params, 0), field::<2>(params, 8), field::<8>(params, 10), field::<4>(params, 18))
-        else {
-            self.enqueue(Llid::Control, &[OP_REJECT_IND, ERROR_UNSUPPORTED_FEATURE]);
-            return;
-        };
-        crypto::wipe(&mut self.encryption.skd);
-        crypto::wipe(&mut self.encryption.iv);
-        self.encryption.skd[..8].copy_from_slice(&central_skd);
-        self.encryption.iv[..4].copy_from_slice(&central_iv);
-        self.encryption.phase = Phase::AwaitingEntropy(KeyLookup { ediv, rand });
     }
 
     /// Starts the procedures of this side while no other runs: once the link
@@ -3416,6 +3319,26 @@ const fn queue_lead(crystal_lead: Micros) -> Micros {
     crystal.max(wake)
 }
 
+/// Time of the statistics log after the one due at `due`, at `now`: one
+/// interval later, or one interval after `now` if that passed already. A
+/// listened event after a long run of skipped events can come more than an
+/// interval after the due time, and a log that only moved on by an interval
+/// would fall further behind with each, until the wrapping clock took it as
+/// ahead after 36 minutes and the log and the host's counters stopped.
+const fn next_report(due: At, now: At) -> At {
+    let next = due.after(REPORT_INTERVAL_US);
+    if next.reached_by(now) { now.after(REPORT_INTERVAL_US) } else { next }
+}
+
+/// The progress deadline in seconds ([`health::checkpoint`]) before a sleep
+/// of `sleep` through skipped events: the sleep in whole seconds, rounded up,
+/// and [`PROGRESS_SECONDS`] after it. With a peripheral latency the sleep
+/// lasts up to half the supervision timeout, 16 s, longer than the usual
+/// deadline, which would otherwise pass while the link sleeps as planned and
+/// stop the firmware's watchdog feed. A sleep that does not end still turns
+/// the health false, once the deadline passed.
+const fn progress_seconds(sleep: Micros) -> u32 { sleep.0.div_ceil(1_000_000).saturating_add(PROGRESS_SECONDS) }
+
 /// Parses the parameters of a connection update.
 const fn parse_update(bytes: &[u8]) -> Option<Update> {
     let [win_size, offset0, offset1, interval0, interval1, latency0, latency1, timeout0, timeout1, instant0, instant1] =
@@ -3481,6 +3404,22 @@ const fn future_instant(now: u16, instant: u16) -> bool {
     let distance = instant.wrapping_sub(now);
     distance != 0 && distance < 0x7FFF
 }
+
+// A control PDU longer than a pending slot reaches `handle_control` cut to
+// the slot's payload, and must then count as one of the wrong length: every
+// known length is shorter than that.
+const _: () = {
+    let mut code: u8 = 0;
+    loop {
+        if let Some(len) = control_len(code) {
+            assert!(len < CONTROL_PAYLOAD_MAX.strict_sub(1), "a cut control PDU could pass as a whole one");
+        }
+        if code == u8::MAX {
+            break;
+        }
+        code = code.strict_add(1);
+    }
+};
 
 /// Exact parameter lengths of the control PDUs this controller understands.
 const fn control_len(code: u8) -> Option<usize> {

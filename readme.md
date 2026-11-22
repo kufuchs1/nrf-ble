@@ -254,7 +254,9 @@ Against a build without the feature (flash of a firmware's release build; static
   error of the link layer, with the code), until the next link starts or a reset: connection events, skipped and
   missed events, CRC errors, packets received, retransmissions, late crystal starts with the crystal's current lead,
   and the largest anchor drift with the window widening it came with. The link layer copies them under the lock every
-  10 s and when the link ends, from the counters of its statistics log, so a firmware can keep them without a log.
+  10 s, at the first connection event it listens at once that time passed (an interval after that event if a long run
+  of skipped events made it later), and when the link ends, from the counters of its statistics log, so a firmware can
+  keep them without a log.
 
 ## What it does
 
@@ -270,14 +272,25 @@ Against a build without the feature (flash of a firmware's release build; static
   `Link::request_params` the host makes while it answers is part of that answer: it leaves an own request of the host
   alone and completes when the central's procedure ends, with the update or with the reason it ended. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
-  is answered as unknown.
-- **Link end:** the host reads every packet the link acknowledged before it gets `Event::Disconnected`; requests of
+  is answered as unknown, except while encryption starts or pauses (see below), when it ends the link.
+- **Link end:** a link whose central sends nothing in its first six connection intervals ends with Connection Failed
+  to be Established (0x3E); the supervision timeout runs from the central's first packet on, also where it is shorter
+  than those six intervals (Core, Vol 6, Part B, 4.5.2). The host reads every packet the link acknowledged before it
+  gets `Event::Disconnected`; requests of
   the host for a link that ended cannot reach the next one, and every link starts with the default authenticated
   payload timeout.
-- **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets. Keys the host gave, and the keys
-  of a link, are overwritten once they are no longer needed.
+- **RSSI:** `Link::rssi` gives the averaged signal strength of the central's packets.
+- **Keys:** keys the host gave, and the keys of a link, are overwritten once they are no longer needed, where the
+  crate keeps them: the long term key of `ltk_reply` once the link layer derived the session key from it, or when the
+  link ends or on a reset if it never did; the session key, IVs and CCM state when the link ends; the identity
+  resolving keys of the resolving list when the host removes them or on a reset, and the link layer task's copy of the
+  list after each advertising event, before the sleep to the next one, and before a link runs. A copy the compiler
+  makes on the stack is out of reach.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
-  the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
+  the new key without a disconnection. From the central's `LL_ENC_REQ` or `LL_PAUSE_ENC_REQ` until the procedure has
+  finished, for a first start as for a refresh and also while the host looks up the key, the central may send only
+  the procedure's next PDU or `LL_TERMINATE_IND` (Core, Vol 6, Part B, 5.1.3): any other PDU, data or control, ends
+  the link unanswered. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
   or as long as the host sets: after three quarters of that time without one, the link layer pings the central at
   the next connection event it listens to anyway, so the ping breaks no run of skipped events; at the latest when
   twice the longest run of events (the latency plus one) is left of the time, and at once for a time too short for
@@ -294,7 +307,8 @@ Against a build without the feature (flash of a firmware's release build; static
   (`Link::set_suggested_length`), and then asks the central itself; a longer length only takes effect once the central
   was told and answered, or acknowledged our answer. The host learns the effective lengths from `Event::DataLength`. The
   host's fragments hold up to 251 octets and are sent in fragments as long as the central
-  receives, within its time on the air. The CCM runs in extended length mode and generates its key stream when it is
+  receives, within its time on the air. A control PDU longer than 27 octets, longer than any this side knows, is
+  answered as one of the wrong length. The CCM runs in extended length mode and generates its key stream when it is
   armed, as in Zephyr, instead of at radio READY.
 - **LE 2M PHY** (nRF52832 only) when the central supports it, which halves the airtime of every packet: the link layer
   asks for it once the link is encrypted and answers the central's own request. Both directions use the same PHY, as the
@@ -352,7 +366,10 @@ Against a build without the feature (flash of a firmware's release build; static
   resumes after that event, as Zephyr's peripheral does: a lost anchor is found again one interval later rather than
   after the whole latency, so a supervision timeout of a few latencies holds, such as 1 s at 15 ms and a latency of
   30 across a fade of half a second. The receive window widens with the time since the last anchor, up to half the
-  interval less the interframe space.
+  interval less the interframe space. A run of skipped events is one sleep, which with the longest latency the
+  specification allows lasts almost half the supervision timeout, up to 16 s: the radio's progress deadline
+  (`health::checkpoint`, 10 s around each event) is armed before it for the planned sleep and 10 s more, so that
+  `health::healthy` stays true while the link sleeps as planned, and a sleep that does not end still turns it false.
 
 ## Crypto for the host
 
