@@ -2696,7 +2696,11 @@ impl Connection {
     }
 
     /// Handles the control PDUs received in the event, in order, and reports
-    /// acknowledged ACL data.
+    /// acknowledged ACL data. A control PDU longer than a [`Pending`] holds,
+    /// which data length extension lets a central send, comes cut to it: the
+    /// length then matches no PDU this side knows, so it is answered as one
+    /// of the wrong length or an unknown one, not dropped after its
+    /// acknowledgement.
     #[inline(never)]
     fn process(&mut self, rx: &PacketBuffer, encrypted: bool, shared: &Shared) {
         self.flush_notifications(shared);
@@ -2708,7 +2712,7 @@ impl Connection {
             crypto::wipe(&mut held.bytes);
             self.pending.drop_front();
             let [header, length, ..] = packet.bytes;
-            let len = usize::from(length);
+            let len = usize::from(length).min(CONTROL_PAYLOAD_MAX);
             match packet.bytes.get(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(len)) {
                 Some(payload) if header & LLID_MASK == Llid::Control.bits() => {
                     self.handle_control(payload, packet.encrypted);
@@ -3523,6 +3527,22 @@ const fn future_instant(now: u16, instant: u16) -> bool {
     let distance = instant.wrapping_sub(now);
     distance != 0 && distance < 0x7FFF
 }
+
+// A control PDU longer than a pending slot reaches `handle_control` cut to
+// the slot's payload, and must then count as one of the wrong length: every
+// known length is shorter than that.
+const _: () = {
+    let mut code: u8 = 0;
+    loop {
+        if let Some(len) = control_len(code) {
+            assert!(len < CONTROL_PAYLOAD_MAX.strict_sub(1), "a cut control PDU could pass as a whole one");
+        }
+        if code == u8::MAX {
+            break;
+        }
+        code = code.strict_add(1);
+    }
+};
 
 /// Exact parameter lengths of the control PDUs this controller understands.
 const fn control_len(code: u8) -> Option<usize> {

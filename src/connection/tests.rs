@@ -1488,6 +1488,47 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
     assert!(link.pending.is_empty());
 }
 
+/// Receives a control PDU of 40 octets with the opcode `opcode` on `link`
+/// and processes it after the event.
+#[cfg(feature = "data-length")]
+fn receive_long_control(link: &mut Connection, opcode: u8, shared: &Shared) {
+    let mut rx = PacketBuffer::ZERO;
+    rx.0[0] = Llid::Control.bits();
+    rx.0[1] = 40;
+    rx.0[DATA_HEADER_LEN] = opcode;
+    rx.0[DATA_HEADER_LEN + 1..DATA_HEADER_LEN + 40].fill(0x11);
+    assert_eq!(link.receive(rx.0[0], 40, true, 999, shared), Some(true));
+    link.stash(&rx, false, shared);
+    link.process(&rx, false, shared);
+}
+
+#[cfg(feature = "data-length")]
+#[test]
+fn a_control_pdu_longer_than_27_octets_is_answered_after_its_acknowledgement() {
+    let shared = Shared::new();
+    // An unknown one, and a known one of the wrong length: answered as
+    // unknown, and nothing of the known one is taken.
+    for opcode in [0xF0, OP_FEATURE_REQ, OP_CONNECTION_PARAM_REQ, OP_TERMINATE_IND] {
+        let mut link = connection();
+        receive_long_control(&mut link, opcode, &shared);
+        assert_eq!(link.abort, None);
+        assert_eq!(link.queue.front().copied().map(|queued| queued.data[..2] == [OP_UNKNOWN_RSP, opcode]), Some(true));
+        assert_eq!(link.queue.len(), 1);
+        assert!(link.central_features.is_none() && link.remote_request.is_none() && link.terminated.is_none());
+    }
+    // While encryption pauses, where an answer would get in the way: a PDU
+    // the procedure allows ends the link as one of the wrong length, any
+    // other as not allowed.
+    for (opcode, error) in [(OP_ENC_REQ, ERROR_INVALID_PARAMETERS), (OP_PING_REQ, ERROR_PDU_NOT_ALLOWED)] {
+        let mut link = connection();
+        link.encryption.phase = Phase::Paused;
+        receive_long_control(&mut link, opcode, &shared);
+        assert_eq!(link.abort, Some(error));
+        assert!(link.queue.is_empty());
+        assert!(link.encryption.phase == Phase::Paused);
+    }
+}
+
 #[test]
 fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
     let shared = Shared::new();

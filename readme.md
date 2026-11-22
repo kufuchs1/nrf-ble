@@ -296,7 +296,8 @@ Against a build without the feature (flash of a firmware's release build; static
   (`Link::set_suggested_length`), and then asks the central itself; a longer length only takes effect once the central
   was told and answered, or acknowledged our answer. The host learns the effective lengths from `Event::DataLength`. The
   host's fragments hold up to 251 octets and are sent in fragments as long as the central
-  receives, within its time on the air. The CCM runs in extended length mode and generates its key stream when it is
+  receives, within its time on the air. A control PDU longer than 27 octets, longer than any this side knows, is
+  answered as one of the wrong length. The CCM runs in extended length mode and generates its key stream when it is
   armed, as in Zephyr, instead of at radio READY.
 - **LE 2M PHY** (nRF52832 only) when the central supports it, which halves the airtime of every packet: the link layer
   asks for it once the link is encrypted and answers the central's own request. Both directions use the same PHY, as the
