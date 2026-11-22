@@ -348,7 +348,7 @@
 
 /// Connectable advertising and the advertising data writer.
 pub mod adv;
-/// The attribute protocol: requests, responses, notifications, indications.
+/// The attribute protocol: requests, responses and notifications.
 pub mod att;
 /// The bond with the one central and its stored form.
 pub mod bond;
@@ -737,7 +737,6 @@ const impl From<AttNotifyError> for NotifyError {
         match error {
             AttNotifyError::Insecure => Self::Insecure,
             AttNotifyError::NotSubscribed => Self::NotSubscribed,
-            AttNotifyError::Pending => Self::Busy,
             AttNotifyError::TooLong => Self::TooLong,
             #[cfg(feature = "eatt")]
             AttNotifyError::Unsupported => Self::Unsupported,

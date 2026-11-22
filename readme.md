@@ -153,8 +153,8 @@ Each is off by default, so a device without it builds exactly as without the fea
   517, so in its first discovery after pairing a Read or Read Blob Response carries up to 64 octets of a value, a Find
   Information Response up to 15 entries of 16-bit UUIDs and a Read By Type Response up to 9 characteristic declarations,
   each in up to three link layer fragments: a Report Map of 167 octets takes 3 reads instead of 8. A reconnection with
-  a cached table reads little and gains little. Notifications and indications stay within 20 octets and one fragment,
-  and a dynamic value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets.
+  a cached table reads little and gains little. Notifications stay within 20 octets and one fragment, and a dynamic
+  value within 22 octets (`gatt::DYNAMIC_MAX`). The engine's response slot grows from 23 to 65 octets.
   `att::Server::handle` then takes a slot of `att::ATT_MAX` octets. Runs on the mouse: BlueZ's Exchange MTU of 517
   gets 65.
 - **`eatt`** (implies `att-mtu`): Enhanced ATT as responder. A central opens enhanced bearers with L2CAP's Enhanced

@@ -5,22 +5,21 @@
 //!
 //! [`Server`] decodes the requests `BlueZ` sends, answers them from the GATT
 //! table ([`crate::host::gatt::Db`]) with the error codes of the Core
-//! specification, and encodes notifications and indications. A request arrives
-//! on a [`Bearer`], whose ATT MTU bounds its response: the fixed channel, or
-//! with the feature `eatt` an enhanced bearer, which serves every request but
-//! the Exchange MTU (Request Not Supported, 0x06) and ignores a Handle Value
-//! Confirmation. One request is outstanding on each bearer at a time, so the
-//! engine keeps one response slot of [`ATT_MAX`] octets for each. One
-//! indication waits for its confirmation; the 30 s limit on that wait is for
-//! the engine to time, which does not send indications yet.
+//! specification, and encodes notifications. A request arrives on a
+//! [`Bearer`], whose ATT MTU bounds its response: the fixed channel, or with
+//! the feature `eatt` an enhanced bearer, which serves every request but the
+//! Exchange MTU (Request Not Supported, 0x06). One request is outstanding on
+//! each bearer at a time, so the engine keeps one response slot of
+//! [`ATT_MAX`] octets for each. Indications are not sent, Service Changed's
+//! included, and a Handle Value Confirmation is ignored on any bearer.
 //!
 //! It serves exactly these requests:
 //!
 //! - Exchange MTU: the answer is [`ATT_MAX`], 23 or with `att-mtu` 65. With
 //!   `att-mtu` the fixed channel's ATT MTU then becomes the smaller of the
 //!   client's and 65, at least 23, from the next PDU on; the response itself
-//!   still fits the ATT MTU before it. Notifications and indications still
-//!   carry at most [`NOTIFY_MAX`] (20) octets of a value, in a PDU of 23.
+//!   still fits the ATT MTU before it. Notifications still carry at most
+//!   [`NOTIFY_MAX`] (20) octets of a value, in a PDU of 23.
 //! - Find Information.
 //! - Find By Type Value, for primary services (0x2800) only.
 //! - Read By Type, for any attribute type: characteristic declarations (0x2803)
@@ -79,9 +78,8 @@
 //! need authenticated pairing while it is compiled
 //! ([`crate::host::gatt::Db::new`]), so the server never sends 0x05.
 //!
-//! Notifications and indications need the security their characteristic
-//! was declared with, also for a characteristic that can be neither read
-//! nor written.
+//! Notifications need the security their characteristic was declared with,
+//! also for a characteristic that can be neither read nor written.
 
 use crate::host::gatt::{
     AttError,
@@ -92,7 +90,6 @@ use crate::host::gatt::{
     Handler,
     Kind,
     PRIMARY_SERVICE,
-    PROP_INDICATE,
     PROP_NOTIFY,
     SECONDARY_SERVICE,
     Sec,
@@ -113,7 +110,7 @@ pub const MTU: usize = 23;
 /// The server answers an Exchange MTU Request with it, and a response slot
 /// is this long.
 pub const ATT_MAX: usize = if cfg!(feature = "att-mtu") { 65 } else { MTU };
-/// Longest value a notification or indication carries.
+/// Longest value a notification carries.
 pub const NOTIFY_MAX: usize = MTU.strict_sub(3);
 /// Opcode of an Error Response.
 pub const ERROR_RESPONSE: u8 = 0x01;
@@ -203,13 +200,11 @@ const NOT_REQUESTS: [u8; 16] =
 const FORMAT_16: u8 = 0x01;
 /// Format of a Find Information Response with 128-bit UUIDs.
 const FORMAT_128: u8 = 0x02;
-/// The range a Service Changed indication names: the whole table.
-const WHOLE_RANGE: [u8; 4] = [0x01, 0x00, 0xFF, 0xFF];
 /// Longest value the server builds itself: a characteristic declaration
 /// with a 128-bit UUID is 19 octets, a dynamic value up to 22.
 const LOCAL_MAX: usize = DYNAMIC_MAX;
 
-/// Why a notification or an indication cannot be sent.
+/// Why a notification cannot be sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -218,8 +213,6 @@ pub enum NotifyError {
     Insecure,
     /// The client has not enabled it, or the characteristic cannot do it.
     NotSubscribed,
-    /// An indication still waits for its confirmation.
-    Pending,
     /// The value is longer than [`NOTIFY_MAX`]; for a Multiple Handle Value
     /// Notification, the values do not fit one PDU of [`MTU`] octets.
     TooLong,
@@ -239,8 +232,7 @@ pub enum Bearer {
     /// An enhanced bearer of Enhanced ATT (`crate::host::ecfc`), with the
     /// feature `eatt`: its ATT MTU is fixed when the channel opens, the
     /// smaller of its MTU and the peer's, at least [`MTU`] and at most
-    /// [`ATT_MAX`]. It serves no Exchange MTU and takes no Handle Value
-    /// Confirmation, as indications go on the fixed channel only.
+    /// [`ATT_MAX`]. It serves no Exchange MTU.
     #[cfg(feature = "eatt")]
     Enhanced {
         /// The ATT MTU.
@@ -268,9 +260,8 @@ struct Prepared {
     offset: u16,
 }
 
-/// The attribute server of one link: the table, the link's client
-/// characteristic configuration and the indication waiting for its
-/// confirmation.
+/// The attribute server of one link: the table and the link's client
+/// characteristic configuration.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Server {
@@ -279,8 +270,6 @@ pub struct Server {
     client_features: u8,
     /// The table.
     db:              &'static Db,
-    /// Whether an indication waits for its confirmation.
-    indicating:      bool,
     /// The fixed channel's ATT MTU: [`MTU`] until an Exchange MTU.
     #[cfg(feature = "att-mtu")]
     mtu:             u16,
@@ -333,11 +322,6 @@ impl Server {
                 .clamp(MTU.saturating_cast::<u16>(), ATT_MAX.saturating_cast::<u16>());
         }
     }
-
-    /// Forgets the indication waiting for its confirmation, after its 30 s
-    /// timeout ended the link.
-    #[inline]
-    pub const fn cancel_indication(&mut self) { self.indicating = false; }
 
     /// The client's Client Supported Features, bits 0 to 2: written on this
     /// link, or restored from the bond ([`Self::restore_client_features`]).
@@ -464,11 +448,9 @@ impl Server {
         let out = slot.get_mut(..mtu)?;
         let (&opcode, params) = pdu.split_first()?;
         #[cfg(feature = "eatt")]
-        if bearer != Bearer::Fixed && matches!(opcode, EXCHANGE_MTU_REQUEST | CONFIRMATION) {
-            // The ATT MTU of an enhanced bearer is the channel's, and the
-            // server sends no indication there.
-            return (opcode == EXCHANGE_MTU_REQUEST)
-                .then(|| error_response(out, opcode, 0, AttError::REQUEST_NOT_SUPPORTED));
+        if bearer != Bearer::Fixed && opcode == EXCHANGE_MTU_REQUEST {
+            // The ATT MTU of an enhanced bearer is the channel's.
+            return Some(error_response(out, opcode, 0, AttError::REQUEST_NOT_SUPPORTED));
         }
         let answer = match opcode {
             EXCHANGE_MTU_REQUEST => {
@@ -495,47 +477,13 @@ impl Server {
                 let _ignored: Result<(), Failure> = self.write(params, level, app, false);
                 return None;
             },
-            CONFIRMATION => {
-                if params.is_empty() {
-                    self.indicating = false;
-                }
-                return None;
-            },
+            // No indication is sent, so nothing waits for a confirmation.
+            CONFIRMATION => return None,
             _ if opcode & COMMAND_FLAG != 0 || NOT_REQUESTS.contains(&opcode) => return None,
             _ => Err((0, AttError::REQUEST_NOT_SUPPORTED)),
         };
         Some(answer.unwrap_or_else(|(handle, error)| error_response(out, opcode, handle, error)))
     }
-
-    /// A Handle Value Indication of `data` for `characteristic` on a link of
-    /// security `level`, written into `out`; returns its length. The
-    /// indication then waits for its confirmation.
-    ///
-    /// # Errors
-    ///
-    /// Why it cannot be sent: [`NotifyError::Pending`] while the previous
-    /// one waits for its confirmation.
-    #[inline]
-    pub const fn indicate(
-        &mut self,
-        characteristic: Char,
-        data: &[u8],
-        level: Sec,
-        out: &mut [u8; MTU],
-    ) -> Result<usize, NotifyError> {
-        let subscribed = characteristic.cccd().is_some_and(const |index| self.subscriptions.indicating(index));
-        check_notify(characteristic, PROP_INDICATE, subscribed, data, level)?;
-        if self.indicating {
-            return Err(NotifyError::Pending);
-        }
-        self.indicating = true;
-        Ok(handle_value(out, INDICATION, characteristic.handle(), data))
-    }
-
-    /// Whether an indication waits for its confirmation.
-    #[inline]
-    #[must_use = "the state is only read"]
-    pub const fn is_indicating(&self) -> bool { self.indicating }
 
     /// The server of a new link over the table `db`, with no subscriptions.
     #[inline]
@@ -545,7 +493,6 @@ impl Server {
             #[cfg(feature = "eatt")]
             client_features: 0,
             db,
-            indicating: false,
             #[cfg(feature = "att-mtu")]
             mtu: MTU.saturating_cast(),
             #[cfg(feature = "eatt")]
@@ -569,8 +516,8 @@ impl Server {
         out: &mut [u8; MTU],
     ) -> Result<usize, NotifyError> {
         let subscribed = characteristic.cccd().is_some_and(const |index| self.subscriptions.notifying(index));
-        check_notify(characteristic, PROP_NOTIFY, subscribed, data, level)?;
-        Ok(handle_value(out, NOTIFICATION, characteristic.handle(), data))
+        check_notify(characteristic, subscribed, data, level)?;
+        Ok(handle_value(out, characteristic.handle(), data))
     }
 
     /// A Multiple Handle Value Notification of `values`, each a
@@ -599,7 +546,7 @@ impl Server {
         let mut rest = values;
         while let Some((&(characteristic, data), tail)) = rest.split_first() {
             let subscribed = characteristic.cccd().is_some_and(const |index| self.subscriptions.notifying(index));
-            check_notify(characteristic, PROP_NOTIFY, subscribed, data, level)?;
+            check_notify(characteristic, subscribed, data, level)?;
             let [handle0, handle1] = characteristic.handle().to_le_bytes();
             let [len0, len1] = data.len().saturating_cast::<u16>().to_le_bytes();
             if !writer.push(&[handle0, handle1, len0, len1]) || !writer.push(data) {
@@ -806,23 +753,6 @@ impl Server {
     #[inline]
     pub const fn restore_client_features(&mut self, bits: u8) { self.client_features |= bits & CLIENT_FEATURES; }
 
-    /// A Service Changed indication of the whole table, written into `out`,
-    /// if the table has the characteristic and the client wrote its
-    /// configuration on this link with indications on, and no indication
-    /// waits. It is to be asked for only after the Write Response to that
-    /// write went out, as `BlueZ` registers its handler only then; an earlier
-    /// indication would be confirmed and dropped. The engine does not ask
-    /// for it yet: that ordering is still to be done, with the 30 s timer
-    /// of the confirmation.
-    #[inline]
-    pub const fn service_changed(&mut self, level: Sec, out: &mut [u8; MTU]) -> Option<usize> {
-        let characteristic = self.db.service_changed()?;
-        if !self.subscriptions.is_written(characteristic.cccd()?) {
-            return None;
-        }
-        self.indicate(characteristic, &WHOLE_RANGE, level, out).ok()
-    }
-
     /// The link's client characteristic configuration.
     #[inline]
     #[must_use = "the configuration is only read"]
@@ -1012,16 +942,10 @@ impl<'out> Writer<'out> {
     const fn rest(&mut self) -> &mut [u8] { self.buf.get_mut(self.len..).unwrap_or_default() }
 }
 
-/// Checks a notification or indication (`prop`) of `data` for
-/// `characteristic` on a link of security `level`.
-const fn check_notify(
-    characteristic: Char,
-    prop: u8,
-    subscribed: bool,
-    data: &[u8],
-    level: Sec,
-) -> Result<(), NotifyError> {
-    if characteristic.props() & prop == 0 || !subscribed {
+/// Checks a notification of `data` for `characteristic`, `subscribed` or
+/// not, on a link of security `level`.
+const fn check_notify(characteristic: Char, subscribed: bool, data: &[u8], level: Sec) -> Result<(), NotifyError> {
+    if characteristic.props() & PROP_NOTIFY == 0 || !subscribed {
         return Err(NotifyError::NotSubscribed);
     }
     if !characteristic.sec().met_by(level) {
@@ -1042,10 +966,10 @@ const fn error_response(out: &mut [u8], opcode: u8, handle: u16, error: AttError
     writer.finish()
 }
 
-/// Writes a notification or indication (`opcode`) of `data` for `handle`
-/// into `out` and returns its length.
-const fn handle_value(out: &mut [u8], opcode: u8, handle: u16, data: &[u8]) -> usize {
-    let mut writer = Writer::new(out, opcode);
+/// Writes a Handle Value Notification of `data` for `handle` into `out` and
+/// returns its length.
+const fn handle_value(out: &mut [u8], handle: u16, data: &[u8]) -> usize {
+    let mut writer = Writer::new(out, NOTIFICATION);
     writer.push(&handle.to_le_bytes());
     writer.push(data);
     writer.finish()
