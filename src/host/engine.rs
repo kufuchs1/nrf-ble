@@ -405,11 +405,7 @@ struct Fate {
 enum Inputs {
     /// The central acknowledged the Write Response that completed it.
     Acked,
-    /// The Write Response that completes it waits in the response slot.
-    #[cfg(not(feature = "eatt"))]
-    Answering,
     /// The Write Response that completes it waits in this response slot.
-    #[cfg(feature = "eatt")]
     Answering(AttSlot),
     /// Not complete on this link yet.
     Open,
@@ -486,11 +482,12 @@ const _: () = assert!(
     "the ATT MTU fits the slot, the payload and the reassembly buffer"
 );
 
-/// An ATT response slot.
-#[cfg(feature = "eatt")]
+/// An ATT response slot: the fixed channel's, and with the feature `eatt`
+/// each enhanced bearer's. Without it the type has the one value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttSlot {
     /// That of this enhanced bearer, whose response goes in K-frames.
+    #[cfg(feature = "eatt")]
     Eatt(BearerId),
     /// The fixed channel's.
     Fixed,
@@ -499,11 +496,7 @@ enum AttSlot {
 /// Where the PDU being sent comes from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Source {
-    /// The ATT response slot.
-    #[cfg(not(feature = "eatt"))]
-    Att,
     /// This ATT response slot.
-    #[cfg(feature = "eatt")]
     Att(AttSlot),
     /// A command of the credit based channels, rendered from their state.
     #[cfg(feature = "eatt")]
@@ -588,16 +581,9 @@ impl Engine {
         }
     }
 
-    /// Answers an ATT PDU received `encrypted` or not; with the feature
-    /// `eatt`, on the channel of the response slot `slot`.
-    fn att_pdu(
-        &mut self,
-        app: &dyn Handler,
-        #[cfg(feature = "eatt")] slot: AttSlot,
-        pdu: &[u8],
-        encrypted: bool,
-        now: Instant,
-    ) {
+    /// Answers an ATT PDU received `encrypted` or not on the channel of the
+    /// response slot `slot`.
+    fn att_pdu(&mut self, app: &dyn Handler, slot: AttSlot, pdu: &[u8], encrypted: bool, now: Instant) {
         let Some(link) = self.link.as_mut() else { return };
         link.activity = now;
         let received = if encrypted && link.key.is_some() { Sec::Encrypted } else { Sec::Open };
@@ -614,10 +600,8 @@ impl Engine {
         #[cfg(not(feature = "passkey"))]
         let level = received;
         let mut out: [u8; ATT_MAX] = [0; ATT_MAX];
-        #[cfg(not(feature = "eatt"))]
-        let answer = self.att.handle(pdu, level, app, &mut out);
-        #[cfg(feature = "eatt")]
         let answer = match slot {
+            #[cfg(feature = "eatt")]
             AttSlot::Eatt(bearer) => {
                 let Some(mtu) = self.ecfc.att_mtu(bearer) else { return };
                 self.att.handle_on(Bearer::Enhanced { mtu }, pdu, level, app, &mut out)
@@ -625,9 +609,6 @@ impl Engine {
             AttSlot::Fixed => self.att.handle(pdu, level, app, &mut out),
         };
         if let Some(len) = answer {
-            #[cfg(not(feature = "eatt"))]
-            let entry = &mut self.response;
-            #[cfg(feature = "eatt")]
             let Some(entry) = self.slot_mut(slot) else { return };
             if entry.is_none() {
                 *entry = Some(Slot { bytes: out, len: len.saturating_cast() });
@@ -645,11 +626,7 @@ impl Engine {
                     && let Some(answering) = self.link.as_mut()
                     && answering.inputs == Inputs::Open
                 {
-                    #[cfg(not(feature = "eatt"))]
-                    let inputs = Inputs::Answering;
-                    #[cfg(feature = "eatt")]
-                    let inputs = Inputs::Answering(slot);
-                    answering.inputs = inputs;
+                    answering.inputs = Inputs::Answering(slot);
                 }
             } else {
                 // A client waits for each response before its next request.
@@ -943,18 +920,16 @@ impl Engine {
         }
     }
 
-    /// Forgets the ATT response waiting, with the link.
-    #[cfg(not(feature = "eatt"))]
-    const fn forget_responses(&mut self) { self.response = None; }
-
-    /// Forgets the ATT responses waiting and the enhanced bearers, with the
-    /// link.
-    #[cfg(feature = "eatt")]
+    /// Forgets the ATT responses waiting, with the link; with the feature
+    /// `eatt` the enhanced bearers too.
     const fn forget_responses(&mut self) {
         self.response = None;
-        self.eatt_responses = [None; BEARERS];
-        self.ecfc = Ecfc::new();
-        self.served = BearerId::FIRST;
+        #[cfg(feature = "eatt")]
+        {
+            self.eatt_responses = [None; BEARERS];
+            self.ecfc = Ecfc::new();
+            self.served = BearerId::FIRST;
+        }
     }
 
     /// Notes that the fragment [`Self::next_fragment`] gave was queued by the
@@ -975,20 +950,21 @@ impl Engine {
             return;
         }
         match source {
-            #[cfg(feature = "eatt")]
-            Source::Att(slot) => self.response_sent(slot, &segmenter, now),
+            Source::Att(slot) => {
+                // An enhanced bearer's response is sent once its last K-frame
+                // went, or once its bearer closed; until then the rest waits
+                // in the slot.
+                #[cfg(feature = "eatt")]
+                if let AttSlot::Eatt(bearer) = slot
+                    && self.ecfc.is_open(bearer)
+                    && segmenter.kframe_end().is_some_and(|(end, total)| end < total)
+                {
+                    return;
+                }
+                self.response_sent(slot, now);
+            },
             #[cfg(feature = "eatt")]
             Source::Ecfc(signal) => self.ecfc.signal_sent(signal, now),
-            #[cfg(not(feature = "eatt"))]
-            Source::Att => {
-                self.response = None;
-                if let Some(link) = self.link.as_mut() {
-                    link.activity = now;
-                    if link.inputs == Inputs::Answering {
-                        link.inputs = Inputs::Sent;
-                    }
-                }
-            },
             Source::Reply => self.sig_reply = None,
             Source::Request => {
                 self.sig_req = None;
@@ -1051,21 +1027,21 @@ impl Engine {
         })
     }
 
-    /// Whether an ATT response waits to be sent.
-    #[cfg(not(feature = "eatt"))]
-    const fn has_response(&self) -> bool { self.response.is_some() }
-
     /// Whether an ATT response waits that can be sent: on the fixed channel,
-    /// or on an enhanced bearer that has a credit for its next K-frame; or a
-    /// command of the credit based channels.
-    #[cfg(feature = "eatt")]
+    /// or with the feature `eatt` on an enhanced bearer that has a credit for
+    /// its next K-frame; or a command of the credit based channels.
+    #[cfg_attr(not(feature = "eatt"), expect(clippy::missing_const_for_fn, reason = "const only without eatt"))]
     fn has_response(&self) -> bool {
-        let ready = |(bearer, entry): (BearerId, &Option<Slot>)| {
-            entry.is_some_and(|response| self.ecfc.kframe(bearer, usize::from(response.len)).is_some())
-        };
+        #[cfg(feature = "eatt")]
+        {
+            let ready = |(bearer, entry): (BearerId, &Option<Slot>)| {
+                entry.is_some_and(|response| self.ecfc.kframe(bearer, usize::from(response.len)).is_some())
+            };
+            if BearerId::all().zip(self.eatt_responses.iter()).any(ready) || self.ecfc.next_signal().is_some() {
+                return true;
+            }
+        }
         self.response.is_some()
-            || BearerId::all().zip(self.eatt_responses.iter()).any(ready)
-            || self.ecfc.next_signal().is_some()
     }
 
     /// The link `epoch`'s information, with the parameters it has now.
@@ -1219,38 +1195,12 @@ impl Engine {
     /// queue; `None` without one, or without room for it. Call
     /// [`Self::fragment_sent`] once the link layer took it, and nothing else
     /// that changes the engine in between.
-    #[cfg(not(feature = "eatt"))]
-    #[inline]
-    pub fn next_fragment(&mut self, room: usize) -> Option<Fragment> {
-        if room == 0 || self.link.is_none() {
-            return None;
-        }
-        let (source, payload) = match self.sending {
-            Some((source, _)) => (source, self.payload(source)?),
-            None => [Source::Smp, Source::Reply, Source::Att, Source::Request]
-                .into_iter()
-                .filter(|&source| source != Source::Request || room >= 2)
-                .find_map(|source| self.payload(source).map(|payload| (source, payload)))?,
-        };
-        let bytes = payload.bytes.get(..payload.len)?;
-        let segmenter = match self.sending {
-            Some((_, segmenter)) => segmenter,
-            None => Segmenter::new(source.channel(), bytes.len())?,
-        };
-        self.sending = Some((source, segmenter));
-        segmenter.fragment(bytes)
-    }
-
-    /// The next fragment to queue, given the `room` in the link layer's
-    /// queue; `None` without one, or without room for it. Call
-    /// [`Self::fragment_sent`] once the link layer took it, and nothing else
-    /// that changes the engine in between.
     ///
     /// A PDU whose first fragment was queued goes on to its end; otherwise
-    /// the next starts, in the order of the module documentation. An enhanced
-    /// bearer's response goes in K-frames, each a PDU of its own, so other
-    /// PDUs may go between the K-frames of one response.
-    #[cfg(feature = "eatt")]
+    /// the next starts, in the order of the module documentation. With the
+    /// feature `eatt` an enhanced bearer's response goes in K-frames, each a
+    /// PDU of its own, so other PDUs may go between the K-frames of one
+    /// response.
     #[inline]
     pub fn next_fragment(&mut self, room: usize) -> Option<Fragment> {
         if room == 0 || self.link.is_none() {
@@ -1347,9 +1297,6 @@ impl Engine {
         };
         let pdu = buffer.get(..len).unwrap_or_default();
         match channel {
-            #[cfg(not(feature = "eatt"))]
-            Channel::Att => self.att_pdu(app, pdu, encrypted, now),
-            #[cfg(feature = "eatt")]
             Channel::Att => self.att_pdu(app, AttSlot::Fixed, pdu, encrypted, now),
             Channel::SecurityManager => {
                 let outcome = self.smp.receive(crypto, pdu, encrypted, now);
@@ -1538,9 +1485,6 @@ impl Engine {
     fn payload(&mut self, source: Source) -> Option<Payload> {
         let mut payload = Payload { bytes: [0; smp::PDU_MAX], len: 0 };
         let output = match source {
-            #[cfg(not(feature = "eatt"))]
-            Source::Att => self.response.map(|slot| (slot.bytes, usize::from(slot.len))),
-            #[cfg(feature = "eatt")]
             Source::Att(slot) => self.slot(slot).map(|entry| (entry.bytes, usize::from(entry.len))),
             #[cfg(feature = "eatt")]
             Source::Ecfc(signal) => {
@@ -1608,19 +1552,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Notes that the PDU from the response slot `slot` went whole, the last
-    /// fragment of `segmenter` queued at `now`. On an enhanced bearer that is
-    /// a K-frame: the response is sent once its last K-frame went, or once its
-    /// bearer closed; until then the rest waits in the slot.
-    #[cfg(feature = "eatt")]
-    fn response_sent(&mut self, slot: AttSlot, segmenter: &Segmenter, now: Instant) {
+    /// Notes that the response in the slot `slot` was sent, its last fragment
+    /// queued at `now`; with the feature `eatt` also a response whose bearer
+    /// closed.
+    fn response_sent(&mut self, slot: AttSlot, now: Instant) {
         let open = match slot {
+            #[cfg(feature = "eatt")]
             AttSlot::Eatt(bearer) => self.ecfc.is_open(bearer),
             AttSlot::Fixed => true,
         };
-        if open && segmenter.kframe_end().is_some_and(|(end, total)| end < total) {
-            return;
-        }
         if let Some(entry) = self.slot_mut(slot) {
             *entry = None;
         }
@@ -1669,18 +1609,22 @@ impl Engine {
     }
 
     /// The response waiting in the slot `slot`, if any.
-    #[cfg(feature = "eatt")]
     const fn slot(&self, slot: AttSlot) -> Option<Slot> {
         match slot {
+            #[cfg(feature = "eatt")]
             AttSlot::Eatt(bearer) => self.eatt_responses.get(bearer.index()).copied().flatten(),
             AttSlot::Fixed => self.response,
         }
     }
 
     /// The response slot `slot`.
-    #[cfg(feature = "eatt")]
+    #[cfg_attr(
+        not(feature = "eatt"),
+        expect(clippy::unnecessary_wraps, reason = "an enhanced bearer's may be missing")
+    )]
     const fn slot_mut(&mut self, slot: AttSlot) -> Option<&mut Option<Slot>> {
         match slot {
+            #[cfg(feature = "eatt")]
             AttSlot::Eatt(bearer) => self.eatt_responses.get_mut(bearer.index()),
             AttSlot::Fixed => Some(&mut self.response),
         }
@@ -1688,14 +1632,16 @@ impl Engine {
 
     /// The PDU to start, given the `room` in the link layer's queue, with
     /// its payload and its segmenter: in the order the security manager, our
-    /// signalling reply, the commands of the credit based channels, the
-    /// fixed channel's ATT response, the responses of the enhanced bearers
-    /// (those that have a credit, taking turns from the bearer after the one
-    /// served last), and our connection parameter request, which leaves the
-    /// last place in the queue free.
-    #[cfg(feature = "eatt")]
+    /// signalling reply, with the feature `eatt` the commands of the credit
+    /// based channels, the fixed channel's ATT response, with `eatt` the
+    /// responses of the enhanced bearers (those that have a credit, taking
+    /// turns from the bearer after the one served last), and our connection
+    /// parameter request, which leaves the last place in the queue free.
     fn start(&mut self, room: usize) -> Option<(Source, Payload, Segmenter)> {
+        #[cfg(feature = "eatt")]
         let signal = self.ecfc.next_signal().map(Source::Ecfc);
+        #[cfg(not(feature = "eatt"))]
+        let signal = None;
         for source in
             [Some(Source::Smp), Some(Source::Reply), signal, Some(Source::Att(AttSlot::Fixed))].into_iter().flatten()
         {
@@ -1704,6 +1650,20 @@ impl Engine {
                 return Some((source, payload, segmenter));
             }
         }
+        #[cfg(feature = "eatt")]
+        if let Some(kframe) = self.start_kframe() {
+            return Some(kframe);
+        }
+        let payload = self.payload(Source::Request).filter(|_| room >= 2)?;
+        let segmenter = Segmenter::new(Source::Request.channel(), payload.len)?;
+        Some((Source::Request, payload, segmenter))
+    }
+
+    /// The first K-frame to start of an enhanced bearer's response, with its
+    /// payload and its segmenter: of a bearer that has a credit, taking turns
+    /// from the bearer after the one served last.
+    #[cfg(feature = "eatt")]
+    fn start_kframe(&mut self) -> Option<(Source, Payload, Segmenter)> {
         let mut bearer = self.served;
         for _ in 0..BEARERS {
             bearer = bearer.next();
@@ -1715,9 +1675,7 @@ impl Engine {
                 return Some((source, payload, segmenter));
             }
         }
-        let payload = self.payload(Source::Request).filter(|_| room >= 2)?;
-        let segmenter = Segmenter::new(Source::Request.channel(), payload.len)?;
-        Some((Source::Request, payload, segmenter))
+        None
     }
 
     /// Notes that no advertising call waits for a link any more: the call
@@ -1896,11 +1854,7 @@ impl LinkState {
     const fn ready_idle(&self) -> Duration {
         match self.inputs {
             Inputs::Acked => INPUTS_IDLE,
-            #[cfg(not(feature = "eatt"))]
-            Inputs::Answering => READY_IDLE,
-            #[cfg(feature = "eatt")]
-            Inputs::Answering(_) => READY_IDLE,
-            Inputs::Open | Inputs::Sent => READY_IDLE,
+            Inputs::Answering(_) | Inputs::Open | Inputs::Sent => READY_IDLE,
         }
     }
 }
@@ -1909,11 +1863,8 @@ impl Source {
     /// The channel its PDUs go to.
     const fn channel(self) -> Channel {
         match self {
-            #[cfg(not(feature = "eatt"))]
-            Self::Att => Channel::Att,
             #[cfg(feature = "eatt")]
             Self::Att(AttSlot::Eatt(bearer)) => Channel::Eatt(bearer),
-            #[cfg(feature = "eatt")]
             Self::Att(AttSlot::Fixed) => Channel::Att,
             #[cfg(feature = "eatt")]
             Self::Ecfc(_) => Channel::Signalling,
