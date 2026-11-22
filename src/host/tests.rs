@@ -907,6 +907,20 @@ fn request_queued<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R
 }
 
 #[test]
+fn a_received_fragment_is_overwritten_once_taken() {
+    let host = host(Unclaimed::Keep);
+    let mut device = Device(0x0123_4567_89AB_CDEF);
+    // A Pairing Request, whole in one fragment.
+    let mut fragment = vec![7, 0, 6, 0, 0x01];
+    fragment.extend_from_slice(&linux_request(true, true));
+    let mut acl = AclIn::for_test(true, true, &fragment);
+    host.receive(Rx::Acl, &mut acl, &App, &mut device);
+    assert_eq!(acl.payload(), &[0_u8; 0]);
+    assert!(!acl.start());
+    assert!(!acl.encrypted());
+}
+
+#[test]
 fn output_waiting_for_room_goes_out_when_the_link_layer_takes_a_fragment() {
     let host = host(Unclaimed::Keep);
     let link = host.port();

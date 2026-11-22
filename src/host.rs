@@ -1225,8 +1225,10 @@ where
     pub const fn port(&self) -> &P { &self.port }
 
     /// Takes what the link layer gave, a fragment in `acl`, with `crypto`
-    /// for the security manager and `app` for the dynamic values.
-    fn receive<C>(&self, rx: Rx, acl: &AclIn, app: &dyn Handler, crypto: &mut C)
+    /// for the security manager and `app` for the dynamic values, and then
+    /// overwrites `acl` with an empty fragment: it may have carried keys of
+    /// a pairing.
+    fn receive<C>(&self, rx: Rx, acl: &mut AclIn, app: &dyn Handler, crypto: &mut C)
     where
         C: Aes + Random,
     {
@@ -1247,6 +1249,7 @@ where
                 matches!(event, Event::Disconnected(_))
             },
         });
+        forget(acl, AclIn::EMPTY);
         if arrived {
             // A link for the advertising call; or one that ended, whose
             // notifier learns it.
@@ -1291,11 +1294,7 @@ where
             };
             let woken = select4(self.port.receive(&mut acl), timer, room_changed, self.wake.wait()).await;
             match woken {
-                Either4::First(rx) => {
-                    self.receive(rx, &acl, app, crypto);
-                    // It may have carried keys of a pairing.
-                    forget(&mut acl, AclIn::EMPTY);
-                },
+                Either4::First(rx) => self.receive(rx, &mut acl, app, crypto),
                 Either4::Third(()) => {
                     self.with(|state| state.notify_waiting = false);
                     self.room.signal(());
