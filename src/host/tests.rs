@@ -1471,7 +1471,7 @@ fn a_pairing_on_a_link_encrypted_with_the_bond_s_key_completes_with_the_key_refr
     // The link stayed encrypted: no second Encrypted, only the new bond.
     let ConnEvent::Bonded(new_bond) = ({
         let value = next!(conn);
-        assert!(matches!(value, ConnEvent::Bonded(_)), "no second new_bond");
+        assert!(matches!(value, ConnEvent::Bonded(_)), "no second bond");
         value
     }) else {
         return;
@@ -3044,7 +3044,7 @@ fn a_failed_pairing_is_followed_by_a_new_key_pair_and_a_bond_by_none() {
     assert_eq!(smp(link, &mut tasks, &central_identity, true), Vec::<Vec<u8>>::new());
     assert_eq!(next!(next_conn), ConnEvent::Encrypted { bonded: false });
     assert!(matches!(next!(next_conn), ConnEvent::Bonded(_)));
-    // Nothing is computed after the bond, while the next_central discovers the
+    // Nothing is computed after the bond, while the central discovers the
     // table and the application sends its input.
     link.advance(5_000);
     tasks.step();

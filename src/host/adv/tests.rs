@@ -481,7 +481,9 @@ fn the_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() 
         let mut rest = data;
         while let Some((&len, tail)) = rest.split_first() {
             assert_ne!(len, 0, "an empty structure");
-            let (structure, next) = tail.split_at_checked(usize::from(len))?;
+            let split = tail.split_at_checked(usize::from(len));
+            assert!(split.is_some(), "a structure of {len} octets overruns the data");
+            let (structure, next) = split?;
             if structure.first() == Some(&kind) {
                 return structure.get(1..).map(<[u8]>::to_vec);
             }
