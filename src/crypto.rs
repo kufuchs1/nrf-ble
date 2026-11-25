@@ -52,7 +52,7 @@ pub(crate) const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
 
 // The scratch space takes the longest key stream the CCM may generate, 27
 // octets on the nRF51 and as many as the untrusted eight-bit length field
-// announces on the nRF52832, after the 16 octets of the MIC and header.
+// announces on the nRF52 chips, after the 16 octets of the MIC and header.
 const _: () = {
     let key_stream_max: usize = if cfg!(feature = "nrf51") { 27 } else { 255 };
     assert!(SCRATCH_LEN >= key_stream_max.saturating_add(16), "the CCM's key stream overruns its scratch space");

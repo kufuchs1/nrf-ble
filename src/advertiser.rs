@@ -33,7 +33,7 @@ use privacy::{FilterList, ResolvingList};
 /// Advertising channels with their bit in the channel map.
 const CHANNELS: [(u8, u8); 3] = [(37, 0x01), (38, 0x02), (39, 0x04)];
 /// Largest advertising data: 31 octets, or with extended advertising 245
-/// on the nRF52832 and 242 on the nRF51 (six less when directed, see
+/// on the nRF52 chips and 242 on the nRF51 (six less when directed, see
 /// `Kind::data_max`).
 pub const DATA_MAX: usize = variant::DATA_MAX;
 /// Time after the end of a packet until a request's access address must have
@@ -113,7 +113,7 @@ pub struct Settings {
     pub scan_data:          [u8; SCAN_DATA_MAX],
     /// PHY of the `AUX_ADV_IND`, of the `AUX_CONNECT_REQ` and
     /// `AUX_CONNECT_RSP`, and of the connection's start: LE 1M, or LE 2M on
-    /// the nRF52832. The nRF51 takes LE 1M whatever it holds.
+    /// the nRF52 chips. The nRF51 takes LE 1M whatever it holds.
     #[cfg(feature = "extended-advertising")]
     pub secondary_phy:      Phy,
     /// Length of [`Self::scan_data`].

@@ -142,6 +142,7 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         radio.set_crc_init(request.crc_init);
         let mut connection = Connection::new(&request, end, setup);
         connection.set_preferred_phys(shared.preferred_phys());
+        connection.set_max_power(shared.max_power());
         connection.set_suggested_length(shared.suggested_length());
         let central = request.central();
         let mut shown = central.address;

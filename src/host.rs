@@ -53,7 +53,7 @@
 //! the link layer's queue has fewer than two free places, which keeps one for
 //! the ATT responses, the security manager and signalling. A depth of three
 //! queues a button or key report behind the two movement reports before it;
-//! the queue is the same, so it costs no RAM. On the nRF52832 the report can
+//! the queue is the same, so it costs no RAM. On the nRF52 chips the report can
 //! then ride their connection event if the central keeps it open (MD); the
 //! nRF51 sends one new PDU per event, so there it goes out at a later event.
 //!

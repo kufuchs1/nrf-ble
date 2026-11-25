@@ -866,7 +866,7 @@ fn a_depth_of_three_queues_a_third_notification() {
     tasks!(host, tasks, multiplications);
     reconnected!(host, link, tasks, conn);
     // Two movement reports wait for the event; the key report is queued
-    // behind them (on the nRF52832 it can go out in the same event).
+    // behind them (on the nRF52 chips it can go out in the same event).
     assert_eq!(conn.try_notify(example::KEYBOARD, &[1; 8]), Ok(()));
     assert_eq!(conn.try_notify(example::KEYBOARD, &[2; 8]), Ok(()));
     assert_eq!(conn.try_notify(example::KEYBOARD, &[3; 8]), Ok(()));

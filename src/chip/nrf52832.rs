@@ -1,203 +1,66 @@
-//! nRF52832 register code: the errata workarounds, the fast ramp-up, LE 2M,
-//! the radio's S1 byte in RAM and the CCM's extended length mode.
+//! What the nRF52832 alone needs: the registers of the workarounds of
+//! anomalies 182 and 192, which its product specification does not
+//! document, the turnaround timing of Zephyr's Nordic HAL for this chip, its
+//! transmit power levels and its 8-bit TIFS register.
 
-use crate::{
-    clock::RC_PPM,
-    radio::{LENGTH_BITS, Phy},
-};
-use core::ptr::{read_volatile, with_exposed_provenance_mut, write_volatile};
-use embassy_nrf::pac::{
-    CCM,
-    PPI,
-    RADIO,
-    TEMP,
-    ccm::vals::{Datarate, Length, Mode as CcmMode},
-    radio::vals::{Mode, Plen, Ru, S1incl, Txpower},
-};
+use crate::radio::Phy;
+use embassy_nrf::pac::RADIO;
 
 /// Register holding the enable bit for the fixes of anomalies 102, 106 and
-/// 107 (anomaly 182).
-const ANOMALY_182_REGISTER: usize = 0x4000_173C;
-/// Enable bit in [`ANOMALY_182_REGISTER`].
-const ANOMALY_182_BIT: u32 = 1_u32.strict_shl(10);
+/// 107 (anomaly 182), and that bit.
+pub const ANOMALY_182: Option<(usize, u32)> = Some((0x4000_173C, 1_u32.strict_shl(10)));
 /// Register of the workaround for nRF52832 anomaly 192: the RC oscillator's
 /// frequency can be off by more than 500 ppm after a calibration during
 /// which the CPU slept.
-const ANOMALY_192_REGISTER: usize = 0x4000_0C34;
-/// AMLI RAM priority register of the radio.
-const AMLI_RAMPRI_RADIO: usize = 0x4000_0E08;
-/// AMLI RAM priority register of the CCM.
-const AMLI_RAMPRI_CCM: usize = 0x4000_0E10;
-/// Time the high frequency crystal gets to start before TIMER0 restarts, at
-/// first: the 32 MHz crystal typically starts in about 360 us.
-pub const CRYSTAL_LEAD_US: u32 = 800;
-/// Bounds of the crystal lead time.
-pub const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 1500);
-/// Largest advertising channel payload the radio accepts: as on the data
-/// channels, which takes in the longest `AUX_ADV_IND` of extended
-/// advertising.
-pub const ADV_MAXLEN: u8 = MAX_PAYLOAD;
-/// Busy-wait iterations for a decryption to finish after the packet end,
-/// about 250 us at 64 MHz.
-pub const DECRYPT_WAIT: u32 = 2000;
-/// Busy-wait iterations for sealing a PDU ahead of its event, whose key
-/// stream the CCM generates first: about 1 ms at 64 MHz, far above
-/// the time it takes.
-pub const SEAL_WAIT: u32 = 8000;
-/// Whether host data queued while the crystal started for an event, after
-/// the sleep before it stopped listening for the host, is still prepared
-/// once TIMER0 restarted, within the [`crate::clock::SETUP_US`] before the
-/// radio's start: a preparation takes a few microseconds at 64 MHz, the
-/// radio's setup after it about as long.
-pub const PREPARE_AFTER_RESTART: bool = true;
-/// Whether the next PDU is prepared, and sealed, while our answer goes out,
-/// so that one connection event carries several PDUs of ours: a few
-/// microseconds at 64 MHz, well within our packet and the interframe space
-/// after it.
-pub const PREPARE_IN_EVENT: bool = true;
+pub const ANOMALY_192: Option<usize> = Some(0x4000_0C34);
 /// Transmit power levels in dBm, lowest first: the radio's levels from
 /// -20 dBm up.
 pub const LEVELS_DBM: [i8; 8] = [-20, -16, -12, -8, -4, 0, 3, 4];
-/// Largest payload the radio accepts on any channel.
-const MAX_PAYLOAD: u8 = 255;
-/// The most octets of a packet in RAM: S0, length, S1 and payload together
-/// cannot exceed 258 bytes, whatever MAXLEN holds (nRF52832 Product
-/// Specification v1.0, 23.3): every payload of 255 octets fits, also with
-/// the data channels' S1 octet.
-pub const PACKET_RAM_MAX: usize = 258;
-/// Largest payload the radio accepts on any channel, for the size of the
-/// packet buffers.
-pub const PAYLOAD_MAX: usize = 255;
-/// Whether the radio has LE 2M.
-pub const PHY_2M: bool = true;
-/// Receiver ready time after RXEN with fast ramp-up.
-pub const RX_READY_US: u32 = 40;
-/// CCM scratch space for every value of an untrusted eight-bit length field:
-/// RADIO MAXLEN bounds radio DMA but does not rewrite that field for the CCM.
-pub const SCRATCH_LEN: usize = 16_usize.strict_add(255);
 
-/// Sets the CCM mode for a packet on `phy`, in the extended length mode.
+/// Delay of the receive chain in ns on `phy`, from the last bit on air to
+/// the radio's END event, as in Zephyr's Nordic HAL (`radio_nrf52832.h`):
+/// `HAL_RADIO_NRF52832_RX_CHAIN_DELAY_1M_NS` 9400 and
+/// `HAL_RADIO_NRF52832_RX_CHAIN_DELAY_2M_NS` 5450 ("5.0 + 0.45").
 #[inline]
-pub fn ccm_mode(mode: CcmMode, phy: Phy) {
-    CCM.mode().write(|w| {
-        w.set_mode(mode);
-        w.set_datarate(datarate(phy));
-        w.set_length(Length::Extended);
-    });
-}
-
-/// The CCM data rate matching `phy`, for decryption on the fly.
-const fn datarate(phy: Phy) -> Datarate {
+#[must_use = "the delay is only computed"]
+pub const fn rx_chain_ns(phy: Phy) -> u32 {
     match phy {
-        Phy::M1 => Datarate::_1mbit,
-        Phy::M2 => Datarate::_2mbit,
+        Phy::M1 => 9400,
+        Phy::M2 => 5450,
     }
 }
 
-/// Disables PPI `channel` alone.
+/// Sets the radio's interframe space to `us`: TIFS has eight bits on the
+/// nRF52832.
 #[inline]
-pub fn disable_channel(channel: usize) { PPI.chenclr().write(|w| w.set_ch(channel, true)); }
+pub fn set_tifs(us: u8) { RADIO.tifs().write(|w| w.set_tifs(us)); }
 
-/// The fast ramp-up of 40 us instead of 140 us.
+/// Time in ns from TXEN until the first bit of the packet is on air on
+/// `phy`, with the fast ramp-up, as in Zephyr's Nordic HAL
+/// (`radio_nrf52832.h`): `HAL_RADIO_NRF52832_TXEN_TXIDLE_TX_1M_FAST_NS` 41050
+/// ("40.1 + 0.95") and `HAL_RADIO_NRF52832_TXEN_TXIDLE_TX_2M_FAST_NS` 40000
+/// ("40.1 - 0.1").
 #[inline]
-pub fn fast_ramp_up() { RADIO.modecnf0().write(|w| w.set_ru(Ru::Fast)); }
-
-/// Applies the fix for anomaly 182, which covers anomalies 102, 106 and 107,
-/// after the radio was powered.
-#[inline]
-pub fn radio_trim() {
-    let register = with_exposed_provenance_mut::<u32>(ANOMALY_182_REGISTER);
-    // SAFETY: the anomaly 182 register is a word-aligned RADIO register.
-    let value = unsafe { read_volatile(register) };
-    // SAFETY: Nordic documents this write for the anomaly 182 fix.
-    unsafe { write_volatile(register, value | ANOMALY_182_BIT) }
-}
-
-/// Gives the radio and the CCM the highest priority on every RAM block, as
-/// Zephyr does on the nRF52832. The CCM decrypts a packet while the radio
-/// writes it to RAM; a radio write that waits behind the CPU or another DMA
-/// master, such as SPIM, SAADC or PWM, lets the CCM read stale bytes
-/// and fail a packet with a valid CRC on its MIC. All other masters keep
-/// their reset priority.
-#[inline]
-pub fn ram_priority() {
-    for register in [AMLI_RAMPRI_RADIO, AMLI_RAMPRI_CCM] {
-        // SAFETY: the AMLI RAM priority registers of the radio and the CCM,
-        // word-aligned, with one priority field per RAM block; 0 is the
-        // highest.
-        unsafe { write_volatile(with_exposed_provenance_mut::<u32>(register), 0) }
+#[must_use = "the time is only computed"]
+pub const fn tx_ready_ns(phy: Phy) -> u32 {
+    match phy {
+        Phy::M1 => 41_050,
+        Phy::M2 => 40_000,
     }
 }
 
-/// Accuracy of the low frequency clock in ppm: the RC oscillator, which
-/// [`crate::clock::calibrate_rc`] keeps calibrated.
-#[inline]
-pub const fn sleep_clock_ppm() -> u32 { RC_PPM }
+#[cfg(test)]
+mod tests {
+    use crate::radio::Phy;
 
-/// The die temperature in units of 0.25 °C, once a measurement is ready.
-#[inline]
-pub fn read_temperature() -> i32 { TEMP.temp().read().cast_signed() }
-
-/// Makes PPI `channel` disable `group` on its event, with the channel alone
-/// in the group: enabling the group arms the channel for one event.
-#[inline]
-pub fn self_disabling(channel: usize, group: usize) {
-    PPI.chg(group).write(|w| w.set_ch(channel, true));
-    PPI.fork(channel).tep().write_value(PPI.tasks_chg(group).dis().as_ptr().addr().strict_cast());
+    #[test]
+    fn turnaround_offsets_match_nrf52832_hal_timing_vectors() {
+        assert_eq!(Phy::M2.response_offset_us(Phy::M1), 101);
+        assert_eq!(Phy::M1.response_offset_us(Phy::M2), 103);
+        assert_eq!(Phy::M1.response_offset_us(Phy::M1), 100);
+        assert_eq!(Phy::M2.response_offset_us(Phy::M2), 105);
+        // Ready 8 us before the earliest packet: 150 - 41 - 8.
+        assert_eq!(Phy::M1.listen_offset_us(), 101);
+        assert_eq!(Phy::M2.listen_offset_us(), 101);
+    }
 }
-
-/// Sets the workaround for anomaly 192 while an RC calibration may run, and
-/// clears it after.
-pub fn set_calibration_workaround(calibrating: bool) {
-    let register = with_exposed_provenance_mut::<u32>(ANOMALY_192_REGISTER);
-    // SAFETY: Nordic documents these writes for the anomaly 192 workaround.
-    unsafe { write_volatile(register, if calibrating { 2 } else { 0 }) }
-}
-
-/// The most octets the radio writes to RAM for a packet received with the
-/// packet layout of [`set_packet_layout`]: S0, length, the S1 byte on the
-/// data channels, and as many octets as MAXLEN admits.
-#[inline]
-#[must_use = "the length is only computed"]
-pub const fn packet_ram_len(data_channel: bool) -> usize {
-    let s1: usize = if data_channel { 1 } else { 0 };
-    2_usize.strict_add(s1).strict_add(MAX_PAYLOAD.strict_cast())
-}
-
-/// Sets whether packets in RAM carry the S1 byte, which the CCM needs on
-/// data channels.
-#[inline]
-pub fn set_packet_layout(data_channel: bool) {
-    // Data PDUs carry up to 251 payload octets and the four-byte MIC
-    // with the data length extension, as advertising PDUs fit 255 too:
-    // the radio receives and sends whole packets of either.
-    RADIO.pcnf1().modify(|w| w.set_maxlen(MAX_PAYLOAD));
-    RADIO.pcnf0().modify(|w| {
-        w.set_lflen(LENGTH_BITS);
-        w.set_s0len(true);
-        w.set_s1len(0);
-        w.set_s1incl(if data_channel { S1incl::Include } else { S1incl::Automatic });
-    });
-}
-
-/// Sets the radio mode and preamble of `phy`. The radio must be disabled.
-#[inline]
-pub fn set_phy(phy: Phy) {
-    RADIO.mode().write(|w| {
-        w.set_mode(match phy {
-            Phy::M1 => Mode::Ble1mbit,
-            Phy::M2 => Mode::Ble2mbit,
-        });
-    });
-    RADIO.pcnf0().modify(|w| {
-        w.set_plen(match phy {
-            Phy::M1 => Plen::_8bit,
-            Phy::M2 => Plen::_16bit,
-        });
-    });
-}
-
-/// The transmit power setting of `dbm`, one of the levels the radio
-/// supports: the register takes the level in dBm.
-#[inline]
-pub const fn txpower(dbm: i8) -> Txpower { Txpower::from_bits(dbm.cast_unsigned()) }

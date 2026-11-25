@@ -1,11 +1,13 @@
 # nrf-ble
 
-A Bluetooth LE link layer for the nRF52832 and the nRF51, written in Rust on Embassy, together with a minimal host for
-Linux and BlueZ in the same crate. The link layer drives the radio directly; the host serves one central as a
-peripheral. Three firmwares use it from its main branch: those of the Logitech MX Master 3S mouse and the MX Keys S
-keyboard on the nRF52832, and that of a presentation remote on an nRF51802. The nRF51 path runs on hardware with
-BlueZ in the presentation remote (see [nRF51](#nrf51)), the nRF52832 path in the mouse: extended and directed
-advertising on LE 2M, pairing, reconnection and EATT with BlueZ 5.88 on Linux 7.3.
+A Bluetooth LE link layer for the nRF52832, the nRF52833 and the nRF51, written in Rust on Embassy, together with a
+minimal host for Linux and BlueZ in the same crate. The link layer drives the radio directly; the host serves one
+central as a peripheral. Three firmwares use it from its main branch: those of the Logitech MX Master 3S mouse and the
+MX Keys S keyboard on the nRF52832, and that of a presentation remote on an nRF51802. The nRF51 path runs on hardware
+with BlueZ in the presentation remote (see [nRF51](#nrf51)), the nRF52832 path in the mouse: extended and directed
+advertising on LE 2M, pairing, reconnection and EATT with BlueZ 5.88 on Linux 7.3. The nRF52833 builds and passes the
+host tests, but nothing has run on one yet (see [nRF52833](#nrf52833)). Where this readme says "the nRF52 chips", it
+means the nRF52832 and the nRF52833, which share the link layer's code.
 
 ## Status
 
@@ -68,7 +70,7 @@ What it holds:
   after its future was dropped;
   `Conn::notify` paces by acknowledgement, with at most `engine::Config::notify_depth` fragments in flight (two by
   default, three with `Config::with_notify_depth(3)`, which queues a button or key report behind the two movement
-  reports before it at no RAM cost, as the link layer's queue is the same: on the nRF52832 it can ride their connection
+  reports before it at no RAM cost, as the link layer's queue is the same: on the nRF52 chips it rides their connection
   event if the central keeps the event open (MD), while the nRF51 sends one new PDU per event, so there it only waits
   in the queue for a later event) and one place of the queue kept free. The link layer is reached through the
   `host::Port` trait, which `link::Link` implements; the host tests drive the whole host over a stand-in link layer.
@@ -136,7 +138,7 @@ Each is off by default, so a device without it builds exactly as without the fea
   is random and changes, never to the value last sent, with every new data and every new private address, and so does
   the secondary channel sequence. A central connects with `AUX_CONNECT_REQ`, which the `AUX_CONNECT_RSP` answers
   within the interframe space; the connection's transmit window opens 2.5 ms after the request, on the secondary
-  channel's PHY and channel selection algorithm 2. The secondary channel runs on LE 1M, or on the nRF52832 on LE 2M
+  channel's PHY and channel selection algorithm 2. The secondary channel runs on LE 1M, or on the nRF52 chips on LE 2M
   with `Advertising::with_secondary_phy(Phy::M2)` (`AdvParams::secondary_phy` at the link API), half the airtime for a
   central that takes it; the nRF51 stays on LE 1M. Every packet starts at a time of TIMER0, so each `ADV_EXT_IND`'s
   `AuxPtr` names the same 30 us unit; a packet whose start is too close when the radio is armed is skipped and
@@ -208,7 +210,8 @@ A firmware enables the features it needs: a mouse, for example, `param-requests`
 
 ### Cost
 
-Against a build without the feature (flash of a firmware's release build; static RAM):
+Against a build without the feature (flash of a firmware's release build; static RAM). The nRF52833 builds the same
+code as the nRF52832; its costs have not been measured separately.
 
 | Feature | nRF52832 | nRF51 |
 |---|---|---|
@@ -241,7 +244,7 @@ Against a build without the feature (flash of a firmware's release build; static
   `queue_by`, the latest time a fragment queued then still goes out at that event, and the `interval`, for a firmware
   that takes its input just before an event and queues its report in time instead of at a random point of the
   interval. The link layer plans each event before it sleeps towards it and stores the plan in a few words under the
-  lock; the host converts it when it asks. `queue_by` is 331 µs before `start` on the nRF52832 (TIMER0's restart,
+  lock; the host converts it when it asks. `queue_by` is 331 µs before `start` on the nRF52 chips (TIMER0's restart,
   which may come an RTC tick early), and 331 µs plus the crystal's current lead on the nRF51 (see the host data before
   an event below). It is a best-effort bound: a crystal that comes up late, about one restart in fifty, can still
   leave the data for the next event. A firmware reaches it through `Host::port()`.
@@ -301,8 +304,8 @@ Against a build without the feature (flash of a firmware's release build; static
 - **Connection parameter requests from the host** run one at a time: `Link::request_params` returns
   `Error::Disallowed` until the previous one reported its `Event::ParamsUpdated`, and `Error::UnsupportedRemote` for a
   central without the connection parameters request procedure, for which the host sends the L2CAP request.
-- **Data length extension** (feature `data-length`, nRF52832 only): payloads of up to 251 octets each way instead of 27.
-  The link layer receives 251 octets from the start and tells a central that asks (LL_LENGTH_REQ). It sends longer
+- **Data length extension** (feature `data-length`, nRF52 chips only): payloads of up to 251 octets each way instead of
+  27. The link layer receives 251 octets from the start and tells a central that asks (LL_LENGTH_REQ). It sends longer
   packets once the host allows them for the link (`Link::set_data_length`) or for new links
   (`Link::set_suggested_length`), and then asks the central itself; a longer length only takes effect once the central
   was told and answered, or acknowledged our answer. The host learns the effective lengths from `Event::DataLength`. The
@@ -310,20 +313,25 @@ Against a build without the feature (flash of a firmware's release build; static
   receives, within its time on the air. A control PDU longer than 27 octets, longer than any this side knows, is
   answered as one of the wrong length. The CCM runs in extended length mode and generates its key stream when it is
   armed, as in Zephyr, instead of at radio READY.
-- **LE 2M PHY** (nRF52832 only) when the central supports it, which halves the airtime of every packet: the link layer
-  asks for it once the link is encrypted and answers the central's own request. Both directions use the same PHY, as the
-  radio switches PHYs only while it is disabled.
+- **LE 2M PHY** (nRF52 chips only) when the central supports it, which halves the airtime of every packet: the link
+  layer asks for it once the link is encrypted and answers the central's own request. Both directions use the same PHY,
+  as the radio switches PHYs only while it is disabled.
 - **Features and parameters:** once the link is encrypted it asks for the central's features; a connection parameter
   request from the host goes out with the connection parameters request procedure if the central supports it, on an
   encrypted link or not.
 - **LE power control:** a central can ask for another transmit power, learns of the link layer's own changes and how far
   it could lower its own power. The transmit power also follows the link on its own: the radio measures the signal of
   every packet from the central and, taking the path as symmetric, lowers the power from 0 dBm in steps down to -20 dBm
-  while the central would still hear the device well, and raises it again, up to +4 dBm (by way of +3 dBm on the
-  nRF52832), when the signal weakens or the central does not acknowledge a packet that went out in time; after that it
-  waits 64 packets before stepping down. A power a central asked for is kept as a floor for 1024 received packets
-  (about 8 s of traffic at 7.5 ms); then the link layer decides again and reports each change to a central that asked
-  for reports. Some centrals ask for the maximum once and never again. Advertising always uses 0 dBm.
+  (-40 dBm on the nRF52833) while the central would still hear the device well, and raises it again, up to the ceiling
+  (by way of +3 dBm on the nRF52832, and of +2 and +3 dBm on the nRF52833), when the signal weakens or the central does
+  not acknowledge a packet that went out in time; after that it waits 64 packets before stepping down. It steps down
+  only to a level at which the central would still hear the device within the window, so the 20 dB between the
+  nRF52833's -40 and -20 dBm do not make it step back and forth. The ceiling is +4 dBm, the highest level of the
+  nRF52832 and the nRF51; `Link::set_max_tx_power` sets another for the links that start afterwards, between 0 dBm and
+  the chip's highest level, +8 dBm on the nRF52833 (see [nRF52833](#nrf52833)), and a central's requests stop at it too.
+  A power a central asked for is kept as a floor for 1024 received packets (about 8 s of traffic at 7.5 ms); then the
+  link layer decides again and reports each change to a central that asked for reports. Some centrals ask for the
+  maximum once and never again. Advertising always uses 0 dBm.
 - **Connection events with several packets:** the event goes on while the central or the link layer has more data
   (MD) and another exchange fits before the next event. Received payloads wait in plain text and are handled after
   the event, so the answer within the 150 µs interframe space stays short. A control PDU, a CRC error, a payload
@@ -337,13 +345,13 @@ Against a build without the feature (flash of a firmware's release build; static
   an empty PDU there, and patches the header flags, which the MIC does not cover: no copy, no seal, no queue and no
   host call. An answer that comes too late resends our previous PDU with its previous flags, which the central takes
   as a retransmission, and never sends the received packet back; within the interframe space nothing writes to the
-  buffer the radio points at but that header byte. The nRF52832 prepares the next PDU while its answer goes out, so an
-  event carries several PDUs of ours; the nRF51 prepares between events only and sends one new PDU per event until its
-  timing is measured.
+  buffer the radio points at but that header byte. The nRF52 chips prepare the next PDU while their answer goes out,
+  so an event carries several PDUs of ours; the nRF51 prepares between events only and sends one new PDU per event
+  until its timing is measured.
 - **Host data before an event:** the next PDU is prepared before the link layer sleeps towards an event, and the sleep
   wakes on the host's signal, so data the host queues meanwhile is prepared again and goes out at that event while at
   least 500 µs remain. The sleep listens for the host only until the crystal starts, 300 µs plus the crystal's lead
-  before the radio. On the nRF52832, what the host queued since is prepared once TIMER0 runs again, 300 µs before the
+  before the radio. On the nRF52 chips, what the host queued since is prepared once TIMER0 runs again, 300 µs before the
   radio, while 200 µs remain (the preparation takes a few microseconds there, the radio's setup about as long): data
   queued until TIMER0's restart goes out at the coming event, a limit the crystal's lead, 0.3 to 1.5 ms, closer to it.
   The same holds where TIMER0 kept running because the event follows the last one within 3 ms: the sleep then waits
@@ -521,15 +529,15 @@ The cost: one multiplication more after each pairing that showed our public key 
 
 ## Power
 
-On the nRF52832 the radio uses the fast ramp-up of 40 µs instead of 140 µs, which shortens every receive window and
+On the nRF52 chips the radio uses the fast ramp-up of 40 µs instead of 140 µs, which shortens every receive window and
 turnaround by 100 µs. The radio's own interframe timing works only with the slow ramp-up, so TIMER1 times the 150 µs
 between two packets as in Zephyr's software switch: PPI channel 4 starts it at the end of a packet, and its compare
 enables the radio through PPI channel 5. Pass `TIMER1` to `Radio::new` and keep the `TIMER1` interrupt disabled in the
 NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5, the fixed channels 20, 21, 25, 26 and 27
 and the channel groups 0 and 1; leave them to it. `nrf_ble::PPI_CHANNELS` and `nrf_ble::PPI_GROUPS` hold them as bit
 masks for the chip built for, so a firmware that uses PPI checks its own channels and groups against them in a const
-assert. TIMER0 and TIMER1 are shut down, not only stopped, between uses, which avoids the standby current of nRF52832
-anomaly 78. The nRF51 differs: see [nRF51](#nrf51).
+assert. TIMER0 and TIMER1 are shut down, not only stopped, between uses, which avoids the standby current of anomaly 78
+of the nRF52832 and the nRF52833. The nRF51 differs: see [nRF51](#nrf51).
 
 The link layer also takes Embassy's tokens of its PPI channels and groups, so no Embassy driver can have them:
 `clock::Ppi` for `Clock::new` (channels 0, 1, 20, 21, 26 and 27 and group 1), `clock::CalibrationPpi` for
@@ -563,13 +571,13 @@ other tasks run: bind and enable `RNG` to `rng::on_interrupt`.
 The RC oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the
 calibration once the crystal runs and the clock interrupt reports the end, so the CPU wakes twice instead of polling.
 The link layer counts on 500 ppm for its own sleep clock. Following the nRF52832 errata, the calibration runs with the
-anomaly 192 workaround set, the channel starting it disables itself after the first crystal start event, which may come
-twice (anomaly 201), and the crystal counts as running once it reported its start, without reading `HFCLKSTAT`. The
-channel capturing the timer at an RTC tick disables itself after the first compare event too, which may also come twice
-(anomaly 179). `clock::calibrate_rc` takes the `TEMP` peripheral and its `clock::CalibrationPpi`, and is driven by
-interrupts only: bind and enable `TEMP` to `clock::on_temperature_interrupt` and `CLOCK_POWER` to
-`clock::on_clock_interrupt`, or it waits forever for its first temperature. A calibration whose crystal or end does not
-come within 100 ms is retried at the next interval.
+anomaly 192 workaround set (on the nRF52832 alone), the channel starting it disables itself after the first crystal
+start event, which may come twice (anomaly 201), and the crystal counts as running once it reported its start, without
+reading `HFCLKSTAT`. The channel capturing the timer at an RTC tick disables itself after the first compare event too,
+which may also come twice (anomaly 179). `clock::calibrate_rc` takes the `TEMP` peripheral and its
+`clock::CalibrationPpi`, and is driven by interrupts only: bind and enable `TEMP` to `clock::on_temperature_interrupt`
+and `CLOCK_POWER` to `clock::on_clock_interrupt`, or it waits forever for its first temperature. A calibration whose
+crystal or end does not come within 100 ms is retried at the next interval.
 Dropping the calibration future releases the crystal. A firmware whose radio idles for long (a light sleep without
 advertising or a link) calls `clock::pause_calibration`: the task finishes a calibration under way, then measures no
 temperature and starts no crystal, so the crystal stays off; `clock::resume_calibration` before advertising again
@@ -579,6 +587,37 @@ before it listens.
 
 Run the link layer in an interrupt executor above every other task, so nothing can delay its answer within the 150 µs
 interframe space.
+
+## nRF52833
+
+Build with `default-features = false, features = ["nrf52833"]`; without `default-features = false` the build stops in
+nrf-pac's build script, as for the nRF51. The nRF52833 is a 64 MHz Cortex-M4F like the nRF52832, with 512 KB of flash
+and 128 KB of RAM, and its radio has all of the nRF52832's. The link layer runs the same code on both chips
+([`src/chip/nrf52.rs`](src/chip/nrf52.rs)): the same peripherals, PPI channels, groups and Embassy tokens, LE 1M and
+LE 2M, the fast ramp-up and the TIMER1 turnarounds, as described above. What differs is in
+[`src/chip/nrf52833.rs`](src/chip/nrf52833.rs):
+
+- **Nothing has run on an nRF52833.** The crate builds for it and passes its host tests; its radio, clock and CCM code
+  has not been tried on the chip. The 10 s report's late answers, crystal lead and setup time are the counters to
+  watch on the first links.
+- **Errata:** the workarounds of nRF52832 anomalies 182 and 192, which write registers that the nRF52833 does not
+  document, do not run. Of the nRF52833's errata on the link layer's peripherals, 78 (TIMER) is handled as on the
+  nRF52832, 36 (CLOCK) and 66 (TEMP) are covered, and 225, the RSSI's dependence on the temperature by up to 3 dB
+  (4 dB above 85 °C), is not corrected. The chip module names the sources (nrfx's errata table, Nordic's and Zephyr's
+  code) and the errata whose subject is still to be read in Nordic's errata document, which could not be read for this
+  port.
+- **Turnaround timing:** from Zephyr's `radio_nrf52833.h`: 40.9 µs from TXEN to the first bit on air on LE 1M and
+  40.0 µs on LE 2M, and a receive chain of 9.4 µs on LE 1M and 5.0 µs on LE 2M. Against the nRF52832 only the answer on
+  LE 1M to a packet received on LE 2M moves, 104 µs after the END event instead of 103 µs, and an extended advertising
+  event takes 1 µs less. The values are Zephyr's, not measured with this crate.
+- **Transmit power:** the levels are the radio's, -40 dBm and -20 to +8 dBm; the deprecated -30 dBm setting, which the
+  chip sends at -40 dBm, is left out. The power stays at or below +4 dBm, as on the nRF52832, until the firmware raises
+  the ceiling with `link.set_max_tx_power(8)`. Above +4 dBm the radio needs supply headroom on the board, and the
+  product's regulatory approval must cover the power, so each firmware chooses its ceiling.
+- **Registers:** TIFS has ten bits. The CCM's `MAXPACKETSIZE`, `RATEOVERRIDE` and `HEADERMASK`, which the nRF52832
+  lacks, keep their reset values, as do the radio's fields for LE Coded, direction finding and IEEE 802.15.4.
+- **Not supported:** LE Coded (long range), direction finding with a constant tone extension and IEEE 802.15.4, which
+  the nRF52833's radio has: the link layer neither claims nor uses them.
 
 ## nRF51
 
@@ -658,11 +697,14 @@ Embassy assumes 128 KB of flash on the nRF51, so its `Nvmc` cannot write the upp
 ```toml
 [dependencies]
 nrf-ble = { git = "https://github.com/kufuchs1/nrf-ble", branch = "main" }
+# On an nRF52833:
+# nrf-ble = { git = "https://github.com/kufuchs1/nrf-ble", branch = "main", default-features = false,
+#     features = ["nrf52833"] }
 # On an nRF51:
 # nrf-ble = { git = "https://github.com/kufuchs1/nrf-ble", branch = "main", default-features = false, features = ["nrf51"] }
 ```
 
-Enable the `defmt` feature for logs, and on the nRF52832 `data-length` for payloads of up to 251 octets. That feature
+Enable the `defmt` feature for logs, and on the nRF52 chips `data-length` for payloads of up to 251 octets. That feature
 costs about 1.5 KB more static RAM, which on the nRF52832 comes out of the stack; without it the link layer answers a
 central's data length request with the 27-octet default. The host's `param-requests`, `key-missing` and `passkey` are
 described in [Optional features](#optional-features); they work on both chips.
@@ -837,13 +879,20 @@ cargo test                                         # host tests, also with --fea
                                                    # directed-advertising, param-requests,key-missing,passkey,
                                                    # extended-advertising (with and without directed-advertising),
                                                    # att-mtu, eatt, eatt-bearers-5
+cargo test --no-default-features --features nrf52833  # host tests for the nRF52833, also with the
+                                                      # features of the first line
 cargo test --no-default-features --features nrf51  # host tests for the nRF51
 cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt and data-length
+cargo clippy --target thumbv7em-none-eabihf --no-default-features --features nrf52833
+                                                   # lints for the nRF52833, also with defmt, and with defmt and the
+                                                   # features of the first line
 cargo clippy --target thumbv6m-none-eabi --no-default-features --features nrf51   # also with defmt
 cargo build --release --target thumbv7em-none-eabihf
+cargo build --release --target thumbv7em-none-eabihf --no-default-features --features nrf52833
 cargo build --release --target thumbv6m-none-eabi --no-default-features --features nrf51
 cargo fmt --check
 cargo doc --no-deps                                # rustdoc lints are errors too
+cargo doc --no-deps --no-default-features --features nrf52833
 ```
 
 Clippy runs on the library for the chip targets. The tests are not linted (`cargo clippy --all-targets` fails on the

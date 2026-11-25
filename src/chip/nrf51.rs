@@ -309,6 +309,11 @@ pub fn set_phy(phy: Phy) {
     RADIO.mode().write(|w| w.set_mode(Mode::Ble1mbit));
 }
 
+/// Sets the radio's interframe space to `us`: TIFS has eight bits on the
+/// nRF51.
+#[inline]
+pub fn set_tifs(us: u8) { RADIO.tifs().write(|w| w.set_tifs(us)); }
+
 /// The transmit power setting of the highest level the radio supports that
 /// is not above `dbm`: +4, 0, -4, -8, -12, -16, -20 or -30 dBm.
 #[inline]

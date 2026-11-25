@@ -540,8 +540,8 @@ impl Config {
     /// `depth` fragments of the link are in flight, at least one: 3 queues a
     /// button or key report behind two movement reports, where
     /// [`NOTIFY_DEPTH`] holds it until the central acknowledged one of them.
-    /// On the nRF52832, which prepares the next PDU while its answer goes out,
-    /// it can then join them in the same connection event if the central
+    /// On the nRF52 chips, which prepare the next PDU while their answer goes
+    /// out, it can then join them in the same connection event if the central
     /// keeps the event open (MD); the nRF51 sends one new PDU per event, so
     /// there it only waits in the queue and goes out at a later event. The
     /// link layer's queue bounds it too, as a notification always leaves one

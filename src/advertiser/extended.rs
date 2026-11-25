@@ -8,7 +8,7 @@
 //! selection algorithm 2. This module holds its types and data limits, the
 //! renewal of the advertising set's ADI and secondary channel, its PDUs from
 //! the settings, its event, and the event's timing, checked at compile time
-//! for LE 1M and, on the nRF52832, LE 2M on the secondary channel.
+//! for LE 1M and, on the nRF52 chips, LE 2M on the secondary channel.
 //!
 //! # Timing
 //!
@@ -81,27 +81,27 @@ pub const AUX_GAP_US: u32 = 462;
 ///
 /// On the 64 MHz Cortex-M4F the next packet's setup takes a few
 /// microseconds.
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 pub const CPU_SLACK_MIN_US: u32 = 60;
 /// Least CPU time between the radio's DISABLED after a packet and the TXEN
 /// of the next.
 ///
 /// On the 16 MHz Cortex-M0 the next packet's setup takes several times as
-/// long as on the nRF52832.
+/// long as on the nRF52 chips.
 #[cfg(feature = "nrf51")]
 pub const CPU_SLACK_MIN_US: u32 = 100;
 /// Largest advertising data: the largest payload the chip sends
 /// ([`AUX_PAYLOAD_MAX`]) after the extended header of an undirected
-/// `AUX_ADV_IND`, 245 octets on the nRF52832 and 242 on the nRF51.
+/// `AUX_ADV_IND`, 245 octets on the nRF52 chips and 242 on the nRF51.
 pub const DATA_MAX: usize = AUX_PAYLOAD_MAX.strict_sub(AUX_HEADER_LEN);
 /// Largest advertising data of directed advertising, whose extended header
-/// also holds the target: 239 octets on the nRF52832 and 236 on the nRF51.
+/// also holds the target: 239 octets on the nRF52 chips and 236 on the nRF51.
 pub const DIRECTED_DATA_MAX: usize = AUX_PAYLOAD_MAX.strict_sub(AUX_DIRECTED_HEADER_LEN);
 /// Time from the END of a sent packet until the radio is DISABLED.
 pub const DISABLE_US: u32 = 6;
 /// Time from the start of an event until the first TXEN: the PDUs are built
 /// before, so this only covers arming the radio.
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 pub const EVENT_LEAD_US: u32 = 60;
 /// Time from the start of an event until the first TXEN: the PDUs are built
 /// before, so this only covers arming the radio.
@@ -109,7 +109,7 @@ pub const EVENT_LEAD_US: u32 = 60;
 pub const EVENT_LEAD_US: u32 = 120;
 /// The least time ahead a TXEN is armed for: a start closer than this may
 /// pass before the compare is set, and the packet is skipped instead.
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 pub const MIN_LEAD_US: u32 = 5;
 /// The least time ahead a TXEN is armed for: a start closer than this may
 /// pass before the compare is set, and the packet is skipped instead.
@@ -121,7 +121,7 @@ pub const MIN_LEAD_US: u32 = 10;
 const NOBODY: Peer = Peer::new([0; 6], false);
 /// Time from the start of one primary packet to the next on air: nine
 /// units of 30 us.
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 pub const PRIMARY_SPACING_US: u32 = 270;
 /// Time from the start of one primary packet to the next on air: thirteen
 /// units of 30 us, for the nRF51's 140 us ramp-up and slower CPU.
@@ -135,7 +135,7 @@ pub const RENEWAL_LEN: usize = 4;
 /// Largest scan response data: extended connectable advertising has none.
 pub const SCAN_DATA_MAX: usize = 0;
 /// The PHYs the secondary channel can use: LE 1M and LE 2M.
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 pub const SECONDARY_PHYS: [Phy; 2] = [Phy::M1, Phy::M2];
 /// The PHYs the secondary channel can use: LE 1M, the nRF51's only one.
 #[cfg(feature = "nrf51")]
@@ -667,7 +667,8 @@ fn listen(
 /// no longer stops the answer, and the central takes the connection as made
 /// (see [`late_connect_decisions`]). The END event the check starts from
 /// comes the receive chain's delay later, about 9 us on LE 1M and 5 us on
-/// LE 2M on the nRF52832, which leaves about 333 and 245 us from there.
+/// LE 2M on the nRF52 chips, which leaves about 332 to 333 and 245 us from
+/// there.
 #[inline]
 #[must_use = "the time is only computed"]
 pub const fn decision_budget_us(phy: Phy) -> u32 { T_IFS_US.strict_add(airtime_us(phy, AUX_CONNECT_RSP_LEN)) }
@@ -769,18 +770,15 @@ pub const fn set_own(settings: &mut Settings, own: Peer) {
     settings.own = own;
 }
 
-/// Time from TXEN until the packet starts on air on `phy`: the fast
-/// ramp-up and the TX chain, as in Zephyr's Nordic HAL (41.05 us on LE 1M,
-/// 40 us on LE 2M), rounded down.
-#[cfg(feature = "nrf52832")]
+/// Time from TXEN until the packet starts on air on `phy`.
+///
+/// It is the fast ramp-up and the TX chain, as in Zephyr's Nordic HAL,
+/// rounded down: 41 us on LE 1M (41.05 us) and 40 us on LE 2M on the
+/// nRF52832, 40 us on both (40.9 and 40 us) on the nRF52833.
+#[cfg(feature = "_nrf52")]
 #[inline]
 #[must_use = "the time is only computed"]
-pub const fn tx_ready_us(phy: Phy) -> u32 {
-    match phy {
-        Phy::M1 => 41,
-        Phy::M2 => 40,
-    }
-}
+pub const fn tx_ready_us(phy: Phy) -> u32 { chip::tx_ready_ns(phy).strict_div(1000) }
 
 /// Time from TXEN until the packet starts on air: the nRF51's ramp-up,
 /// about 140 us on LE 1M, its only PHY.

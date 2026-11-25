@@ -94,6 +94,7 @@ use crate::{
     clock::Micros,
     crypto,
     pdu::{Llid, ParamCheck, Peer},
+    power_control::{CEILING_DBM, LEVELS_DBM, ceiling_level},
     rng,
 };
 #[cfg(feature = "extended-advertising")]
@@ -631,7 +632,7 @@ pub struct AdvParams {
     pub private:       bool,
     /// PHY of the secondary channel: of the `AUX_ADV_IND`, the
     /// `AUX_CONNECT_REQ` and `AUX_CONNECT_RSP`, and of the connection's
-    /// start. LE 1M, or LE 2M on the nRF52832, half the airtime for a
+    /// start. LE 1M, or LE 2M on the nRF52 chips, half the airtime for a
     /// central that takes it; the nRF51 refuses LE 2M.
     #[cfg(feature = "extended-advertising")]
     pub secondary_phy: Phy,
@@ -863,6 +864,9 @@ pub struct Shared {
     hold_latency:    AtomicBool = AtomicBool::new(false),
     /// The host decides on a central's connection parameter requests.
     host_decides:    AtomicBool = AtomicBool::new(false),
+    /// Highest transmit power in dBm of the links that start, one of
+    /// [`LEVELS_DBM`].
+    max_power:       AtomicI8 = AtomicI8::new(CEILING_DBM),
     /// Connection parameters the host asks the central for.
     param_request:   Signal<CriticalSectionRawMutex, [u16; 4]> = Signal::new(),
     /// The host's answer to a central's connection parameter request: the
@@ -1009,6 +1013,9 @@ impl Shared {
 
     /// Whether the host holds the peripheral latency off.
     pub(crate) fn latency_held(&self) -> bool { self.hold_latency.load(Ordering::Relaxed) }
+
+    /// Highest transmit power in dBm of a link that starts.
+    pub(crate) fn max_power(&self) -> i8 { self.max_power.load(Ordering::Relaxed) }
 
     /// Creates the shared state.
     #[inline]
@@ -1924,7 +1931,8 @@ impl<'shared> Link<'shared> {
     }
 
     /// Resets the link layer: ends the link and advertising and forgets
-    /// every setting and key the host gave. Returns once the radio stopped.
+    /// every setting and key the host gave, but for the transmit power
+    /// ceiling ([`Self::set_max_tx_power`]). Returns once the radio stopped.
     #[inline]
     pub async fn reset(&self) {
         self.shared.reset_done.reset();
@@ -2025,6 +2033,31 @@ impl<'shared> Link<'shared> {
             settings.own = settings.address;
             Ok(())
         })
+    }
+
+    /// Sets the highest transmit power in dBm of the links that start from
+    /// now on, and returns the ceiling that takes effect: the highest level
+    /// of [`LEVELS_DBM`] not above `dbm`, and at least 0 dBm, the power of
+    /// advertising and of a link's start. A link that runs keeps its
+    /// ceiling.
+    ///
+    /// Until it is called the ceiling is [`CEILING_DBM`], +4 dBm, the
+    /// highest level of the nRF52832 and the nRF51. Only the nRF52833 goes
+    /// higher, up to +8 dBm. Above +4 dBm the radio needs supply headroom
+    /// that the board must provide, and the product's regulatory approval
+    /// has to cover the power, so the firmware decides whether to raise it.
+    /// Power control and a central's power requests stay at or below the
+    /// ceiling, and a central learns that the ceiling is this side's
+    /// maximum.
+    ///
+    /// The ceiling holds across [`Self::reset`]: it belongs to the device,
+    /// not to a link.
+    #[inline]
+    #[must_use = "the ceiling may lie below the power asked for"]
+    pub fn set_max_tx_power(&self, dbm: i8) -> i8 {
+        let ceiling = LEVELS_DBM.get(ceiling_level(dbm)).copied().unwrap_or(CEILING_DBM);
+        self.shared.max_power.store(ceiling, Ordering::Relaxed);
+        ceiling
     }
 
     /// Sets the authenticated payload timeout of the link in units of 10 ms.

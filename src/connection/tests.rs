@@ -802,7 +802,7 @@ fn while_paused_only_a_new_encryption_request_or_termination_is_accepted() {
     assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
 }
 
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 #[test]
 fn a_symmetric_phy_update_takes_effect_at_its_instant() {
     let mut link = encrypted();
@@ -871,7 +871,7 @@ fn without_2m_a_host_phy_request_completes_at_once_on_le_1m() {
     assert_eq!(shared.take_event(), Some(Event::PhyUpdated { rx: 1, status: 0, tx: 1 }));
 }
 
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 #[test]
 fn the_peripheral_asks_for_2m_once_encrypted_and_answers_a_central_request() {
     let shared = Shared::new();
@@ -992,6 +992,23 @@ fn a_power_control_request_moves_the_power_and_reports_it() {
 }
 
 #[test]
+fn a_power_request_stops_at_the_ceiling_the_firmware_chose() {
+    let highest = LEVELS_DBM[LEVELS_DBM.len() - 1];
+    let mut link = encrypted();
+    link.set_max_power(i8::MAX);
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 0x7F, 0], true);
+    let response = *link.queue.front().unwrap();
+    assert_eq!(response.data[..4], [OP_POWER_CONTROL_RSP, 0x02, highest.cast_unsigned(), highest.cast_unsigned()]);
+    assert_eq!(highest, if cfg!(feature = "nrf52833") { 8 } else { 4 });
+    // A lower ceiling is the maximum the central learns of.
+    let mut link = encrypted();
+    link.set_max_power(1);
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 3, 0], true);
+    let response = *link.queue.front().unwrap();
+    assert_eq!(response.data[..4], [OP_POWER_CONTROL_RSP, 0x02, 0, 0]);
+}
+
+#[test]
 fn power_changes_are_announced_only_to_a_central_that_supports_them() {
     let shared = Shared::new();
     let mut link = encrypted();
@@ -1004,9 +1021,10 @@ fn power_changes_are_announced_only_to_a_central_that_supports_them() {
     link.central_features = Some([0x1F, 0, 0, 0, 0x06, 0, 0, 0]);
     link.power_reporting = 1;
     link.start_procedures(At(0), &shared);
-    // One level up from 0 dBm: +3 dBm, or +4 dBm, the maximum, on the nRF51.
+    // One level up from 0 dBm: +3 dBm on the nRF52832, +2 dBm on the
+    // nRF52833, or +4 dBm, the ceiling, on the nRF51.
     let raised = LEVELS_DBM[DEFAULT_LEVEL + 1].cast_unsigned();
-    let flags = if DEFAULT_LEVEL + 2 == LEVELS_DBM.len() { 0x02 } else { 0 };
+    let flags = if DEFAULT_LEVEL + 1 == link.power[0].top() { 0x02 } else { 0 };
     let indication = *link.queue.front().unwrap();
     assert_eq!(indication.data[..5], [OP_POWER_CHANGE_IND, 1, flags, raised, raised]);
 }
@@ -1237,7 +1255,7 @@ fn plain_duplicate_can_acknowledge_tx_without_delivering_rx_twice() {
     assert_eq!(link.completed, 1);
 }
 
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 #[test]
 fn asymmetric_phy_update_keeps_both_directions_and_unchanged_fields() {
     for (receive, transmit) in [(1, 2), (2, 1)] {
@@ -1254,7 +1272,7 @@ fn asymmetric_phy_update_keeps_both_directions_and_unchanged_fields() {
     }
 }
 
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 #[test]
 fn host_notifications_survive_queue_pressure() {
     let full = Shared::with_all_events();
@@ -1289,7 +1307,7 @@ fn power_requests_for_2m_are_refused_and_round_up_without_3_dbm() {
     assert_eq!(tx_power(link.power[0].level()), 4);
 }
 
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 #[test]
 fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
     for phy in [0, 3, 4, 8, 255] {
@@ -1334,7 +1352,7 @@ fn host_remote_queries_work_without_encryption_and_version_is_sent_once() {
     assert_eq!(queued(&shared), 0);
 }
 
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 #[test]
 fn host_phy_request_completes_even_when_the_central_keeps_the_current_phy() {
     let shared = Shared::with_all_events();
@@ -2372,9 +2390,9 @@ fn a_supervision_timeout_of_a_few_latencies_survives_a_fade_over_a_listened_even
 
 #[test]
 fn host_data_queued_while_the_crystal_starts_goes_out_where_the_chip_has_the_time() {
-    // The nRF52832 prepares it once TIMER0 restarted; the nRF51 leaves it
+    // The nRF52 chips prepare it once TIMER0 restarted; the nRF51 leaves it
     // for the next event until its setup time is measured.
-    assert_eq!(chip::PREPARE_AFTER_RESTART, cfg!(feature = "nrf52832"));
+    assert_eq!(chip::PREPARE_AFTER_RESTART, cfg!(feature = "_nrf52"));
     // That a crystal up to 70 us late still leaves the time is checked at
     // compile time, beside PREPARE_LATE_US.
     let shared = Shared::new();

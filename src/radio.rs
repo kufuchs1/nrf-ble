@@ -4,12 +4,12 @@
 #[cfg(feature = "nrf51")]
 #[path = "radio/switch_tifs.rs"]
 mod switch;
-/// The turnaround timing: TIMER1 on the nRF52832.
-#[cfg(feature = "nrf52832")]
+/// The turnaround timing: TIMER1 on the nRF52832 and the nRF52833.
+#[cfg(feature = "_nrf52")]
 #[path = "radio/switch_timer.rs"]
 mod switch;
 
-#[cfg(feature = "nrf52832")] use crate::crypto;
+#[cfg(feature = "_nrf52")] use crate::crypto;
 use crate::{chip, pdu::BUFFER_LEN, sleep};
 use core::sync::atomic::{Ordering, compiler_fence};
 use embassy_nrf::{
@@ -24,13 +24,13 @@ use embassy_nrf::{
     },
     peripherals::{RADIO, RNG},
 };
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 use embassy_nrf::{
     peripherals::{PPI_CH4, PPI_CH5, PPI_CH25, TIMER1},
     ppi::Channel as _,
 };
 /// The PPI channels of the turnaround, for [`crate::PPI_CHANNELS`].
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 pub(crate) use switch::{PPI_SWITCH_ENABLE, PPI_SWITCH_START};
 
 /// Base address length in bytes.
@@ -42,18 +42,18 @@ const IFS_US: u8 = 150;
 /// Length field size in bits.
 pub(crate) const LENGTH_BITS: u8 = 8;
 /// Receiver ready time after RXEN: 40 us with the fast ramp-up of the
-/// nRF52832, about 140 us on the nRF51.
+/// nRF52832 and the nRF52833, about 140 us on the nRF51.
 pub const RX_READY_US: u32 = chip::RX_READY_US;
 /// Whether the answer within the interframe space sets the next turnaround.
 ///
 /// It does so right after its packet pointer with the nRF51's own
-/// turnaround; with TIMER1 on the nRF52832 the exchange sets it once the
+/// turnaround; with TIMER1 on the nRF52 chips the exchange sets it once the
 /// answer started.
 pub const TURNAROUND_IN_ANSWER: bool = switch::SET_IN_ANSWER;
 /// Time by which the receiver is ready before the earliest packet start one
 /// interframe space after our packet: the peer may be 2 us early, and the
 /// receiver locks onto the preamble before the access address.
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 const RX_EARLY_US: u32 = 8;
 /// Whitening initial value bit that the radio requires to be set.
 const WHITENING_BIT6: u8 = 0x40;
@@ -129,38 +129,31 @@ impl Phy {
     /// TIMER RXEN offset from the END of our packet sent on this PHY, so the
     /// receiver is ready shortly before a packet one interframe space later.
     /// The fast ramp-up and TX chain timings follow Zephyr's Nordic HAL.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     #[must_use = "the delay is only computed"]
     #[inline]
     pub const fn listen_offset_us(self) -> u32 {
         let rx_ready_ns = RX_READY_US.saturating_mul(1000);
-        let tx_chain_ns: u32 = 600;
-        let delay = rx_ready_ns.saturating_add(tx_chain_ns).div_ceil(1000);
+        let delay = rx_ready_ns.saturating_add(chip::TX_CHAIN_NS).div_ceil(1000);
         150_u32.saturating_sub(delay).saturating_sub(RX_EARLY_US)
     }
 
-    /// TIMER TXEN offset from RX END for a 150-us interframe space.
-    /// nRF52832 fast-ramp and RX-chain timings match Zephyr's Nordic HAL.
-    #[cfg(feature = "nrf52832")]
+    /// TIMER TXEN offset from RX END for a 150-us interframe space: the
+    /// chip's fast ramp-up and RX chain timings of Zephyr's Nordic HAL,
+    /// rounded to the microsecond.
+    #[cfg(feature = "_nrf52")]
     #[must_use = "the delay is only computed"]
     #[inline]
     pub const fn response_offset_us(self, receive: Self) -> u32 {
-        let tx_ready_ns: u32 = match self {
-            Self::M1 => 41_050,
-            Self::M2 => 40_000,
-        };
-        let rx_chain_ns: u32 = match receive {
-            Self::M1 => 9400,
-            Self::M2 => 5450,
-        };
-        let delay = tx_ready_ns.saturating_add(rx_chain_ns).saturating_add(500).strict_div(1000);
+        let delay =
+            chip::tx_ready_ns(self).saturating_add(chip::rx_chain_ns(receive)).saturating_add(500).strict_div(1000);
         150_u32.saturating_sub(delay)
     }
 }
 
 /// What the radio does after a packet.
 ///
-/// On the nRF52832 a turnaround is timed by TIMER1,
+/// On the nRF52832 and the nRF52833 a turnaround is timed by TIMER1,
 /// which PPI starts at the packet END, and whose compare enables the radio
 /// one interframe space after the packet, as Zephyr's software switch does:
 /// the radio's own interframe timing works only with the slow ramp-up. The
@@ -176,13 +169,13 @@ pub enum Turnaround {
     Transmit,
 }
 
-/// The PPI channels of a [`Radio`] on the nRF52832, which it owns for its
-/// lifetime.
+/// The PPI channels of a [`Radio`] on the nRF52832 and the nRF52833, which
+/// it owns for its lifetime.
 ///
 /// They are the programmable channels 4 and 5 of the turnaround, and the
 /// fixed channel 25, from the access address to the CCM's decryption.
 /// [`crate::PPI_CHANNELS`] holds every channel of the link layer.
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 pub struct Ppi<'peripherals> {
     /// Fixed channel 25: RADIO ADDRESS to CCM CRYPT.
     _crypt:         Peri<'peripherals, PPI_CH25>,
@@ -192,7 +185,7 @@ pub struct Ppi<'peripherals> {
     _switch_start:  Peri<'peripherals, PPI_CH4>,
 }
 
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 impl<'peripherals> Ppi<'peripherals> {
     /// Takes the channels 4, 5 and 25.
     #[inline]
@@ -211,24 +204,25 @@ impl<'peripherals> Ppi<'peripherals> {
     }
 }
 
-/// The radio, configured for BLE, with fast ramp-up on the nRF52832.
+/// The radio, configured for BLE, with fast ramp-up on the nRF52832 and the
+/// nRF52833.
 pub struct Radio<'peripherals> {
     /// The radio peripheral, owned for the lifetime of the driver.
     _peripheral: Peri<'peripherals, RADIO>,
     /// The PPI channels, owned for the lifetime of the driver.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     _ppi:        Ppi<'peripherals>,
     /// The random number generator, which [`crate::rng`] drives for the
     /// link layer and the host, owned for the lifetime of the driver.
     _rng:        Peri<'peripherals, RNG>,
     /// The timer of the turnarounds, owned for the lifetime of the driver.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     _switch:     Peri<'peripherals, TIMER1>,
     /// The most octets the current packet layout lets the radio write to
     /// RAM for a reception.
     longest:     usize,
     /// PHY the turnarounds are timed for.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     phy:         Phy,
     /// Size of the buffer the radio points at, 0 for a PDU only to send or
     /// once the radio is disabled.
@@ -284,7 +278,7 @@ impl<'peripherals> Radio<'peripherals> {
             Self::sleep_on(|w| w.set_disabled(true), || self.is_disabled());
         }
         REGS.events_disabled().write_value(0);
-        // Not in `wait_disabled` or `wait_stopped`: on the nRF52832 a
+        // Not in `wait_disabled` or `wait_stopped`: on the nRF52 chips a
         // turnaround to receive enables the radio again after it was
         // disabled.
         self.pointed = 0;
@@ -306,18 +300,18 @@ impl<'peripherals> Radio<'peripherals> {
     #[must_use = "the event is only read"]
     pub fn is_end(&self) -> bool { REGS.events_end().read() != 0 }
 
-    /// Powers the radio and configures it for BLE 1 Mbit: on the nRF52832
-    /// with the fast ramp-up and TIMER1 timing the turnarounds through the
-    /// channels of `ppi`, on the nRF51 with the radio's own interframe timing
-    /// and the radio trim values of FICR. The high frequency crystal must be
-    /// running. Takes the RNG, which [`crate::rng`] drives, so that no other
-    /// driver can.
+    /// Powers the radio and configures it for BLE 1 Mbit: on the nRF52832 and
+    /// the nRF52833 with the fast ramp-up and TIMER1 timing the turnarounds
+    /// through the channels of `ppi`, on the nRF51 with the radio's own
+    /// interframe timing and the radio trim values of FICR. The high frequency
+    /// crystal must be running. Takes the RNG, which [`crate::rng`] drives, so
+    /// that no other driver can.
     #[inline]
     #[must_use = "the radio is unusable once dropped"]
     pub fn new(
         radio: Peri<'peripherals, RADIO>,
-        #[cfg(feature = "nrf52832")] switch: Peri<'peripherals, TIMER1>,
-        #[cfg(feature = "nrf52832")] ppi: Ppi<'peripherals>,
+        #[cfg(feature = "_nrf52")] switch: Peri<'peripherals, TIMER1>,
+        #[cfg(feature = "_nrf52")] ppi: Ppi<'peripherals>,
         rng: Peri<'peripherals, RNG>,
     ) -> Self {
         sleep::enable();
@@ -326,7 +320,7 @@ impl<'peripherals> Radio<'peripherals> {
         chip::ram_priority();
         REGS.mode().write(|w| w.set_mode(Mode::Ble1mbit));
         chip::fast_ramp_up();
-        REGS.tifs().write(|w| w.set_tifs(IFS_US));
+        chip::set_tifs(IFS_US);
         switch::init();
         REGS.pcnf0().write(|w| {
             w.set_lflen(LENGTH_BITS);
@@ -350,13 +344,13 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.txpower().write(|w| w.set_txpower(Txpower::_0dBm));
         Self {
             _peripheral: radio,
-            #[cfg(feature = "nrf52832")]
+            #[cfg(feature = "_nrf52")]
             _ppi: ppi,
             _rng: rng,
-            #[cfg(feature = "nrf52832")]
+            #[cfg(feature = "_nrf52")]
             _switch: switch,
             longest: chip::packet_ram_len(false),
-            #[cfg(feature = "nrf52832")]
+            #[cfg(feature = "_nrf52")]
             phy: Phy::M1,
             pointed: 0,
         }
@@ -483,7 +477,7 @@ impl<'peripherals> Radio<'peripherals> {
     pub fn set_phy(&mut self, phy: Phy) { chip::set_phy(phy); }
 
     /// Sets the PHY of the following packets. The radio must be disabled.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     #[inline]
     pub fn set_phy(&mut self, phy: Phy) {
         self.phy = phy;
@@ -528,7 +522,7 @@ impl<'peripherals> Radio<'peripherals> {
         }
         #[cfg(feature = "nrf51")]
         switch::arm(turnaround);
-        #[cfg(feature = "nrf52832")]
+        #[cfg(feature = "_nrf52")]
         switch::arm(self, turnaround);
     }
 
@@ -604,7 +598,7 @@ impl<'peripherals> Radio<'peripherals> {
     ///
     /// Unlike [`Self::wait_end`] and [`Self::wait_disabled`] it returns also
     /// when that packet ended before and its events came and were cleared,
-    /// as [`Self::wait_switched`] clears the disabled event on the nRF52832:
+    /// as [`Self::wait_switched`] clears the disabled event on the nRF52 chips:
     /// an answer that has already gone out leaves the radio disabled, and no
     /// event follows.
     #[inline]
@@ -646,20 +640,5 @@ const fn frequency(channel: u8) -> u8 {
         38 => 26,
         39 => 80,
         _ => 2,
-    }
-}
-
-#[cfg(all(test, feature = "nrf52832"))]
-mod tests {
-    use super::Phy;
-    #[test]
-    fn turnaround_offsets_match_nrf52832_hal_timing_vectors() {
-        assert_eq!(Phy::M2.response_offset_us(Phy::M1), 101);
-        assert_eq!(Phy::M1.response_offset_us(Phy::M2), 103);
-        assert_eq!(Phy::M1.response_offset_us(Phy::M1), 100);
-        assert_eq!(Phy::M2.response_offset_us(Phy::M2), 105);
-        // Ready 8 us before the earliest packet: 150 - 41 - 8.
-        assert_eq!(Phy::M1.listen_offset_us(), 101);
-        assert_eq!(Phy::M2.listen_offset_us(), 101);
     }
 }

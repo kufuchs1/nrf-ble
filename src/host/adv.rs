@@ -2,8 +2,8 @@
 //!
 //! [`Data`] writes advertising and scan response data, AD structures of
 //! [`DATA_MAX`] octets at most (31, or with the feature
-//! `extended-advertising`, which has no scan response, 245 on the nRF52832 and
-//! 242 on the nRF51): flags, the complete or
+//! `extended-advertising`, which has no scan response, 245 on the nRF52 chips
+//! and 242 on the nRF51): flags, the complete or
 //! shortened local name, the appearance, the complete list of 16-bit service
 //! UUIDs and the TX power level. A structure that does not fit is refused with
 //! [`Overflow`] and leaves the data as it was. [`Content`] builds both sets of
@@ -166,7 +166,7 @@ use embassy_time::Duration;
 /// Largest advertising or scan response data.
 ///
 /// 31 octets, or with the feature `extended-advertising` 245 octets of
-/// advertising data on the nRF52832 and 242 on the nRF51, whose radio sends
+/// advertising data on the nRF52 chips and 242 on the nRF51, whose radio sends
 /// a shorter payload, and no scan response.
 pub const DATA_MAX: usize = advertiser::DATA_MAX;
 /// AD type: flags.
@@ -556,7 +556,7 @@ impl<'name> Content<'name> {
     /// advertising data, up to [`DATA_MAX`] octets, holds the TX power level
     /// after the appearance, and then the name, which is shortened only if it
     /// does not fit there. Without `discoverable`, for a reconnection that
-    /// may be directed, the data takes six octets less: 239 on the nRF52832,
+    /// may be directed, the data takes six octets less: 239 on the nRF52 chips,
     /// 236 on the nRF51.
     ///
     /// # Errors
