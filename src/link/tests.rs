@@ -675,7 +675,7 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
         // With the feature `coded-phy` the primary channels go on LE Coded
         // too, not on LE 2M, and the interval grows to the event on LE
         // Coded: 0x0030 units are 30 ms, more than the 26 ms of the longest
-        // event, 0x0020 units 20 ms, less.
+        // event, 0x0020 units 20 ms, less, which grows to 42 units, 26.25 ms.
         #[cfg(feature = "coded-phy")]
         {
             let coded = params.primary_phy(Phy::CodedS8).secondary_phy(Phy::CodedS8);
@@ -691,7 +691,7 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
                 link.advertise(&coded.interval(0x0020), zeros.get(..undirected).unwrap_or_default(), &[]),
                 Ok(())
             );
-            assert_eq!(assert_some!(shared.advertising()).interval, 26_016);
+            assert_eq!(assert_some!(shared.advertising()).interval, 26_250);
         }
     }
     link.stop_advertising();

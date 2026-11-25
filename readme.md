@@ -667,14 +667,16 @@ the specification's, not measured with this crate.
   within the 2120 µs of 251 octets there.
 - **Power control:** one control per PHY of the power control procedures, LE Coded with S=8 and with S=2 being PHYs 3
   and 4. Its targets are those of LE 1M; LE Coded's better sensitivity is not taken into account.
-- **Extended advertising** (with `extended-advertising`): `AdvParams::primary_phy` and
-  `Advertising::with_primary_phy` put the `ADV_EXT_IND`s on LE Coded, `secondary_phy` and `with_secondary_phy` the
-  `AUX_ADV_IND`, the `AUX_CONNECT_RSP` and the link's start. On LE Coded the primaries are 1290 µs apart with S=8 and
-  690 µs with S=2, and the `AUX_ADV_IND` follows the last after 1482 and 912 µs, 12 µs into a unit of 30 µs from every
-  `AuxPtr` as on LE 1M. The `AUX_CONNECT_RSP` is armed on TIMER0 once the request ended, by its coding, and a request
-  whose answer cannot be armed in time is refused and counted as a late decision. The link's transmit window opens
-  3.75 ms after the request (Zephyr's `WIN_DELAY_CODED`). An event on LE Coded may outlast 20 ms, 26 ms with S=8 on
-  both channels and 245 octets of data: `Link::advertise` raises the interval to the event's length.
+- **Extended advertising** (with `extended-advertising`): `AdvParams::primary_phy` and `Advertising::with_primary_phy`
+  put the `ADV_EXT_IND`s on LE Coded, `secondary_phy` and `with_secondary_phy` the `AUX_ADV_IND`, the
+  `AUX_CONNECT_RSP` and the link's start. On LE Coded the primaries are 1290 µs apart with S=8 and 690 µs with S=2,
+  and the `AUX_ADV_IND` follows the last after 1482 and 912 µs, 12 µs into a unit of 30 µs from every `AuxPtr` as on
+  LE 1M. The `AUX_CONNECT_RSP` is armed on TIMER0 once the request ended, by its coding, and a request whose answer
+  cannot be armed in time is refused and counted as a late decision. The link's transmit window opens 3.75 ms after
+  the request (Zephyr's `WIN_DELAY_CODED`). An event on LE Coded may outlast 20 ms, 26 ms with S=8 on both channels
+  and 245 octets of data: `Link::advertise` raises the interval to the event's length, rounded up to a whole multiple
+  of 0.625 ms (26.25 ms there). On an LE Coded secondary channel the event counts the `AUX_CONNECT_REQ` with S=8, as
+  its coding is the central's choice.
 
 What has to be measured on an nRF52833 before a firmware relies on LE Coded, with a sniffer that decodes LE Coded and
 a central that supports it (BlueZ with a Bluetooth 5 controller that has LE Coded):

@@ -455,8 +455,9 @@ fn the_event_plan_on_le_coded_keeps_its_times() {
 }
 
 /// An event on LE Coded with S=8 on both channels and 245 octets of data,
-/// 255 octets of payload, takes about 26 ms, more than the shortest
-/// interval, which grows to it; on LE 1M the interval stays.
+/// 255 octets of payload, takes 26016 us, more than the shortest interval,
+/// which grows to it, rounded up to 26250 us, 42 units of 0.625 ms; on LE
+/// 1M the interval stays.
 #[cfg(feature = "coded-phy")]
 #[test]
 fn an_event_on_le_coded_sets_the_least_interval() {
@@ -471,12 +472,29 @@ fn an_event_on_le_coded_sets_the_least_interval() {
     settings.primary_phy = Phy::CodedS8;
     settings.secondary_phy = Phy::CodedS8;
     fit_interval(&mut settings);
-    assert_eq!(settings.interval, event_us_on(3, Phy::CodedS8, Phy::CodedS8, AUX_HEADER_LEN + DATA_MAX));
-    assert_eq!(settings.interval, longest);
+    assert_eq!(event_us_on(3, Phy::CodedS8, Phy::CodedS8, AUX_HEADER_LEN + DATA_MAX), longest);
+    assert_eq!(settings.interval, 26_250);
+    assert_eq!(settings.interval.strict_rem(625), 0);
     // A longer interval stays.
     settings.interval = 100_000;
     fit_interval(&mut settings);
     assert_eq!(settings.interval, 100_000);
+}
+
+/// With S=2 on the secondary channel the central may still send its
+/// `AUX_CONNECT_REQ` with S=8, 2896 us against 1006 us with S=2, which the
+/// event counts; the `AUX_ADV_IND` and the `AUX_CONNECT_RSP` go out with
+/// S=2.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn an_event_on_le_coded_with_s2_counts_the_request_with_s8() {
+    assert_eq!(airtime_us(Phy::CodedS8, usize::from(CONNECT_IND_LEN)), 2896);
+    assert_eq!(airtime_us(Phy::CodedS2, usize::from(CONNECT_IND_LEN)), 1006);
+    assert_eq!(airtime_us(Phy::CodedS2, AUX_PAYLOAD_MAX), 4542);
+    assert_eq!(airtime_us(Phy::CodedS2, AUX_CONNECT_RSP_LEN), 686);
+    let longest = 60 + 42 + 2 * 1290 + 1482 + 4542 + 150 + 2896 + 150 + 686;
+    assert_eq!(event_us_on(3, Phy::CodedS8, Phy::CodedS2, AUX_PAYLOAD_MAX), longest);
+    assert_eq!(longest, 12_588);
 }
 
 /// The PDUs of advertising on LE Coded: each primary's `AuxPtr` names LE

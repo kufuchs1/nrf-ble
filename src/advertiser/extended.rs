@@ -75,6 +75,9 @@ const ADV_INTERVAL_MIN_US: u32 = 20_000;
 /// it comes into: the header and the largest payload the advertising
 /// channels admit.
 pub const AUX_BUFFER_LEN: usize = HEADER_LEN.strict_add(AUX_PAYLOAD_MAX);
+/// The unit of an advertising interval, 0.625 ms, in microseconds.
+#[cfg(feature = "coded-phy")]
+const INTERVAL_UNIT_US: u32 = 625;
 /// Time from the start of the last primary packet on LE 1M to the start of
 /// the auxiliary packet on air: at least `T_MAFS` after the primary's end,
 /// and 12 us into a 30 us unit.
@@ -869,17 +872,29 @@ pub const fn event_us(channels: usize, phy: Phy, aux_len: usize) -> u32 { event_
 /// The longest an event of `channels` primaries on `primary` takes with an
 /// auxiliary packet of `aux_len` payload octets on `phy`, from its start
 /// until the end of an `AUX_CONNECT_RSP`.
+#[cfg_attr(
+    feature = "coded-phy",
+    doc = "",
+    doc = "On an LE Coded secondary channel the `AUX_CONNECT_REQ` counts with S=8, whatever the advertising's coding: \
+           its coding is the central's choice. The `AUX_CONNECT_RSP` goes out with the advertising's coding."
+)]
 #[inline]
 #[must_use = "the time is only computed"]
 pub const fn event_us_on(channels: usize, primary: Phy, phy: Phy, aux_len: usize) -> u32 {
     let spacing: u32 = channels.strict_sub(1).strict_cast();
+    #[cfg(not(feature = "coded-phy"))]
+    let request = phy;
+    // On LE Coded the central chooses the coding of its request, whatever
+    // ours: S=8 takes the longer.
+    #[cfg(feature = "coded-phy")]
+    let request = if phy.is_coded() { Phy::CodedS8 } else { phy };
     EVENT_LEAD_US
         .strict_add(tx_ready_us(primary))
         .strict_add(spacing.strict_mul(primary_spacing_us(primary)))
         .strict_add(aux_gap_us(primary))
         .strict_add(airtime_us(phy, aux_len))
         .strict_add(T_IFS_US)
-        .strict_add(airtime_us(phy, usize::from(CONNECT_IND_LEN)))
+        .strict_add(airtime_us(request, usize::from(CONNECT_IND_LEN)))
         .strict_add(T_IFS_US)
         .strict_add(airtime_us(phy, AUX_CONNECT_RSP_LEN))
 }
@@ -962,20 +977,22 @@ pub const fn aux_gap_us(primary: Phy) -> u32 {
     unit.div_ceil(UNIT_US).strict_mul(UNIT_US).strict_add(residue)
 }
 
-/// Raises the interval of `settings` to the longest its event takes.
+/// Raises the interval of `settings` to the longest its event takes,
+/// rounded up to a whole multiple of 0.625 ms, which an advertising
+/// interval is (Core, Vol 6, Part B, 4.4.2.2.1).
 ///
-/// That is from its start until the end of an `AUX_CONNECT_RSP`
-/// ([`event_us`]), so that one event ends before the next starts and the
+/// The event lasts from its start until the end of an `AUX_CONNECT_RSP`
+/// ([`event_us_on`]), so that one event ends before the next starts and the
 /// random delay between them holds. Only an event on LE Coded can outlast the
 /// shortest interval, 20 ms: with S=8 on both channels, three primaries and 245
-/// octets of data take about 26 ms.
+/// octets of data take 26016 us, which rounds up to 26250 us.
 #[cfg(feature = "coded-phy")]
 #[inline]
 pub fn fit_interval(settings: &mut Settings) {
     let (_, channels) = primary_channels(settings.channel_map);
     let aux_len = auxiliary(settings).as_bytes().len().saturating_sub(HEADER_LEN);
     let event = event_us_on(channels.max(1), primary_phy(settings), secondary_phy(settings), aux_len);
-    settings.interval = settings.interval.max(event);
+    settings.interval = settings.interval.max(event.div_ceil(INTERVAL_UNIT_US).strict_mul(INTERVAL_UNIT_US));
 }
 
 /// The `ADV_EXT_IND` of `settings` with the pointer `aux`.
