@@ -220,11 +220,6 @@ const PREPARE_LATE_US: Micros = Micros(200);
 // A crystal up to 70 us late still leaves the time.
 const _: () =
     assert!(SETUP_US >= PREPARE_LATE_US.0.strict_add(70), "a crystal up to 70 us late no longer leaves the time");
-/// Highest transmit power in dBm.
-const MAX_POWER_DBM: i8 = {
-    let [.., highest] = LEVELS_DBM;
-    highest
-};
 /// Acceptable power reduction when no packet has been measured yet.
 const UNKNOWN_REDUCTION: u8 = 0xFF;
 /// Error code: different transaction collision, another procedure with an
@@ -313,9 +308,9 @@ pub struct Stats {
     /// Longest time from TIMER0's restart before an event, [`SETUP_US`]
     /// ahead of the radio's start, until that start was programmed, in
     /// microseconds: a late crystal or restart and the radio's setup, and on
-    /// the nRF52832 the preparation of data the host queued while the crystal
-    /// started. What it leaves of `SETUP_US` bounds what may still run after
-    /// the restart, such as that preparation on the nRF51.
+    /// the nRF52 chips the preparation of data the host queued while the
+    /// crystal started. What it leaves of `SETUP_US` bounds what may still run
+    /// after the restart, such as that preparation on the nRF51.
     pub setup_us_max:      u32,
     /// Connection events skipped with peripheral latency.
     pub skipped:           u32,
@@ -997,6 +992,7 @@ impl Connection {
     /// own transmit power.
     const fn announce_power(&mut self) {
         let level = for_phy_mut(&mut self.power, self.tx_phy).level();
+        let top = for_phy_mut(&mut self.power, self.tx_phy).top();
         let supports = self.central_features.is_some_and(const |[_, _, _, _, power, ..]| power & 0x02 != 0);
         let free = self.encryption.phase.is_idle() && self.queue.is_empty();
         if level == *for_phy_mut(&mut self.announced_power, self.tx_phy)
@@ -1012,7 +1008,7 @@ impl Connection {
         self.enqueue(Llid::Control, &[
             OP_POWER_CHANGE_IND,
             self.tx_phy.hci(),
-            limit_flags(level),
+            limit_flags(level, top),
             delta.cast_unsigned(),
             now.cast_unsigned(),
         ]);
@@ -1665,7 +1661,7 @@ impl Connection {
             if asymmetric {
                 // The other PHY is set while the radio is disabled, and the
                 // answer started from TIMER0 in its place.
-                #[cfg(feature = "nrf52832")]
+                #[cfg(feature = "_nrf52")]
                 {
                     radio.wait_disabled();
                     radio.set_phy(self.tx_phy);
@@ -2133,9 +2129,11 @@ impl Connection {
             i32::from(before).saturating_add(i32::from(delta.cast_signed()))
         };
         // Round upward to the lowest available power at least as high as
-        // requested.
-        let requested_level =
-            LEVELS_DBM.iter().copied().find(|&level| i32::from(level) >= requested).unwrap_or(MAX_POWER_DBM);
+        // requested, up to the ceiling.
+        let top = for_phy_mut(&mut self.power, request_phy).top();
+        let allowed = LEVELS_DBM.get(..=top).unwrap_or(&LEVELS_DBM);
+        let highest = tx_power(top);
+        let requested_level = allowed.iter().copied().find(|&level| i32::from(level) >= requested).unwrap_or(highest);
         for_phy_mut(&mut self.power, request_phy).move_to(i32::from(requested_level));
         self.power_reporting |= phy;
         let level = for_phy_mut(&mut self.power, request_phy).level();
@@ -2144,7 +2142,7 @@ impl Connection {
         let reduction = UNKNOWN_REDUCTION;
         self.enqueue(Llid::Control, &[
             OP_POWER_CONTROL_RSP,
-            limit_flags(level),
+            limit_flags(level, top),
             change.cast_unsigned(),
             now.cast_unsigned(),
             reduction,
@@ -2498,7 +2496,7 @@ impl Connection {
     }
 
     /// Prepares the next PDU in the free slot, between events, or on the
-    /// nRF52832 also while our answer goes out: the first control PDU,
+    /// nRF52 chips also while our answer goes out: the first control PDU,
     /// otherwise the next fragment of the host's data, which waits while
     /// encryption starts or pauses, otherwise an empty PDU. It copies the
     /// payload and, on an encrypted link, seals it with the next packet
@@ -3008,6 +3006,15 @@ impl Connection {
         }
     }
 
+    /// Applies the firmware's transmit power ceiling in dBm when
+    /// establishing a new link, on both PHYs.
+    #[cfg(feature = "nrf52833")]
+    pub(crate) const fn set_max_power(&mut self, dbm: i8) {
+        let &mut [ref mut one, ref mut two] = &mut self.power;
+        one.set_ceiling(dbm);
+        two.set_ceiling(dbm);
+    }
+
     /// Applies the default PHY preference when establishing a new link.
     pub(crate) const fn set_preferred_phys(&mut self, preferences: [u8; 2]) { self.preferred_phys = preferences; }
 
@@ -3446,11 +3453,9 @@ const fn control_len(code: u8) -> Option<usize> {
 /// peripheral latency off: nothing follows them.
 const fn is_ping(opcode: u8) -> bool { matches!(opcode, OP_PING_REQ | OP_PING_RSP) }
 
-/// Power control flags of `level`: bit 0 at the lowest power, bit 1 at the
-/// highest.
-const fn limit_flags(level: usize) -> u8 {
-    u8::from(level == 0) | u8::from(level.saturating_add(1) >= LEVELS_DBM.len()).wrapping_shl(1)
-}
+/// Power control flags of `level` under the ceiling `top`: bit 0 at the
+/// lowest power, bit 1 at the highest this side uses.
+const fn limit_flags(level: usize, top: usize) -> u8 { u8::from(level == 0) | u8::from(level >= top).wrapping_shl(1) }
 
 /// Whether a connection parameter request or response has parameters within
 /// the specification: an interval range, latency and supervision timeout.

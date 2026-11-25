@@ -3,13 +3,17 @@ name = "nrf-ble"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Bluetooth LE link layer and a minimal host for the nRF52832 and the nRF51, joined by a typed link API"
+description = "Bluetooth LE link layer and a minimal host for the nRF52832, the nRF52833 and the nRF51, joined by a typed link API"
 readme = "readme.md"
 
 [features]
 default = ["nrf52832"]
-nrf52832 = ["embassy-nrf/nrf52832"]
+nrf52832 = ["embassy-nrf/nrf52832", "_nrf52"]
+nrf52833 = ["embassy-nrf/nrf52833", "_nrf52"]
 nrf51 = ["embassy-nrf/nrf51"]
+# What the nRF52832 and the nRF52833 share; set by their chip features, not
+# meant to be enabled on its own.
+_nrf52 = []
 defmt = ["dep:defmt", "embassy-time/defmt"]
 data-length = []
 param-requests = []

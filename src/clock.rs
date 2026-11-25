@@ -30,7 +30,7 @@ use embassy_nrf::{
     peripherals::{self, PPI_CH0, PPI_CH1, PPI_CH3, PPI_GROUP0, PPI_GROUP1, RTC0, TIMER0},
     ppi::Group as _,
 };
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 use embassy_nrf::{
     peripherals::{PPI_CH20, PPI_CH21, PPI_CH26, PPI_CH27},
     ppi::Channel as _,
@@ -363,22 +363,22 @@ pub enum LowFrequency {
 ///
 /// They are the programmable channels 0, from the RTC to the timer's start,
 /// and 1, from the RTC to a capture of the timer, and group 1, which
-/// disables channel 1 after its first event. On the nRF52832 they include
+/// disables channel 1 after its first event. On the nRF52 chips they include
 /// the fixed channels 20 and 21, which start the radio, and 26 and 27, which
 /// capture its packet timing. On the nRF51, whose fixed channels have no
 /// Embassy tokens, channel 9 stands in for the FORK of channel 1 instead.
 /// [`crate::PPI_CHANNELS`] holds every channel of the link layer.
 pub struct Ppi<'peripherals> {
     /// Fixed channel 26: RADIO ADDRESS to TIMER0 CAPTURE1.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     _address:    Peri<'peripherals, PPI_CH26>,
     /// Fixed channel 27: RADIO END to TIMER0 CAPTURE2.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     _end:        Peri<'peripherals, PPI_CH27>,
     /// Channel 0: RTC0 COMPARE0 to TIMER0 START.
     _resume:     Peri<'peripherals, PPI_CH0>,
     /// Fixed channel 21: TIMER0 COMPARE0 to RADIO RXEN.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     _rxen:       Peri<'peripherals, PPI_CH21>,
     /// Channel 1: RTC0 COMPARE1 to TIMER0 CAPTURE3.
     _sync:       Peri<'peripherals, PPI_CH1>,
@@ -388,7 +388,7 @@ pub struct Ppi<'peripherals> {
     /// Group 1, which holds channel 1 alone.
     _sync_group: Peri<'peripherals, PPI_GROUP1>,
     /// Fixed channel 20: TIMER0 COMPARE0 to RADIO TXEN.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     _txen:       Peri<'peripherals, PPI_CH20>,
 }
 
@@ -454,8 +454,8 @@ impl Drop for ResumeGuard<'_, '_> {
         PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
         self.clock.cancel_start();
         REGS.tasks_stop().write_value(1);
-        // STOP alone keeps drawing current (nRF52832 anomaly 78), and on the
-        // nRF51 only SHUTDOWN powers the timer down.
+        // STOP alone keeps drawing current (anomaly 78 of the nRF52832 and the
+        // nRF52833), and on the nRF51 only SHUTDOWN powers the timer down.
         REGS.tasks_shutdown().write_value(1);
         REGS.tasks_clear().write_value(1);
         RTC.events_compare(RTC_RESUME).write_value(0);
@@ -477,7 +477,7 @@ impl<'peripherals> CalibrationPpi<'peripherals> {
         #[cfg(feature = "nrf51")] fork: Peri<'peripherals, PPI_CH11>,
         group: Peri<'peripherals, PPI_GROUP0>,
     ) -> Self {
-        #[cfg(feature = "nrf52832")]
+        #[cfg(feature = "_nrf52")]
         debug_assert_eq!(channel.number(), PPI_CALIBRATE, "the calibration's PPI channel is not its token");
         debug_assert_eq!(group.number(), PPI_GROUP_CALIBRATE, "the calibration's PPI group is not its token");
         Self {
@@ -505,9 +505,9 @@ impl<'peripherals> Ppi<'peripherals> {
         Self { _resume: resume, _sync: sync, _sync_fork: sync_fork, _sync_group: sync_group }
     }
 
-    /// Takes the channels 0, 1, 20, 21, 26 and 27 and group 1 on the
-    /// nRF52832.
-    #[cfg(feature = "nrf52832")]
+    /// Takes the channels 0, 1, 20, 21, 26 and 27 and group 1 on the nRF52
+    /// chips.
+    #[cfg(feature = "_nrf52")]
     #[inline]
     #[must_use = "the channels are only claimed while the clock holds them"]
     pub fn new(
@@ -670,7 +670,7 @@ impl<'peripherals> Clock<'peripherals> {
 
     /// Sets up the timer, the RTC and the PPI channels of `ppi`. The clock
     /// starts paused.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     #[inline]
     #[must_use = "the clock stops being usable once dropped"]
     pub fn new(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>, ppi: Ppi<'peripherals>) -> Self {
@@ -709,8 +709,8 @@ impl<'peripherals> Clock<'peripherals> {
         chip::disable_channel(PPI_SYNC);
         let time = self.base.after(Micros(REGS.cc(CC_NOW).read()));
         REGS.tasks_stop().write_value(1);
-        // STOP alone keeps drawing current (nRF52832 anomaly 78), and on the
-        // nRF51 only SHUTDOWN powers the timer down.
+        // STOP alone keeps drawing current (anomaly 78 of the nRF52832 and the
+        // nRF52833), and on the nRF51 only SHUTDOWN powers the timer down.
         REGS.tasks_shutdown().write_value(1);
         REGS.tasks_clear().write_value(1);
         release_crystal();
@@ -751,8 +751,8 @@ impl<'peripherals> Clock<'peripherals> {
     #[inline]
     fn setup(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>, ppi: Ppi<'peripherals>) -> Self {
         REGS.tasks_stop().write_value(1);
-        // STOP alone keeps drawing current (nRF52832 anomaly 78), and on the
-        // nRF51 only SHUTDOWN powers the timer down.
+        // STOP alone keeps drawing current (anomaly 78 of the nRF52832 and the
+        // nRF52833), and on the nRF51 only SHUTDOWN powers the timer down.
         REGS.tasks_shutdown().write_value(1);
         REGS.mode().write(|w| w.set_mode(Mode::Timer));
         REGS.bitmode().write(|w| w.set_bitmode(Bitmode::_32bit));
@@ -886,7 +886,7 @@ impl<'peripherals> Clock<'peripherals> {
     pub(crate) fn transmit_ahead(&mut self, at: At, lead: Micros) -> bool { self.start_ahead(at, lead, PPI_TXEN) }
 
     /// Starts sending at `at`. Returns false if `at` is not in the future.
-    #[cfg(feature = "nrf52832")]
+    #[cfg(feature = "_nrf52")]
     #[inline]
     pub(crate) fn transmit_at(&mut self, at: At) -> bool { self.start_at(at, PPI_TXEN).is_some() }
 

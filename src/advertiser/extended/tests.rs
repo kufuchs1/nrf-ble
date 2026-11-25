@@ -42,7 +42,7 @@ fn the_primaries_point_to_the_same_auxiliary_packet_12_us_into_its_unit() {
         }
     }
     // The first primary to the auxiliary packet with three channels: 1002 us
-    // on the nRF52832, 1242 us on the nRF51.
+    // on the nRF52 chips, 1242 us on the nRF51.
     assert_eq!(aux_start_us(3, 0), if cfg!(feature = "nrf51") { 1242 } else { 1002 });
 }
 
@@ -67,7 +67,7 @@ fn the_auxiliary_packet_keeps_the_minimum_aux_frame_space() {
 fn airtimes_and_the_longest_event_fit_the_shortest_interval() {
     // Reconnection data (13 octets) in an undirected AUX_ADV_IND: 23 octets
     // of payload; the longest one the chip sends: 255 octets on the
-    // nRF52832, 252 on the nRF51.
+    // nRF52 chips, 252 on the nRF51.
     assert_eq!(airtime_us(Phy::M1, AUX_HEADER_LEN + 13), 264);
     assert_eq!(airtime_us(Phy::M2, AUX_HEADER_LEN + 13), 136);
     assert_eq!(airtime_us(Phy::M1, 255), 2120);
@@ -79,15 +79,26 @@ fn airtimes_and_the_longest_event_fit_the_shortest_interval() {
     for phy in SECONDARY_PHYS {
         assert!(event_us(3, phy, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US);
     }
-    // nRF52832, reconnection data on LE 1M: 60 + 41 + 540 + 462 + 264 + 150 +
-    // 352 + 150 + 192.
+    // Reconnection data on LE 1M: 60 + 41 + 540 + 462 + 264 + 150 + 352 +
+    // 150 + 192 on the nRF52832; the nRF52833's LE 1M ramp-up rounds to
+    // 40 us, one less.
     if cfg!(feature = "nrf52832") {
         assert_eq!(event_us(3, Phy::M1, AUX_HEADER_LEN + 13), 2211);
     }
-    // The CPU gets time between two packets: 87 us on the nRF52832, 108 on
-    // the nRF51.
+    if cfg!(feature = "nrf52833") {
+        assert_eq!(event_us(3, Phy::M1, AUX_HEADER_LEN + 13), 2210);
+    }
+    // The CPU gets time between two packets: 87 us on the nRF52832, 88 on
+    // the nRF52833, 108 on the nRF51.
     let between = PRIMARY_SPACING_US - PRIMARY_US - DISABLE_US - tx_ready_us(Phy::M1);
-    assert_eq!(between, if cfg!(feature = "nrf51") { 108 } else { 87 });
+    let expected = if cfg!(feature = "nrf51") {
+        108
+    } else if cfg!(feature = "nrf52833") {
+        88
+    } else {
+        87
+    };
+    assert_eq!(between, expected);
 }
 
 #[test]
@@ -114,7 +125,7 @@ fn the_auxiliary_channel_covers_all_37_secondary_channels() {
 
 #[test]
 fn the_data_takes_what_the_chip_sends_and_no_scan_response() {
-    // The nRF52832 sends the largest payload, 255 octets; the nRF51 252, as
+    // The nRF52 chips send the largest payload, 255 octets; the nRF51 252, as
     // its radio takes at most 254 octets of a packet from RAM.
     let (undirected, directed) = if cfg!(feature = "nrf51") { (242, 236) } else { (245, 239) };
     assert_eq!(AUX_PAYLOAD_MAX, if cfg!(feature = "nrf51") { 252 } else { 255 });
@@ -308,10 +319,12 @@ fn the_event_plan_keeps_its_times_and_budgets_on_every_secondary_phy() {
             let last_end = primary_txen(At(first), channels - 1).0 + tx_ready_us(Phy::M1) + PRIMARY_US;
             let budget = aux_txen(At(first), channels, phy).0 - last_end - DISABLE_US;
             assert!(budget >= CPU_SLACK_MIN_US);
-            assert_eq!(budget, match (cfg!(feature = "nrf51"), phy) {
-                (true, _) => 180,
-                (false, Phy::M1) => 279,
-                (false, Phy::M2) => 280,
+            // The nRF52833's LE 1M ramp-up rounds to 40 us like its LE 2M
+            // one, so its two budgets are the same.
+            assert_eq!(budget, match (cfg!(feature = "nrf51"), cfg!(feature = "nrf52833"), phy) {
+                (true, ..) => 180,
+                (false, false, Phy::M1) => 279,
+                (false, true, Phy::M1) | (false, _, Phy::M2) => 280,
             });
         }
         // The request's access address comes before the listen ends: T_IFS
@@ -329,14 +342,15 @@ fn the_event_plan_keeps_its_times_and_budgets_on_every_secondary_phy() {
     assert!(between >= CPU_SLACK_MIN_US);
     // A whole event with the reconnection data, three channels, request and
     // answer: on the nRF52832 2211 us on LE 1M and on LE 2M 60 + 41 + 540 +
-    // 462 + 136 + 150 + 180 + 150 + 100 = 1819 us; on the nRF51 its
-    // longer spacing and ramp-up.
+    // 462 + 136 + 150 + 180 + 150 + 100 = 1819 us, on the nRF52833 1 us
+    // less on either, as the LE 1M ramp-up of its primaries rounds to 40 us;
+    // on the nRF51 its longer spacing and ramp-up.
     let reconnect = AUX_HEADER_LEN + 13;
     if cfg!(feature = "nrf51") {
         assert_eq!(event_us(3, Phy::M1, reconnect), 120 + 140 + 780 + 462 + 264 + 150 + 352 + 150 + 192);
     } else {
-        assert_eq!(event_us(3, Phy::M1, reconnect), 2211);
-        assert_eq!(event_us(3, Phy::M2, reconnect), 1819);
+        assert_eq!(event_us(3, Phy::M1, reconnect), if cfg!(feature = "nrf52833") { 2210 } else { 2211 });
+        assert_eq!(event_us(3, Phy::M2, reconnect), if cfg!(feature = "nrf52833") { 1818 } else { 1819 });
     }
     // The longest, 20 ms at the shortest interval, on every PHY.
     for phy in SECONDARY_PHYS {
@@ -350,11 +364,11 @@ fn a_connection_request_is_decided_before_its_answer_ends() {
     // LE 1M, 100 us on LE 2M.
     assert_eq!(decision_budget_us(Phy::M1), 342);
     assert_eq!(decision_budget_us(Phy::M2), 250);
-    // Less the nRF52832's receive chain delay before the END event and its
-    // TIMER1 turnaround, the answer ends about 245 us after the END on
-    // LE 2M, and 333 us on LE 1M.
-    #[cfg(feature = "nrf52832")]
-    for (phy, from_end) in [(Phy::M1, 333), (Phy::M2, 245)] {
+    // Less the receive chain delay before the END event and the TIMER1
+    // turnaround, the answer ends about 245 us after the END on LE 2M, and
+    // 333 us on LE 1M on the nRF52832, 332 us on the nRF52833.
+    #[cfg(feature = "_nrf52")]
+    for (phy, from_end) in [(Phy::M1, if cfg!(feature = "nrf52833") { 332 } else { 333 }), (Phy::M2, 245)] {
         let ends = phy.response_offset_us(phy) + tx_ready_us(phy) + airtime_us(phy, AUX_CONNECT_RSP_LEN);
         assert_eq!(ends, from_end);
         assert!(decision_budget_us(phy) - ends <= 10);

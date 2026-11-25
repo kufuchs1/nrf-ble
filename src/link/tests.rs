@@ -56,6 +56,20 @@ fn reset_waits_for_radio_shutdown_and_clears_old_queues() {
     assert!(!shared.state.lock(|cell| cell.borrow().connected));
 }
 
+#[cfg(feature = "nrf52833")]
+#[test]
+fn the_transmit_power_ceiling_is_a_level_and_outlives_a_reset() {
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    assert_eq!(shared.max_power(), 4);
+    assert_eq!(link.set_max_tx_power(-10), 0);
+    assert_eq!(link.set_max_tx_power(3), 3);
+    assert_eq!(link.set_max_tx_power(i8::MAX), 8);
+    assert_eq!(shared.max_power(), 8);
+    shared.complete_reset();
+    assert_eq!(shared.max_power(), 8);
+}
+
 #[test]
 fn a_second_connection_update_waits_for_the_first_to_complete() {
     let shared = Shared::new();
@@ -133,7 +147,7 @@ fn info_keeps_the_addresses_on_the_air_and_the_identity_apart() {
     assert!(link.info().is_none());
 }
 
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 #[test]
 fn phy_requests_are_validated_and_one_runs_at_a_time() {
     let shared = Shared::new();

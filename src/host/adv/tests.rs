@@ -133,7 +133,7 @@ fn structures_are_written_with_their_length_and_type() {
 fn a_structure_that_does_not_fit_is_refused_and_changes_nothing() {
     let mut data = Data::new();
     // 29 octets of data fill the 31 exactly; with extended advertising 243
-    // the 245 of the nRF52832, 240 the 242 of the nRF51.
+    // the 245 of the nRF52 chips, 240 the 242 of the nRF51.
     let extended = if cfg!(feature = "nrf51") { 242 } else { 245 };
     assert_eq!(DATA_MAX, if cfg!(feature = "extended-advertising") { extended } else { 31 });
     data.push(0xFF, &[7; DATA_MAX - 2]).unwrap();
@@ -145,7 +145,7 @@ fn a_structure_that_does_not_fit_is_refused_and_changes_nothing() {
     assert_eq!(data.push(0xFF, &[7; DATA_MAX - 4]).err(), Some(Overflow::TooLong));
     assert!(data == before);
     // Fourteen services fit an empty set, fifteen do not; 121 and 122 with
-    // extended advertising on the nRF52832, 120 and 121 on the nRF51.
+    // extended advertising on the nRF52 chips, 120 and 121 on the nRF51.
     let services = (DATA_MAX - 2) / 2;
     assert!(Data::new().services(&[0x1800; 121][..services]).is_ok());
     assert_eq!(Data::new().services(&[0x1800; 122][..=services]).err(), Some(Overflow::TooLong));
@@ -258,7 +258,7 @@ fn extended_reconnection_data_is_without_the_name_and_fits_directed_advertising(
     assert!(!advertising.mode().pairable() && !advertising.mode().discoverable());
     // The flags, the services and the appearance take 9 + 2n octets. With
     // the fewest services too many for directed advertising, 241 of its 239
-    // octets on the nRF52832 (116 services) and 237 of 236 on the nRF51
+    // octets on the nRF52 chips (116 services) and 237 of 236 on the nRF51
     // (114), reconnection refuses them; pairing shortens the name to the
     // octets left of 245, or 242 on the nRF51.
     let directed = Kind::DirectedLowDuty.data_max();
@@ -438,7 +438,7 @@ fn the_secondary_phy_reaches_the_link_layer_where_the_chip_has_it() {
     assert!(advertising.secondary_phy() == Phy::M1);
     advertising.start(&control, &example::PHASES[0]).unwrap();
     assert!(control.0.get().unwrap().secondary_phy == Phy::M1);
-    // LE 2M on the nRF52832; the nRF51, with LE 1M alone, keeps it.
+    // LE 2M on the nRF52 chips; the nRF51, with LE 1M alone, keeps it.
     let fast = advertising.with_secondary_phy(Phy::M2);
     let expected = if cfg!(feature = "nrf51") { Phy::M1 } else { Phy::M2 };
     assert!(fast.secondary_phy() == expected);

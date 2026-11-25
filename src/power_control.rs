@@ -18,17 +18,60 @@
 //! reported to a central that asked for reports. Some centrals ask for the
 //! maximum once and never again, which a permanent floor would keep for the
 //! whole connection. A later request of the central sets a new floor.
+//!
+//! The power never rises above a ceiling, [`CEILING_DBM`], +4 dBm, the
+//! highest level of the nRF52832 and the nRF51. On the nRF52833, which goes
+//! up to +8 dBm, the firmware chooses another ceiling with
+//! `Link::set_max_tx_power`; only there does the ceiling exist at run time.
+//! Where two adjacent levels lie further apart than the window between the
+//! targets, as the nRF52833's -40 and -20 dBm do, the power steps down only
+//! to a level at which the central would still hear this side at
+//! `TARGET_LOW_DBM` or above, so that it does not step back and forth.
 
 use crate::chip;
 
-/// Transmit power levels in dBm, lowest first: -20 to +4 dBm, with +3 dBm
-/// on the nRF52832.
+/// Transmit power levels in dBm, lowest first, as the chip's radio offers
+/// them: -20 to +4 dBm, with +3 dBm on the nRF52832, and -40 dBm and -20 to
+/// +8 dBm on the nRF52833.
 pub const LEVELS_DBM: [i8; chip::LEVELS_DBM.len()] = chip::LEVELS_DBM;
 /// Level at the start of a connection and for advertising: 0 dBm.
-pub const DEFAULT_LEVEL: usize = 5;
+pub const DEFAULT_LEVEL: usize = level_at_most(0);
+/// Highest transmit power in dBm a connection uses unless the firmware
+/// chooses another ceiling: +4 dBm, the highest level of the nRF52832 and
+/// the nRF51.
+///
+/// The nRF52833 goes up to +8 dBm. Above +4 dBm the radio needs supply
+/// headroom that a board may not have, and the product's regulatory
+/// approval has to cover the higher power, so on the nRF52833 a firmware
+/// chooses its ceiling itself with `Link::set_max_tx_power`.
+pub const CEILING_DBM: i8 = 4;
+/// Index into [`LEVELS_DBM`] of the highest level.
+const HIGHEST_LEVEL: usize = LEVELS_DBM.len().saturating_sub(1);
+/// Whether two adjacent levels lie further apart than the window between
+/// `TARGET_LOW_DBM` and `TARGET_HIGH_DBM`, as the nRF52833's -40 and
+/// -20 dBm do: only then can a step down from above the window leave it
+/// below.
+const WIDE_STEP: bool = {
+    let mut wide = false;
+    let mut rest = LEVELS_DBM.as_slice();
+    while let Some((&level, tail)) = rest.split_first() {
+        if let Some(&next) = tail.first()
+            && i32::from(next).saturating_sub(i32::from(level)) > TARGET_HIGH_DBM.saturating_sub(TARGET_LOW_DBM)
+        {
+            wide = true;
+        }
+        rest = tail;
+    }
+    wide
+};
 
 // Every level is a setting of the radio's TXPOWER register, the levels
-// ascend, and the default is 0 dBm.
+// ascend, the default is 0 dBm and the default ceiling +4 dBm. The first
+// check holds for any level on the nRF52 chips, whose register takes the
+// level in dBm; their chip modules' tests compare each level with the
+// PAC's settings instead. Only the nRF52833 has levels above the default
+// ceiling, and only it keeps a ceiling at run time; on the other chips the
+// ceiling is the highest level.
 const _: () = {
     let mut rest = LEVELS_DBM.as_slice();
     while let Some((&level, tail)) = rest.split_first() {
@@ -37,6 +80,11 @@ const _: () = {
         rest = tail;
     }
     assert!(matches!(LEVELS_DBM.get(DEFAULT_LEVEL), Some(&0)), "the default level is not 0 dBm");
+    assert!(matches!(LEVELS_DBM.get(level_at_most(CEILING_DBM)), Some(&4)), "the default ceiling is not +4 dBm");
+    assert!(
+        cfg!(feature = "nrf52833") == (level_at_most(CEILING_DBM) < HIGHEST_LEVEL),
+        "only the nRF52833 has levels above the default ceiling"
+    );
 };
 /// Estimated signal at the central above which the power steps down.
 ///
@@ -74,6 +122,10 @@ pub struct PowerControl {
     level:      usize,
     /// Samples since the last decision.
     samples:    u8,
+    /// Index into [`LEVELS_DBM`] of the ceiling, which the power never
+    /// exceeds.
+    #[cfg(feature = "nrf52833")]
+    top:        usize,
 }
 
 impl PowerControl {
@@ -82,17 +134,23 @@ impl PowerControl {
     #[must_use = "the signal strength is only read"]
     pub const fn average_dbm(&self) -> Option<i32> { self.average.map(const |average| average.strict_div(SCALE)) }
 
-    /// Steps the power down or up by one level from the average.
+    /// Steps the power down or up by one level from the average, up only to
+    /// the ceiling. With [`WIDE_STEP`] it steps down only if the central
+    /// would still hear the lower level at `TARGET_LOW_DBM` or above.
     const fn decide(&mut self) {
         let Some(average) = self.average else { return };
-        let own = i32::from(LEVELS_DBM.get(self.level).copied().unwrap_or_default());
-        let at_central = own.saturating_add(average.strict_div(SCALE));
-        if at_central > TARGET_HIGH_DBM && self.hold == 0 && self.level > self.floor {
+        let estimate = at_central(self.level, average);
+        if estimate > TARGET_HIGH_DBM
+            && self.hold == 0
+            && self.level > self.floor
+            && (!WIDE_STEP || at_central(self.level.saturating_sub(1), average) >= TARGET_LOW_DBM)
+        {
             self.level = self.level.saturating_sub(1);
-        } else if at_central < TARGET_LOW_DBM {
-            self.level = self.level.saturating_add(1).min(LEVELS_DBM.len().saturating_sub(1));
+        } else if estimate < TARGET_LOW_DBM {
+            self.level = self.level.saturating_add(1).min(self.top());
         } else {
-            // Within the window: keep the level.
+            // Within the window, or a step down would leave it: keep the
+            // level.
         }
     }
 
@@ -101,29 +159,41 @@ impl PowerControl {
     #[must_use = "the level is only read"]
     pub const fn level(&self) -> usize { self.level }
 
-    /// Moves to the level closest to `dbm`, as the central asked, and keeps
-    /// the own control from stepping below it for `FLOOR_HOLD` packets.
+    /// Moves to the level closest to `dbm` up to the ceiling, as the central
+    /// asked, and keeps the own control from stepping below it for
+    /// `FLOOR_HOLD` packets.
     #[inline]
     pub fn move_to(&mut self, dbm: i32) {
+        // The levels ascend, so the closest level, if above the ceiling, is
+        // the closest at or below it once lowered to the ceiling.
         let closest = LEVELS_DBM.iter().enumerate().min_by_key(|&(_, &level)| i32::from(level).abs_diff(dbm));
-        self.level = closest.map_or(self.level, |(index, _)| index);
+        self.level = closest.map_or(self.level, |(index, _)| index).min(self.top());
         self.floor = self.level;
         self.floor_left = FLOOR_HOLD;
         self.samples = 0;
         self.hold = HOLD_AFTER_LOSS;
     }
 
-    /// Starts at [`DEFAULT_LEVEL`].
+    /// Starts at [`DEFAULT_LEVEL`], with the ceiling at [`CEILING_DBM`].
     #[inline]
     #[must_use = "the control is only created"]
     pub const fn new() -> Self {
-        Self { average: None, floor: 0, floor_left: 0, hold: 0, level: DEFAULT_LEVEL, samples: 0 }
+        Self {
+            average: None,
+            floor: 0,
+            floor_left: 0,
+            hold: 0,
+            level: DEFAULT_LEVEL,
+            samples: 0,
+            #[cfg(feature = "nrf52833")]
+            top: ceiling_level(CEILING_DBM),
+        }
     }
 
     /// Takes a packet of ours that the central did not acknowledge.
     #[inline]
     pub const fn on_loss(&mut self) {
-        self.level = self.level.saturating_add(1).min(LEVELS_DBM.len().saturating_sub(1));
+        self.level = self.level.saturating_add(1).min(self.top());
         self.samples = 0;
         self.hold = HOLD_AFTER_LOSS;
     }
@@ -149,6 +219,30 @@ impl PowerControl {
             self.decide();
         }
     }
+
+    /// Sets the ceiling to `dbm`: the highest level not above it, and at
+    /// least [`DEFAULT_LEVEL`] ([`ceiling_level`]). A level or floor above
+    /// the ceiling comes down to it.
+    #[cfg(feature = "nrf52833")]
+    #[inline]
+    pub const fn set_ceiling(&mut self, dbm: i8) {
+        self.top = ceiling_level(dbm);
+        self.level = self.level.min(self.top);
+        self.floor = self.floor.min(self.top);
+    }
+
+    /// Index into [`LEVELS_DBM`] of the ceiling.
+    #[cfg(feature = "nrf52833")]
+    #[inline]
+    #[must_use = "the level is only read"]
+    pub const fn top(&self) -> usize { self.top }
+
+    /// Index into [`LEVELS_DBM`] of the ceiling: the highest level, as none
+    /// lies above [`CEILING_DBM`].
+    #[cfg(not(feature = "nrf52833"))]
+    #[inline]
+    #[must_use = "the level is only read"]
+    pub const fn top(&self) -> usize { HIGHEST_LEVEL }
 }
 
 impl Default for PowerControl {
@@ -156,9 +250,45 @@ impl Default for PowerControl {
     fn default() -> Self { Self::new() }
 }
 
+/// The estimated signal at the central in dBm while this side sends at
+/// `level` and hears the central at `average`, in dBm times [`SCALE`], the
+/// path taken as symmetric and the central as sending at 0 dBm.
+const fn at_central(level: usize, average: i32) -> i32 {
+    i32::from(LEVELS_DBM.get(level).copied().unwrap_or_default()).saturating_add(average.strict_div(SCALE))
+}
+
+/// Index into [`LEVELS_DBM`] of the ceiling `dbm`: the highest level not
+/// above it, and at least [`DEFAULT_LEVEL`], so that the ceiling never lies
+/// below the power a link starts with.
+#[cfg(feature = "nrf52833")]
+#[inline]
+#[must_use = "the level is only computed"]
+pub const fn ceiling_level(dbm: i8) -> usize { level_at_most(dbm).max(DEFAULT_LEVEL) }
+
+/// Index into [`LEVELS_DBM`] of the highest level not above `dbm`, or of
+/// the lowest level if all are above it.
+const fn level_at_most(dbm: i8) -> usize {
+    let mut found: usize = 0;
+    let mut index: usize = 0;
+    let mut rest = LEVELS_DBM.as_slice();
+    while let Some((&level, tail)) = rest.split_first() {
+        if level <= dbm {
+            found = index;
+        }
+        index = index.saturating_add(1);
+        rest = tail;
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A central so close that the power goes down to the lowest level on
+    /// every chip: 20 dB above the window at the second level, and within
+    /// it at the lowest.
+    fn close() -> u8 { u8::try_from(i32::from(LEVELS_DBM[0]) + 60).unwrap() }
 
     fn settle(control: &mut PowerControl, rssi: u8) {
         for _ in 0..u32::from(SAMPLES_PER_DECISION) * 20 {
@@ -166,24 +296,82 @@ mod tests {
         }
     }
 
+    /// Index of the default ceiling, +4 dBm.
+    fn top() -> usize { PowerControl::new().top() }
+
     #[test]
-    fn only_the_nrf52832_has_3_dbm() {
+    fn the_nrf51_alone_lacks_3_dbm() {
         // The rest of the table is checked at compile time, beside it.
-        assert_eq!(LEVELS_DBM.contains(&3), cfg!(feature = "nrf52832"));
+        assert_eq!(LEVELS_DBM.contains(&3), !cfg!(feature = "nrf51"));
+    }
+
+    #[test]
+    fn only_the_nrf52833_goes_from_minus_40_to_plus_8_dbm() {
+        let range = (LEVELS_DBM[0], LEVELS_DBM[LEVELS_DBM.len() - 1]);
+        assert_eq!(range, if cfg!(feature = "nrf52833") { (-40, 8) } else { (-20, 4) });
+    }
+
+    #[test]
+    fn the_default_ceiling_is_4_dbm_on_every_chip() {
+        assert_eq!(LEVELS_DBM[top()], 4);
+        assert_eq!(LEVELS_DBM[DEFAULT_LEVEL], 0);
+    }
+
+    #[test]
+    fn only_the_nrf52833_has_a_step_wider_than_the_window() {
+        assert_eq!(WIDE_STEP, cfg!(feature = "nrf52833"));
+    }
+
+    #[cfg(feature = "nrf52833")]
+    #[test]
+    fn a_ceiling_rounds_down_to_a_level_and_never_below_0_dbm() {
+        assert_eq!(ceiling_level(i8::MAX), LEVELS_DBM.len() - 1);
+        assert_eq!(ceiling_level(4), top());
+        assert_eq!(ceiling_level(-10), DEFAULT_LEVEL);
+        assert_eq!(ceiling_level(i8::MIN), DEFAULT_LEVEL);
+        assert_eq!(LEVELS_DBM[ceiling_level(1)], 0);
+        assert_eq!(LEVELS_DBM[ceiling_level(3)], 3);
+        assert_eq!(LEVELS_DBM[ceiling_level(7)], 7);
     }
 
     #[test]
     fn a_central_close_by_brings_the_power_to_the_minimum() {
         let mut control = PowerControl::new();
-        settle(&mut control, 40);
+        settle(&mut control, close());
         assert_eq!(control.level(), 0);
     }
 
     #[test]
-    fn a_weak_central_brings_the_power_to_the_maximum() {
+    fn a_weak_central_brings_the_power_to_the_ceiling() {
         let mut control = PowerControl::new();
         settle(&mut control, 85);
+        assert_eq!(control.level(), top());
+        assert_eq!(LEVELS_DBM[control.level()], 4);
+    }
+
+    #[cfg(feature = "nrf52833")]
+    #[test]
+    fn a_raised_ceiling_lets_the_power_reach_the_highest_level() {
+        let mut control = PowerControl::new();
+        control.set_ceiling(i8::MAX);
+        settle(&mut control, 95);
         assert_eq!(control.level(), LEVELS_DBM.len() - 1);
+        assert_eq!(LEVELS_DBM[control.level()], 8);
+    }
+
+    #[cfg(feature = "nrf52833")]
+    #[test]
+    fn a_lowered_ceiling_brings_the_level_and_the_floor_down() {
+        let mut control = PowerControl::new();
+        control.move_to(4);
+        control.set_ceiling(0);
+        assert_eq!((control.level(), control.top()), (DEFAULT_LEVEL, DEFAULT_LEVEL));
+        control.on_loss();
+        settle(&mut control, 85);
+        assert_eq!(control.level(), DEFAULT_LEVEL);
+        // The central's request still holds as a floor, at the ceiling.
+        settle(&mut control, close());
+        assert_eq!(control.level(), DEFAULT_LEVEL);
     }
 
     #[test]
@@ -192,33 +380,53 @@ mod tests {
             let mut control = PowerControl::new();
             settle(&mut control, rssi);
             let at_central = i32::from(LEVELS_DBM[control.level()]) - i32::from(rssi);
-            let at_limit = control.level() == 0 || control.level() == LEVELS_DBM.len() - 1;
+            let at_limit = control.level() == 0 || control.level() == top();
             assert!(at_limit || (TARGET_LOW_DBM..=TARGET_HIGH_DBM).contains(&at_central), "rssi -{rssi}");
+        }
+    }
+
+    #[test]
+    fn the_power_settles_without_stepping_back_and_forth() {
+        for rssi in 0..=110 {
+            let mut control = PowerControl::new();
+            #[cfg(feature = "nrf52833")]
+            control.set_ceiling(i8::MAX);
+            settle(&mut control, rssi);
+            let settled = control.level();
+            for _ in 0..u32::from(SAMPLES_PER_DECISION) * 8 {
+                control.on_packet(rssi);
+                assert_eq!(control.level(), settled, "rssi -{rssi}");
+            }
+            // Above the window only where a step down would leave it below.
+            let at_central = |level: usize| i32::from(LEVELS_DBM[level]) - i32::from(rssi);
+            if settled != 0 && at_central(settled) > TARGET_HIGH_DBM {
+                assert!(at_central(settled - 1) < TARGET_LOW_DBM, "rssi -{rssi}");
+            }
         }
     }
 
     #[test]
     fn a_lost_packet_raises_the_power_at_once() {
         let mut control = PowerControl::new();
-        settle(&mut control, 40);
+        settle(&mut control, close());
         control.on_loss();
         assert_eq!(control.level(), 1);
         for _ in 0..20 {
             control.on_loss();
         }
-        assert_eq!(control.level(), LEVELS_DBM.len() - 1);
+        assert_eq!(control.level(), top());
     }
 
     #[test]
     fn after_a_loss_the_power_holds_before_stepping_down() {
         let mut control = PowerControl::new();
-        settle(&mut control, 40);
+        settle(&mut control, close());
         control.on_loss();
         for _ in 0..HOLD_AFTER_LOSS - 1 {
-            control.on_packet(40);
+            control.on_packet(close());
         }
         assert_eq!(control.level(), 1);
-        settle(&mut control, 40);
+        settle(&mut control, close());
         assert_eq!(control.level(), 0);
     }
 
@@ -228,10 +436,10 @@ mod tests {
         control.move_to(-13);
         assert_eq!(LEVELS_DBM[control.level()], -12);
         control.move_to(40);
-        assert_eq!(control.level(), LEVELS_DBM.len() - 1);
+        assert_eq!(control.level(), top());
         control.move_to(-12);
         for _ in 0..SAMPLES_PER_DECISION {
-            control.on_packet(40);
+            control.on_packet(close());
         }
         assert_eq!(LEVELS_DBM[control.level()], -12);
     }
@@ -240,14 +448,14 @@ mod tests {
     fn a_requested_power_is_the_floor_until_the_central_lowers_it() {
         let mut control = PowerControl::new();
         control.move_to(-4);
-        settle(&mut control, 40);
+        settle(&mut control, close());
         assert_eq!(LEVELS_DBM[control.level()], -4);
         settle(&mut control, 85);
-        assert_eq!(control.level(), LEVELS_DBM.len() - 1);
-        settle(&mut control, 40);
+        assert_eq!(control.level(), top());
+        settle(&mut control, close());
         assert_eq!(LEVELS_DBM[control.level()], -4);
         control.move_to(-12);
-        settle(&mut control, 40);
+        settle(&mut control, close());
         assert_eq!(LEVELS_DBM[control.level()], -12);
     }
 
@@ -255,7 +463,7 @@ mod tests {
     fn one_decision_moves_one_level() {
         let mut control = PowerControl::new();
         for _ in 0..SAMPLES_PER_DECISION {
-            control.on_packet(40);
+            control.on_packet(close());
         }
         assert_eq!(control.level(), DEFAULT_LEVEL - 1);
     }
@@ -265,10 +473,10 @@ mod tests {
         let mut control = PowerControl::new();
         control.move_to(4);
         for _ in 0..FLOOR_HOLD - 1 {
-            control.on_packet(40);
+            control.on_packet(close());
         }
-        assert_eq!(control.level(), LEVELS_DBM.len() - 1);
-        settle(&mut control, 40);
+        assert_eq!(control.level(), top());
+        settle(&mut control, close());
         assert_eq!(control.level(), 0);
     }
 }

@@ -1,6 +1,6 @@
-//! Bluetooth LE link layer for the nRF52832 and the nRF51, and a minimal host
-//! for Linux and `BlueZ`, which talks to the link layer through the typed API
-//! of [`link`] instead of HCI.
+//! Bluetooth LE link layer for the nRF52832, the nRF52833 and the nRF51, and
+//! a minimal host for Linux and `BlueZ`, which talks to the link layer
+//! through the typed API of [`link`] instead of HCI.
 
 #![no_std]
 // Const trait implementations of the standard library, so that const
@@ -36,20 +36,33 @@
     loop_hints,
     split_array
 )]
-// Rustdoc marks each item behind a Cargo feature with the feature it needs.
+// Rustdoc marks each item behind a Cargo feature with the feature it needs,
+// but for the internal `_nrf52`, which the chip features nrf52832 and
+// nrf52833 set: an item behind it alone carries no mark.
 #![cfg_attr(doc, feature(doc_cfg))]
+#![cfg_attr(doc, doc(auto_cfg(hide(feature, values("_nrf52")))))]
 // The fuzz test of the credit based channels checks that it runs with overflow
 // checks (`cfg!(overflow_checks)`).
 #![cfg_attr(all(test, feature = "eatt"), feature(cfg_overflow_checks))]
 
+#[cfg(all(feature = "nrf52832", feature = "nrf52833"))]
+compile_error!(
+    "the chip features nrf52832 and nrf52833 exclude each other: build for the nRF52833 with default-features = false"
+);
 #[cfg(all(feature = "nrf52832", feature = "nrf51"))]
 compile_error!(
     "the chip features nrf52832 and nrf51 exclude each other: build for the nRF51 with default-features = false"
 );
-#[cfg(not(any(feature = "nrf52832", feature = "nrf51")))]
-compile_error!("enable a chip feature: nrf52832, the default, or nrf51");
+#[cfg(all(feature = "nrf52833", feature = "nrf51"))]
+compile_error!("the chip features nrf52833 and nrf51 exclude each other: enable one chip feature only");
+#[cfg(not(any(feature = "nrf52832", feature = "nrf52833", feature = "nrf51")))]
+compile_error!("enable a chip feature: nrf52832, the default, nrf52833 or nrf51");
+#[cfg(all(feature = "_nrf52", not(any(feature = "nrf52832", feature = "nrf52833"))))]
+compile_error!("_nrf52 is internal: enable the chip feature nrf52832 or nrf52833 instead");
 #[cfg(all(feature = "nrf51", feature = "data-length"))]
-compile_error!("the nRF51 CCM encrypts payloads of up to 27 octets: the data-length feature needs the nRF52832");
+compile_error!(
+    "the nRF51 CCM encrypts payloads of up to 27 octets: the data-length feature needs the nRF52832 or the nRF52833"
+);
 
 /// Logging, first: its macros serve the modules after it.
 #[macro_use]
@@ -63,8 +76,8 @@ pub mod channel;
 #[path = "chip/nrf51.rs"]
 mod chip;
 /// Register code that differs between the chips.
-#[cfg(feature = "nrf52832")]
-#[path = "chip/nrf52832.rs"]
+#[cfg(feature = "_nrf52")]
+#[path = "chip/nrf52.rs"]
 mod chip;
 /// Microsecond time base.
 pub mod clock;
@@ -94,9 +107,9 @@ pub mod rng;
 /// Sleeping on peripheral events.
 mod sleep;
 
-/// The PPI channels of the link layer on the nRF52832: those of the clock,
+/// The PPI channels of the link layer on the nRF52 chips: those of the clock,
 /// the turnaround and the CCM.
-#[cfg(feature = "nrf52832")]
+#[cfg(feature = "_nrf52")]
 const LINK_PPI_CHANNELS: [usize; 10] = [
     clock::PPI_RESUME,
     clock::PPI_SYNC,
@@ -132,7 +145,7 @@ const LINK_PPI_GROUPS: [usize; 2] = [clock::PPI_GROUP_CALIBRATE, clock::PPI_GROU
 /// with bit `n` set for channel `n`.
 ///
 /// They are programmable channels and fixed channels between TIMER0, RTC0,
-/// the clock, the radio and the CCM, and on the nRF52832 the two
+/// the clock, the radio and the CCM, and on the nRF52 chips the two
 /// programmable channels of the turnaround timer. On the nRF51 they include
 /// the programmable channels that stand in for the FORK registers it lacks.
 ///
@@ -145,7 +158,7 @@ const LINK_PPI_GROUPS: [usize; 2] = [clock::PPI_GROUP_CALIBRATE, clock::PPI_GROU
 /// `const _: () = assert!(nrf_ble::PPI_CHANNELS & MY_CHANNELS == 0);`.
 ///
 /// The link layer owns the Embassy tokens of the channels that have one
-/// ([`clock::Ppi`], [`clock::CalibrationPpi`] and on the nRF52832
+/// ([`clock::Ppi`], [`clock::CalibrationPpi`] and on the nRF52 chips
 /// `radio::Ppi`), so no Embassy driver can take them. The fixed channels of
 /// the nRF51 have no tokens, and only this mask covers them.
 pub const PPI_CHANNELS: u32 = ppi_mask(&LINK_PPI_CHANNELS);
@@ -198,7 +211,7 @@ mod tests {
     /// or group its constant numbers.
     #[test]
     fn ppi_tokens_are_the_channels_programmed() {
-        #[cfg(feature = "nrf52832")]
+        #[cfg(feature = "_nrf52")]
         let _clock = Ppi::new(
             token!(PPI_CH0),
             token!(PPI_CH1),
@@ -216,7 +229,7 @@ mod tests {
             token!(PPI_CH11),
             token!(PPI_GROUP0),
         );
-        #[cfg(feature = "nrf52832")]
+        #[cfg(feature = "_nrf52")]
         let _radio = crate::radio::Ppi::new(token!(PPI_CH4), token!(PPI_CH5), token!(PPI_CH25));
     }
 }

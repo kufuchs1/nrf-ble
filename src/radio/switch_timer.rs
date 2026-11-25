@@ -1,4 +1,4 @@
-//! The turnaround on the nRF52832: TIMER1, which PPI starts at the packet
+//! The turnaround on the nRF52 chips: TIMER1, which PPI starts at the packet
 //! END, enables the radio one interframe space after the packet through its
 //! compare, as Zephyr's software switch does. The radio's own interframe
 //! timing works only with the slow ramp-up.
@@ -38,8 +38,9 @@ pub fn arm(radio: &Radio<'_>, turnaround: Turnaround) {
         w.set_ch(PPI_SWITCH_ENABLE, true);
     });
     SWITCH.tasks_stop().write_value(1);
-    // STOP alone keeps the timer's clock requested (nRF52832 anomaly
-    // 78), as Zephyr notes for its software switch timer.
+    // STOP alone keeps the timer's clock requested (anomaly 78 of the
+    // nRF52832 and the nRF52833), as Zephyr notes for its software switch
+    // timer.
     SWITCH.tasks_shutdown().write_value(1);
     SWITCH.tasks_clear().write_value(1);
     SWITCH.events_compare(0).write_value(0);

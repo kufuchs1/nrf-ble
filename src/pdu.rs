@@ -15,7 +15,7 @@ pub const ADV_PAYLOAD_MAX: usize = 255;
 /// Size of a packet buffer of the data channels and of legacy advertising:
 /// header, S1 byte and the largest payload the radio accepts there.
 ///
-/// That is 255 octets on the nRF52832 and 37 on the nRF51. With
+/// That is 255 octets on the nRF52 chips and 37 on the nRF51. With
 /// `extended-advertising` the advertising channels receive into the
 /// advertiser's own buffer instead, of `HEADER_LEN` and `AUX_PAYLOAD_MAX`
 /// octets.
@@ -25,7 +25,7 @@ pub const HEADER_LEN: usize = 2;
 
 // A packet buffer takes, as the radio's DMA writes it, the longest payload
 // the untrusted length field can announce, 31 octets with the nRF51's five
-// bits and 255 with the nRF52832's eight, and a legacy advertising PDU of up
+// bits and 255 with the nRF52 chips' eight, and a legacy advertising PDU of up
 // to 37 octets; and the radio takes a packet of the buffer's size from RAM.
 const _: () = {
     let length_field_max: usize = if cfg!(feature = "nrf51") { 31 } else { 255 };
@@ -33,12 +33,12 @@ const _: () = {
     assert!(BUFFER_LEN >= HEADER_LEN.saturating_add(37), "a legacy advertising PDU overruns a packet buffer");
     assert!(BUFFER_LEN <= chip::PACKET_RAM_MAX, "a packet buffer exceeds the radio's packet in RAM");
 };
-/// Largest payload of an `AUX_ADV_IND` we send: 255 octets on the nRF52832
+/// Largest payload of an `AUX_ADV_IND` we send: 255 octets on the nRF52 chips
 /// and 252 on the nRF51.
 ///
 /// That is the largest advertising channel payload, 255 octets, as far as
 /// the radio sends it from RAM after the two-octet header: S0, length and
-/// payload take at most 258 octets of RAM on the nRF52832 and 254 on the
+/// payload take at most 258 octets of RAM on the nRF52 chips and 254 on the
 /// nRF51.
 ///
 /// A longer one would go on air with its full length field but a cut
