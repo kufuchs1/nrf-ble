@@ -884,11 +884,18 @@ cargo test                                         # host tests, also with --fea
 cargo test --no-default-features --features nrf52833  # host tests for the nRF52833, also with the
                                                       # features of the first line
 cargo test --no-default-features --features nrf51  # host tests for the nRF51
-cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt and data-length
-cargo clippy --target thumbv7em-none-eabihf --no-default-features --features nrf52833
-                                                   # lints for the nRF52833, also with defmt, and with defmt and the
-                                                   # features of the first line
-cargo clippy --target thumbv6m-none-eabi --no-default-features --features nrf51   # also with defmt
+ALL=defmt,param-requests,key-missing,passkey,event-timing,directed-advertising,extended-advertising,att-mtu,eatt,\
+eatt-bearers-2,eatt-bearers-3,eatt-bearers-4,eatt-bearers-5
+cargo clippy --workspace --all-targets --no-default-features --features nrf52832,data-length,$ALL
+cargo clippy --workspace --lib --bins --target thumbv7em-none-eabihf --no-default-features \
+    --features nrf52832,data-length,$ALL
+cargo clippy --workspace --all-targets --no-default-features --features nrf52833,data-length,$ALL
+cargo clippy --workspace --lib --bins --target thumbv7em-none-eabihf --no-default-features \
+    --features nrf52833,data-length,$ALL
+cargo clippy --workspace --all-targets --no-default-features --features nrf51,$ALL
+cargo clippy --workspace --lib --bins --target thumbv6m-none-eabi --no-default-features --features nrf51,$ALL
+                                                   # each also with the chip feature alone, with defmt, and on the
+                                                   # nRF52 chips with each feature set of the first line
 cargo build --release --target thumbv7em-none-eabihf
 cargo build --release --target thumbv7em-none-eabihf --no-default-features --features nrf52833
 cargo build --release --target thumbv6m-none-eabi --no-default-features --features nrf51
@@ -897,8 +904,16 @@ cargo doc --no-deps                                # rustdoc lints are errors to
 cargo doc --no-deps --no-default-features --features nrf52833
 ```
 
-Clippy runs on the library for the chip targets. The tests are not linted (`cargo clippy --all-targets` fails on the
-test code under the `restriction` group).
+Clippy runs on every crate of the workspace and every target, the tests included: what
+`cargo clippy --workspace --all-targets --all-features` would check, which cannot run as such, as the chip features
+exclude each other. For each chip it runs with every other feature (`data-length` only on the nRF52 chips; of the
+bearer counts the highest takes effect) on the host for all targets, and on the chip's target for the libraries, as the
+tests need `std`; then the same with the chip feature alone, with `defmt`, and on the nRF52 chips with each feature set
+of the tests' first line.
+
+The tests hold to the same lints as the library. A test takes a value it needs out of an `Option` or a `Result` with
+`assert_some!` or `assert_ok!` (`src/test_assert.rs`), which assert that it is there, and compares an `Option` or a
+`Result` with `assert_eq!` where it checks one; slices are read with `get`.
 
 Every Clippy group, `restriction` included, is an error. [`Cargo.toml`](Cargo.toml) allows only lints that another lint
 or the strict setup itself contradicts (`separated_literal_suffix` among them: a literal is written `150_u32`), the two
