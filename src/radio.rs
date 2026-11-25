@@ -175,7 +175,7 @@ impl Phy {
     /// The PHY of a link layer PHY bit field with exactly one of 1M, 2M and
     /// LE Coded, if the radio has it: the nRF51 has LE 1M alone, and only
     /// the nRF52833 with the feature `coded-phy` has LE Coded, which decodes
-    /// as [`Self::CodedS8`], the PHY the radio receives LE Coded in.
+    /// as `CodedS8`, the PHY the radio receives LE Coded in.
     #[inline]
     #[must_use = "the PHY is only decoded"]
     pub const fn from_bits(bits: u8) -> Option<Self> {

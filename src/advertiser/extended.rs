@@ -813,7 +813,7 @@ fn listen_coded(
 /// Time after the end of an `AUX_ADV_IND` on `phy` until a request's access
 /// address event must have come.
 ///
-/// It is [`LISTEN_US`] on LE 1M and LE 2M, and on LE Coded as much longer as
+/// It is the 300 us of LE 1M and LE 2M, and on LE Coded as much longer as
 /// its access address event comes after the packet's start, 636 us.
 #[cfg(feature = "coded-phy")]
 #[inline]
