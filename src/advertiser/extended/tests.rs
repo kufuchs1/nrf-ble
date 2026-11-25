@@ -6,6 +6,7 @@ use super::*;
 use crate::advertiser::tests::{SAMPLE_IRK, SAMPLE_PRAND, SAMPLE_RPA, rpa};
 use crate::{
     advertiser::tests::{CENTRAL, directed},
+    chip::ADV_MAXLEN,
     pdu::Adi,
 };
 
@@ -114,9 +115,9 @@ fn the_auxiliary_channel_covers_all_37_secondary_channels() {
     let mut seen = [false; 37];
     for counter in 0..=u16::MAX {
         let channel = aux_channel(0x1234, counter);
-        seen[usize::from(channel)] = true;
+        *assert_some!(seen.get_mut(usize::from(channel))) = true;
     }
-    assert!(seen.iter().all(|&seen| seen));
+    assert!(seen.iter().all(|&visited| visited));
     // The same identifier and counter give the same channel; another
     // identifier a sequence of its own.
     assert_eq!(aux_channel(0x1234, 7), aux_channel(0x1234, 7));
@@ -137,12 +138,12 @@ fn the_data_takes_what_the_chip_sends_and_no_scan_response() {
     let mut settings = Settings::new();
     let full = [0xA5; DATA_MAX];
     assert!(settings.set_data(&full, &[]));
-    assert_eq!((settings.data, settings.len), (full, undirected.try_into().unwrap()));
+    assert_eq!((settings.data, settings.len), (full, assert_ok!(undirected.try_into())));
     settings.stale = false;
     // Longer data, or any scan response, changes nothing.
     for (adv, scan) in [(&[1; DATA_MAX + 1][..], &[][..]), (&[1; 3][..], &[2][..])] {
         assert!(!settings.set_data(adv, scan));
-        assert_eq!((settings.data, settings.len), (full, undirected.try_into().unwrap()));
+        assert_eq!((settings.data, settings.len), (full, assert_ok!(undirected.try_into())));
         assert!(!settings.stale);
     }
     // Shorter data replaces it, with zeros after it.
@@ -194,38 +195,43 @@ fn the_settings_give_the_primary_and_the_auxiliary_pdu() {
     assert_eq!(auxiliary.as_bytes(), [0x47, 13, 0x49, 0x09, 1, 2, 3, 4, 5, 0xC6, 0xBC, 0x0A, 2, 1, 6]);
 }
 
+/// `settings` with the central's identity as the target on air, which
+/// settings only hold with the feature `directed-advertising`.
+#[cfg(feature = "directed-advertising")]
+const fn to_central(settings: &Settings) -> Settings { Settings { target: CENTRAL, ..*settings } }
+
+/// `settings`, whose target on air is the peer's identity without the
+/// feature `directed-advertising`.
+#[cfg(not(feature = "directed-advertising"))]
+const fn to_central(settings: &Settings) -> Settings { *settings }
+
 #[test]
 fn directed_advertising_targets_the_central_in_the_auxiliary_pdu() {
-    let mut settings = directed();
-    assert!(settings.set_data(&[2, 1, 4], &[]));
-    settings.adi = Adi::new(0, 0x0ABC);
+    let mut base = directed();
+    assert!(base.set_data(&[2, 1, 4], &[]));
+    base.adi = Adi::new(0, 0x0ABC);
     // Without a key on air, or without the feature, the target is the
     // central's identity, public: no RxAdd.
-    #[cfg(feature = "directed-advertising")]
-    {
-        settings.target = CENTRAL;
-    }
-    let bytes = auxiliary(&settings);
-    let bytes = bytes.as_bytes();
-    assert_eq!(bytes[..4], [0x47, 19, 0x4F, 0x0B]);
-    assert_eq!(bytes[4..10], settings.own.address);
-    assert_eq!(bytes[10..16], CENTRAL.address);
-    assert_eq!(bytes[16..], [0xBC, 0x0A, 2, 1, 4]);
+    let mut settings = to_central(&base);
+    let pdu = auxiliary(&settings);
+    let bytes = pdu.as_bytes();
+    assert_eq!(bytes.get(..4), Some(&[0x47, 19, 0x4F, 0x0B][..]));
+    assert_eq!(bytes.get(4..10), Some(&settings.own.address[..]));
+    assert_eq!(bytes.get(10..16), Some(&CENTRAL.address[..]));
+    assert_eq!(bytes.get(16..), Some(&[0xBC, 0x0A, 2, 1, 4][..]));
     // With the feature and the central's key, a resolvable private address
     // made with it: RxAdd.
     #[cfg(feature = "directed-advertising")]
-    {
-        settings.target = rpa(SAMPLE_IRK, SAMPLE_PRAND);
-        let bytes = auxiliary(&settings);
-        let bytes = bytes.as_bytes();
-        assert_eq!(bytes[..4], [0xC7, 19, 0x4F, 0x0B]);
-        assert_eq!(bytes[10..16], SAMPLE_RPA);
-    }
+    let to_private = auxiliary(&Settings { target: rpa(SAMPLE_IRK, SAMPLE_PRAND), ..settings });
+    #[cfg(feature = "directed-advertising")]
+    assert_eq!(to_private.as_bytes().get(..4), Some(&[0xC7, 19, 0x4F, 0x0B][..]));
+    #[cfg(feature = "directed-advertising")]
+    assert_eq!(to_private.as_bytes().get(10..16), Some(&SAMPLE_RPA[..]));
     // Data that only fits undirected advertising is cut off; the link layer
     // refuses it before (`Kind::data_max`).
     assert!(settings.set_data(&[7; DATA_MAX], &[]));
     assert_eq!(auxiliary(&settings).as_bytes().len(), 2 + AUX_PAYLOAD_MAX);
-    assert_eq!(auxiliary(&settings).as_bytes()[1], if cfg!(feature = "nrf51") { 252 } else { 255 });
+    assert_eq!(auxiliary(&settings).as_bytes().get(1), Some(&if cfg!(feature = "nrf51") { 252 } else { 255 }));
 }
 
 #[test]
@@ -249,7 +255,7 @@ fn an_aux_connect_req_is_accepted_as_the_filter_policy_says() {
     // Undirected without a filter: anyone, with channel selection
     // algorithm 2.
     let settings = undirected();
-    let accepted = accepted_request(&settings, &request(CENTRAL, OWN)).unwrap();
+    let accepted = assert_some!(accepted_request(&settings, &request(CENTRAL, OWN)));
     assert!(accepted.csa2 && accepted.central() == CENTRAL);
     // Not to another advertiser.
     assert!(accepted_request(&settings, &request(CENTRAL, Peer::new(OWN.address, false))).is_none());
@@ -284,16 +290,22 @@ fn an_event_s_pdus_point_to_the_auxiliary_packet_on_its_channel_and_phy() {
     for (index, pdu) in pdus.primaries.iter().take(2).enumerate() {
         let expected = primary(&settings, AuxPtr::new(pdus.aux_channel, aux_offset(2, index), phy));
         assert_eq!(pdu.as_bytes(), expected.as_bytes());
-        let [channel, offset0, offset1] = pdu.as_bytes()[6..9] else { unreachable!() };
+        let Some(&[channel, offset0, offset1]) = ({
+            let value = pdu.as_bytes().get(6..9);
+            assert!(matches!(value, Some(&[_, _, _])), "an AuxPtr");
+            value
+        }) else {
+            return;
+        };
         assert_eq!(channel, pdus.aux_channel);
         let field = u16::from_le_bytes([offset0, offset1]);
         assert_eq!(field & 0x1FFF, aux_offset(2, index));
-        assert_eq!(field >> 13, if phy == Phy::M2 { 1 } else { 0 });
+        assert_eq!(field >> 13_i32, u16::from(phy == Phy::M2));
     }
     // The auxiliary packet in its buffer, which also takes the request.
     let auxiliary = auxiliary(&settings);
-    assert_eq!(pdus.auxiliary.0[..auxiliary.as_bytes().len()], *auxiliary.as_bytes());
-    assert_eq!(pdus.auxiliary.0.len(), 2 + usize::from(crate::chip::ADV_MAXLEN));
+    assert_eq!(pdus.auxiliary.0.get(..auxiliary.as_bytes().len()), Some(auxiliary.as_bytes()));
+    assert_eq!(pdus.auxiliary.0.len(), 2 + usize::from(ADV_MAXLEN));
     // Another event, another channel in time: CSA #2 over the 37 channels.
     assert!((0..8).any(|counter| Pdus::new(&settings, counter).aux_channel != pdus.aux_channel));
 }
@@ -308,7 +320,7 @@ fn the_event_plan_keeps_its_times_and_budgets_on_every_secondary_phy() {
             // ramp-up before.
             for index in 0..channels {
                 let on_air = primary_txen(At(first), index).0 + tx_ready_us(Phy::M1);
-                assert_eq!(on_air, first + u32::try_from(index).unwrap() * PRIMARY_SPACING_US);
+                assert_eq!(on_air, first + assert_ok!(u32::try_from(index)) * PRIMARY_SPACING_US);
                 // Seen from each primary, the auxiliary packet starts 12 us
                 // into the unit its Aux Offset names, on either PHY.
                 let aux_on_air = aux_txen(At(first), channels, phy).0 + tx_ready_us(phy);

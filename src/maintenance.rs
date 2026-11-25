@@ -114,7 +114,7 @@ pub async fn service(clock: &mut Clock<'_>, radio: &mut Radio<'_>) {
 mod tests {
     use super::*;
     use core::{
-        future::Future,
+        future::Future as _,
         pin::pin,
         task::{Context, Poll, Waker},
     };
@@ -129,34 +129,40 @@ mod tests {
         assert!(pending());
         let mut parked = pin!(park());
         assert!(parked.as_mut().poll(&mut context()).is_pending());
-        let Poll::Ready(guard) = first.as_mut().poll(&mut context()) else { panic!("not granted") };
+        let first_grant = first.as_mut().poll(&mut context());
+        assert!(first_grant.is_ready(), "not granted");
+        let Poll::Ready(guard) = first_grant else { return };
         assert!(parked.as_mut().poll(&mut context()).is_pending());
         // The next request arrives before the link layer saw the release:
         // it stays parked and grants it at once.
         drop(guard);
         let mut second = pin!(acquire());
-        let Poll::Ready(guard) = second.as_mut().poll(&mut context()) else { panic!("second not granted") };
+        let second_grant = second.as_mut().poll(&mut context());
+        assert!(second_grant.is_ready(), "second not granted");
+        let Poll::Ready(second_guard) = second_grant else { return };
         assert!(parked.as_mut().poll(&mut context()).is_pending());
-        drop(guard);
+        drop(second_guard);
         assert!(parked.as_mut().poll(&mut context()).is_ready());
         assert!(!pending());
 
         // Withdrawn before the link layer saw it.
-        {
+        let withdrawn_pending = {
             let mut request = pin!(acquire());
-            assert!(request.as_mut().poll(&mut context()).is_pending());
-        }
+            request.as_mut().poll(&mut context()).is_pending()
+        };
+        assert!(withdrawn_pending);
         assert!(!pending());
         assert!(pin!(park()).as_mut().poll(&mut context()).is_ready());
 
         // Withdrawn while the link layer is parked for it.
-        let mut parked = pin!(park());
-        {
+        let mut parked_again = pin!(park());
+        let both_pending = {
             let mut request = pin!(acquire());
             assert!(request.as_mut().poll(&mut context()).is_pending());
-            assert!(parked.as_mut().poll(&mut context()).is_pending());
-        }
-        assert!(parked.as_mut().poll(&mut context()).is_ready());
+            parked_again.as_mut().poll(&mut context()).is_pending()
+        };
+        assert!(both_pending);
+        assert!(parked_again.as_mut().poll(&mut context()).is_ready());
         assert!(!pending());
     }
 }

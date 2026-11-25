@@ -1,11 +1,35 @@
 //! Tests of the typed link API.
 
 use super::*;
+/// The directed advertising type of the host's directed phases.
+#[cfg(feature = "directed-advertising")]
+use crate::host::adv::DIRECTED;
 use core::{
     future::Future,
     pin::pin,
     task::{Context, Poll, Waker},
 };
+
+/// The output of `$future`, polled once, which must not block.
+macro_rules! run {
+    ($future:expr) => {
+        assert_some!(poll_once($future), "operation unexpectedly blocked")
+    };
+}
+
+/// The identity resolving key of the sample of the random address hash
+/// function ah (Core, Vol 3, Part H, D.7), least significant octet first.
+#[cfg(feature = "directed-advertising")]
+const SAMPLE_IRK: [u8; 16] =
+    [0x9B, 0x7D, 0x39, 0x0A, 0xA6, 0x10, 0x10, 0x34, 0x05, 0xAD, 0xC8, 0x57, 0xA3, 0x34, 0x02, 0xEC];
+
+/// The sample's prand, least significant octet first.
+#[cfg(feature = "directed-advertising")]
+const SAMPLE_PRAND: [u8; 3] = [0x94, 0x81, 0x70];
+
+/// The sample's resolvable private address: hash `0dfbaa` below prand.
+#[cfg(feature = "directed-advertising")]
+const SAMPLE_RPA: [u8; 6] = [0xAA, 0xFB, 0x0D, 0x94, 0x81, 0x70];
 
 /// Starts a link and returns its epoch.
 fn connect(shared: &Shared) -> Epoch {
@@ -17,12 +41,15 @@ fn connect(shared: &Shared) -> Epoch {
     )
 }
 
-/// Polls `future` once; it must not block.
-fn run<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(result) => result,
-        Poll::Pending => panic!("operation unexpectedly blocked"),
+/// Polls `future` once: its output, `None` if it blocks.
+fn poll_once<F>(future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    let mut pinned = pin!(future);
+    match pinned.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(result) => Some(result),
+        Poll::Pending => None,
     }
 }
 
@@ -98,7 +125,7 @@ fn rssi_reports_the_link_average_or_nothing() {
     assert_eq!(link.rssi(Epoch(1)), None);
     let epoch = connect(&shared);
     assert_eq!(link.rssi(epoch), None);
-    shared.set_rssi(Some(-61));
+    shared.set_rssi(Some(-61_i32));
     assert_eq!(link.rssi(epoch), Some(-61));
     shared.set_connected(false);
     let next = connect(&shared);
@@ -108,6 +135,8 @@ fn rssi_reports_the_link_average_or_nothing() {
 
 #[test]
 fn privacy_enable_mode_and_list_changes_are_enforced() {
+    use crate::advertiser::privacy::RESOLVING_LIST_SIZE;
+
     let shared = Shared::new();
     let link = Link::new(&shared);
     let peer = Peer::new([1; 6], true);
@@ -121,7 +150,7 @@ fn privacy_enable_mode_and_list_changes_are_enforced() {
     shared.state.lock(|cell| cell.borrow_mut().adv_enabled = false);
     assert_eq!(link.set_address_resolution(false), Ok(()));
     assert!(!shared.state.lock(|cell| cell.borrow().adv.resolution_enabled));
-    for slot in 2..=u8::try_from(crate::advertiser::privacy::RESOLVING_LIST_SIZE).unwrap() {
+    for slot in 2..=assert_ok!(u8::try_from(RESOLVING_LIST_SIZE)) {
         assert_eq!(link.add_peer(Peer::new([slot; 6], true), [0; 16], [0; 16]), Ok(()));
     }
     assert_eq!(link.add_peer(Peer::new([0xEE; 6], true), [0; 16], [0; 16]), Err(Error::Full));
@@ -137,7 +166,7 @@ fn info_keeps_the_addresses_on_the_air_and_the_identity_apart() {
     let identity = Peer::new([6; 6], false);
     let local = Peer::new([0xAA, 0xFB, 0x0D, 0x94, 0x81, 0x70], true);
     let epoch = shared.set_info((on_air, Some(identity), local), ConnectionParams::new(12, 0, 600), (5, true));
-    let info = link.info().unwrap();
+    let info = assert_some!(link.info());
     assert_eq!(info.epoch, epoch);
     assert!(info.peer == on_air && info.identity == Some(identity) && info.local == local);
     assert_eq!(info.params, ConnectionParams::new(12, 0, 600));
@@ -210,8 +239,8 @@ fn cached_private_address_survives_restarts_but_not_expiry_or_key_changes() {
     shared.state.lock(|cell| {
         let mut state = cell.borrow_mut();
         state.private_address = Some((address, [7; 16], Instant::from_secs(900)));
-        assert!(state.cached_address([7; 16], Instant::from_secs(3)) == Some(address));
-        assert!(state.cached_address([7; 16], Instant::from_secs(899)) == Some(address));
+        assert_eq!(state.cached_address([7; 16], Instant::from_secs(3)), Some(address));
+        assert_eq!(state.cached_address([7; 16], Instant::from_secs(899)), Some(address));
         assert!(state.cached_address([7; 16], Instant::from_secs(900)).is_none());
         assert!(state.cached_address([8; 16], Instant::from_secs(15)).is_none());
     });
@@ -235,8 +264,8 @@ fn a_fragment_for_a_link_that_ended_cannot_enter_the_next_one() {
     assert!(matches!(pending.as_mut().poll(&mut context), Poll::Ready(Err(Error::Gone))));
     assert!(shared.next_acl_out().is_none());
     assert_eq!(link.try_send(epoch, true, &[99]), Err(Error::Gone));
-    run(link.send(next, true, &[99])).unwrap();
-    assert_eq!(shared.next_acl_out().unwrap().data[0], 99);
+    assert_ok!(run!(link.send(next, true, &[99])));
+    assert_eq!(assert_some!(shared.next_acl_out()).data[0], 99);
 }
 
 #[test]
@@ -247,11 +276,11 @@ fn oversized_fragments_are_refused_and_an_empty_one_continues() {
     assert_eq!(link.try_send(epoch, true, &[0; ACL_MAX + 1]), Err(Error::Invalid));
     assert!(!shared.has_acl_out());
     assert_eq!(link.try_send(epoch, true, &[]), Ok(()));
-    assert!(shared.next_acl_out().unwrap().llid == Llid::Continuation);
+    assert!(assert_some!(shared.next_acl_out()).llid == Llid::Continuation);
     assert_eq!(link.try_send(epoch, false, &[1]), Ok(()));
-    assert!(shared.next_acl_out().unwrap().llid == Llid::Continuation);
+    assert!(assert_some!(shared.next_acl_out()).llid == Llid::Continuation);
     assert_eq!(link.try_send(epoch, true, &[1]), Ok(()));
-    assert!(shared.next_acl_out().unwrap().llid == Llid::Start);
+    assert!(assert_some!(shared.next_acl_out()).llid == Llid::Start);
 }
 
 #[test]
@@ -260,8 +289,8 @@ fn in_flight_counts_queued_fragments_until_the_central_acknowledges_them() {
     let link = Link::new(&shared);
     let epoch = connect(&shared);
     assert_eq!(link.in_flight(epoch), 0);
-    link.try_send(epoch, true, &[1]).unwrap();
-    link.try_send(epoch, true, &[2]).unwrap();
+    assert_ok!(link.try_send(epoch, true, &[1]));
+    assert_ok!(link.try_send(epoch, true, &[2]));
     assert_eq!(link.in_flight(epoch), 2);
     // Taken for the air, not yet acknowledged.
     assert!(shared.next_acl_out().is_some());
@@ -285,15 +314,15 @@ fn taking_a_fragment_for_the_air_signals_room() {
     let mut context = Context::from_waker(Waker::noop());
     let mut room = pin!(link.tx_room_changed());
     assert!(room.as_mut().poll(&mut context).is_pending());
-    link.try_send(epoch, true, &[1]).unwrap();
+    assert_ok!(link.try_send(epoch, true, &[1]));
     assert!(room.as_mut().poll(&mut context).is_pending());
     assert!(shared.next_acl_out().is_some());
     assert!(room.as_mut().poll(&mut context).is_ready());
     // The end of the link frees the queue too.
-    let mut room = pin!(link.tx_room_changed());
-    assert!(room.as_mut().poll(&mut context).is_pending());
+    let mut room_after_end = pin!(link.tx_room_changed());
+    assert!(room_after_end.as_mut().poll(&mut context).is_pending());
     shared.set_connected(false);
-    assert!(room.as_mut().poll(&mut context).is_ready());
+    assert!(room_after_end.as_mut().poll(&mut context).is_ready());
 }
 
 #[test]
@@ -302,17 +331,17 @@ fn an_acknowledgement_signals_room() {
     let link = Link::new(&shared);
     let epoch = connect(&shared);
     let mut context = Context::from_waker(Waker::noop());
-    link.try_send(epoch, true, &[1]).unwrap();
+    assert_ok!(link.try_send(epoch, true, &[1]));
     assert!(shared.next_acl_out().is_some());
     let mut room = pin!(link.tx_room_changed());
     assert!(room.as_mut().poll(&mut context).is_ready());
     // Fewer fragments in flight is room for the host's pacing too.
-    let mut room = pin!(link.tx_room_changed());
-    assert!(room.as_mut().poll(&mut context).is_pending());
+    let mut fewer_in_flight = pin!(link.tx_room_changed());
+    assert!(fewer_in_flight.as_mut().poll(&mut context).is_pending());
     shared.acknowledged(0);
-    assert!(room.as_mut().poll(&mut context).is_pending());
+    assert!(fewer_in_flight.as_mut().poll(&mut context).is_pending());
     shared.acknowledged(1);
-    assert!(room.as_mut().poll(&mut context).is_ready());
+    assert!(fewer_in_flight.as_mut().poll(&mut context).is_ready());
     assert_eq!(link.in_flight(epoch), 0);
 }
 
@@ -469,7 +498,7 @@ fn disconnect_drops_outgoing_data_and_requests_but_keeps_received_data() {
     let link = Link::new(&shared);
     let epoch = connect(&shared);
     assert!(shared.push_acl_in(Llid::Start, &[1, 2, 3], true));
-    link.try_send(epoch, true, &[0]).unwrap();
+    assert_ok!(link.try_send(epoch, true, &[0]));
     assert!(shared.request_ltk([0; 8], [0; 2]));
     assert_eq!(shared.take_event(), Some(Event::LtkRequest { ediv: 0, rand: [0; 8] }));
     assert_eq!(link.ltk_reply(epoch, Some([0xAA; 16])), Ok(()));
@@ -480,7 +509,13 @@ fn disconnect_drops_outgoing_data_and_requests_but_keeps_received_data() {
     // Acknowledged data reaches the host before the disconnection, with its
     // encryption.
     let mut acl = AclIn::EMPTY;
-    let Some(Rx::Acl) = link.try_next(&mut acl) else { panic!("the received fragment is kept") };
+    let Some(Rx::Acl) = ({
+        let value = link.try_next(&mut acl);
+        assert!(matches!(value, Some(Rx::Acl)), "the received fragment is kept");
+        value
+    }) else {
+        return;
+    };
     assert!(acl.start() && acl.encrypted() && acl.payload() == [1, 2, 3]);
     assert!(shared.next_acl_out().is_none());
     assert!(shared.take_ltk().is_none());
@@ -549,6 +584,10 @@ fn queries_run_one_at_a_time_per_kind() {
 
 #[test]
 fn advertising_needs_an_identity_valid_parameters_and_no_link() {
+    use crate::advertiser::DATA_MAX;
+    #[cfg(feature = "extended-advertising")]
+    use crate::radio::Phy;
+
     let shared = Shared::new();
     let link = Link::new(&shared);
     let params = AdvParams::new(Kind::ConnectableUndirected).interval(0x0030);
@@ -556,7 +595,7 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
     assert_eq!(link.set_identity([1, 2, 3, 4, 5, 0xC6]), Ok(()));
     assert_eq!(link.advertise(&params.interval(0x001F), &[], &[]), Err(Error::Invalid));
     assert_eq!(link.advertise(&params.channel_map(0), &[], &[]), Err(Error::Invalid));
-    assert_eq!(link.advertise(&params, &[0; crate::advertiser::DATA_MAX + 1], &[]), Err(Error::Invalid));
+    assert_eq!(link.advertise(&params, &[0; DATA_MAX + 1], &[]), Err(Error::Invalid));
     assert_eq!(link.advertise(&params, &[], &[0; 32]), Err(Error::Invalid));
     #[cfg(not(feature = "extended-advertising"))]
     let scan = [3, 9, 0x41, 0x42];
@@ -566,17 +605,17 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
     #[cfg(feature = "extended-advertising")]
     assert_eq!(link.advertise(&params, &[2, 1, 6], &[3]), Err(Error::Invalid));
     assert_eq!(link.advertise(&params, &[2, 1, 6], &scan), Ok(()));
-    let settings = shared.advertising().unwrap();
+    let settings = assert_some!(shared.advertising());
     assert_eq!(settings.own.address, [1, 2, 3, 4, 5, 0xC6]);
     assert_eq!(settings.interval, 0x30 * 625);
-    assert_eq!(&settings.data[..usize::from(settings.len)], &[2, 1, 6]);
+    assert_eq!(settings.data.get(..usize::from(settings.len)), Some(&[2, 1, 6][..]));
     #[cfg(not(feature = "extended-advertising"))]
-    assert_eq!(&settings.scan_data[..usize::from(settings.scan_len)], &scan);
+    assert_eq!(settings.scan_data.get(..usize::from(settings.scan_len)), Some(&scan[..]));
     assert_eq!(link.set_identity([7; 6]), Err(Error::Disallowed));
     // Advertising again replaces the data.
     assert_eq!(link.advertise(&params, &[2, 1, 4], &[]), Ok(()));
     #[cfg(not(feature = "extended-advertising"))]
-    assert_eq!(shared.advertising().unwrap().scan_len, 0);
+    assert_eq!(shared.advertising().map(|replaced| replaced.scan_len), Some(0));
     // Extended advertising takes 245 octets, directed 239: the target
     // takes the room of six; on the nRF51, whose radio sends 252 octets of
     // payload at most, 242 and 236.
@@ -584,22 +623,27 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
     {
         let (undirected, directed_max) = if cfg!(feature = "nrf51") { (242, 236) } else { (245, 239) };
         let directed = AdvParams::new(Kind::DirectedLowDuty).interval(0x0030).peer(Peer::new([9; 6], false));
-        assert_eq!(link.advertise(&params, &[0; 246][..=undirected], &[]), Err(Error::Invalid));
-        assert_eq!(link.advertise(&params, &[0; 246][..undirected], &[]), Ok(()));
-        assert_eq!(link.advertise(&directed, &[0; 246][..=directed_max], &[]), Err(Error::Invalid));
-        assert_eq!(link.advertise(&directed, &[0; 246][..directed_max], &[]), Ok(()));
-        let settings = shared.advertising().unwrap();
-        assert!(settings.kind == Kind::DirectedLowDuty && usize::from(settings.len) == directed_max && settings.stale);
+        let zeros = [0; 246];
+        assert_eq!(link.advertise(&params, zeros.get(..=undirected).unwrap_or_default(), &[]), Err(Error::Invalid));
+        assert_eq!(link.advertise(&params, zeros.get(..undirected).unwrap_or_default(), &[]), Ok(()));
+        assert_eq!(link.advertise(&directed, zeros.get(..=directed_max).unwrap_or_default(), &[]), Err(Error::Invalid));
+        assert_eq!(link.advertise(&directed, zeros.get(..directed_max).unwrap_or_default(), &[]), Ok(()));
+        let directed_settings = assert_some!(shared.advertising());
+        assert!(
+            directed_settings.kind == Kind::DirectedLowDuty
+                && usize::from(directed_settings.len) == directed_max
+                && directed_settings.stale
+        );
         // The secondary channel on LE 1M by default; LE 2M where the radio
         // has it, refused on the nRF51.
-        assert!(settings.secondary_phy == crate::radio::Phy::M1);
-        let fast = params.secondary_phy(crate::radio::Phy::M2);
+        assert!(directed_settings.secondary_phy == Phy::M1);
+        let fast = params.secondary_phy(Phy::M2);
         if cfg!(feature = "nrf51") {
             assert_eq!(link.advertise(&fast, &[2, 1, 6], &[]), Err(Error::Invalid));
-            assert!(shared.advertising().unwrap().secondary_phy == crate::radio::Phy::M1);
+            assert!(assert_some!(shared.advertising()).secondary_phy == Phy::M1);
         } else {
             assert_eq!(link.advertise(&fast, &[2, 1, 6], &[]), Ok(()));
-            assert!(shared.advertising().unwrap().secondary_phy == crate::radio::Phy::M2);
+            assert!(assert_some!(shared.advertising()).secondary_phy == Phy::M2);
         }
     }
     link.stop_advertising();
@@ -626,18 +670,18 @@ fn an_event_takes_the_advertising_set_only_once_it_is_renewed() {
         bytes.copy_from_slice(&[0xBC, 0x0A, 0x34 + draws.get(), 0x12]);
     };
     // Not advertising: nothing to renew, no draw.
-    assert!(run(shared.renewed_advertising_with(counted)).is_none());
+    assert!(run!(shared.renewed_advertising_with(counted)).is_none());
     assert_eq!(draws.get(), 0);
     // New advertising is stale: one draw renews it, and the event takes it.
     assert_eq!(link.set_identity([1, 2, 3, 4, 5, 0xC6]), Ok(()));
     let params = AdvParams::new(Kind::ConnectableUndirected).interval(0x0030);
     assert_eq!(link.advertise(&params, &[2, 1, 6], &[]), Ok(()));
-    let settings = run(shared.renewed_advertising_with(counted)).unwrap();
+    let settings = assert_some!(run!(shared.renewed_advertising_with(counted)));
     assert_eq!(draws.get(), 1);
     assert!(!settings.stale && settings.adi.did() == 0x0ABC && settings.aux_id == 0x1235);
-    assert!(settings.last_used == settings.adi && shared.advertising().unwrap().last_used == settings.adi);
+    assert!(settings.last_used == settings.adi && assert_some!(shared.advertising()).last_used == settings.adi);
     // Unchanged: no draw.
-    let again = run(shared.renewed_advertising_with(counted)).unwrap();
+    let again = assert_some!(run!(shared.renewed_advertising_with(counted)));
     assert!(again.adi == settings.adi && again.aux_id == settings.aux_id);
     assert_eq!(draws.get(), 1);
     // New data that changes again while the renewal draws: the renewal,
@@ -648,20 +692,20 @@ fn an_event_takes_the_advertising_set_only_once_it_is_renewed() {
     let changing = async |bytes: &mut [u8]| {
         counted(bytes).await;
         assert_eq!(link.advertise(&params, &[2, 1, 5], &[]), Ok(()));
-        assert!(shared.advertising().unwrap().stale);
+        assert!(assert_some!(shared.advertising()).stale);
     };
-    let settings = run(shared.renewed_advertising_with(changing)).unwrap();
+    let refreshed = assert_some!(run!(shared.renewed_advertising_with(changing)));
     assert_eq!(draws.get(), 2);
-    assert!(!settings.stale && settings.adi.did() == 0x0ABD && settings.aux_id == 0x1236);
-    assert_eq!(settings.data[..usize::from(settings.len)], [2, 1, 5]);
-    assert!(shared.advertising().unwrap().last_used.did() == 0x0ABD);
+    assert!(!refreshed.stale && refreshed.adi.did() == 0x0ABD && refreshed.aux_id == 0x1236);
+    assert_eq!(refreshed.data.get(..usize::from(refreshed.len)), Some(&[2, 1, 5][..]));
+    assert_eq!(assert_some!(shared.advertising()).last_used.did(), 0x0ABD);
     // A connection, or advertising stopped: nothing, and no draw.
     assert_eq!(link.advertise(&params, &[2, 1, 6], &[]), Ok(()));
     link.stop_advertising();
-    assert!(run(shared.renewed_advertising_with(counted)).is_none());
+    assert!(run!(shared.renewed_advertising_with(counted)).is_none());
     assert_eq!(link.advertise(&params, &[2, 1, 6], &[]), Ok(()));
     connect(&shared);
-    assert!(run(shared.renewed_advertising_with(counted)).is_none());
+    assert!(run!(shared.renewed_advertising_with(counted)).is_none());
     assert_eq!(draws.get(), 2);
 }
 
@@ -669,7 +713,7 @@ fn an_event_takes_the_advertising_set_only_once_it_is_renewed() {
 fn the_accept_list_is_locked_while_advertising_filters_on_it() {
     let shared = Shared::new();
     let link = Link::new(&shared);
-    for slot in 0..u8::try_from(ACCEPT_LIST_SIZE).unwrap() {
+    for slot in 0..assert_ok!(u8::try_from(ACCEPT_LIST_SIZE)) {
         assert_eq!(link.accept_list_add(Peer::new([slot; 6], false)), Ok(()));
     }
     assert_eq!(link.accept_list_add(Peer::new([0xEE; 6], false)), Err(Error::Full));
@@ -705,11 +749,11 @@ fn next_returns_events_before_fragments_and_marks_the_fragment_read() {
     assert!(shared.push_acl_in(Llid::Start, &[1], false));
     assert!(shared.try_push_event(Event::Connected(epoch)));
     let mut acl = AclIn::EMPTY;
-    assert!(matches!(run(link.next(&mut acl)), Rx::Event(Event::Connected(e)) if e == epoch));
+    assert!(matches!(run!(link.next(&mut acl)), Rx::Event(Event::Connected(connected)) if connected == epoch));
     let mut drained = pin!(shared.acl_in_drained());
     let mut context = Context::from_waker(Waker::noop());
     assert!(drained.as_mut().poll(&mut context).is_pending());
-    assert!(matches!(run(link.next(&mut acl)), Rx::Acl));
+    assert!(matches!(run!(link.next(&mut acl)), Rx::Acl));
     assert!(acl.payload() == [1] && !acl.encrypted());
     assert!(drained.as_mut().poll(&mut context).is_ready());
 }
@@ -724,7 +768,7 @@ fn the_next_connection_event_is_known_only_for_its_link_once_planned() {
     let at = Instant::from_secs(10);
     // The radio starts 5 ms after `at`; data is due 331 us before it.
     shared.set_next_event(at, 5000, Micros(331), Micros(15_000));
-    let next = link.next_connection_event(epoch).unwrap();
+    let next = assert_some!(link.next_connection_event(epoch));
     assert_eq!(next.start, at + Duration::from_micros(5000));
     assert_eq!(next.queue_by, next.start - Duration::from_micros(331));
     assert_eq!(next.interval, Duration::from_micros(15_000));
@@ -757,18 +801,6 @@ fn a_planned_event_converts_to_the_host_time_both_ways() {
     assert_eq!(early.resolve().queue_by, Instant::from_ticks(0));
 }
 
-/// The identity resolving key of the sample of the random address hash
-/// function ah (Core, Vol 3, Part H, D.7), least significant octet first.
-#[cfg(feature = "directed-advertising")]
-const SAMPLE_IRK: [u8; 16] =
-    [0x9B, 0x7D, 0x39, 0x0A, 0xA6, 0x10, 0x10, 0x34, 0x05, 0xAD, 0xC8, 0x57, 0xA3, 0x34, 0x02, 0xEC];
-/// The sample's prand, least significant octet first.
-#[cfg(feature = "directed-advertising")]
-const SAMPLE_PRAND: [u8; 3] = [0x94, 0x81, 0x70];
-/// The sample's resolvable private address: hash `0dfbaa` below prand.
-#[cfg(feature = "directed-advertising")]
-const SAMPLE_RPA: [u8; 6] = [0xAA, 0xFB, 0x0D, 0x94, 0x81, 0x70];
-
 /// Software AES-128 in place of the ECB.
 #[cfg(feature = "directed-advertising")]
 fn software(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
@@ -776,18 +808,12 @@ fn software(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
     Software.encrypt(key, block)
 }
 
-/// The directed advertising type of the host's directed phases.
-#[cfg(feature = "directed-advertising")]
-use crate::host::adv::DIRECTED;
-
-/// Random bytes that must not be drawn.
-#[cfg(feature = "directed-advertising")]
-fn no_draw(_: &mut [u8]) { panic!("no random bytes are needed") }
-
 #[cfg(feature = "directed-advertising")]
 #[test]
 fn directed_advertising_from_a_private_address_targets_a_new_address_of_the_peer_s_key() {
     use crate::crypto::resolves_with;
+    use core::cell::Cell;
+
     let shared = Shared::new();
     let link = Link::new(&shared);
     let central = Peer::new([1, 2, 3, 4, 5, 6], false);
@@ -801,13 +827,13 @@ fn directed_advertising_from_a_private_address_targets_a_new_address_of_the_peer
     let sample = |bytes: &mut [u8]| bytes.copy_from_slice(&SAMPLE_PRAND);
     for kind in [DIRECTED, Kind::DirectedLowDuty] {
         let target = shared.directed_target_with((true, kind, central), sample, software);
-        assert!(target == Peer::new(SAMPLE_RPA, true));
+        assert_eq!(target, Peer::new(SAMPLE_RPA, true));
         assert!(resolves_with(SAMPLE_IRK, target.address, software));
         assert!(!resolves_with(local_irk, target.address, software));
         assert!(!resolves_with([0x77; 16], target.address, software));
     }
     // Every call draws new random bytes, and so a new address.
-    let draws = core::cell::Cell::new(0_u8);
+    let draws = Cell::new(0_u8);
     let mut targets = [Peer::new([0; 6], false); 2];
     for target in &mut targets {
         let fill = |bytes: &mut [u8]| {
@@ -818,7 +844,7 @@ fn directed_advertising_from_a_private_address_targets_a_new_address_of_the_peer
         assert!(target.random && resolves_with(SAMPLE_IRK, target.address, software));
     }
     assert_eq!(draws.get(), 2);
-    assert!(targets[0] != targets[1]);
+    assert_ne!(targets[0], targets[1]);
     // From the identity address, for undirected advertising, to a peer
     // without a key or one the list does not hold: the identity, and no
     // random bytes.
@@ -831,6 +857,8 @@ fn directed_advertising_from_a_private_address_targets_a_new_address_of_the_peer
         (true, DIRECTED, other),
         (true, DIRECTED, Peer::new(central.address, true)),
     ] {
-        assert!(shared.directed_target_with((private, kind, peer), no_draw, software) == peer);
+        let no_draw = |_: &mut [u8]| draws.set(draws.get().strict_add(1));
+        assert_eq!(shared.directed_target_with((private, kind, peer), no_draw, software), peer);
     }
+    assert_eq!(draws.get(), 2, "no random bytes are needed");
 }

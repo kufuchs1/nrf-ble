@@ -794,6 +794,10 @@ const fn sca_ppm(field: u8) -> u32 {
 mod tests {
     use super::*;
 
+    /// Our address in the extended advertising tests: random.
+    #[cfg(feature = "extended-advertising")]
+    const OWN: Peer = Peer::new([1, 2, 3, 4, 5, 6], true);
+
     #[test]
     fn invalid_channel_maps_are_rejected() {
         assert!(!valid_channel_map([0; 5]));
@@ -848,16 +852,16 @@ mod tests {
     fn truncated_scan_and_connection_requests_never_parse() {
         let peer = Peer::new([1; 6], true);
         let mut bytes = connection_request(CONNECT_IND | TX_ADD_RANDOM | RX_ADD_RANDOM, peer);
-        assert!(!ConnectInd::parse(&bytes, peer).unwrap().csa2);
+        assert!(!assert_some!(ConnectInd::parse(&bytes, peer)).csa2);
         bytes[0] |= CH_SEL;
-        assert!(ConnectInd::parse(&bytes, peer).unwrap().csa2);
+        assert!(assert_some!(ConnectInd::parse(&bytes, peer)).csa2);
         for len in 0..bytes.len() {
-            assert!(ConnectInd::parse(&bytes[..len], peer).is_none());
+            assert!(ConnectInd::parse(bytes.get(..len).unwrap_or_default(), peer).is_none());
         }
         bytes[0] = SCAN_REQ | RX_ADD_RANDOM;
         bytes[1] = SCAN_REQ_LEN;
         for len in 0..14 {
-            assert!(scan_request(&bytes[..len], peer).is_none());
+            assert!(scan_request(bytes.get(..len).unwrap_or_default(), peer).is_none());
         }
         assert!(scan_request(&bytes[..14], peer).is_some());
         assert!(scan_request(&bytes[..14], Peer::new([2; 6], true)).is_none());
@@ -872,10 +876,6 @@ mod tests {
         assert_eq!(LegacyAdvertisement::undirected(ADV_NONCONN_IND, peer, &[]).bytes[0] & CH_SEL, 0);
         assert_eq!(LegacyAdvertisement::undirected(SCAN_RSP, peer, &[]).bytes[0] & CH_SEL, 0);
     }
-
-    /// Our address in the extended advertising tests: random.
-    #[cfg(feature = "extended-advertising")]
-    const OWN: Peer = Peer::new([1, 2, 3, 4, 5, 6], true);
 
     #[cfg(feature = "extended-advertising")]
     #[test]
@@ -895,9 +895,10 @@ mod tests {
         assert_eq!(aux.to_bytes(), [0x45, 0xFF, 0x3F]);
         // Out of range fields do not spill into their neighbours.
         assert_eq!(AuxPtr::new(0xFF, 0xFFFF, Phy::M1).to_bytes(), [0x3F, 0xFF, 0x1F]);
-        assert_eq!(ext_primary(Adi::new(3, 1), AuxPtr::new(0, 15, Phy::M2)).as_bytes()[4..], [
-            0x01, 0x30, 0x00, 0x0F, 0x20
-        ]);
+        assert_eq!(
+            ext_primary(Adi::new(3, 1), AuxPtr::new(0, 15, Phy::M2)).as_bytes().get(4..),
+            Some(&[0x01, 0x30, 0x00, 0x0F, 0x20][..])
+        );
     }
 
     #[cfg(feature = "extended-advertising")]
@@ -948,9 +949,9 @@ mod tests {
         ]);
         // To a resolvable private address: RxAdd.
         let private = Peer::new([0xAA, 0xFB, 0x0D, 0x94, 0x81, 0x70], true);
-        assert_eq!(aux_directed(OWN, private, adi, &[]).as_bytes()[..4], [0xC7, 16, 0x4F, 0x0B]);
+        assert_eq!(aux_directed(OWN, private, adi, &[]).as_bytes().get(..4), Some(&[0xC7, 16, 0x4F, 0x0B][..]));
         // From a public address: no TxAdd.
-        assert_eq!(aux_undirected(central, adi, &[]).as_bytes()[..4], [0x07, 10, 0x49, 0x09]);
+        assert_eq!(aux_undirected(central, adi, &[]).as_bytes().get(..4), Some(&[0x07, 10, 0x49, 0x09][..]));
         assert_eq!(AUX_HEADER_LEN, 10);
         assert_eq!(AUX_DIRECTED_HEADER_LEN, 16);
     }
@@ -964,20 +965,24 @@ mod tests {
         // payload, 242 and 236 of data.
         let (payload, undirected, directed) = if cfg!(feature = "nrf51") { (252, 242, 236) } else { (255, 245, 239) };
         assert_eq!(AUX_PAYLOAD_MAX, payload);
-        assert!(HEADER_LEN + AUX_PAYLOAD_MAX <= chip::PACKET_RAM_MAX);
+        const { assert!(HEADER_LEN + AUX_PAYLOAD_MAX <= chip::PACKET_RAM_MAX) };
         let adi = Adi::new(0, 1);
         let central = Peer::new([0x11; 6], false);
         let data = [0xA5; 256];
         for len in [undirected, undirected + 1, 256] {
-            let pdu = aux_undirected(OWN, adi, &data[..len]);
+            let pdu = aux_undirected(OWN, adi, data.get(..len).unwrap_or_default());
             assert_eq!(pdu.as_bytes().len(), HEADER_LEN + AUX_HEADER_LEN + undirected);
-            assert_eq!(usize::from(pdu.as_bytes()[1]), payload);
-            assert!(pdu.as_bytes()[HEADER_LEN + AUX_HEADER_LEN..].iter().all(|&octet| octet == 0xA5));
+            assert_eq!(pdu.as_bytes().get(1).copied().map(usize::from), Some(payload));
+            assert!(
+                pdu.as_bytes()
+                    .get(HEADER_LEN + AUX_HEADER_LEN..)
+                    .is_some_and(|sent| sent.iter().all(|&octet| octet == 0xA5))
+            );
         }
         for len in [directed, directed + 1] {
-            let pdu = aux_directed(OWN, central, adi, &data[..len]);
+            let pdu = aux_directed(OWN, central, adi, data.get(..len).unwrap_or_default());
             assert_eq!(pdu.as_bytes().len(), HEADER_LEN + AUX_DIRECTED_HEADER_LEN + directed);
-            assert_eq!(usize::from(pdu.as_bytes()[1]), payload);
+            assert_eq!(pdu.as_bytes().get(1).copied().map(usize::from), Some(payload));
         }
     }
 
@@ -989,7 +994,7 @@ mod tests {
         // 13 and AdvMode 0; flags AdvA and TargetA (Core, Vol 6, Part B,
         // 2.3.3.2).
         let mut response = aux_connect_rsp(OWN, Peer::new([0; 6], false));
-        assert_eq!(response.as_bytes()[..4], [0x48, 14, 0x0D, 0x03]);
+        assert_eq!(response.as_bytes().get(..4), Some(&[0x48, 14, 0x0D, 0x03][..]));
         retarget(&mut response, initiator);
         assert_eq!(response.as_bytes(), aux_connect_rsp(OWN, initiator).as_bytes());
         assert_eq!(response.as_bytes(), [0xC8, 14, 0x0D, 0x03, 1, 2, 3, 4, 5, 6, 2, 2, 2, 2, 2, 2]);
@@ -1003,13 +1008,13 @@ mod tests {
         // ChSel is reserved in AUX_CONNECT_REQ: the connection takes channel
         // selection algorithm 2 whatever the bit holds.
         let mut bytes = connection_request(CONNECT_IND | TX_ADD_RANDOM | RX_ADD_RANDOM, OWN);
-        let request = ConnectInd::parse_aux(&bytes, OWN).unwrap();
+        let request = assert_some!(ConnectInd::parse_aux(&bytes, OWN));
         assert!(request.csa2 && request.central() == Peer::new([2; 6], true));
         assert_eq!((request.interval, request.timeout, request.hop), (12, 600, 5));
         bytes[0] |= CH_SEL;
-        assert!(ConnectInd::parse_aux(&bytes, OWN).unwrap().csa2);
+        assert!(ConnectInd::parse_aux(&bytes, OWN).is_some_and(|with_ch_sel| with_ch_sel.csa2));
         for len in 0..bytes.len() {
-            assert!(ConnectInd::parse_aux(&bytes[..len], OWN).is_none());
+            assert!(ConnectInd::parse_aux(bytes.get(..len).unwrap_or_default(), OWN).is_none());
         }
         // Only to our address with our address type, and only that PDU
         // type and length.
@@ -1030,10 +1035,10 @@ mod tests {
         pdu[0] = 0x05 | TX_ADD_RANDOM | RX_ADD_RANDOM;
         pdu[1] = 34;
         pdu[2..8].copy_from_slice(&[1, 2, 3, 4, 5, 0x46]);
-        assert!(aux_connect_initiator(&pdu) == Some(Peer::new([1, 2, 3, 4, 5, 0x46], true)));
+        assert_eq!(aux_connect_initiator(&pdu), Some(Peer::new([1, 2, 3, 4, 5, 0x46], true)));
         // A public initiator.
         pdu[0] = 0x05;
-        assert!(aux_connect_initiator(&pdu) == Some(Peer::new([1, 2, 3, 4, 5, 0x46], false)));
+        assert_eq!(aux_connect_initiator(&pdu), Some(Peer::new([1, 2, 3, 4, 5, 0x46], false)));
         // Not a connection request: another type or length, or too short.
         pdu[0] = 0x03;
         assert!(aux_connect_initiator(&pdu).is_none());
@@ -1044,9 +1049,9 @@ mod tests {
         assert!(aux_connect_initiator(&pdu[..7]).is_none());
         // The answer to it names it.
         let mut response = aux_connect_rsp(Peer::new([9; 6], true), Peer::new([0; 6], false));
-        retarget(&mut response, aux_connect_initiator(&pdu).unwrap());
-        assert_eq!(response.as_bytes()[0], AUX_CONNECT_RSP | TX_ADD_RANDOM);
-        assert_eq!(response.as_bytes()[10..16], [1, 2, 3, 4, 5, 0x46]);
+        retarget(&mut response, assert_some!(aux_connect_initiator(&pdu)));
+        assert_eq!(response.as_bytes().first(), Some(&(AUX_CONNECT_RSP | TX_ADD_RANDOM)));
+        assert_eq!(response.as_bytes().get(10..16), Some(&[1, 2, 3, 4, 5, 0x46][..]));
         // The whole buffer of a PDU, for the reception after it.
         let buffer = aux_connect_rsp(Peer::new([9; 6], true), Peer::new([0; 6], false)).into_buffer();
         assert_eq!(buffer.len(), HEADER_LEN + AUX_CONNECT_RSP_LEN);

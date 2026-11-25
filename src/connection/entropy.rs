@@ -63,7 +63,7 @@ mod tests {
     use super::*;
     use core::{
         cell::Cell,
-        future::{Future, pending},
+        future::{Future as _, pending},
         pin::pin,
         task::{Context, Waker},
     };
@@ -82,40 +82,43 @@ mod tests {
         assert_eq!(produced.get(), 1);
         assert!(worker.as_mut().poll(&mut context).is_pending());
         assert_eq!(produced.get(), 1);
-        assert_eq!(prefetch.take().unwrap().0, [1; 12]);
+        assert_eq!(prefetch.take().map(|block| block.0), Some([1; 12]));
         assert!(prefetch.take().is_none());
         assert!(worker.as_mut().poll(&mut context).is_pending());
-        assert_eq!(prefetch.take().unwrap().0, [2; 12]);
+        assert_eq!(prefetch.take().map(|block| block.0), Some([2; 12]));
         assert!(prefetch.take().is_none());
     }
 
     #[test]
     fn cancellation_never_publishes_a_partial_response() {
         let prefetch = Prefetch::new();
-        {
+        // The worker is dropped, and so cancelled, at the end of the block.
+        let cancelled_pending = {
             let mut worker = pin!(prefetch.run_with(async |bytes: &mut [u8]| {
-                bytes[..5].fill(0xA5);
+                bytes.get_mut(..5).unwrap_or_default().fill(0xA5);
                 pending::<()>().await;
             }));
-            assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-        }
+            worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending()
+        };
+        assert!(cancelled_pending);
         assert!(prefetch.take().is_none());
         let mut replacement = pin!(prefetch.run_with(async |bytes: &mut [u8]| bytes.fill(0x3C)));
         assert!(replacement.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-        assert_eq!(prefetch.take().unwrap().0, [0x3C; 12]);
+        assert_eq!(prefetch.take().map(|block| block.0), Some([0x3C; 12]));
     }
 
     #[test]
     fn a_new_connection_does_not_inherit_a_ready_block() {
-        {
+        let old_pending = {
             let old = Prefetch::new();
             let mut worker = pin!(old.run_with(async |bytes: &mut [u8]| bytes.fill(7)));
-            assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-        }
+            worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending()
+        };
+        assert!(old_pending);
         let next = Prefetch::new();
         assert!(next.take().is_none());
         let mut worker = pin!(next.run_with(async |bytes: &mut [u8]| bytes.fill(8)));
         assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-        assert_eq!(next.take().unwrap().0, [8; 12]);
+        assert_eq!(next.take().map(|block| block.0), Some([8; 12]));
     }
 }

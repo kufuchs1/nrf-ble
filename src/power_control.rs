@@ -288,7 +288,7 @@ mod tests {
     /// A central so close that the power goes down to the lowest level on
     /// every chip: 20 dB above the window at the second level, and within
     /// it at the lowest.
-    fn close() -> u8 { u8::try_from(i32::from(LEVELS_DBM[0]) + 60).unwrap() }
+    fn close() -> u8 { i32::from(LEVELS_DBM[0]).strict_add(60).strict_cast() }
 
     fn settle(control: &mut PowerControl, rssi: u8) {
         for _ in 0..u32::from(SAMPLES_PER_DECISION) * 20 {
@@ -307,13 +307,13 @@ mod tests {
 
     #[test]
     fn only_the_nrf52833_goes_from_minus_40_to_plus_8_dbm() {
-        let range = (LEVELS_DBM[0], LEVELS_DBM[LEVELS_DBM.len() - 1]);
-        assert_eq!(range, if cfg!(feature = "nrf52833") { (-40, 8) } else { (-20, 4) });
+        let range = (LEVELS_DBM.first(), LEVELS_DBM.last());
+        assert_eq!(range, if cfg!(feature = "nrf52833") { (Some(&-40), Some(&8)) } else { (Some(&-20), Some(&4)) });
     }
 
     #[test]
     fn the_default_ceiling_is_4_dbm_on_every_chip() {
-        assert_eq!(LEVELS_DBM[top()], 4);
+        assert_eq!(LEVELS_DBM.get(top()), Some(&4));
         assert_eq!(LEVELS_DBM[DEFAULT_LEVEL], 0);
     }
 
@@ -329,9 +329,9 @@ mod tests {
         assert_eq!(ceiling_level(4), top());
         assert_eq!(ceiling_level(-10), DEFAULT_LEVEL);
         assert_eq!(ceiling_level(i8::MIN), DEFAULT_LEVEL);
-        assert_eq!(LEVELS_DBM[ceiling_level(1)], 0);
-        assert_eq!(LEVELS_DBM[ceiling_level(3)], 3);
-        assert_eq!(LEVELS_DBM[ceiling_level(7)], 7);
+        assert_eq!(LEVELS_DBM.get(ceiling_level(1)), Some(&0));
+        assert_eq!(LEVELS_DBM.get(ceiling_level(3)), Some(&3));
+        assert_eq!(LEVELS_DBM.get(ceiling_level(7)), Some(&7));
     }
 
     #[test]
@@ -346,7 +346,7 @@ mod tests {
         let mut control = PowerControl::new();
         settle(&mut control, 85);
         assert_eq!(control.level(), top());
-        assert_eq!(LEVELS_DBM[control.level()], 4);
+        assert_eq!(LEVELS_DBM.get(control.level()), Some(&4));
     }
 
     #[cfg(feature = "nrf52833")]
@@ -356,7 +356,7 @@ mod tests {
         control.set_ceiling(i8::MAX);
         settle(&mut control, 95);
         assert_eq!(control.level(), LEVELS_DBM.len() - 1);
-        assert_eq!(LEVELS_DBM[control.level()], 8);
+        assert_eq!(LEVELS_DBM.get(control.level()), Some(&8));
     }
 
     #[cfg(feature = "nrf52833")]
@@ -379,7 +379,7 @@ mod tests {
         for rssi in 45..80 {
             let mut control = PowerControl::new();
             settle(&mut control, rssi);
-            let at_central = i32::from(LEVELS_DBM[control.level()]) - i32::from(rssi);
+            let at_central = i32::from(*assert_some!(LEVELS_DBM.get(control.level()))) - i32::from(rssi);
             let at_limit = control.level() == 0 || control.level() == top();
             assert!(at_limit || (TARGET_LOW_DBM..=TARGET_HIGH_DBM).contains(&at_central), "rssi -{rssi}");
         }
@@ -398,9 +398,10 @@ mod tests {
                 assert_eq!(control.level(), settled, "rssi -{rssi}");
             }
             // Above the window only where a step down would leave it below.
-            let at_central = |level: usize| i32::from(LEVELS_DBM[level]) - i32::from(rssi);
-            if settled != 0 && at_central(settled) > TARGET_HIGH_DBM {
-                assert!(at_central(settled - 1) < TARGET_LOW_DBM, "rssi -{rssi}");
+            let at_central = |level: usize| LEVELS_DBM.get(level).map(|&dbm| i32::from(dbm) - i32::from(rssi));
+            let settled_at_central = assert_some!(at_central(settled));
+            if settled != 0 && settled_at_central > TARGET_HIGH_DBM {
+                assert!(at_central(settled - 1).is_some_and(|below| below < TARGET_LOW_DBM), "rssi -{rssi}");
             }
         }
     }
@@ -411,7 +412,7 @@ mod tests {
         settle(&mut control, close());
         control.on_loss();
         assert_eq!(control.level(), 1);
-        for _ in 0..20 {
+        for _ in 0..20_u32 {
             control.on_loss();
         }
         assert_eq!(control.level(), top());
@@ -434,14 +435,14 @@ mod tests {
     fn a_requested_power_moves_to_the_closest_level_and_holds() {
         let mut control = PowerControl::new();
         control.move_to(-13);
-        assert_eq!(LEVELS_DBM[control.level()], -12);
+        assert_eq!(LEVELS_DBM.get(control.level()), Some(&-12));
         control.move_to(40);
         assert_eq!(control.level(), top());
         control.move_to(-12);
         for _ in 0..SAMPLES_PER_DECISION {
             control.on_packet(close());
         }
-        assert_eq!(LEVELS_DBM[control.level()], -12);
+        assert_eq!(LEVELS_DBM.get(control.level()), Some(&-12));
     }
 
     #[test]
@@ -449,14 +450,14 @@ mod tests {
         let mut control = PowerControl::new();
         control.move_to(-4);
         settle(&mut control, close());
-        assert_eq!(LEVELS_DBM[control.level()], -4);
+        assert_eq!(LEVELS_DBM.get(control.level()), Some(&-4));
         settle(&mut control, 85);
         assert_eq!(control.level(), top());
         settle(&mut control, close());
-        assert_eq!(LEVELS_DBM[control.level()], -4);
+        assert_eq!(LEVELS_DBM.get(control.level()), Some(&-4));
         control.move_to(-12);
         settle(&mut control, close());
-        assert_eq!(LEVELS_DBM[control.level()], -12);
+        assert_eq!(LEVELS_DBM.get(control.level()), Some(&-12));
     }
 
     #[test]

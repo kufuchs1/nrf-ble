@@ -182,7 +182,7 @@ pub fn on_interrupt() { RNG.interrupt(); }
 mod tests {
     use super::*;
     use core::{
-        future::Future,
+        future::Future as _,
         pin::pin,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         task::{Context, Waker},
@@ -193,6 +193,9 @@ mod tests {
         starts: AtomicUsize,
         stops:  AtomicUsize,
         value:  Mutex<CriticalSectionRawMutex, Cell<Option<u8>>>,
+        /// How often a synchronous fill waited for a byte, which the tests
+        /// always have ready. A wait supplies a zero so that the fill ends.
+        waits:  AtomicUsize,
     }
 
     impl Backend for Mock {
@@ -210,7 +213,8 @@ mod tests {
         fn try_read(&self) -> Option<u8> { self.value.lock(Cell::take) }
 
         fn wait(&self) {
-            panic!("test expected a ready synchronous byte");
+            self.waits.fetch_add(1, Ordering::Relaxed);
+            self.value.lock(|value| value.set(Some(0)));
         }
     }
 
@@ -220,6 +224,7 @@ mod tests {
             starts: AtomicUsize::new(0),
             stops:  AtomicUsize::new(0),
             value:  Mutex::new(Cell::new(None)),
+            waits:  AtomicUsize::new(0),
         })
     }
 
@@ -228,14 +233,15 @@ mod tests {
         let rng = generator();
         let mut bytes = [0; 2];
         let mut context = Context::from_waker(Waker::noop());
-        {
+        let still_pending = {
             let mut future = pin!(rng.fill_async(&mut bytes));
             assert!(future.as_mut().poll(&mut context).is_pending());
             assert!(rng.peripheral.armed.load(Ordering::Relaxed));
             rng.peripheral.value.lock(|value| value.set(Some(0xA5)));
             rng.interrupt();
-            assert!(future.as_mut().poll(&mut context).is_pending());
-        }
+            future.as_mut().poll(&mut context).is_pending()
+        };
+        assert!(still_pending);
         assert_eq!(bytes, [0xA5, 0]);
         assert_eq!(rng.peripheral.stops.load(Ordering::Relaxed), 1);
         assert!(!rng.peripheral.armed.load(Ordering::Relaxed));
@@ -257,14 +263,16 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
         let mut owner = pin!(rng.fill_async(&mut owner_bytes));
         assert!(owner.as_mut().poll(&mut context).is_pending());
-        {
+        let waiter_pending = {
             let mut waiter = pin!(rng.fill_async(&mut other_bytes));
-            assert!(waiter.as_mut().poll(&mut context).is_pending());
-        }
+            waiter.as_mut().poll(&mut context).is_pending()
+        };
+        assert!(waiter_pending);
         rng.peripheral.value.lock(|value| value.set(Some(7)));
         let mut synchronous = [0];
         rng.fill(&mut synchronous);
         assert_eq!(synchronous, [7]);
+        assert_eq!(rng.peripheral.waits.load(Ordering::Relaxed), 0);
         assert_eq!(rng.peripheral.starts.load(Ordering::Relaxed), 1);
         assert_eq!(rng.peripheral.stops.load(Ordering::Relaxed), 0);
         assert!(owner.as_mut().poll(&mut context).is_pending());
@@ -278,6 +286,7 @@ mod tests {
     fn empty_requests_do_not_power_the_peripheral() {
         let rng = generator();
         rng.fill(&mut []);
+        assert_eq!(rng.peripheral.waits.load(Ordering::Relaxed), 0);
         let mut future = pin!(rng.fill_async(&mut []));
         assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_ready());
         assert_eq!(rng.peripheral.starts.load(Ordering::Relaxed), 0);

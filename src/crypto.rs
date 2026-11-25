@@ -18,6 +18,7 @@ use crate::{
     radio::{PacketBuffer, Phy},
     sleep,
 };
+#[cfg(test)] use core::cell::Cell;
 use core::{
     hint::black_box,
     sync::atomic::{Ordering, compiler_fence},
@@ -64,7 +65,7 @@ pub(crate) const COUNTER_LIMIT: u64 = 1_u64.strict_shl(39);
 std::thread_local! {
     /// Whether [`seal_stand_in`] fails on this thread, as the CCM does on an
     /// error: for the tests of a failed seal.
-    pub(crate) static SEAL_FAILS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    pub(crate) static SEAL_FAILS: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A received PDU as the CCM decrypts it ([`arm_decrypt`]): header, length,
@@ -512,6 +513,7 @@ mod tests {
         Aes128,
         cipher::{BlockCipherEncrypt as _, KeyInit as _},
     };
+    use core::array::from_fn;
 
     /// Software AES-128 in place of the ECB.
     fn software(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
@@ -540,13 +542,13 @@ mod tests {
 
     #[test]
     fn session_key_byte_order_matches_a_nist_ecb_vector() {
-        let ltk = core::array::from_fn(|index| 15 - u8::try_from(index).unwrap());
-        let skd = core::array::from_fn(|index| (15 - u8::try_from(index).unwrap()) * 17);
+        let ltk = from_fn(|index| 15_u8.strict_sub(index.strict_cast()));
+        let skd = from_fn(|index| 15_u8.strict_sub(index.strict_cast()).strict_mul(17));
         let ciphertext =
             [0x69, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30, 0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4, 0xC5, 0x5A];
         let key = derive_session_key(ltk, skd, |data| {
-            assert_eq!(&data[..16], &core::array::from_fn::<_, 16, _>(|index| u8::try_from(index).unwrap()));
-            assert_eq!(&data[16..32], &core::array::from_fn::<_, 16, _>(|index| u8::try_from(index).unwrap() * 17));
+            assert_eq!(&data[..16], &from_fn::<u8, 16, _>(|index| index.strict_cast()));
+            assert_eq!(&data[16..32], &from_fn::<u8, 16, _>(|index| index.strict_cast::<u8>().strict_mul(17)));
             data[32..].copy_from_slice(&ciphertext);
             true
         });

@@ -1,18 +1,19 @@
 //! Regression tests for the actual link state machine, without radio MMIO.
 
-extern crate std;
-
-use super::{encryption::KeyLookup, *};
-use crate::{
-    link::{Epoch, Link, ParamRange},
-    pdu::BUFFER_LEN,
-};
-use std::{vec, vec::Vec};
+extern crate alloc;
 
 /// The answer path against a central that follows the specification.
 mod central;
 
-/// The connection request of the tests' connections: CONNECT_IND
+use super::{encryption::KeyLookup, *};
+use crate::{
+    link::{self, Epoch, Link, ParamRange},
+    pdu::BUFFER_LEN,
+};
+use alloc::{vec, vec::Vec};
+use core::{iter::from_fn, ops::RangeInclusive};
+
+/// The connection request of the tests' connections: `CONNECT_IND`
 /// parameters, window offset 0 and size 1.
 const REQUEST: ConnectInd = ConnectInd {
     access_address:   0x9A32_8370,
@@ -31,37 +32,13 @@ const REQUEST: ConnectInd = ConnectInd {
     win_size:         1,
 };
 
-/// Fills the host's event queue.
-fn fill(shared: &Shared) { while shared.try_push_event(Event::PayloadTimeout) {} }
-
-/// Takes the events queued for the host and counts them.
-fn queued(shared: &Shared) -> usize { core::iter::from_fn(|| shared.take_event()).count() }
-
-/// A new connection. It is built in a critical section, which a test that
-/// changes the sleep clock all tests share holds meanwhile.
-fn connection() -> Connection { critical_section::with(|_| new_connection()) }
-
-fn new_connection() -> Connection { Connection::new(&REQUEST, 100, Setup::LEGACY) }
-
-/// The steps of `Connection::respond` that need no radio: the room counted,
-/// the packet validated and taken, and the acknowledgement of ours with what
-/// it completes. Returns whether the packet was new.
+/// The steps of a connection that the tests take one at a time.
 impl Connection {
-    fn receive(&mut self, header: u8, len: u8, mic_ok: bool, address: u32, shared: &Shared) -> Option<bool> {
-        self.prepare_room(shared);
-        let decision = self.decide(Some((header, len, mic_ok)), At(address), false, shared)?;
-        if let Some(acked) = decision.acked {
-            self.after_ack(acked);
-        }
-        Some(!decision.duplicate)
-    }
-
     /// The acknowledgement of our PDU alone.
-    fn acknowledge(&mut self, header: u8, _shared: &Shared) -> Option<()> {
+    fn acknowledge(&mut self, header: u8, _shared: &Shared) {
         if let (Some(acked), _) = self.ack_fast(header) {
             self.after_ack(acked);
         }
-        Some(())
     }
 
     /// Prepares the next PDU and puts it on the air at once, as the first
@@ -76,7 +53,42 @@ impl Connection {
             }
         }
     }
+
+    /// The steps of `Connection::respond` that need no radio: the room
+    /// counted, the packet validated and taken, and the acknowledgement of
+    /// ours with what it completes. Returns whether the packet was new.
+    fn receive(&mut self, header: u8, len: u8, mic_ok: bool, address: u32, shared: &Shared) -> Option<bool> {
+        self.prepare_room(shared);
+        let decision = self.decide(Some((header, len, mic_ok)), At(address), false, shared)?;
+        if let Some(acked) = decision.acked {
+            self.after_ack(acked);
+        }
+        Some(!decision.duplicate)
+    }
 }
+
+/// What the central's packets do at an event in these tests.
+#[derive(Clone, Copy)]
+enum Air {
+    /// A packet with a CRC error.
+    Corrupt,
+    /// An empty PDU with a valid CRC.
+    Heard,
+    /// Nothing.
+    Silent,
+}
+
+/// Fills the host's event queue.
+fn fill(shared: &Shared) { while shared.try_push_event(Event::PayloadTimeout) {} }
+
+/// Takes the events queued for the host and counts them.
+fn queued(shared: &Shared) -> usize { from_fn(|| shared.take_event()).count() }
+
+/// A new connection. It is built in a critical section, which a test that
+/// changes the sleep clock all tests share holds meanwhile.
+fn connection() -> Connection { critical_section::with(|_| new_connection()) }
+
+fn new_connection() -> Connection { Connection::new(&REQUEST, 100, Setup::LEGACY) }
 
 #[test]
 fn the_transmit_window_and_the_phy_follow_the_setup() {
@@ -101,11 +113,11 @@ fn the_transmit_window_and_the_phy_follow_the_setup() {
 #[cfg(feature = "extended-advertising")]
 #[test]
 fn a_connection_from_an_aux_connect_req_starts_2_5_ms_later_with_csa2_on_the_secondary_phy() {
-    use crate::advertiser::extended::SECONDARY_PHYS;
+    use crate::{advertiser::extended::SECONDARY_PHYS, pdu::Peer};
     // The request as it comes on air: AUX_CONNECT_REQ from a public central
     // to a static random advertiser, ChSel 0 as it is reserved, window
     // offset 3 and size 1, interval 12, hop 5.
-    let advertiser = crate::pdu::Peer::new([1, 2, 3, 4, 5, 0xC6], true);
+    let advertiser = Peer::new([1, 2, 3, 4, 5, 0xC6], true);
     let mut pdu = [0_u8; 36];
     pdu[0] = 0x05 | 0x80;
     pdu[1] = 34;
@@ -119,7 +131,7 @@ fn a_connection_from_an_aux_connect_req_starts_2_5_ms_later_with_csa2_on_the_sec
     pdu[28..30].copy_from_slice(&600_u16.to_le_bytes());
     pdu[30..35].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F]);
     pdu[35] = 5;
-    let request = ConnectInd::parse_aux(&pdu, advertiser).unwrap();
+    let request = assert_some!(ConnectInd::parse_aux(&pdu, advertiser));
     assert!(request.csa2 && request.win_offset == 3);
     for phy in SECONDARY_PHYS {
         // The request ended at 100 us: the transmit window opens 2500 us
@@ -134,7 +146,7 @@ fn a_connection_from_an_aux_connect_req_starts_2_5_ms_later_with_csa2_on_the_sec
     }
     // A CONNECT_IND keeps the legacy setup: 1.25 ms, LE 1M.
     assert!(Setup::LEGACY.window_delay_us == 1250 && Setup::LEGACY.phy == Phy::M1);
-    assert!(Setup::aux(Phy::M1).window_delay_us == 2500);
+    assert_eq!(Setup::aux(Phy::M1).window_delay_us, 2500);
 }
 
 #[test]
@@ -151,9 +163,9 @@ fn version_indication_is_queued_only_once_per_connection() {
     let version = [OP_VERSION_IND, 0x0B, 0, 0, 0, 0];
     link.handle_control(&version, false);
     assert_eq!(link.queue.len(), 1);
-    assert_eq!(link.queue.front().unwrap().data[0], OP_VERSION_IND);
+    assert_eq!(assert_some!(link.queue.front()).data[0], OP_VERSION_IND);
     link.queue.clear();
-    for _ in 0..10 {
+    for _ in 0_i32..10_i32 {
         link.handle_control(&version, false);
     }
     assert!(link.queue.is_empty());
@@ -163,12 +175,12 @@ fn version_indication_is_queued_only_once_per_connection() {
 #[test]
 fn unanswered_control_procedures_end_the_link_despite_keepalives() {
     let shared = Shared::new();
-    for procedure in 0..3 {
+    for procedure in 0_i32..3_i32 {
         let mut link = connection();
         link.establishment_deadline = None;
         match procedure {
-            0 => link.features_request = Request::Requested(At(1000)),
-            1 => link.phy_request = Request::Requested(At(1000)),
+            0_i32 => link.features_request = Request::Requested(At(1000)),
+            1_i32 => link.phy_request = Request::Requested(At(1000)),
             _ => link.param_request = Some(At(1000)),
         }
         link.last_valid = At(999);
@@ -202,7 +214,7 @@ fn keepalive_packets_cannot_extend_a_local_disconnect_deadline() {
 #[test]
 fn first_valid_packet_replaces_the_short_establishment_deadline() {
     let mut link = connection();
-    let deadline = link.establishment_deadline.unwrap();
+    let deadline = assert_some!(link.establishment_deadline);
     assert!(matches!(link.ended(deadline), Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH))));
     assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 1000, &Shared::new()), Some(true));
     assert!(link.establishment_deadline.is_none());
@@ -419,13 +431,11 @@ fn tx_counter_exhaustion_cannot_wrap() {
 fn controls_require_exact_lengths_and_valid_parameters() {
     // A wrong length is answered as an unknown PDU.
     for payload in [&[OP_START_ENC_RSP, 0][..], &[OP_CHANNEL_MAP_IND, 1][..], &[OP_ENC_REQ][..]] {
+        let opcode = *assert_some!(payload.first());
         let mut link = connection();
         link.handle_control(payload, false);
         assert_eq!(link.abort, None);
-        assert_eq!(
-            link.queue.front().copied().map(|queued| queued.data[..2] == [OP_UNKNOWN_RSP, payload[0]]),
-            Some(true)
-        );
+        assert_eq!(link.queue.front().copied().map(|queued| queued.data[..2] == [OP_UNKNOWN_RSP, opcode]), Some(true));
         assert!(link.channel_update.is_none() && link.encryption.phase == Phase::Plain);
     }
     // Unless an encryption procedure runs, which an answer would block.
@@ -434,7 +444,7 @@ fn controls_require_exact_lengths_and_valid_parameters() {
     link.handle_control(&[OP_START_ENC_RSP, 0], false);
     assert_eq!(link.abort, Some(ERROR_INVALID_PARAMETERS));
     assert!(link.queue.is_empty());
-    let mut link = connection();
+    link = connection();
     link.handle_control(&[OP_CHANNEL_MAP_IND, 0, 0, 0, 0, 0, 6, 0], false);
     assert_eq!(link.abort, Some(ERROR_INVALID_PARAMETERS));
     assert!(link.channel_update.is_none());
@@ -607,7 +617,7 @@ fn a_failed_seal_in_the_event_closes_it() {
         // prepared while ours goes out.
         link.prepare_room(&shared);
         let decision =
-            link.decide(Some((Llid::Continuation.bits() | NESN | MD, 0, true)), At(1000), true, &shared).unwrap();
+            assert_some!(link.decide(Some((Llid::Continuation.bits() | NESN | MD, 0, true)), At(1000), true, &shared));
         assert!(decision.acked.is_some());
         assert_eq!(decision.follow.md, !fails && chip::PREPARE_IN_EVENT);
         assert_eq!(decision.follow.more, !fails);
@@ -679,7 +689,7 @@ fn a_termination_waits_while_the_central_would_misread_it_and_its_deadline_runs(
         assert!(link.terminate == Some((0x13, Termination::Waiting)));
         // A procedure that stalls ends the link at the termination's
         // deadline, without it.
-        let deadline = link.terminate_deadline.unwrap();
+        let deadline = assert_some!(link.terminate_deadline);
         assert!(link.ended(deadline.before(Micros(1))).is_none());
         assert!(matches!(link.ended(deadline), Some(Ended::Local(0x13))));
         // Once the procedure is done the termination goes out, once, as
@@ -784,10 +794,10 @@ fn a_pause_needs_an_encrypted_request_and_a_plain_answer() {
     let mut link = encrypted();
     link.handle_control(&[OP_PAUSE_ENC_REQ], false);
     assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
-    let mut link = connection();
+    link = connection();
     link.handle_control(&[OP_PAUSE_ENC_REQ], true);
     assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
-    let mut link = encrypted();
+    link = encrypted();
     link.encryption.phase = Phase::AwaitingPauseResponse;
     link.handle_control(&[OP_PAUSE_ENC_RSP], true);
     assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
@@ -822,12 +832,12 @@ fn phy_updates_without_a_change_asymmetric_or_coded_are_handled() {
     assert_eq!(link.abort, None);
     assert!(link.phy_update.is_none());
     for (to_peripheral, to_central) in [(4, 4), (3, 3)] {
-        let mut link = encrypted();
+        link = encrypted();
         link.handle_control(&[OP_PHY_UPDATE_IND, to_peripheral, to_central, 10, 0], true);
         assert_eq!(link.abort, Some(ERROR_UNSUPPORTED_VALUE));
     }
     let phy = if chip::PHY_2M { 2 } else { 1 };
-    let mut link = encrypted();
+    link = encrypted();
     link.handle_control(&[OP_PHY_UPDATE_IND, phy, phy, 0, 0], true);
     assert_eq!(link.abort, Some(ERROR_INSTANT_PASSED));
 }
@@ -879,13 +889,13 @@ fn the_peripheral_asks_for_2m_once_encrypted_and_answers_a_central_request() {
     link.central_features = Some([0x1F, 0, 0, 0, 0, 0, 0, 0]);
     link.start_procedures(At(0), &shared);
     assert!(link.queue.is_empty());
-    let mut link = encrypted();
+    link = encrypted();
     link.central_features = Some([0x1F, 0, 0, 0, 0, 0, 0, 0]);
     link.start_procedures(At(0), &shared);
     assert_eq!(link.queue.front().copied().map(|queued| queued.data[..3] == [OP_PHY_REQ, 2, 2]), Some(true));
     link.handle_control(&[OP_UNKNOWN_RSP, OP_PHY_REQ], true);
     assert!(link.phy_request == Request::Done);
-    let mut link = encrypted();
+    link = encrypted();
     link.handle_control(&[OP_PHY_REQ, 3, 3], true);
     assert_eq!(link.queue.front().copied().map(|queued| queued.data[..3] == [OP_PHY_RSP, 2, 2]), Some(true));
     assert!(matches!(link.phy_request, Request::Requested(_)));
@@ -907,13 +917,13 @@ fn a_central_parameter_request_is_accepted_or_rejected_when_invalid() {
     // A host that did not enable the request event leaves it to the link
     // layer.
     link.drive_remote_request(At(0), &Shared::new());
-    let response = *link.queue.front().unwrap();
+    let response = *assert_some!(link.queue.front());
     assert_eq!(usize::from(response.len), 24);
     assert_eq!(response.data[0], OP_CONNECTION_PARAM_RSP);
     assert_eq!(response.data[1..24], parameter_request(OP_CONNECTION_PARAM_REQ)[1..]);
     let mut invalid = parameter_request(OP_CONNECTION_PARAM_REQ);
     invalid[1] = 30;
-    let mut link = encrypted();
+    link = encrypted();
     link.handle_control(&invalid, true);
     assert_eq!(
         link.queue
@@ -970,7 +980,7 @@ fn parameters_already_in_place_are_reported_without_a_procedure() {
 fn the_feature_answer_keeps_only_the_shared_first_byte() {
     let mut link = encrypted();
     link.handle_control(&[OP_FEATURE_REQ, 0x01, 0xFF, 0, 0, 0, 0, 0, 0], true);
-    let response = *link.queue.front().unwrap();
+    let response = *assert_some!(link.queue.front());
     assert_eq!(response.data[..3], [OP_FEATURE_RSP, 0x01, FEATURES[1]]);
 }
 
@@ -978,34 +988,34 @@ fn the_feature_answer_keeps_only_the_shared_first_byte() {
 fn a_power_control_request_moves_the_power_and_reports_it() {
     let mut link = encrypted();
     link.handle_control(&[OP_POWER_CONTROL_REQ, 1, (-8_i8).cast_unsigned(), 0], true);
-    let response = *link.queue.front().unwrap();
+    let response = *assert_some!(link.queue.front());
     assert_eq!(response.data[0], OP_POWER_CONTROL_RSP);
     assert_eq!(response.data[2].cast_signed(), -8);
     assert_eq!(response.data[3].cast_signed(), -8);
     // Nothing measured yet: the acceptable reduction is unknown.
     assert_eq!(response.data[4], 0xFF);
-    let mut link = encrypted();
+    link = encrypted();
     link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 100, 0], true);
-    let response = *link.queue.front().unwrap();
-    assert_eq!(response.data[1], 0x02);
-    assert_eq!(response.data[3].cast_signed(), 4);
+    let limited = *assert_some!(link.queue.front());
+    assert_eq!(limited.data[1], 0x02);
+    assert_eq!(limited.data[3].cast_signed(), 4);
 }
 
 #[cfg(feature = "nrf52833")]
 #[test]
 fn a_power_request_stops_at_the_ceiling_the_firmware_chose() {
-    let highest = LEVELS_DBM[LEVELS_DBM.len() - 1];
+    let highest = *assert_some!(LEVELS_DBM.last());
     let mut link = encrypted();
     link.set_max_power(i8::MAX);
     link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 0x7F, 0], true);
-    let response = *link.queue.front().unwrap();
+    let mut response = *assert_some!(link.queue.front());
     assert_eq!(response.data[..4], [OP_POWER_CONTROL_RSP, 0x02, highest.cast_unsigned(), highest.cast_unsigned()]);
     assert_eq!(highest, 8);
     // A lower ceiling is the maximum the central learns of.
-    let mut link = encrypted();
+    link = encrypted();
     link.set_max_power(1);
     link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 3, 0], true);
-    let response = *link.queue.front().unwrap();
+    response = *assert_some!(link.queue.front());
     assert_eq!(response.data[..4], [OP_POWER_CONTROL_RSP, 0x02, 0, 0]);
 }
 
@@ -1026,7 +1036,7 @@ fn power_changes_are_announced_only_to_a_central_that_supports_them() {
     // nRF52833, or +4 dBm, the ceiling, on the nRF51.
     let raised = LEVELS_DBM[DEFAULT_LEVEL + 1].cast_unsigned();
     let flags = if DEFAULT_LEVEL + 1 == link.power[0].top() { 0x02 } else { 0 };
-    let indication = *link.queue.front().unwrap();
+    let indication = *assert_some!(link.queue.front());
     assert_eq!(indication.data[..5], [OP_POWER_CHANGE_IND, 1, flags, raised, raised]);
 }
 
@@ -1124,7 +1134,7 @@ fn data_while_encryption_starts_or_pauses_ends_the_link_unacknowledged() {
         // Where received packets are encrypted, the opcode comes with its
         // four octet MIC.
         let len = if phase.rx_on() { 5 } else { 1 };
-        let mut link = connection();
+        link = connection();
         link.encryption.phase = phase;
         assert_eq!(link.receive(Llid::Control.bits(), len, true, 999, &Shared::new()), Some(true));
         assert_eq!(link.abort, None);
@@ -1198,11 +1208,11 @@ fn the_host_learns_of_updates_that_change_something_or_that_it_asked_for() {
     assert_eq!(events_at_instant(&mut link), 1);
     assert_eq!(link.interval, Micros(24 * UNIT_1250_US));
     // The same parameters again: only the anchor moves.
-    let mut link = encrypted();
+    link = encrypted();
     link.handle_control(&update_to(12), true);
     assert_eq!(events_at_instant(&mut link), 0);
     // Unless they answer the host's request.
-    let mut link = encrypted();
+    link = encrypted();
     link.param_request = Some(At(1000));
     link.handle_control(&update_to(12), true);
     assert!(link.param_request.is_none());
@@ -1298,7 +1308,7 @@ fn host_notifications_survive_queue_pressure() {
 fn power_requests_for_2m_are_refused_and_round_up_without_3_dbm() {
     let mut link = connection();
     link.handle_control(&[OP_POWER_CONTROL_REQ, 2, 0, 0], false);
-    assert_eq!(link.queue.front().unwrap().data[..3], [
+    assert_eq!(assert_some!(link.queue.front()).data[..3], [
         OP_REJECT_EXT_IND,
         OP_POWER_CONTROL_REQ,
         ERROR_UNSUPPORTED_VALUE
@@ -1314,7 +1324,7 @@ fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
     for phy in [0, 3, 4, 8, 255] {
         let mut link = connection();
         link.handle_control(&[OP_POWER_CONTROL_REQ, phy, 0, 0], false);
-        assert_eq!(link.queue.front().unwrap().data[..3], [
+        assert_eq!(assert_some!(link.queue.front()).data[..3], [
             OP_REJECT_EXT_IND,
             OP_POWER_CONTROL_REQ,
             ERROR_UNSUPPORTED_VALUE
@@ -1322,7 +1332,7 @@ fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
     }
     let mut link = connection();
     link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 0, 126], false);
-    assert_eq!(link.queue.front().unwrap().data[2], ERROR_INVALID_PARAMETERS);
+    assert_eq!(assert_some!(link.queue.front()).data[2], ERROR_INVALID_PARAMETERS);
     link.queue.clear();
     link.handle_control(&[OP_POWER_CONTROL_REQ, 2, (-6_i8).cast_unsigned(), 0], false);
     assert_eq!(tx_power(link.power[0].level()), 0);
@@ -1338,10 +1348,10 @@ fn host_remote_queries_work_without_encryption_and_version_is_sent_once() {
     let mut link = connection();
     shared.request_queries(3);
     link.service_queries(At(0), &shared);
-    assert_eq!(link.queue.front().unwrap().data[0], OP_VERSION_IND);
+    assert_eq!(assert_some!(link.queue.front()).data[0], OP_VERSION_IND);
     link.queue.clear();
     link.start_procedures(At(0), &shared);
-    assert_eq!(link.queue.front().unwrap().data[0], OP_PERIPHERAL_FEATURE_REQ);
+    assert_eq!(assert_some!(link.queue.front()).data[0], OP_PERIPHERAL_FEATURE_REQ);
     link.queue.clear();
     link.handle_control(&[OP_VERSION_IND, 11, 1, 2, 3, 4], false);
     assert!(link.queue.is_empty());
@@ -1361,7 +1371,7 @@ fn host_phy_request_completes_even_when_the_central_keeps_the_current_phy() {
     link.host_phy = Some([1, 2]);
     link.preferred_phys = [1, 2];
     link.start_procedures(At(0), &shared);
-    assert_eq!(link.queue.front().unwrap().data[..3], [OP_PHY_REQ, 1, 2]);
+    assert_eq!(assert_some!(link.queue.front()).data[..3], [OP_PHY_REQ, 1, 2]);
     link.queue.clear();
     link.handle_control(&[OP_PHY_UPDATE_IND, 0, 0, 0, 0], false);
     assert_eq!(link.phy_status, Some(0));
@@ -1375,7 +1385,7 @@ fn host_phy_request_completes_even_when_the_central_keeps_the_current_phy() {
 #[test]
 fn encryption_waits_without_rng_work_and_builds_the_prefetched_response() {
     use core::{
-        future::Future,
+        future::Future as _,
         pin::pin,
         task::{Context, Waker},
     };
@@ -1387,7 +1397,7 @@ fn encryption_waits_without_rng_work_and_builds_the_prefetched_response() {
     request[0] = OP_ENC_REQ;
     link.handle_control(&request, false);
     assert!(matches!(link.encryption.phase, Phase::AwaitingEntropy(_)));
-    for _ in 0..5 {
+    for _ in 0_i32..5_i32 {
         link.drive_encryption(&shared, &prefetch);
         assert!(link.queue.is_empty());
         assert_eq!(link.abort, None);
@@ -1400,7 +1410,7 @@ fn encryption_waits_without_rng_work_and_builds_the_prefetched_response() {
     assert!(
         matches!(link.encryption.phase, Phase::AwaitingKey(lookup, _) if lookup == KeyLookup { ediv: [0x11; 2], rand: [0x11; 8] })
     );
-    let response = *link.queue.front().unwrap();
+    let response = *assert_some!(link.queue.front());
     assert_eq!(response.data[0], OP_ENC_RSP);
     assert_eq!(&response.data[1..13], &[0x22; 12]);
     assert_eq!(&link.encryption.skd[..8], &[0x11; 8]);
@@ -1414,7 +1424,7 @@ fn encryption_waits_without_rng_work_and_builds_the_prefetched_response() {
 fn encryption_refresh_consumes_a_different_prefetched_block() {
     use core::{
         cell::Cell,
-        future::Future,
+        future::Future as _,
         pin::pin,
         task::{Context, Waker},
     };
@@ -1432,7 +1442,7 @@ fn encryption_refresh_consumes_a_different_prefetched_block() {
     assert!(worker.as_mut().poll(&mut context).is_pending());
     link.handle_control(&request, false);
     link.drive_encryption(&shared, &prefetch);
-    assert_eq!(&link.queue.front().unwrap().data[1..13], &[1; 12]);
+    assert_eq!(&assert_some!(link.queue.front()).data[1..13], &[1; 12]);
     assert!(worker.as_mut().poll(&mut context).is_pending());
     // Model the encrypted link after its pause handshake completed.
     link.encryption.phase = Phase::Paused;
@@ -1440,7 +1450,7 @@ fn encryption_refresh_consumes_a_different_prefetched_block() {
     link.handle_control(&request, false);
     assert!(link.encryption.procedure == Procedure::Refresh);
     link.drive_encryption(&shared, &prefetch);
-    assert_eq!(&link.queue.front().unwrap().data[1..13], &[2; 12]);
+    assert_eq!(&assert_some!(link.queue.front()).data[1..13], &[2; 12]);
     assert_eq!(&link.encryption.iv[4..], &[2; 4]);
     assert!(prefetch.take().is_none());
 }
@@ -1451,10 +1461,10 @@ fn entropy_wait_preserves_response_deadline_and_accepts_termination() {
     request[0] = OP_ENC_REQ;
     let mut link = connection();
     link.handle_control(&request, false);
-    let deadline = link.procedure_deadline.unwrap();
+    let deadline = assert_some!(link.procedure_deadline);
     link.last_valid = deadline.before(Micros(1));
     assert!(matches!(link.ended(deadline), Some(Ended::Error(ERROR_RESPONSE_TIMEOUT))));
-    let mut link = connection();
+    link = connection();
     link.handle_control(&request, false);
     link.handle_control(&[OP_TERMINATE_IND, 0x13], false);
     assert!(matches!(link.ended(At(101)), Some(Ended::Terminated(0x13))));
@@ -1503,8 +1513,8 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
         [(Llid::Start.bits(), &[0xA1]), (Llid::Start.bits() | SN, &[0xA2]), (Llid::Control.bits(), &[OP_PING_REQ])];
     for (header, payload) in packets {
         rx.0[0] = header;
-        rx.0[1] = u8::try_from(payload.len()).unwrap();
-        rx.0[DATA_HEADER_LEN..DATA_HEADER_LEN + payload.len()].copy_from_slice(payload);
+        rx.0[1] = assert_ok!(u8::try_from(payload.len()));
+        rx.0.get_mut(DATA_HEADER_LEN..DATA_HEADER_LEN + payload.len()).unwrap_or_default().copy_from_slice(payload);
         assert_eq!(link.receive(header, rx.0[1], true, 999, &shared), Some(true));
         assert!(link.seq.received);
         link.stash(&rx, false, &shared);
@@ -1527,12 +1537,12 @@ fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_en
     link.stash(&rx, false, &shared);
     link.process(&shared);
     assert_eq!(
-        shared.take_acl_in().map(|acl| (acl.payload()[0], acl.start(), acl.encrypted())),
-        Some((0xA1, true, false))
+        shared.take_acl_in().map(|acl| (acl.payload().first().copied(), acl.start(), acl.encrypted())),
+        Some((Some(0xA1), true, false))
     );
     assert_eq!(
-        shared.take_acl_in().map(|acl| (acl.payload()[0], acl.start(), acl.encrypted())),
-        Some((0xA2, true, false))
+        shared.take_acl_in().map(|acl| (acl.payload().first().copied(), acl.start(), acl.encrypted())),
+        Some((Some(0xA2), true, false))
     );
     assert_eq!(link.queue.front().copied().map(|queued| queued.data[0]), Some(OP_PING_RSP));
     assert_eq!(link.stats.received, 4);
@@ -1592,7 +1602,10 @@ fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
     assert_eq!(link.receive(rx.0[0], 5, true, 999, &shared), Some(true));
     link.stash(&rx, true, &shared);
     assert_eq!(link.encryption.rx_counter, 1);
-    assert_eq!(shared.take_acl_in().map(|acl| (acl.payload()[0], acl.encrypted())), Some((0x42, true)));
+    assert_eq!(
+        shared.take_acl_in().map(|acl| (acl.payload().first().copied(), acl.encrypted())),
+        Some((Some(0x42), true))
+    );
 }
 
 #[test]
@@ -1634,9 +1647,9 @@ fn a_host_that_enabled_the_event_decides_on_a_central_parameter_request() {
     assert_eq!(shared.take_event(), Some(Event::ParamsRequested(ParamRange::new(12, 24, 4, 600))));
     // The host offers 30 to 40 units, latency 2 and timeout 800.
     assert_eq!(link_api.reply_params(epoch, Ok(ParamRange::new(30, 40, 2, 800))), Ok(()));
-    assert_eq!(link_api.reply_params(epoch, Err(0x3B)), Err(crate::link::Error::Disallowed));
+    assert_eq!(link_api.reply_params(epoch, Err(0x3B)), Err(link::Error::Disallowed));
     link.drive_remote_request(At(1000), &shared);
-    let response = *link.queue.front().unwrap();
+    let response = *assert_some!(link.queue.front());
     assert_eq!(response.data[..9], [OP_CONNECTION_PARAM_RSP, 30, 0, 40, 0, 2, 0, 0x20, 0x03]);
     assert_eq!(response.data[9..24], parameter_request(OP_CONNECTION_PARAM_REQ)[9..]);
     assert!(link.remote_request.is_none());
@@ -1668,7 +1681,7 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     assert_eq!(link.tx_payload_max(), 27);
     // The central receives and sends 251 octets in 2120 us.
     link.handle_control(&[OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
-    let response = *link.queue.front().unwrap();
+    let response = *assert_some!(link.queue.front());
     // We receive 251 octets but send only what the host allowed so far.
     assert_eq!(response.data[..9], [OP_LENGTH_RSP, 251, 0, 0x48, 0x08, 27, 0, 0x48, 0x01]);
     assert_eq!(link.length.effective(), [27, 328, 251, 2120]);
@@ -1698,10 +1711,10 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     link.encryption.phase = Phase::Encrypted;
     assert_eq!(link.tx_payload_max(), 251);
     link.length.take_peer(&[251, 0, 0xE8, 0x03, 251, 0, 0x48, 0x08]);
-    assert_eq!(link.tx_payload_max(), 1000 / 8 - 10 - 4);
+    assert_eq!(link.tx_payload_max(), 1000_usize.strict_div(8) - 10 - 4);
     // On LE 2M the same time holds twice the octets, less the overhead.
     link.tx_phy = Phy::M2;
-    assert_eq!(link.tx_payload_max(), 1000 / 4 - 11 - 4);
+    assert_eq!(link.tx_payload_max(), 1000_usize.strict_div(4) - 11 - 4);
 }
 
 #[test]
@@ -1712,7 +1725,7 @@ fn host_data_is_sent_in_fragments_the_central_receives() {
     let mut link = connection();
     let mut data = [0; ACL_MAX];
     for (index, byte) in data.iter_mut().enumerate() {
-        *byte = u8::try_from(index).unwrap();
+        *byte = assert_ok!(u8::try_from(index));
     }
     assert!(shared.queue_acl_for_test(&data[..60]));
     link.load_next(&shared);
@@ -1729,7 +1742,7 @@ fn host_data_is_sent_in_fragments_the_central_receives() {
     assert_eq!(link.current().plain.0[3..9], data[54..60]);
     // Only the last fragment completes the host's packet.
     link.tx_kind = TxKind::AclPart;
-    assert_eq!(link.acknowledge(NESN, &shared), Some(()));
+    link.acknowledge(NESN, &shared);
     assert_eq!(link.completed, 0);
 }
 
@@ -1769,10 +1782,10 @@ fn a_length_response_takes_effect_once_acknowledged_and_an_unknown_one_ends_the_
     assert_eq!(link.tx_payload_max(), 27);
     link.current_mut().plain.0[DATA_HEADER_LEN] = OP_LENGTH_RSP;
     link.tx_kind = TxKind::Control;
-    assert_eq!(link.acknowledge(NESN, &shared), Some(()));
+    link.acknowledge(NESN, &shared);
     assert_eq!(link.tx_payload_max(), 251);
     // A central that does not know the procedure is not asked again.
-    let mut link = encrypted();
+    link = encrypted();
     link.features_request = Request::Done;
     link.phy_request = Request::Done;
     link.length.local_tx = LENGTH_MAX;
@@ -1851,7 +1864,7 @@ fn a_host_update_sent_with_the_answer_completes_once_the_central_update_is_in_pl
     assert_eq!(host.request_params(epoch, range), Ok(()));
     assert_eq!(host.reply_params(epoch, Ok(range)), Ok(()));
     link.drive_remote_request(At(10), &shared);
-    let response = *link.queue.front().unwrap();
+    let response = *assert_some!(link.queue.front());
     assert_eq!(response.data[..10], [OP_CONNECTION_PARAM_RSP, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0]);
     link.queue.clear();
     // Nothing of ours starts while the central's update is pending.
@@ -1887,7 +1900,7 @@ fn a_merged_host_update_completes_with_the_central_rejection() {
     link.drive_remote_request(At(10), &shared);
     link.handle_control(&[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_RSP, ERROR_INVALID_PARAMETERS], true);
     link.drive_remote_request(At(20), &shared);
-    assert!(matches!(shared.take_event(), Some(Event::ParamsUpdated { status: ERROR_INVALID_PARAMETERS, .. })));
+    assert!(matches!(shared.take_event(), Some(Event::ParamsUpdated { status: ERROR_INVALID_PARAMETERS, params: _ })));
     assert_eq!(shared.take_event(), None);
 }
 
@@ -1902,7 +1915,7 @@ fn owed_update_complete_events_wait_for_room_instead_of_being_dropped() {
     assert_eq!(link.updates_owed.0, 2);
     // The host reads its events: the rest follows in order.
     let mut updates = 0;
-    for _ in 0..8 {
+    for _ in 0_i32..8_i32 {
         while let Some(event) = shared.take_event() {
             updates += usize::from(event.is_params_update());
         }
@@ -1919,7 +1932,7 @@ fn without_the_data_length_feature_the_link_stays_at_27_octets() {
     assert_eq!(FEATURES[0] & FEATURE_DATA_LENGTH, 0);
     let mut link = connection();
     link.handle_control(&[OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
-    let response = *link.queue.front().unwrap();
+    let response = *assert_some!(link.queue.front());
     assert_eq!(response.data[..9], [OP_LENGTH_RSP, 27, 0, 0x48, 0x01, 27, 0, 0x48, 0x01]);
     assert_eq!(link.length.effective(), [27, 328, 27, 328]);
     assert_eq!(link.tx_payload_max(), 27);
@@ -1961,7 +1974,7 @@ fn a_batch_of_skipped_events_ends_as_the_event_by_event_loop() {
             }
             // Event by event.
             loop {
-                let _ = loop_top(&mut one, &shared);
+                _ = loop_top(&mut one, &shared);
                 if one.skipped >= one.latency {
                     break;
                 }
@@ -1970,17 +1983,17 @@ fn a_batch_of_skipped_events_ends_as_the_event_by_event_loop() {
                 one.counter = one.counter.wrapping_add(1);
             }
             // One batch.
-            let _ = loop_top(&mut batch, &shared);
+            _ = loop_top(&mut batch, &shared);
             let listen = batch.listen_counter();
             batch.skip_to(listen, &shared);
-            let _ = loop_top(&mut batch, &shared);
+            _ = loop_top(&mut batch, &shared);
             assert_eq!(
                 (one.counter, one.skipped, one.stats.skipped),
                 (batch.counter, batch.skipped, batch.stats.skipped)
             );
             assert_eq!(batch.counter, 1030);
             assert_eq!(one.channel_update.is_none(), batch.channel_update.is_none());
-            for _ in 0..40 {
+            for _ in 0_i32..40_i32 {
                 one.counter = one.counter.wrapping_add(1);
                 batch.counter = batch.counter.wrapping_add(1);
                 assert_eq!(loop_top(&mut one, &shared), loop_top(&mut batch, &shared));
@@ -1999,7 +2012,7 @@ fn the_start_of_a_later_event_matches_its_window() {
         assert_eq!(link.window().enable, start);
     }
     // Across the counter and time wrap.
-    let mut link = latent(true);
+    link = latent(true);
     link.anchor = At(u32::MAX - 20_000);
     link.anchor_counter = u16::MAX - 1;
     for offset in [0_u16, 1, 2, 3, 31] {
@@ -2065,7 +2078,10 @@ fn a_ping_point_or_a_reply_deadline_ends_a_batch_early() {
     // Not the ping's due point, which an event listened at anyway takes,
     // but its latest: twice 31 events of 15 ms before the timeout.
     let timeout = shared.payload_timeout();
-    assert_eq!(link.ping_window(timeout), (Micros(timeout.0 - timeout.0 / 4), Micros(timeout.0 - 2 * 31 * 15_000)));
+    assert_eq!(
+        link.ping_window(timeout),
+        (Micros(timeout.0 - timeout.0.strict_div(4)), Micros(timeout.0 - 2 * 31 * 15_000))
+    );
     assert_eq!(link.next_deadline(now, &shared), now.after(Micros(timeout.0 - 930_000)));
     // A timeout too short for that: the due point.
     shared.set_payload_timeout_for_test(100);
@@ -2196,14 +2212,14 @@ fn an_acknowledged_payload_of_ours_holds_the_latency_off_too() {
     let now = link.anchor;
     link.tx_kind = TxKind::Control;
     link.last_valid = now;
-    assert_eq!(link.acknowledge(NESN, &shared), Some(()));
+    link.acknowledge(NESN, &shared);
     assert!(link.tx_kind == TxKind::Empty);
     assert!(!link.can_skip(now.after(Micros(LATENCY_HOLD_US - 1)), &shared));
     assert!(link.can_skip(now.after(Micros(LATENCY_HOLD_US)), &shared));
     // The acknowledgement of an empty PDU holds nothing.
     let mut quiet = latent(false);
     quiet.last_valid = now;
-    assert_eq!(quiet.acknowledge(NESN, &shared), Some(()));
+    quiet.acknowledge(NESN, &shared);
     assert!(quiet.can_skip(now, &shared));
 }
 
@@ -2211,9 +2227,9 @@ fn an_acknowledged_payload_of_ours_holds_the_latency_off_too() {
 fn the_host_can_hold_the_latency_off() {
     let shared = Shared::new();
     let link = latent(false);
-    crate::link::Link::new(&shared).hold_latency(true);
+    Link::new(&shared).hold_latency(true);
     assert!(!link.can_skip(link.anchor, &shared));
-    crate::link::Link::new(&shared).hold_latency(false);
+    Link::new(&shared).hold_latency(false);
     assert!(link.can_skip(link.anchor, &shared));
 }
 
@@ -2233,14 +2249,15 @@ fn encrypted_data_is_marked_before_the_host_learns_of_the_encryption() {
     link.rx_plain.bytes_mut()[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
     assert_eq!(link.receive(rx.0[0], 5, true, 999, &full), Some(true));
     link.stash(&rx, true, &full);
-    let acl = full.take_acl_in().unwrap();
+    let acl = assert_some!(full.take_acl_in());
     assert!(acl.encrypted());
     assert!(!queued_encryption(&full));
 }
 
 /// Whether the host's queue holds an encryption event.
 fn queued_encryption(shared: &Shared) -> bool {
-    core::iter::from_fn(|| shared.take_event()).any(|event| matches!(event, Event::Encryption { on: true, .. }))
+    from_fn(|| shared.take_event())
+        .any(|event| matches!(event, Event::Encryption { on: true, refresh: _, status: _ }))
 }
 
 #[test]
@@ -2262,14 +2279,14 @@ fn data_waits_while_the_host_has_not_got_the_start_of_the_link() {
 fn acknowledged_host_packets_are_counted_for_the_host() {
     let shared = Shared::new();
     shared.set_connected(true);
-    let link_api = crate::link::Link::new(&shared);
+    let link_api = Link::new(&shared);
     let epoch = Epoch::for_test(1);
-    link_api.try_send(epoch, true, &[1]).unwrap();
+    assert_ok!(link_api.try_send(epoch, true, &[1]));
     let mut link = connection();
     link.load_next(&shared);
     assert!(link.tx_kind == TxKind::Acl);
     assert_eq!(link_api.in_flight(epoch), 1);
-    assert_eq!(link.acknowledge(NESN, &shared), Some(()));
+    link.acknowledge(NESN, &shared);
     link.process(&shared);
     assert_eq!(link_api.in_flight(epoch), 0);
     assert_eq!(link_api.acked(), 1);
@@ -2280,17 +2297,6 @@ fn acknowledged_host_packets_are_counted_for_the_host() {
 /// loop's own condition.
 fn listens_at(link: &Connection, shared: &Shared) -> u16 {
     if link.skips(link.expected_anchor(), shared) { link.listen_counter() } else { link.counter }
-}
-
-/// What the central's packets do at an event in these tests.
-#[derive(Clone, Copy)]
-enum Air {
-    /// A packet with a CRC error.
-    Corrupt,
-    /// An empty PDU with a valid CRC.
-    Heard,
-    /// Nothing.
-    Silent,
 }
 
 /// Listens at the current event as the run loop does, through
@@ -2321,7 +2327,7 @@ fn after_an_event_that_heard_nothing_every_event_is_listened_at_until_the_centra
     // One that heard nothing, or only a packet with a CRC error: the next
     // event is listened at, and so is every one after it that hears
     // nothing.
-    let mut link = latent(false);
+    link = latent(false);
     for (counter, air) in (1000..1006_u16).zip([Air::Silent, Air::Corrupt].into_iter().cycle()) {
         assert_eq!(link.counter, counter);
         listen_with(&mut link, &shared, air);
@@ -2339,12 +2345,7 @@ fn after_an_event_that_heard_nothing_every_event_is_listened_at_until_the_centra
 /// `Connection::listened` does); without, a miss leaves the latency to skip
 /// again. Returns that event, or `None` if the supervision timeout ended the
 /// link first.
-fn ride_out(
-    link: &mut Connection,
-    shared: &Shared,
-    fade: core::ops::RangeInclusive<u16>,
-    break_latency: bool,
-) -> Option<u16> {
+fn ride_out(link: &mut Connection, shared: &Shared, fade: RangeInclusive<u16>, break_latency: bool) -> Option<u16> {
     loop {
         if link.ended(link.expected_anchor()).is_some() {
             return None;
@@ -2391,6 +2392,8 @@ fn a_supervision_timeout_of_a_few_latencies_survives_a_fade_over_a_listened_even
 
 #[test]
 fn host_data_queued_while_the_crystal_starts_goes_out_where_the_chip_has_the_time() {
+    use crate::clock::RESTART_EARLY_US;
+
     // The nRF52 chips prepare it once TIMER0 restarted; the nRF51 leaves it
     // for the next event until its setup time is measured.
     assert_eq!(chip::PREPARE_AFTER_RESTART, cfg!(feature = "_nrf52"));
@@ -2399,16 +2402,16 @@ fn host_data_queued_while_the_crystal_starts_goes_out_where_the_chip_has_the_tim
     let shared = Shared::new();
     shared.set_connected(true);
     let packet = [1_u8, 2, 3];
-    for (restart, start, prepares) in [
+    for (restart, start, on_time) in [
         // TIMER0 restarted on time, or an RTC tick early.
         (1000_u32, 1000 + SETUP_US, true),
-        (1000, 1000 + SETUP_US + crate::clock::RESTART_EARLY_US, true),
+        (1000, 1000 + SETUP_US + RESTART_EARLY_US, true),
         // The crystal came up 70 us late.
         (1070, 1000 + SETUP_US, true),
         // Too late for it: the data waits for the next event.
         (1000, 1000 + PREPARE_LATE_US.0, false),
     ] {
-        let prepares = prepares && chip::PREPARE_AFTER_RESTART;
+        let prepares = on_time && chip::PREPARE_AFTER_RESTART;
         let mut link = connection();
         link.start_slots(&shared);
         link.prepare_next(&shared);
@@ -2422,10 +2425,10 @@ fn host_data_queued_while_the_crystal_starts_goes_out_where_the_chip_has_the_tim
         if prepares {
             // The central's acknowledgement at the event sends it.
             let decision =
-                link.decide(Some((Llid::Continuation.bits() | NESN, 0, true)), At(start), true, &shared).unwrap();
+                assert_some!(link.decide(Some((Llid::Continuation.bits() | NESN, 0, true)), At(start), true, &shared));
             assert!(decision.acked.is_some());
             assert!(link.tx_kind == TxKind::Acl);
-            assert_eq!(&link.current().plain.0[DATA_HEADER_LEN..DATA_HEADER_LEN + packet.len()], &packet[..]);
+            assert_eq!(link.current().plain.0.get(DATA_HEADER_LEN..DATA_HEADER_LEN + packet.len()), Some(&packet[..]));
         } else {
             // The next event's preparation takes it; on the nRF51 the
             // host's signal is left for the sleep before it.
@@ -2506,7 +2509,7 @@ fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ende
     link.stats.crc_errors = 3;
     link.stats.received = 40;
     link.stats.retx = 2;
-    link.drift = (-40, Micros(60));
+    link.drift = (-40_i32, Micros(60));
     link.report(link.report_at, CrystalStats { late: 9, lead: Micros(900) }, &shared);
     let reported = counters.counters();
     assert_eq!(
@@ -2514,18 +2517,18 @@ fn the_host_gets_the_counters_of_the_link_with_the_largest_drift_and_how_it_ende
         (1200, 300, 12, 3, 40)
     );
     assert_eq!((reported.retransmissions, reported.late_crystal, reported.crystal_lead_us), (2, 2, 900));
-    assert_eq!((reported.drift_us, reported.widening_us, reported.end), (-40, 60, None));
+    assert_eq!((reported.drift_us, reported.widening_us, reported.end), (-40_i32, 60, None));
     // The log's drift starts again at each report; the host's stays the
     // largest of the link.
     assert_eq!(link.drift, NO_DRIFT);
-    link.drift = (25, Micros(50));
+    link.drift = (25_i32, Micros(50));
     link.report(link.report_at, CrystalStats { late: 9, lead: Micros(898) }, &shared);
-    assert_eq!((counters.counters().drift_us, counters.counters().widening_us), (-40, 60));
+    assert_eq!((counters.counters().drift_us, counters.counters().widening_us), (-40_i32, 60));
     // The end counts the drift since the last report too.
-    link.drift = (70, Micros(80));
+    link.drift = (70_i32, Micros(80));
     link.publish_counters(CrystalStats { late: 10, lead: Micros(998) }, Ended::Lost.link_end(), &shared);
     let ended = counters.counters();
-    assert_eq!((ended.drift_us, ended.widening_us, ended.late_crystal, ended.crystal_lead_us), (70, 80, 3, 998));
+    assert_eq!((ended.drift_us, ended.widening_us, ended.late_crystal, ended.crystal_lead_us), (70_i32, 80, 3, 998));
     assert_eq!(ended.end, Some(End::Timeout));
     assert_eq!(ended.end.map(End::reason), Some(0x08));
 }
