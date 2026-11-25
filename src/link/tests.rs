@@ -221,6 +221,29 @@ fn the_coding_of_new_links_is_s8_until_the_firmware_chooses() {
     assert!(shared.coding() == Coding::S8);
 }
 
+/// A link that starts on LE Coded prefers LE Coded alone until the host
+/// sets the default preferences, which then hold for it as for any link,
+/// until a reset; the other links take the default.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn a_link_that_starts_on_le_coded_prefers_it_until_the_host_chooses() {
+    use crate::radio::Phy;
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    for start in [Phy::CodedS8, Phy::CodedS2] {
+        assert_eq!(shared.preferred_phys_on(start), [4, 4]);
+    }
+    assert_eq!(shared.preferred_phys_on(Phy::M1), [2, 2]);
+    assert_eq!(shared.preferred_phys_on(Phy::M2), [2, 2]);
+    assert_eq!(link.set_default_phy(Some(2), Some(2)), Ok(()));
+    assert_eq!(shared.preferred_phys_on(Phy::CodedS8), [2, 2]);
+    assert_eq!(link.set_default_phy(None, None), Ok(()));
+    assert_eq!(shared.preferred_phys_on(Phy::CodedS2), [7, 7]);
+    shared.signal_reset();
+    shared.complete_reset();
+    assert_eq!(shared.preferred_phys_on(Phy::CodedS8), [4, 4]);
+}
+
 #[cfg(feature = "nrf51")]
 #[test]
 fn without_2m_phy_requests_naming_2m_or_coded_are_unsupported() {

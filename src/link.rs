@@ -92,6 +92,8 @@ use crate::advertiser::extended::fit_interval;
 use crate::power_control::{CEILING_DBM, LEVELS_DBM, ceiling_level};
 #[cfg(feature = "coded-phy")]
 use crate::radio::Coding;
+#[cfg(all(feature = "coded-phy", not(feature = "extended-advertising")))]
+use crate::radio::Phy;
 #[cfg(feature = "extended-advertising")]
 use crate::{advertiser::extended::RENEWAL_LEN, radio::Phy};
 use crate::{
@@ -661,7 +663,10 @@ pub struct AdvParams {
         doc = "",
         doc = "With the feature `coded-phy` also LE Coded, with S=8 or S=2, which the `AUX_ADV_IND`, the \
                `AUX_CONNECT_RSP` and the link go out with. The connection's transmit window then comes 3.75 ms \
-               after the request, and the advertising interval grows to the event's length where that is longer."
+               after the request, and the advertising interval grows to the event's length where that is longer. \
+               Such a link prefers LE Coded alone both ways, so that a central that names every PHY in its \
+               `LL_PHY_REQ` keeps it on LE Coded, unless the host set other preferences with \
+               [`Link::set_default_phy`]."
     )]
     #[cfg(feature = "extended-advertising")]
     pub secondary_phy: Phy,
@@ -804,7 +809,12 @@ struct HostState {
     /// Current receive and transmit PHY, updated at the instant.
     phys:             [u8; 2],
     /// Default transmit and receive PHY preferences.
+    #[cfg(not(feature = "coded-phy"))]
     preferred_phys:   [u8; 2],
+    /// Default transmit and receive PHY preferences the host set with
+    /// [`Link::set_default_phy`], if it did: LE 2M both ways otherwise.
+    #[cfg(feature = "coded-phy")]
+    preferred_phys:   Option<[u8; 2]>,
     /// The last resolvable private address, the key it was made with and
     /// when it expires. Advertising keeps it until then.
     private_address:  Option<(Peer, [u8; 16], Instant)>,
@@ -874,7 +884,10 @@ impl HostState {
             payload_timeout: DEFAULT_PAYLOAD_TIMEOUT,
             phy_pending: None,
             phys: [1, 1],
+            #[cfg(not(feature = "coded-phy"))]
             preferred_phys: [2, 2],
+            #[cfg(feature = "coded-phy")]
+            preferred_phys: None,
             private_address: None,
             private_timeout: PRIVATE_ADDRESS_TIMEOUT,
             queries: 0,
@@ -1122,7 +1135,29 @@ impl Shared {
     }
 
     /// Default PHY preference for new connections.
+    #[cfg(not(feature = "coded-phy"))]
     pub(crate) fn preferred_phys(&self) -> [u8; 2] { self.state.lock(|cell| cell.borrow().preferred_phys) }
+
+    /// Default PHY preference for new connections: the host's, or LE 2M
+    /// both ways.
+    #[cfg(feature = "coded-phy")]
+    pub(crate) fn preferred_phys(&self) -> [u8; 2] {
+        self.state.lock(|cell| cell.borrow().preferred_phys).unwrap_or([2, 2])
+    }
+
+    /// PHY preference of a new connection that starts on `start`: the
+    /// default, and LE Coded alone both ways on a link that starts on LE
+    /// Coded unless the host set the default with [`Link::set_default_phy`].
+    /// A central that names every PHY in its `LL_PHY_REQ` then keeps such a
+    /// link on LE Coded, whose range it was started for, rather than moving
+    /// it to LE 2M.
+    #[cfg(feature = "coded-phy")]
+    pub(crate) fn preferred_phys_on(&self, start: Phy) -> [u8; 2] {
+        if start.is_coded() && self.state.lock(|cell| cell.borrow().preferred_phys.is_none()) {
+            return [start.bit(); 2];
+        }
+        self.preferred_phys()
+    }
 
     /// The key of the resolvable private address the current advertising
     /// settings ask for, if any.
@@ -2078,7 +2113,10 @@ impl<'shared> Link<'shared> {
         feature = "coded-phy",
         doc = "",
         doc = "With the feature `coded-phy` also bit 2 for LE Coded, whose coding this side sends with is \
-               [`Self::set_coding`]'s."
+               [`Self::set_coding`]'s. A link that extended advertising on LE Coded starts prefers LE Coded alone \
+               both ways until the host calls this function; from then on it takes these preferences like any \
+               other, and with LE 2M among them a central that names every PHY moves it to LE 2M.",
+        doc = ""
     )]
     /// # Errors
     ///
@@ -2087,7 +2125,10 @@ impl<'shared> Link<'shared> {
     #[inline]
     pub fn set_default_phy(&self, tx: Option<u8>, rx: Option<u8>) -> Result<(), Error> {
         let preferences = phy_preferences(tx, rx)?;
+        #[cfg(not(feature = "coded-phy"))]
         self.shared.state.lock(|cell| cell.borrow_mut().preferred_phys = preferences);
+        #[cfg(feature = "coded-phy")]
+        self.shared.state.lock(|cell| cell.borrow_mut().preferred_phys = Some(preferences));
         Ok(())
     }
 

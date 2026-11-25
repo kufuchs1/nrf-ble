@@ -1008,6 +1008,21 @@ fn a_link_that_starts_on_le_coded_keeps_the_coding_it_started_with() {
     assert!(link.coding == Coding::S2);
 }
 
+/// A link that LE Coded advertising started, with the preferences such a
+/// link gets by default, answers a central that names every PHY with LE
+/// Coded alone, so the central keeps it on LE Coded.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn a_link_started_on_le_coded_answers_a_request_for_every_phy_with_le_coded() {
+    let shared = Shared::new();
+    let setup = Setup { phy: Phy::CodedS8, window_delay_us: 3750 };
+    let mut link = critical_section::with(|_| Connection::new(&REQUEST, 100, setup));
+    link.set_preferred_phys(shared.preferred_phys_on(setup.phy));
+    link.handle_control(&[OP_PHY_REQ, 7, 7], false);
+    let answer = *assert_some!(link.queue.front());
+    assert_eq!(answer.data[..3], [OP_PHY_RSP, 4, 4]);
+}
+
 /// The air time of an exchange on LE Coded: our longest answer twice and the
 /// central's longest packet, 27 octets with S=8, with three interframe
 /// spaces, each packet with the S1 octet in RAM counted, which errs on the

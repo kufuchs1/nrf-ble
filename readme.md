@@ -646,7 +646,9 @@ the specification's, not measured with this crate.
   (`Link::set_phy` and `Link::set_default_phy` take bit 2). Events and `Link::phy` report LE Coded as 3, HCI's value.
   A link receives LE Coded in the radio's mode of S=8 and sends with its own coding, which the procedure leaves to each
   side: `Link::set_coding(Coding::S8)`, the default, or `Coding::S2`, for the links that start afterwards. A link that
-  extended advertising on LE Coded starts sends with the advertising's coding.
+  extended advertising on LE Coded starts sends with the advertising's coding, and prefers LE Coded alone both ways
+  until the host calls `Link::set_default_phy`: a central that names every PHY in its `LL_PHY_REQ` would otherwise
+  move it to LE 2M, which a link at long range is likely to lose.
 - **Timing:** from Zephyr's `radio_nrf52833.h` (commit 02f236e1): 42.3 µs from TXEN to the first bit on LE Coded, a
   receive chain of 29.6 µs with S=8 and 24.6 µs with S=2 (the header's comment says 19.6), the receiver ready after
   40.3 µs as on LE 1M; the access address event 376 µs after the packet's start (Zephyr's `addr_us_get`). The anchor

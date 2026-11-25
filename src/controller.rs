@@ -148,7 +148,10 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         radio.set_access_address(request.access_address);
         radio.set_crc_init(request.crc_init);
         let mut connection = Connection::new(&request, end, setup);
+        #[cfg(not(feature = "coded-phy"))]
         connection.set_preferred_phys(shared.preferred_phys());
+        #[cfg(feature = "coded-phy")]
+        connection.set_preferred_phys(shared.preferred_phys_on(setup.phy));
         #[cfg(feature = "nrf52833")]
         connection.set_max_power(shared.max_power());
         connection.set_suggested_length(shared.suggested_length());
