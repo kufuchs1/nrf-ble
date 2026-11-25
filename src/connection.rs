@@ -227,6 +227,10 @@ const UNKNOWN_REDUCTION: u8 = 0xFF;
 const ERROR_DIFFERENT_TRANSACTION: u8 = 0x2A;
 /// Offset field of a connection parameter request without a preference.
 const NO_OFFSET: [u8; 2] = [0xFF, 0xFF];
+/// PHYs with a power control of their own: LE 1M and LE 2M, and with the
+/// feature `coded-phy` LE Coded with S=8 and with S=2, the PHYs of the power
+/// control procedures (Core, Vol 6, Part B, 2.4.2.31).
+const POWER_PHYS: usize = if cfg!(feature = "coded-phy") { 4 } else { 2 };
 
 /// Why a connection ended.
 #[derive(Clone, Copy)]
@@ -720,8 +724,8 @@ pub struct Connection {
     anchor:                 At,
     /// Event counter of [`Self::anchor`].
     anchor_counter:         u16 = 0,
-    /// Transmit power level the central last learned.
-    announced_power:        [usize; 2],
+    /// Transmit power level the central last learned, per PHY.
+    announced_power:        [usize; POWER_PHYS],
     /// The central's features, once known.
     central_features:       Option<[u8; 8]>,
     /// Channel map update and its instant.
@@ -814,9 +818,10 @@ pub struct Connection {
     phy_update:             Option<(Phy, u16)>,
     /// Response deadline of our `LL_PING_REQ` (Core, Vol 6, Part B, 5.2).
     ping_request:           Option<At> = None,
-    /// Transmit power control.
-    power:                  [PowerControl; 2],
-    /// PHY mask for which the peer has requested power control.
+    /// Transmit power control, per PHY.
+    power:                  [PowerControl; POWER_PHYS],
+    /// PHYs for which the central asked for power control, as the bits of
+    /// [`Phy::power_bit`].
     power_reporting:        u8 = 0,
     /// PHY preference for this connection.
     preferred_phys:         [u8; 2],
@@ -998,7 +1003,7 @@ impl Connection {
         if level == *for_phy_mut(&mut self.announced_power, self.tx_phy)
             || !supports
             || !free
-            || self.power_reporting & self.tx_phy.hci() == 0
+            || self.power_reporting & self.tx_phy.power_bit() == 0
         {
             return;
         }
@@ -1007,7 +1012,7 @@ impl Connection {
         let delta: i8 = i32::from(now).saturating_sub(before).saturating_cast();
         self.enqueue(Llid::Control, &[
             OP_POWER_CHANGE_IND,
-            self.tx_phy.hci(),
+            self.tx_phy.power_bit(),
             limit_flags(level, top),
             delta.cast_unsigned(),
             now.cast_unsigned(),
@@ -2110,7 +2115,7 @@ impl Connection {
     /// its own. An unknown acceptable reduction is reported as 0xFF.
     fn handle_power(&mut self, params: &[u8]) {
         let Some([phy, delta, central_power]) = field::<3>(params, 0) else { return };
-        let error = if Phy::from_bits(phy).is_none() {
+        let error = if Phy::from_power(phy).is_none() {
             Some(ERROR_UNSUPPORTED_VALUE)
         } else if central_power == 126 {
             Some(ERROR_INVALID_PARAMETERS)
@@ -2121,7 +2126,7 @@ impl Connection {
             self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_POWER_CONTROL_REQ, reason]);
             return;
         }
-        let Some(request_phy) = Phy::from_bits(phy) else { return };
+        let Some(request_phy) = Phy::from_power(phy) else { return };
         let before = tx_power(for_phy_mut(&mut self.power, request_phy).level());
         let requested = if delta == 0x7F {
             i32::from(i8::MAX)
@@ -2135,7 +2140,12 @@ impl Connection {
         let highest = tx_power(top);
         let requested_level = allowed.iter().copied().find(|&level| i32::from(level) >= requested).unwrap_or(highest);
         for_phy_mut(&mut self.power, request_phy).move_to(i32::from(requested_level));
-        self.power_reporting |= phy;
+        // The value of LE 1M and LE 2M is their bit as well.
+        #[cfg(not(feature = "coded-phy"))]
+        let reporting = phy;
+        #[cfg(feature = "coded-phy")]
+        let reporting = request_phy.power_bit();
+        self.power_reporting |= reporting;
         let level = for_phy_mut(&mut self.power, request_phy).level();
         let now = tx_power(level);
         let change: i8 = i32::from(now).saturating_sub(i32::from(before)).saturating_cast();
@@ -2298,7 +2308,7 @@ impl Connection {
             length: DataLength::new(LENGTH_DEFAULT),
             notifications: [None; 3],
             anchor: ended,
-            announced_power: [DEFAULT_LEVEL; 2],
+            announced_power: [DEFAULT_LEVEL; POWER_PHYS],
             central_features: None,
             channel_update: None,
             drift: NO_DRIFT,
@@ -2327,7 +2337,7 @@ impl Connection {
             param_update: None,
             payload_timer: None,
             phy_update: None,
-            power: [PowerControl::new(); 2],
+            power: [PowerControl::new(); POWER_PHYS],
             report_at: ended.after(REPORT_INTERVAL_US),
             reported: (Stats::default(), 0),
             queue: Ring::new(Queued { data: [0; CONTROL_PAYLOAD_MAX], len: 0, llid: Llid::Continuation }),
@@ -3007,12 +3017,20 @@ impl Connection {
     }
 
     /// Applies the firmware's transmit power ceiling in dBm when
-    /// establishing a new link, on both PHYs.
+    /// establishing a new link, on every PHY.
     #[cfg(feature = "nrf52833")]
     pub(crate) const fn set_max_power(&mut self, dbm: i8) {
+        #[cfg(not(feature = "coded-phy"))]
         let &mut [ref mut one, ref mut two] = &mut self.power;
+        #[cfg(feature = "coded-phy")]
+        let &mut [ref mut one, ref mut two, ref mut s8, ref mut s2] = &mut self.power;
         one.set_ceiling(dbm);
         two.set_ceiling(dbm);
+        #[cfg(feature = "coded-phy")]
+        {
+            s8.set_ceiling(dbm);
+            s2.set_ceiling(dbm);
+        }
     }
 
     /// Applies the default PHY preference when establishing a new link.
@@ -3393,11 +3411,26 @@ fn log_radio(radio: &Radio<'_>) {
 }
 
 /// Selects per-PHY state without indexing or a fallible conversion.
-const fn for_phy_mut<Value>(values: &mut [Value; 2], phy: Phy) -> &mut Value {
+#[cfg(not(feature = "coded-phy"))]
+const fn for_phy_mut<Value>(values: &mut [Value; POWER_PHYS], phy: Phy) -> &mut Value {
     let &mut [ref mut one, ref mut two] = values;
     match phy {
         Phy::M1 => one,
         Phy::M2 => two,
+    }
+}
+
+/// Selects per-PHY state without indexing or a fallible conversion: LE
+/// Coded keeps one for each coding, as the power control procedures tell
+/// them apart.
+#[cfg(feature = "coded-phy")]
+const fn for_phy_mut<Value>(values: &mut [Value; POWER_PHYS], phy: Phy) -> &mut Value {
+    let &mut [ref mut one, ref mut two, ref mut s8, ref mut s2] = values;
+    match phy {
+        Phy::M1 => one,
+        Phy::M2 => two,
+        Phy::CodedS8 => s8,
+        Phy::CodedS2 => s2,
     }
 }
 

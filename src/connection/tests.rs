@@ -831,7 +831,10 @@ fn phy_updates_without_a_change_asymmetric_or_coded_are_handled() {
     link.handle_control(&[OP_PHY_UPDATE_IND, 0, 0, 10, 0], true);
     assert_eq!(link.abort, None);
     assert!(link.phy_update.is_none());
-    for (to_peripheral, to_central) in [(4, 4), (3, 3)] {
+    // Two PHYs at once name none; LE Coded is one only with the feature
+    // `coded-phy`.
+    let refused: &[(u8, u8)] = if cfg!(feature = "coded-phy") { &[(3, 3), (6, 4)] } else { &[(4, 4), (3, 3)] };
+    for &(to_peripheral, to_central) in refused {
         link = encrypted();
         link.handle_control(&[OP_PHY_UPDATE_IND, to_peripheral, to_central, 10, 0], true);
         assert_eq!(link.abort, Some(ERROR_UNSUPPORTED_VALUE));
@@ -1321,7 +1324,9 @@ fn power_requests_for_2m_are_refused_and_round_up_without_3_dbm() {
 #[cfg(feature = "_nrf52")]
 #[test]
 fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
-    for phy in [0, 3, 4, 8, 255] {
+    // LE Coded's 3 and 4 name a PHY with the feature `coded-phy` only.
+    let refused: &[u8] = if cfg!(feature = "coded-phy") { &[0, 5, 8, 255] } else { &[0, 3, 4, 8, 255] };
+    for &phy in refused {
         let mut link = connection();
         link.handle_control(&[OP_POWER_CONTROL_REQ, phy, 0, 0], false);
         assert_eq!(assert_some!(link.queue.front()).data[..3], [
@@ -1340,6 +1345,36 @@ fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
     link.queue.clear();
     link.handle_control(&[OP_POWER_CONTROL_REQ, 2, 0x7F, 0], false);
     assert_eq!(tx_power(link.power[1].level()), 4);
+}
+
+/// LE Coded with S=8 and with S=2 are the power control's PHYs 3 and 4,
+/// each with a power of its own, and bits 2 and 3 of the PHYs whose changes
+/// the central learns.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn each_coding_of_le_coded_has_a_power_control_of_its_own() {
+    let mut link = connection();
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 3, (-6_i8).cast_unsigned(), 0], false);
+    assert_eq!(assert_some!(link.queue.front()).data[0], OP_POWER_CONTROL_RSP);
+    link.queue.clear();
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 4, 0x7F, 0], false);
+    // -6 dBm rounds up to -4 dBm; the maximum stops at the ceiling.
+    let powers = link.power.map(|control| tx_power(control.level()));
+    assert_eq!(powers, [0, 0, -4, 4]);
+    assert_eq!(link.power_reporting, 0b1100);
+    // A change on S=2 is announced with bit 3.
+    let shared = Shared::new();
+    link = encrypted();
+    link.phy_request = Request::Done;
+    link.features_request = Request::Done;
+    link.central_features = Some([0x1F, 0, 0, 0, 0x06, 0, 0, 0]);
+    link.tx_phy = Phy::CodedS2;
+    link.power_reporting = 0b1000;
+    link.power[3].on_loss();
+    link.start_procedures(At(0), &shared);
+    let raised = LEVELS_DBM[DEFAULT_LEVEL + 1].cast_unsigned();
+    let indication = *assert_some!(link.queue.front());
+    assert_eq!(indication.data[..5], [OP_POWER_CHANGE_IND, 0b1000, 0, raised, raised]);
 }
 
 #[test]

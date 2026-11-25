@@ -402,13 +402,16 @@ fn arm(radio: &mut Radio<'_>, clock: &mut Clock<'_>, at: At) -> bool {
 
 /// Airtime of a packet with `payload_len` octets of payload on `phy`:
 /// preamble, access address, header, payload and CRC, at 8 us per octet on
-/// LE 1M and 4 us on LE 2M, whose preamble is two octets.
+/// LE 1M and 4 us on LE 2M, whose preamble is two octets, and on LE Coded
+/// as [`Phy::pdu_us`] has it.
 #[inline]
 #[must_use = "the time is only computed"]
 pub const fn airtime_us(phy: Phy, payload_len: usize) -> u32 {
     let (overhead, octet_us): (u32, u32) = match phy {
         Phy::M1 => (10, 8),
         Phy::M2 => (11, 4),
+        #[cfg(feature = "coded-phy")]
+        Phy::CodedS8 | Phy::CodedS2 => return phy.pdu_us(payload_len.saturating_add(HEADER_LEN)),
     };
     payload_len.saturating_cast::<u32>().saturating_add(overhead).saturating_mul(octet_us)
 }

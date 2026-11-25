@@ -8,6 +8,10 @@ mod switch;
 #[cfg(feature = "_nrf52")]
 #[path = "radio/switch_timer.rs"]
 mod switch;
+/// The tests of the PHYs.
+#[cfg(test)]
+#[path = "radio/tests.rs"]
+mod tests;
 
 #[cfg(feature = "_nrf52")] use crate::crypto;
 use crate::{chip, pdu::BUFFER_LEN, sleep};
@@ -24,6 +28,8 @@ use embassy_nrf::{
     },
     peripherals::{RADIO, RNG},
 };
+#[cfg(feature = "coded-phy")]
+use embassy_nrf::{pac::PPI, peripherals::PPI_CH18};
 #[cfg(feature = "_nrf52")]
 use embassy_nrf::{
     peripherals::{PPI_CH4, PPI_CH5, PPI_CH25, TIMER1},
@@ -33,6 +39,13 @@ use embassy_nrf::{
 #[cfg(feature = "_nrf52")]
 pub(crate) use switch::{PPI_SWITCH_ENABLE, PPI_SWITCH_START};
 
+/// Time on air of the part of an LE Coded packet always sent with S=8.
+///
+/// It is the preamble (80 us), access address (256 us), coding indicator
+/// (16 us) and TERM1 (24 us) (Core, Vol 6, Part B, 2.2; Zephyr's
+/// `CODED_PHY_*_TIME_US` in `pdu.h`).
+#[cfg(feature = "coded-phy")]
+pub const CODED_ADDRESS_US: u32 = 376;
 /// Base address length in bytes.
 const BASE_ADDRESS_LEN: u8 = 3;
 /// BLE CRC polynomial x^24 + x^10 + x^9 + x^6 + x^4 + x^3 + x + 1.
@@ -86,49 +99,145 @@ pub type PacketBuffer = Buffer<BUFFER_LEN>;
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Phy {
+    /// LE Coded with S=2: 500 kbit/s after the same S=8 part as
+    /// [`Self::CodedS8`], twice the airtime of LE 1M for the header,
+    /// payload and CRC. Only a transmit PHY.
+    #[cfg(feature = "coded-phy")]
+    CodedS2,
+    /// LE Coded with S=8: 125 kbit/s, eight times the airtime of LE 1M for
+    /// the header, payload and CRC, after a preamble, access address,
+    /// coding indicator and TERM1 always sent with S=8. As a receive PHY it
+    /// stands for LE Coded with either coding: the radio decodes both, by
+    /// the coding indicator of each packet.
+    #[cfg(feature = "coded-phy")]
+    CodedS8,
     /// LE 1M: 1 Mbit/s, 8-bit preamble.
     M1,
     /// LE 2M: 2 Mbit/s, 16-bit preamble, half the airtime.
     M2,
 }
 
+/// The coding of the packets this side sends on LE Coded: S=8 for the
+/// longest range, S=2 for a quarter of the airtime of the header, payload
+/// and CRC.
+#[cfg(feature = "coded-phy")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Coding {
+    /// S=2, 500 kbit/s.
+    S2,
+    /// S=8, 125 kbit/s.
+    S8,
+}
+
 impl Phy {
-    /// Time from the start of a packet to the end of its access address:
-    /// 8 preamble and 32 address bits at 1 Mbit/s, 16 and 32 at 2 Mbit/s.
+    /// Time from the start of a packet to its access address event: 8
+    /// preamble and 32 address bits at 1 Mbit/s, 16 and 32 at 2 Mbit/s,
+    /// and on LE Coded the 80 us preamble, the 256 us access address, the
+    /// 16 us coding indicator and the 24 us TERM1, 376 us, after which the
+    /// radio knows the packet's coding. The time of LE Coded is Zephyr's
+    /// (`addr_us_get` in `lll_tim_internal.h`: `case BIT(2): return 376;`).
     #[inline]
     #[must_use = "the time is only computed"]
     pub const fn address_offset_us(self) -> u32 {
         match self {
             Self::M1 => 40,
             Self::M2 => 24,
+            #[cfg(feature = "coded-phy")]
+            Self::CodedS8 | Self::CodedS2 => CODED_ADDRESS_US,
         }
     }
 
-    /// The PHY of a link layer PHY bit field with exactly one of 1M and 2M,
-    /// if the radio has it: the nRF51 has LE 1M alone.
+    /// The bit of the PHY in a link layer PHY bit field: bit 0 for LE 1M,
+    /// bit 1 for LE 2M and bit 2 for LE Coded with either coding.
+    #[inline]
+    #[must_use = "the bit is only computed"]
+    pub const fn bit(self) -> u8 {
+        match self {
+            Self::M1 => 1,
+            Self::M2 => 2,
+            #[cfg(feature = "coded-phy")]
+            Self::CodedS8 | Self::CodedS2 => 4,
+        }
+    }
+
+    /// LE Coded with `coding`.
+    #[cfg(feature = "coded-phy")]
+    #[inline]
+    #[must_use = "the PHY is only built"]
+    pub const fn coded(coding: Coding) -> Self {
+        match coding {
+            Coding::S8 => Self::CodedS8,
+            Coding::S2 => Self::CodedS2,
+        }
+    }
+
+    /// The PHY of a link layer PHY bit field with exactly one of 1M, 2M and
+    /// LE Coded, if the radio has it: the nRF51 has LE 1M alone, and only
+    /// the nRF52833 with the feature `coded-phy` has LE Coded, which decodes
+    /// as [`Self::CodedS8`], the PHY the radio receives LE Coded in.
     #[inline]
     #[must_use = "the PHY is only decoded"]
     pub const fn from_bits(bits: u8) -> Option<Self> {
         match bits {
             1 => Some(Self::M1),
             2 if chip::PHY_2M => Some(Self::M2),
+            #[cfg(feature = "coded-phy")]
+            4 => Some(Self::CodedS8),
             _ => None,
         }
     }
 
-    /// The link layer and HCI value of the PHY.
+    /// The PHY of the power control procedures' PHY value (Core, Vol 6,
+    /// Part B, 2.4.2.31): 1 for LE 1M, 2 for LE 2M, and with the feature
+    /// `coded-phy` 3 for LE Coded with S=8 and 4 with S=2, if the radio has
+    /// it.
+    #[inline]
+    #[must_use = "the PHY is only decoded"]
+    pub const fn from_power(value: u8) -> Option<Self> {
+        match value {
+            #[cfg(feature = "coded-phy")]
+            3 => Some(Self::CodedS8),
+            #[cfg(feature = "coded-phy")]
+            4 => Some(Self::CodedS2),
+            _ => Self::from_bits(value),
+        }
+    }
+
+    /// The HCI value of the PHY: 1 for LE 1M, 2 for LE 2M and 3 for LE
+    /// Coded with either coding.
     #[inline]
     #[must_use = "the value is only computed"]
     pub const fn hci(self) -> u8 {
         match self {
             Self::M1 => 1,
             Self::M2 => 2,
+            #[cfg(feature = "coded-phy")]
+            Self::CodedS8 | Self::CodedS2 => 3,
+        }
+    }
+
+    /// Whether the PHY is LE Coded.
+    #[inline]
+    #[must_use = "the property is only read"]
+    pub const fn is_coded(self) -> bool {
+        match self {
+            Self::M1 | Self::M2 => false,
+            #[cfg(feature = "coded-phy")]
+            Self::CodedS8 | Self::CodedS2 => true,
         }
     }
 
     /// TIMER RXEN offset from the END of our packet sent on this PHY, so the
     /// receiver is ready shortly before a packet one interframe space later.
     /// The fast ramp-up and TX chain timings follow Zephyr's Nordic HAL.
+    #[cfg_attr(
+        feature = "coded-phy",
+        doc = "",
+        doc = "On LE Coded the nRF52833's receiver is ready after 40.3 us with the fast ramp-up and its transmit \
+               chain takes 0.6 us, as on LE 1M (`HAL_RADIO_NRF52833_RXEN_RXIDLE_RX_S8_FAST_NS` and `_S2_FAST_NS` \
+               40300, `HAL_RADIO_NRF52833_TX_CHAIN_DELAY_S8_NS` and `_S2_NS` 600), so the offset is the same."
+    )]
     #[cfg(feature = "_nrf52")]
     #[must_use = "the delay is only computed"]
     #[inline]
@@ -138,9 +247,66 @@ impl Phy {
         150_u32.saturating_sub(delay).saturating_sub(RX_EARLY_US)
     }
 
+    /// The most PDU octets, header, payload and MIC, a packet on LE Coded
+    /// with this coding carries within `us` microseconds on the air: the
+    /// inverse of [`Self::pdu_us`], 33 octets in 2704 us with S=8.
+    #[cfg(feature = "coded-phy")]
+    #[inline]
+    #[must_use = "the length is only computed"]
+    pub const fn pdu_octets_within(self, us: u32) -> u32 {
+        let us_per_bit: u32 = if matches!(self, Self::CodedS2) { 2 } else { 8 };
+        us.saturating_sub(CODED_ADDRESS_US).strict_div(us_per_bit).saturating_sub(27).strict_div(8)
+    }
+
+    /// Time on air of a packet whose PDU, header, payload and MIC, holds
+    /// `pdu_octets` octets: preamble, access address, PDU and CRC at 8 us
+    /// an octet on LE 1M and 4 us on LE 2M, whose preamble is two octets;
+    /// on LE Coded the 376 us of preamble, access address, coding indicator
+    /// and TERM1, then the PDU, the CRC and the three bits of TERM2 at 8 us
+    /// a bit with S=8 and 2 us with S=2 (Core, Vol 6, Part B, 2.2; Zephyr's
+    /// `PDU_US` in `pdu.h`). An empty PDU takes 80 us on LE 1M and 720 us
+    /// with S=8; 27 octets with a MIC take 328 us on LE 1M, 2704 us with
+    /// S=8 and 958 us with S=2.
+    #[inline]
+    #[must_use = "the time is only computed"]
+    pub const fn pdu_us(self, pdu_octets: usize) -> u32 {
+        let octets: u32 = pdu_octets.saturating_cast();
+        match self {
+            Self::M1 => octets.saturating_add(8).saturating_mul(8),
+            Self::M2 => octets.saturating_add(9).saturating_mul(4),
+            #[cfg(feature = "coded-phy")]
+            Self::CodedS8 => coded_block2_bits(octets).saturating_mul(8).saturating_add(CODED_ADDRESS_US),
+            #[cfg(feature = "coded-phy")]
+            Self::CodedS2 => coded_block2_bits(octets).saturating_mul(2).saturating_add(CODED_ADDRESS_US),
+        }
+    }
+
+    /// The bit of the PHY in the PHY bit field of `LL_POWER_CHANGE_IND` and
+    /// of the power reports a central asks for (Core, Vol 6, Part B,
+    /// 2.4.2.33): bit 0 for LE 1M, bit 1 for LE 2M, bit 2 for LE Coded with
+    /// S=8 and bit 3 with S=2.
+    #[inline]
+    #[must_use = "the bit is only computed"]
+    pub const fn power_bit(self) -> u8 {
+        match self {
+            Self::M1 => 1,
+            Self::M2 => 2,
+            #[cfg(feature = "coded-phy")]
+            Self::CodedS8 => 4,
+            #[cfg(feature = "coded-phy")]
+            Self::CodedS2 => 8,
+        }
+    }
+
     /// TIMER TXEN offset from RX END for a 150-us interframe space: the
     /// chip's fast ramp-up and RX chain timings of Zephyr's Nordic HAL,
     /// rounded to the microsecond.
+    #[cfg_attr(
+        feature = "coded-phy",
+        doc = "",
+        doc = "A packet received on LE Coded is `receive` [`Self::CodedS8`] or [`Self::CodedS2`] by the coding it \
+               came with ([`Radio::received`]): the receive chain takes 29.6 us with S=8 and 24.6 us with S=2."
+    )]
     #[cfg(feature = "_nrf52")]
     #[must_use = "the delay is only computed"]
     #[inline]
@@ -149,6 +315,13 @@ impl Phy {
             chip::tx_ready_ns(self).saturating_add(chip::rx_chain_ns(receive)).saturating_add(500).strict_div(1000);
         150_u32.saturating_sub(delay)
     }
+
+    /// The PHY with `coding` if it is LE Coded, otherwise itself: a
+    /// transmit PHY with this side's coding.
+    #[cfg(feature = "coded-phy")]
+    #[inline]
+    #[must_use = "the PHY is only built"]
+    pub const fn with_coding(self, coding: Coding) -> Self { if self.is_coded() { Self::coded(coding) } else { self } }
 }
 
 /// What the radio does after a packet.
@@ -173,12 +346,17 @@ pub enum Turnaround {
 /// it owns for its lifetime.
 ///
 /// They are the programmable channels 4 and 5 of the turnaround, and the
-/// fixed channel 25, from the access address to the CCM's decryption.
+/// fixed channel 25, from the access address to the CCM's decryption; with
+/// the feature `coded-phy` also the programmable channel 18, from the
+/// radio's RATEBOOST to the CCM's RATEOVERRIDE.
 /// [`crate::PPI_CHANNELS`] holds every channel of the link layer.
 #[cfg(feature = "_nrf52")]
 pub struct Ppi<'peripherals> {
     /// Fixed channel 25: RADIO ADDRESS to CCM CRYPT.
     _crypt:         Peri<'peripherals, PPI_CH25>,
+    /// Channel 18: RADIO RATEBOOST to CCM RATEOVERRIDE.
+    #[cfg(feature = "coded-phy")]
+    _rate:          Peri<'peripherals, PPI_CH18>,
     /// Channel 5: TIMER1 COMPARE0 to RADIO TXEN or RXEN.
     _switch_enable: Peri<'peripherals, PPI_CH5>,
     /// Channel 4: RADIO END to TIMER1 START.
@@ -187,20 +365,30 @@ pub struct Ppi<'peripherals> {
 
 #[cfg(feature = "_nrf52")]
 impl<'peripherals> Ppi<'peripherals> {
-    /// Takes the channels 4, 5 and 25.
+    /// Takes the channels 4, 5 and 25, and with the feature `coded-phy`
+    /// channel 18.
     #[inline]
     #[must_use = "the channels are only claimed while the radio holds them"]
     pub fn new(
         switch_start: Peri<'peripherals, PPI_CH4>,
         switch_enable: Peri<'peripherals, PPI_CH5>,
         crypt: Peri<'peripherals, PPI_CH25>,
+        #[cfg(feature = "coded-phy")] rate: Peri<'peripherals, PPI_CH18>,
     ) -> Self {
         debug_assert_eq!(
             [switch_start.number(), switch_enable.number(), crypt.number()],
             [PPI_SWITCH_START, PPI_SWITCH_ENABLE, crypto::PPI_CRYPT],
             "a PPI channel of the radio is not its token"
         );
-        Self { _crypt: crypt, _switch_enable: switch_enable, _switch_start: switch_start }
+        #[cfg(feature = "coded-phy")]
+        debug_assert_eq!(rate.number(), crypto::PPI_RATE, "the rate channel of the radio is not its token");
+        Self {
+            _crypt: crypt,
+            #[cfg(feature = "coded-phy")]
+            _rate: rate,
+            _switch_enable: switch_enable,
+            _switch_start: switch_start,
+        }
     }
 }
 
@@ -247,6 +435,8 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.events_end().write_value(0);
         REGS.events_disabled().write_value(0);
         REGS.events_rssiend().write_value(0);
+        #[cfg(feature = "coded-phy")]
+        REGS.events_rateboost().write_value(0);
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -322,6 +512,10 @@ impl<'peripherals> Radio<'peripherals> {
         chip::fast_ramp_up();
         chip::set_tifs(IFS_US);
         switch::init();
+        #[cfg(feature = "coded-phy")]
+        PPI.ch(crypto::PPI_RATE).eep().write_value(REGS.events_rateboost().as_ptr().addr().strict_cast());
+        #[cfg(feature = "coded-phy")]
+        PPI.ch(crypto::PPI_RATE).tep().write_value(crypto::rate_override_task());
         REGS.pcnf0().write(|w| {
             w.set_lflen(LENGTH_BITS);
             w.set_s0len(true);
@@ -398,6 +592,8 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.events_address().write_value(0);
         REGS.events_end().write_value(0);
         REGS.events_rssiend().write_value(0);
+        #[cfg(feature = "coded-phy")]
+        REGS.events_rateboost().write_value(0);
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -411,6 +607,22 @@ impl<'peripherals> Radio<'peripherals> {
     pub fn receive(&mut self) {
         self.check_receivable();
         REGS.tasks_rxen().write_value(1);
+    }
+
+    /// The PHY the last packet received on `phy` came with: on LE Coded
+    /// [`Phy::CodedS2`] if the radio switched to S=2 at its coding indicator
+    /// (its RATEBOOST event, "`Ble_LR` CI field received, receive mode is
+    /// changed from `Ble_LR125Kbit` to `Ble_LR500Kbit`" in the PAC), otherwise
+    /// [`Phy::CodedS8`]; `phy` itself on LE 1M and LE 2M. Zephyr reads the
+    /// same event (`radio_phy_flags_rx_get` in `radio.c`).
+    #[cfg(feature = "coded-phy")]
+    #[inline]
+    #[must_use = "the PHY is only read"]
+    pub fn received(&self, phy: Phy) -> Phy {
+        if !phy.is_coded() {
+            return phy;
+        }
+        if REGS.events_rateboost().read() != 0 { Phy::CodedS2 } else { Phy::CodedS8 }
     }
 
     /// The packet layout, interframe space and whitening as the radio holds
@@ -520,6 +732,14 @@ impl<'peripherals> Radio<'peripherals> {
         if turnaround == Turnaround::Receive {
             self.check_receivable();
         }
+        // TIMER1 is armed before the packet, whose coding sets the receive
+        // chain's delay on LE Coded: an answer to such a packet is started
+        // from TIMER0 once its coding is known.
+        #[cfg(feature = "coded-phy")]
+        debug_assert!(
+            turnaround != Turnaround::Transmit || !self.phy.is_coded(),
+            "a turnaround to send armed before a packet on LE Coded"
+        );
         #[cfg(feature = "nrf51")]
         switch::arm(turnaround);
         #[cfg(feature = "_nrf52")]
@@ -642,3 +862,8 @@ const fn frequency(channel: u8) -> u8 {
         _ => 2,
     }
 }
+
+/// Bits of the second FEC block of an LE Coded packet whose PDU holds
+/// `pdu_octets` octets: the PDU, the 24-bit CRC and the 3-bit TERM2.
+#[cfg(feature = "coded-phy")]
+const fn coded_block2_bits(pdu_octets: u32) -> u32 { pdu_octets.saturating_mul(8).saturating_add(27) }

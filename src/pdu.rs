@@ -371,6 +371,8 @@ impl AuxPtr {
         let phy: u16 = match self.phy {
             Phy::M1 => 0,
             Phy::M2 => 1,
+            #[cfg(feature = "coded-phy")]
+            Phy::CodedS8 | Phy::CodedS2 => 2,
         };
         let [offset0, offset1] = (self.offset & AUX_OFFSET_MAX | phy.strict_shl(13)).to_le_bytes();
         [self.channel & 0x3F | if self.accurate { 0x40 } else { 0 }, offset0, offset1]
