@@ -895,7 +895,8 @@ cargo clippy --workspace --lib --bins --target thumbv7em-none-eabihf --no-defaul
 cargo clippy --workspace --all-targets --no-default-features --features nrf51,$ALL
 cargo clippy --workspace --lib --bins --target thumbv6m-none-eabi --no-default-features --features nrf51,$ALL
                                                    # each also with the chip feature alone, with defmt, and on the
-                                                   # nRF52 chips with each feature set of the first line
+                                                   # nRF52 chips with each feature set of the first line, without
+                                                   # and with defmt
 cargo build --release --target thumbv7em-none-eabihf
 cargo build --release --target thumbv7em-none-eabihf --no-default-features --features nrf52833
 cargo build --release --target thumbv6m-none-eabi --no-default-features --features nrf51
@@ -909,7 +910,7 @@ Clippy runs on every crate of the workspace and every target, the tests included
 exclude each other. For each chip it runs with every other feature (`data-length` only on the nRF52 chips; of the
 bearer counts the highest takes effect) on the host for all targets, and on the chip's target for the libraries, as the
 tests need `std`; then the same with the chip feature alone, with `defmt`, and on the nRF52 chips with each feature set
-of the tests' first line.
+of the tests' first line, without and with `defmt`.
 
 The tests hold to the same lints as the library. A test takes a value it needs out of an `Option` or a `Result` with
 `assert_some!` or `assert_ok!` (`src/test_assert.rs`), which assert that it is there, and compares an `Option` or a
