@@ -358,10 +358,10 @@ mod tests {
 
     #[test]
     fn the_temperature_keeps_its_sign() {
-        assert_eq!(temperature(0x064), 100);
-        assert_eq!(temperature(0x3FF), -1);
-        assert_eq!(temperature(0x3D8), -40);
-        assert_eq!(temperature(0xFFFF_FFD8), -40);
+        assert_eq!(temperature(0x064), 100_i32);
+        assert_eq!(temperature(0x3FF), -1_i32);
+        assert_eq!(temperature(0x3D8), -40_i32);
+        assert_eq!(temperature(0xFFFF_FFD8), -40_i32);
     }
 
     #[test]

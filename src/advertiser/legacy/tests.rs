@@ -16,14 +16,14 @@ fn directed_advertising_targets_a_private_address_of_the_central_s_key() {
     let (primary, _) = pdus(&settings);
     let bytes = primary.as_bytes();
     // ADV_DIRECT_IND with ChSel, TxAdd and RxAdd: both addresses random.
-    assert_eq!(bytes[..2], [0x01 | 0x20 | 0x40 | 0x80, 12]);
-    assert_eq!(bytes[2..8], settings.own.address);
-    assert_eq!(bytes[8..14], SAMPLE_RPA);
-    assert!(resolves(SAMPLE_IRK, bytes[8..14].try_into().unwrap()));
+    assert_eq!(bytes.get(..2), Some(&[0x01 | 0x20 | 0x40 | 0x80, 12][..]));
+    assert_eq!(bytes.get(2..8), Some(&settings.own.address[..]));
+    assert_eq!(bytes.get(8..14), Some(&SAMPLE_RPA[..]));
+    assert!(resolves(SAMPLE_IRK, assert_some!(bytes.get(8..14).and_then(|target| target.try_into().ok()))));
     // The central's identity is not on air, nor our address made with its
     // key.
-    assert!(!resolves(LOCAL_IRK, bytes[8..14].try_into().unwrap()));
-    assert!(bytes[8..14] != CENTRAL.address);
+    assert!(!resolves(LOCAL_IRK, assert_some!(bytes.get(8..14).and_then(|target| target.try_into().ok()))));
+    assert_ne!(bytes.get(8..14), Some(&CENTRAL.address[..]));
 }
 
 #[test]

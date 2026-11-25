@@ -5,14 +5,15 @@
 //! credits, the closes, and the link's end. Each runs with the bearers the
 //! build has ([`BEARERS`]).
 
-extern crate std;
+extern crate alloc;
 
 use super::{
     sim::{ChanState, Kernel, On, Sim},
     *,
 };
 use crate::host::ecfc::{CLOSE_TIMEOUT, HOLD_MAX, RX_CREDITS, TOP_UP};
-use std::{vec, vec::Vec};
+use alloc::{vec, vec::Vec};
+use core::iter::once;
 
 /// A Read Request of the Client Supported Features, whose response is
 /// `[0x0B, features]`.
@@ -23,13 +24,13 @@ fn read_features() -> Vec<u8> {
 
 /// A Read Request of the Report Map, whose response fills an ATT MTU of 65.
 fn read_report_map() -> Vec<u8> {
-    let [handle0, handle1] = (example::KEYBOARD.handle() - 4).to_le_bytes();
+    let [handle0, handle1] = example::KEYBOARD.handle().strict_sub(4).to_le_bytes();
     vec![0x0A, handle0, handle1]
 }
 
 /// The Write Request that enables the notifications of `characteristic`.
 fn enable(characteristic: Char) -> Vec<u8> {
-    let [handle0, handle1] = (characteristic.handle() + 1).to_le_bytes();
+    let [handle0, handle1] = characteristic.handle().strict_add(1).to_le_bytes();
     vec![0x12, handle0, handle1, 0x01, 0x00]
 }
 
@@ -39,7 +40,7 @@ fn granted(count: usize) -> usize { count.min(BEARERS) }
 /// The destination CIDs of `count` single or ascending requests: ours in
 /// order, then 0.
 fn dcids(count: usize) -> Vec<u16> {
-    (0..count).map(|bearer| if bearer < BEARERS { 0x0040 + bearer as u16 } else { 0 }).collect()
+    (0..count).map(|bearer| if bearer < BEARERS { bearer.truncate::<u16>().strict_add(0x0040) } else { 0 }).collect()
 }
 
 /// The results and destination CIDs of our responses.
@@ -57,17 +58,17 @@ fn serve_on_every_bearer(sim: &mut Sim) {
     }
     sim.kernel.request_on(On::Fixed, &read_report_map());
     sim.pump();
-    let responses = &sim.kernel.responses[before..];
-    assert_eq!(responses.len(), bearers.len() + 1);
+    let responses = assert_some!(sim.kernel.responses.get(before..));
+    assert_eq!(responses.len(), bearers.len().strict_add(1));
     for &scid in &bearers {
-        let mine: Vec<_> = responses.iter().filter(|(on, ..)| *on == On::Chan(scid)).collect();
+        let mine: Vec<_> = responses.iter().filter(|entry| entry.0 == On::Chan(scid)).collect();
         assert_eq!(mine.len(), 1);
-        assert_eq!(mine[0].2, [0x0B, sim.engine.att.client_features()]);
+        assert_eq!(mine.first().map(|entry| entry.2.as_slice()), Some(&[0x0B, sim.engine.att.client_features()][..]));
     }
-    let fixed: Vec<_> = responses.iter().filter(|(on, ..)| *on == On::Fixed).collect();
-    let map = &fixed[0].2;
-    assert_eq!(map[0], 0x0B);
-    assert_eq!(map[1..], example::REPORT_MAP[..map.len() - 1]);
+    let fixed: Vec<_> = responses.iter().filter(|entry| entry.0 == On::Fixed).collect();
+    let map = &assert_some!(fixed.first()).2;
+    assert_eq!(map.first(), Some(&0x0B));
+    assert_eq!(map.get(1..), example::REPORT_MAP.get(..map.len().strict_sub(1)));
 }
 
 /// The events waiting.
@@ -98,20 +99,20 @@ fn channels_2_after_pairing_opens_one_bearer_and_reports_go_on_cid_4() {
         sim.kernel.request(&enable(characteristic));
     }
     sim.pump();
-    let writes: Vec<_> = sim.kernel.responses.iter().filter(|(_, request, _)| request[0] == 0x12).skip(1).collect();
+    let writes: Vec<_> = sim.kernel.responses.iter().filter(|entry| entry.1.first() == Some(&0x12)).skip(1).collect();
     assert_eq!(writes.len(), 3);
     // The bearer first, then CID 4 while the bearer is busy; the third,
     // which completes the configuration, on the bearer again.
-    assert_eq!(writes.iter().map(|(on, _, response)| (*on, response.clone())).collect::<Vec<_>>()[2..], [(
-        On::Chan(0x0040),
-        vec![0x13]
-    )]);
-    assert!(writes.iter().any(|(on, ..)| *on == On::Fixed));
+    assert_eq!(
+        writes.iter().map(|entry| (entry.0, entry.2.clone())).collect::<Vec<_>>().get(2..),
+        Some(&[(On::Chan(0x0040), vec![0x13])][..])
+    );
+    assert!(writes.iter().any(|entry| entry.0 == On::Fixed));
     assert!(!events(&mut sim).contains(&ConnEvent::Ready));
     sim.advance(INPUTS_IDLE.as_millis() + 10);
     assert!(events(&mut sim).contains(&ConnEvent::Ready));
-    let report = sim.engine.notification(sim.epoch, example::KEYBOARD, &[0; 8]).unwrap();
-    assert_eq!(report.bytes()[2..5], [0x04, 0x00, 0x1B]);
+    let report = assert_ok!(sim.engine.notification(sim.epoch, example::KEYBOARD, &[0; 8]));
+    assert_eq!(report.bytes().get(2..5), Some(&[0x04, 0x00, 0x1B][..]));
 }
 
 /// A bonded reconnection with `Channels` = 2: `BlueZ` asks for the bearer
@@ -122,7 +123,7 @@ fn channels_2_on_a_reconnection_holds_the_request_until_the_encryption() {
     let mut sim = Sim::reconnection(bond_with_features(0x07), Kernel::linux());
     sim.kernel.connect_eatt(2);
     sim.pump();
-    sim.advance(HOLD_MAX.as_millis() / 2);
+    sim.advance(HOLD_MAX.as_millis().strict_div(2));
     assert_eq!(answers(&sim), []);
     assert_eq!(sim.engine.next_deadline(), Some(at(HOLD_MAX.as_millis())));
     sim.encrypt();
@@ -159,11 +160,11 @@ fn a_hold_waits_for_a_pairing_under_way() {
     let mut engine = Engine::new(&example::DB, example::CONFIG);
     let mut device = Device(9);
     engine.advertise(true, &identity(), None, Duration::from_secs(60));
-    let job = engine.take_job().unwrap();
+    let job = assert_some!(engine.take_job());
     let result = job.run(&mut device.clone(), || ());
     engine.job_done(&mut device, result, at(0));
     engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
-    let epoch = engine.epoch().unwrap();
+    let epoch = assert_some!(engine.epoch());
     let mut sim = Sim { device, engine, epoch, kernel: Kernel::linux(), now: 0 };
     sim.kernel.connect_eatt(2);
     sim.pump();
@@ -234,7 +235,7 @@ fn an_encrypted_att_pdu_answers_the_held_request() {
 fn a_close_drops_a_response_waiting_for_credits() {
     let mut sim = Sim::paired(Kernel::linux());
     sim.kernel.credits = 1;
-    sim.kernel.hold_credits = true;
+    sim.kernel.behaviour.hold_credits = true;
     sim.kernel.connect_eatt(2);
     sim.pump();
     sim.kernel.request_on(On::Chan(0x0040), &enable(example::KEYBOARD));
@@ -257,17 +258,14 @@ fn a_close_drops_a_response_waiting_for_credits() {
     assert!(sim.kernel.chans.is_empty() && !sim.engine.has_output());
     // A new channel on the same CID, with credits: no stale response.
     sim.kernel.credits = 3;
-    sim.kernel.hold_credits = false;
+    sim.kernel.behaviour.hold_credits = false;
     sim.kernel.connect_eatt(2);
     sim.pump();
     assert_eq!(sim.bound(), [(0x0040, 0x0040)]);
     assert_eq!(sim.kernel.responses.len(), 2);
     sim.kernel.request_on(On::Fixed, &enable(example::MOUSE));
     sim.pump();
-    assert_eq!(
-        sim.kernel.responses.last().map(|(on, _, response)| (*on, response.clone())),
-        Some((On::Fixed, vec![0x13]))
-    );
+    assert_eq!(sim.kernel.responses.last().map(|entry| (entry.0, entry.2.clone())), Some((On::Fixed, vec![0x13])));
     sim.advance(INPUTS_IDLE.as_millis() + 10);
     assert!(events(&mut sim).contains(&ConnEvent::Ready));
     serve_on_every_bearer(&mut sim);
@@ -335,11 +333,13 @@ fn a_refusal_for_security_opens_a_bearer_for_each_single_request() {
         assert_eq!(answers(&sim), [(0x0008, vec![0; count])], "Channels = {channels}");
         assert!(sim.kernel.escalated);
         sim.encrypt();
-        let answers = answers(&sim)[1..].to_vec();
+        let all_answers = answers(&sim);
+        let answers = assert_some!(all_answers.get(1..)).to_vec();
         assert_eq!(answers.len(), count, "one request for each channel");
-        for (index, (result, dcids)) in answers.iter().enumerate() {
-            let expected = if index < BEARERS { (0x0000, vec![0x0040 + index as u16]) } else { (0x0004, vec![0]) };
-            assert_eq!((*result, dcids.clone()), expected, "Channels = {channels}, request {index}");
+        for (index, answer) in answers.iter().enumerate() {
+            let expected =
+                if index < BEARERS { (0x0000, vec![0x0040 + index.truncate::<u16>()]) } else { (0x0004, vec![0]) };
+            assert_eq!(*answer, expected, "Channels = {channels}, request {index}");
         }
         assert!(sim.kernel.settled() && !sim.kernel.escalated);
         assert_eq!(sim.bound().len(), granted(count));
@@ -356,11 +356,11 @@ fn a_refusal_for_security_without_a_bond_lets_linux_pair_first() {
     let mut engine = Engine::new(&example::DB, example::CONFIG);
     let mut device = Device(9);
     engine.advertise(true, &identity(), None, Duration::from_secs(60));
-    let job = engine.take_job().unwrap();
+    let job = assert_some!(engine.take_job());
     let result = job.run(&mut device.clone(), || ());
     engine.job_done(&mut device, result, at(0));
     engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
-    let epoch = engine.epoch().unwrap();
+    let epoch = assert_some!(engine.epoch());
     let mut sim = Sim { device, engine, epoch, kernel: Kernel::linux(), now: 0 };
     sim.kernel.connect_eatt(6);
     sim.pump();
@@ -370,9 +370,10 @@ fn a_refusal_for_security_without_a_bond_lets_linux_pair_first() {
     pair_link(&mut sim.engine, &mut sim.device, false, now);
     sim.kernel.encrypted();
     sim.pump();
-    let expected: Vec<_> =
-        (0..5).map(|index| (if index < BEARERS { 0 } else { 4 }, dcids(index + 1)[index..].to_vec())).collect();
-    assert_eq!(answers(&sim)[1..], expected[..]);
+    let expected: Vec<_> = (0..5)
+        .map(|index| (if index < BEARERS { 0 } else { 4 }, dcids(index + 1).get(index..).unwrap_or_default().to_vec()))
+        .collect();
+    assert_eq!(answers(&sim).get(1..), Some(expected.as_slice()));
     assert!(sim.kernel.settled());
     assert_eq!(sim.bound().len(), granted(5));
     serve_on_every_bearer(&mut sim);
@@ -392,7 +393,9 @@ fn an_ascending_request_gets_every_bearer_there_is() {
         assert_eq!(answers(&sim), [(result, dcids(count))], "{count} source CIDs");
         assert_eq!(
             sim.bound(),
-            (0..granted(count)).map(|index| (0x0040 + index as u16, 0x0040 + index as u16)).collect::<Vec<_>>()
+            (0..granted(count))
+                .map(|index| (0x0040 + index.truncate::<u16>(), 0x0040 + index.truncate::<u16>()))
+                .collect::<Vec<_>>()
         );
         assert!(sim.kernel.settled());
         serve_on_every_bearer(&mut sim);
@@ -421,9 +424,9 @@ fn concurrent_requests_are_each_answered_on_their_bearer() {
     }
     sim.pump();
     for on in &bearers {
-        assert!(sim.kernel.responses.iter().any(|(answered, ..)| answered == on), "{on:?}");
+        assert!(sim.kernel.responses.iter().any(|entry| entry.0 == *on), "{on:?}");
     }
-    assert_eq!(sim.kernel.responses.iter().filter(|(_, request, _)| request[0] == 0x12).count(), 3);
+    assert_eq!(sim.kernel.responses.iter().filter(|entry| entry.1.first() == Some(&0x12)).count(), 3);
     sim.advance(INPUTS_IDLE.as_millis() + 10);
     assert!(events(&mut sim).contains(&ConnEvent::Ready));
 }
@@ -450,12 +453,13 @@ fn the_bearers_take_turns() {
     let starts: Vec<(u16, usize)> = fragments
         .iter()
         .filter(|fragment| fragment.start())
-        .map(|fragment| {
-            (u16::from_le_bytes([fragment.bytes()[2], fragment.bytes()[3]]), usize::from(fragment.bytes()[0]))
+        .filter_map(|fragment| {
+            let bytes = fragment.bytes();
+            Some((u16::from_le_bytes([*bytes.get(2)?, *bytes.get(3)?]), usize::from(*bytes.first()?)))
         })
         .collect();
     // From the bearer after bearer 0, which counts as served last.
-    let order = (1..=BEARERS).map(|step| 0x0040 + (step % BEARERS) as u16);
+    let order = (1..=BEARERS).map(|step| 0x0040 + step.strict_rem(BEARERS).truncate::<u16>());
     let first: Vec<_> = order.clone().map(|cid| (cid, 64)).collect();
     let second: Vec<_> = order.map(|cid| (cid, 3)).collect();
     assert_eq!(starts, [first, second].concat());
@@ -475,32 +479,32 @@ fn an_mps_of_64_splits_a_response_with_a_notification_between() {
     sim.kernel.request(&enable(example::BATTERY_LEVEL));
     sim.kernel.connect_eatt(2);
     sim.pump();
-    assert_eq!(sim.kernel.chans[0].rx_credits, 3);
+    assert_eq!(assert_some!(sim.kernel.chans.first()).rx_credits, 3);
     sim.kernel.request_on(On::Chan(0x0040), &read_report_map());
     sim.deliver();
     let now = sim.at();
     let mut first = Vec::new();
-    for _ in 0..3 {
-        first.push(sim.engine.next_fragment(4).unwrap());
+    for _ in 0_i32..3_i32 {
+        first.push(assert_some!(sim.engine.next_fragment(4)));
         sim.engine.fragment_sent(now);
         if first.len() < 3 {
             assert_eq!(sim.engine.notification(sim.epoch, example::BATTERY_LEVEL, &[50]), Err(NotifyError::Busy));
         }
     }
     assert_eq!(first.iter().map(|fragment| fragment.bytes().len()).collect::<Vec<_>>(), [27, 27, 14]);
-    assert_eq!(first[0].bytes()[..6], [64, 0, 0x40, 0x00, 65, 0]);
-    let notification = sim.engine.notification(sim.epoch, example::BATTERY_LEVEL, &[50]).unwrap();
-    assert_eq!(notification.bytes()[2..4], [4, 0]);
+    assert_eq!(first.first().and_then(|fragment| fragment.bytes().get(..6)), Some(&[64, 0, 0x40, 0x00, 65, 0][..]));
+    let notification = assert_ok!(sim.engine.notification(sim.epoch, example::BATTERY_LEVEL, &[50]));
+    assert_eq!(notification.bytes().get(2..4), Some(&[4, 0][..]));
     let second = drain(&mut sim.engine, 4, now);
     assert_eq!(second.len(), 1);
-    assert_eq!(second[0].bytes()[..4], [3, 0, 0x40, 0x00]);
+    assert_eq!(second.first().and_then(|fragment| fragment.bytes().get(..4)), Some(&[3, 0, 0x40, 0x00][..]));
     for fragment in first.iter().chain([&notification]).chain(&second) {
         sim.kernel.receive(fragment);
     }
-    let (on, _, response) = sim.kernel.responses.last().unwrap();
-    assert_eq!(*on, On::Chan(0x0040));
-    assert_eq!(response[..], [&[0x0B][..], &example::REPORT_MAP[..64]].concat()[..]);
-    assert_eq!(sim.kernel.chans[0].rx_credits, 1, "a credit for each K-frame");
+    let last = assert_some!(sim.kernel.responses.last());
+    assert_eq!(last.0, On::Chan(0x0040));
+    assert_eq!(last.2, [&[0x0B][..], &example::REPORT_MAP[..64]].concat());
+    assert_eq!(assert_some!(sim.kernel.chans.first()).rx_credits, 1, "a credit for each K-frame");
     assert_eq!(sim.kernel.notifications.len(), 1);
 }
 
@@ -510,7 +514,7 @@ fn an_mps_of_64_splits_a_response_with_a_notification_between() {
 fn without_credits_a_response_waits_and_cid_4_goes_on() {
     let mut sim = Sim::paired(Kernel::linux());
     sim.kernel.credits = 1;
-    sim.kernel.hold_credits = true;
+    sim.kernel.behaviour.hold_credits = true;
     sim.kernel.connect_eatt(2);
     sim.pump();
     sim.kernel.request_on(On::Chan(0x0040), &read_features());
@@ -519,13 +523,13 @@ fn without_credits_a_response_waits_and_cid_4_goes_on() {
     sim.kernel.request_on(On::Chan(0x0040), &read_features());
     sim.kernel.request_on(On::Fixed, &read_features());
     sim.pump();
-    assert_eq!(sim.kernel.responses.iter().map(|(on, ..)| *on).collect::<Vec<_>>(), [On::Chan(0x0040), On::Fixed]);
+    assert_eq!(sim.kernel.responses.iter().map(|entry| entry.0).collect::<Vec<_>>(), [On::Chan(0x0040), On::Fixed]);
     assert!(!sim.engine.has_output(), "nothing the link layer's room would let go");
     assert!(sim.engine.eatt_responses[0].is_some());
     sim.kernel.give_credits(0x0040, 1);
     sim.pump();
     assert_eq!(sim.kernel.responses.len(), 3);
-    assert_eq!(sim.kernel.responses[2].0, On::Chan(0x0040));
+    assert_eq!(sim.kernel.responses.get(2).map(|entry| entry.0), Some(On::Chan(0x0040)));
 }
 
 /// The central closes a bearer while the first K-frame of its response is
@@ -540,7 +544,7 @@ fn a_close_in_the_middle_of_a_kframe_finishes_it() {
     sim.kernel.request_on(On::Chan(0x0040), &read_report_map());
     sim.deliver();
     let now = sim.at();
-    let start = sim.engine.next_fragment(4).unwrap();
+    let start = assert_some!(sim.engine.next_fragment(4));
     sim.engine.fragment_sent(now);
     let ident = sim.kernel.close(0x0040);
     sim.deliver();
@@ -550,8 +554,8 @@ fn a_close_in_the_middle_of_a_kframe_finishes_it() {
         (false, 14),
         (true, 12)
     ]);
-    assert_eq!(rest[2].bytes(), [8, 0, 5, 0, 0x07, ident, 4, 0, 0x40, 0, 0x40, 0]);
-    for fragment in [&start].into_iter().chain(&rest) {
+    assert_eq!(rest.get(2).map(Fragment::bytes), Some(&[8, 0, 5, 0, 0x07, ident, 4, 0, 0x40, 0, 0x40, 0][..]));
+    for fragment in once(&start).chain(&rest) {
         sim.kernel.receive(fragment);
     }
     assert_eq!(sim.kernel.dropped, 1);
@@ -574,9 +578,9 @@ fn a_kframe_too_long_closes_the_bearer() {
     sim.pump();
     sim.kernel.out.push_back((0x0040, vec![0; 80]));
     sim.pump();
-    let close = sim.kernel.signals.last().unwrap();
-    assert_eq!(close[0], 0x06);
-    assert_eq!(close[4..], [0x40, 0, 0x40, 0]);
+    let close = assert_some!(sim.kernel.signals.last());
+    assert_eq!(close.first(), Some(&0x06));
+    assert_eq!(close.get(4..), Some(&[0x40, 0, 0x40, 0][..]));
     assert_eq!(sim.kernel.chans.len(), 0);
     assert!(!sim.engine.ecfc.is_open(BearerId::FIRST));
     sim.kernel.connect_eatt(2);
@@ -589,24 +593,24 @@ fn a_kframe_too_long_closes_the_bearer() {
 #[test]
 fn an_unanswered_close_frees_the_bearer_after_30_s() {
     let mut sim = Sim::paired(Kernel::linux());
-    sim.kernel.ignore_close = true;
+    sim.kernel.behaviour.ignore_close = true;
     sim.kernel.connect_eatt(2);
     sim.pump();
     sim.kernel.out.push_back((0x0040, vec![0; 80]));
     sim.pump();
-    assert_eq!(sim.kernel.signals.last().unwrap()[0], 0x06);
+    assert_eq!(assert_some!(sim.kernel.signals.last()).first(), Some(&0x06));
     let closed = sim.now;
     assert_eq!(sim.engine.ecfc.deadline(), Some(at(closed + CLOSE_TIMEOUT.as_millis())));
     // The kernel's next channel has the same CID, which the closing bearer
     // still has.
     sim.kernel.connect_eatt(2);
     sim.pump();
-    assert_eq!(answers(&sim)[1..], [(0x000A, vec![0])]);
+    assert_eq!(answers(&sim).get(1..), Some(&[(0x000A, vec![0])][..]));
     sim.advance(CLOSE_TIMEOUT.as_millis());
     assert_eq!(sim.engine.ecfc.deadline(), None);
     sim.kernel.connect_eatt(2);
     sim.pump();
-    assert_eq!(answers(&sim)[2..], [(0x0000, vec![0x0040])]);
+    assert_eq!(answers(&sim).get(2..), Some(&[(0x0000, vec![0x0040])][..]));
 }
 
 /// The link's end forgets the bearers, the held requests and the
@@ -618,7 +622,7 @@ fn the_link_s_end_resets_the_bearers() {
     sim.pump();
     sim.encrypt();
     assert_eq!(sim.bound().len(), BEARERS);
-    sim.kernel.hold_credits = true;
+    sim.kernel.behaviour.hold_credits = true;
     for scid in sim.kernel.bearers() {
         sim.kernel.request_on(On::Chan(scid), &read_features());
     }
@@ -632,7 +636,7 @@ fn the_link_s_end_resets_the_bearers() {
     assert_eq!(sim.engine.ecfc.deadline(), None);
     assert!(BearerId::all().all(|bearer| !sim.engine.ecfc.is_open(bearer)));
     assert_eq!((sim.engine.served, sim.engine.sending), (BearerId::FIRST, None));
-    let mut sim = Sim::reconnect(sim.engine, bond_with_features(0x07), Kernel::spec());
+    sim = Sim::reconnect(sim.engine, bond_with_features(0x07), Kernel::spec());
     sim.kernel.connect_eatt(BEARERS + 1);
     sim.pump();
     assert_eq!(answers(&sim), []);
@@ -648,17 +652,19 @@ fn a_thousand_requests_balance_the_credits() {
     let mut sim = Sim::paired(Kernel::linux());
     sim.kernel.connect_eatt(2);
     sim.pump();
-    for _ in 0..1000 {
+    for _ in 0_i32..1_000_i32 {
         sim.kernel.request_on(On::Chan(0x0040), &read_features());
         sim.pump();
     }
-    assert_eq!(sim.kernel.responses.iter().filter(|(on, ..)| *on == On::Chan(0x0040)).count(), 1000);
-    let credits: Vec<_> = sim.kernel.signals.iter().filter(|signal| signal[0] == 0x16).collect();
+    assert_eq!(sim.kernel.responses.iter().filter(|entry| entry.0 == On::Chan(0x0040)).count(), 1000);
+    let credits: Vec<_> = sim.kernel.signals.iter().filter(|signal| signal.first() == Some(&0x16)).collect();
     assert_eq!(credits.len(), 7);
-    assert!(credits.iter().all(|signal| signal[4..] == [0x40, 0, (RX_CREDITS - TOP_UP) as u8, 0]));
-    let left = i32::from(RX_CREDITS) - 1000 + 7 * i32::from(RX_CREDITS - TOP_UP);
-    assert_eq!(i32::from(sim.kernel.chans[0].tx_credits), left);
-    assert_eq!(sim.kernel.chans[0].state, ChanState::Connected);
+    assert!(
+        credits.iter().all(|signal| signal.get(4..) == Some(&[0x40, 0, (RX_CREDITS - TOP_UP).truncate::<u8>(), 0][..]))
+    );
+    let left = i32::from(RX_CREDITS) - 1_000_i32 + 7_i32 * i32::from(RX_CREDITS - TOP_UP);
+    assert_eq!(i32::from(assert_some!(sim.kernel.chans.first()).tx_credits), left);
+    assert_eq!(assert_some!(sim.kernel.chans.first()).state, ChanState::Connected);
 }
 
 /// The Client Supported Features written on a bearer go into the bond, as
@@ -672,13 +678,19 @@ fn client_features_written_on_a_bearer_reach_the_bond() {
     assert_eq!(events(&mut sim), [ConnEvent::Encrypted { bonded: true }]);
     sim.kernel.request_on(On::Chan(0x0040), &write_features(&[0x07]));
     sim.pump();
-    assert_eq!(sim.kernel.responses.last().unwrap().2, [0x13]);
-    let Some(ConnEvent::BondUpdated(bond)) = sim.engine.take_event(sim.epoch) else { panic!("no update") };
+    assert_eq!(assert_some!(sim.kernel.responses.last()).2, [0x13]);
+    let Some(ConnEvent::BondUpdated(bond)) = ({
+        let value = sim.engine.take_event(sim.epoch);
+        assert!(matches!(value, Some(ConnEvent::BondUpdated(_))), "no update");
+        value
+    }) else {
+        return;
+    };
     assert_eq!(bond.client_features, 0x07);
     // An Exchange MTU on a bearer is not served.
     sim.kernel.request_on(On::Chan(0x0040), &[0x02, 0x05, 0x02]);
     sim.pump();
-    assert_eq!(sim.kernel.responses.last().unwrap().2, [0x01, 0x02, 0x00, 0x00, 0x06]);
+    assert_eq!(assert_some!(sim.kernel.responses.last()).2, [0x01, 0x02, 0x00, 0x00, 0x06]);
 }
 
 /// The encryption failing refuses the held requests for security.

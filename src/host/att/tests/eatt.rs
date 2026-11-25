@@ -121,7 +121,8 @@ fn read_multiple_reports_the_first_handle_with_the_most_important_error() {
     golden(&mut server, &app, &[0x20, level, 0x00, level], &error(0x20, 0, 0x04));
     // Encryption before an invalid handle before a read that is not
     // permitted, whatever their order.
-    let exchange_open = |server: &mut Server, request: &[u8]| exchange(server, &app, request, Sec::Open).unwrap();
+    // No response is an empty one, which none of the expected ones is.
+    let exchange_open = |on: &mut Server, request: &[u8]| exchange(on, &app, request, Sec::Open).unwrap_or_default();
     assert_eq!(
         *exchange_open(&mut server, &read_multiple(&[SINK, NOWHERE, REPORT, SECRET])),
         error(0x20, REPORT, 0x0F)
@@ -144,7 +145,7 @@ fn prepare(handle: u8, offset: u16, part: &[u8]) -> Vec<u8> {
 }
 
 /// The Prepare Write Response that echoes `request`.
-fn prepared(request: &[u8]) -> Vec<u8> { [&[0x17][..], &request[1..]].concat() }
+fn prepared(request: &[u8]) -> Vec<u8> { [&[0x17][..], request.get(1..).unwrap_or_default()].concat() }
 
 #[test]
 fn prepared_parts_that_follow_each_other_are_written_at_the_execute() {
@@ -177,7 +178,7 @@ fn the_prepare_queue_takes_one_value_of_22_octets_in_order() {
     golden(&mut server, &app, &prepare(LEVEL_CCC, 0, &[0x01]), &prepared(&prepare(LEVEL_CCC, 0, &[0x01])));
     // A gap, a part already queued, another attribute: Prepare Queue Full.
     for request in [prepare(LEVEL_CCC, 2, &[0x00]), prepare(LEVEL_CCC, 0, &[0x01]), prepare(SECRET, 1, &[0x00])] {
-        golden(&mut server, &app, &request, &error(0x16, request[1], 0x09));
+        golden(&mut server, &app, &request, &error(0x16, request.get(1).copied().unwrap_or_default(), 0x09));
     }
     golden(&mut server, &app, &[0x18, 0x00], &[0x19]);
     assert!(!server.subscriptions().is_written(0), "cancelled");
@@ -213,7 +214,8 @@ fn the_prepare_queue_takes_one_value_of_22_octets_in_order() {
 fn prepare_write_checks_the_handle_the_permission_and_the_security() {
     let app = App::new();
     let mut server = Server::new(&DB);
-    let mut open = |request: &[u8]| exchange(&mut server, &app, request, Sec::Open).unwrap();
+    // No response is an empty one, which none of the expected ones is.
+    let mut open = |request: &[u8]| exchange(&mut server, &app, request, Sec::Open).unwrap_or_default();
     assert_eq!(*open(&prepare(NOWHERE, 0, &[1])), error(0x16, NOWHERE, 0x01));
     assert_eq!(*open(&prepare(0, 0, &[1])), error(0x16, 0, 0x01));
     assert_eq!(*open(&prepare(SERVER, 0, &[1])), error(0x16, SERVER, 0x03));
@@ -228,8 +230,8 @@ fn prepare_write_checks_the_handle_the_permission_and_the_security() {
     assert_eq!(*open(&[0x18, 0x01, 0x00]), error(0x18, 0, 0x04));
     // The write at the execute needs the security too.
     let request = prepare(SECRET, 0, &[1]);
-    assert_eq!(*exchange(&mut server, &app, &request, Sec::Encrypted).unwrap(), *prepared(&request));
-    assert_eq!(*exchange(&mut server, &app, &[0x18, 0x01], Sec::Open).unwrap(), error(0x18, SECRET, 0x0F));
+    assert_eq!(*assert_some!(exchange(&mut server, &app, &request, Sec::Encrypted)), *prepared(&request));
+    assert_eq!(*assert_some!(exchange(&mut server, &app, &[0x18, 0x01], Sec::Open)), error(0x18, SECRET, 0x0F));
     assert_eq!(app.written.get(), None);
 }
 
@@ -237,7 +239,8 @@ fn prepare_write_checks_the_handle_the_permission_and_the_security() {
 fn the_client_features_keep_bits_0_to_2_and_never_lose_one() {
     let app = App::new();
     let mut server = Server::new(&DB);
-    let mut open = |request: &[u8]| exchange(&mut server, &app, request, Sec::Open).unwrap();
+    // No response is an empty one, which none of the expected ones is.
+    let mut open = |request: &[u8]| exchange(&mut server, &app, request, Sec::Open).unwrap_or_default();
     // Both read without encryption: the client's 0, the server's EATT.
     assert_eq!(*open(&[0x0A, CLIENT, 0x00]), [0x0B, 0x00]);
     assert_eq!(*open(&[0x0A, SERVER, 0x00]), [0x0B, 0x01]);
@@ -252,22 +255,22 @@ fn the_client_features_keep_bits_0_to_2_and_never_lose_one() {
     assert_eq!(server.client_features(), 0x07);
     // A write that clears a bit is not allowed and changes nothing, an
     // empty one included; a Write Command that would is dropped.
-    let mut open = |request: &[u8]| exchange(&mut server, &app, request, Sec::Open);
-    assert_eq!(*open(&[0x12, CLIENT, 0x00, 0x05]).unwrap(), error(0x12, CLIENT, 0x13));
-    assert_eq!(*open(&[0x12, CLIENT, 0x00]).unwrap(), error(0x12, CLIENT, 0x13));
-    assert_eq!(open(&[0x52, CLIENT, 0x00, 0x00]), None);
-    assert_eq!(*open(&[0x12, CLIENT, 0x00, 0x07]).unwrap(), [0x13]);
+    let mut open_raw = |request: &[u8]| exchange(&mut server, &app, request, Sec::Open);
+    assert_eq!(*assert_some!(open_raw(&[0x12, CLIENT, 0x00, 0x05])), error(0x12, CLIENT, 0x13));
+    assert_eq!(*assert_some!(open_raw(&[0x12, CLIENT, 0x00])), error(0x12, CLIENT, 0x13));
+    assert_eq!(open_raw(&[0x52, CLIENT, 0x00, 0x00]), None);
+    assert_eq!(*assert_some!(open_raw(&[0x12, CLIENT, 0x00, 0x07])), [0x13]);
     assert_eq!(server.client_features(), 0x07);
     // On a new link an empty write is 0.
-    let mut server = Server::new(&DB);
-    assert_eq!(*exchange(&mut server, &app, &[0x12, CLIENT, 0x00], Sec::Open).unwrap(), [0x13]);
-    assert_eq!(server.client_features(), 0);
+    let mut new_link = Server::new(&DB);
+    assert_eq!(*assert_some!(exchange(&mut new_link, &app, &[0x12, CLIENT, 0x00], Sec::Open)), [0x13]);
+    assert_eq!(new_link.client_features(), 0);
     // A bond adds its bits to those written before the encryption.
-    assert_eq!(exchange(&mut server, &app, &[0x52, CLIENT, 0x00, 0x04], Sec::Open), None);
-    server.restore_client_features(0xF9);
-    assert_eq!(server.client_features(), 0x05);
+    assert_eq!(exchange(&mut new_link, &app, &[0x52, CLIENT, 0x00, 0x04], Sec::Open), None);
+    new_link.restore_client_features(0xF9);
+    assert_eq!(new_link.client_features(), 0x05);
     assert_eq!(
-        *exchange(&mut server, &app, &[0x12, CLIENT, 0x00, 0x04], Sec::Open).unwrap(),
+        *assert_some!(exchange(&mut new_link, &app, &[0x12, CLIENT, 0x00, 0x04], Sec::Open)),
         error(0x12, CLIENT, 0x13)
     );
 }
@@ -286,14 +289,17 @@ fn multiple_notifications_need_the_client_s_bit_2_and_two_values() {
     assert_eq!(server.notify_multiple(&values, Sec::Encrypted, &mut out), Err(NotifyError::Unsupported));
     golden(&mut server, &app, &[0x12, CLIENT, 0x00, 0x04], &error(0x12, CLIENT, 0x13)[..]);
     golden(&mut server, &app, &[0x12, CLIENT, 0x00, 0x07], &[0x13]);
-    let len = server.notify_multiple(&values, Sec::Encrypted, &mut out).unwrap();
-    assert_eq!(out[..len], [0x23, 0x0A, 0x00, 0x01, 0x00, 50, 0x0E, 0x00, 0x08, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let len = assert_ok!(server.notify_multiple(&values, Sec::Encrypted, &mut out));
+    assert_eq!(
+        out.get(..len),
+        Some(&[0x23, 0x0A, 0x00, 0x01, 0x00, 50, 0x0E, 0x00, 0x08, 0x00, 1, 2, 3, 4, 5, 6, 7, 8][..])
+    );
     // Fewer than two values.
     assert_eq!(server.notify_multiple(&values[..1], Sec::Encrypted, &mut out), Err(NotifyError::Unsupported));
     assert_eq!(server.notify_multiple(&[], Sec::Encrypted, &mut out), Err(NotifyError::Unsupported));
     // Each value is checked as a notification is.
     assert_eq!(server.notify_multiple(&values, Sec::Open, &mut out), Err(NotifyError::Insecure));
-    let map: Char = DB.characteristic(16);
+    let map = DB.characteristic(16);
     assert_eq!(
         server.notify_multiple(&[(LEVEL, &[1]), (map, &[2])], Sec::Open, &mut out),
         Err(NotifyError::NotSubscribed)
@@ -304,8 +310,8 @@ fn multiple_notifications_need_the_client_s_bit_2_and_two_values() {
     );
     // All of them in one PDU of 23 octets, never cut: 1 + 9 + 13 fits,
     // one octet more does not.
-    let len = server.notify_multiple(&[(LEVEL, &[1; 5]), (LEVEL, &[2; 9])], Sec::Open, &mut out).unwrap();
-    assert_eq!(len, MTU);
+    let full = assert_ok!(server.notify_multiple(&[(LEVEL, &[1; 5]), (LEVEL, &[2; 9])], Sec::Open, &mut out));
+    assert_eq!(full, MTU);
     assert_eq!(
         server.notify_multiple(&[(LEVEL, &[1; 5]), (LEVEL, &[2; 10])], Sec::Open, &mut out),
         Err(NotifyError::TooLong)

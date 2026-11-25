@@ -13,7 +13,7 @@
 //! | 11 | Battery service 0x180F |
 //! | 12, 13, 14 | Battery Level 0x2A19, read and notify, through the handler as [`BATTERY_LEVEL_VALUE`]; its configuration |
 //! | 15 | Device Information service 0x180A |
-//! | 16, 17 | PnP ID 0x2A50, read: [`PNP_ID`] |
+//! | 16, 17 | `PnP` ID 0x2A50, read: [`PNP_ID`] |
 //! | 18 | HID service 0x1812 |
 //! | 19, 20 | HID Information 0x2A4A, read: [`HID_INFORMATION`] |
 //! | 21, 22 | Report Map 0x2A4B, read: [`REPORT_MAP`] |

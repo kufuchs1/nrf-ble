@@ -114,7 +114,7 @@ fn a_directed_connection_request_from_another_private_address_of_the_key_is_acce
     // The central initiates from a resolvable private address of its own,
     // never the one the advertising targets (Core, Vol 6, Part B, 6.4).
     let initiator = rpa(SAMPLE_IRK, [0x12, 0x34, 0x56]);
-    assert!(initiator.address != SAMPLE_RPA);
+    assert_ne!(initiator.address, SAMPLE_RPA);
     assert!(accepts(&settings, initiator));
     // From its identity too: its entry is in device privacy mode.
     assert!(accepts(&settings, CENTRAL));

@@ -558,21 +558,21 @@ impl AclIn {
     /// No fragment: the buffer that [`Link::next`] fills.
     pub const EMPTY: Self = Self { data: [0; ACL_MAX], encrypted: false, len: 0, start: false };
 
-    /// A fragment of `payload`, which `start`s an L2CAP message or not and
-    /// was received `encrypted` or not, for tests.
-    #[cfg(test)]
-    pub(crate) fn for_test(start: bool, encrypted: bool, payload: &[u8]) -> Self {
-        let mut data = [0; ACL_MAX];
-        data[..payload.len()].copy_from_slice(payload);
-        Self { data, encrypted, len: u8::try_from(payload.len()).unwrap(), start }
-    }
-
     /// Whether the PDU was received encrypted, with a valid MIC. Set when
     /// the link layer received it, so it holds even if the host learns of
     /// the encryption later.
     #[inline]
     #[must_use = "the flag is only read"]
     pub const fn encrypted(&self) -> bool { self.encrypted }
+
+    /// A fragment of `payload`, which `start`s an L2CAP message or not and
+    /// was received `encrypted` or not, for tests.
+    #[cfg(test)]
+    pub(crate) const fn for_test(start: bool, encrypted: bool, payload: &[u8]) -> Self {
+        let mut data = [0; ACL_MAX];
+        data.get_mut(..payload.len()).unwrap_or_default().copy_from_slice(payload);
+        Self { data, encrypted, len: payload.len().strict_cast(), start }
+    }
 
     /// The payload.
     #[inline]
@@ -1071,13 +1071,6 @@ impl Shared {
         self.state.lock(|cell| Micros(u32::from(cell.borrow().payload_timeout).saturating_mul(10_000)))
     }
 
-    /// Sets the authenticated payload timeout in units of 10 ms, as
-    /// [`Link::set_payload_timeout`] does for a link.
-    #[cfg(test)]
-    pub(crate) fn set_payload_timeout_for_test(&self, timeout: u16) {
-        self.state.lock(|cell| cell.borrow_mut().payload_timeout = timeout);
-    }
-
     /// Default PHY preference for new connections.
     pub(crate) fn preferred_phys(&self) -> [u8; 2] { self.state.lock(|cell| cell.borrow().preferred_phys) }
 
@@ -1288,6 +1281,13 @@ impl Shared {
             let mut state = cell.borrow_mut();
             state.next_event = Some(Planned { ahead, at, epoch: state.epoch, interval: interval.0, lead: lead.0 });
         });
+    }
+
+    /// Sets the authenticated payload timeout in units of 10 ms, as
+    /// [`Link::set_payload_timeout`] does for a link.
+    #[cfg(test)]
+    pub(crate) fn set_payload_timeout_for_test(&self, timeout: u16) {
+        self.state.lock(|cell| cell.borrow_mut().payload_timeout = timeout);
     }
 
     /// Publishes the current receive and transmit PHY.
@@ -1519,6 +1519,28 @@ impl<'shared> Link<'shared> {
         })
     }
 
+    /// [`Self::advertise`] with `fill` and `encrypt` in place of the RNG
+    /// and the ECB, for the host tests: our private address is a new one
+    /// each call, not kept for its lifetime, which needs the clock.
+    #[cfg(all(test, feature = "directed-advertising"))]
+    pub(crate) fn advertise_drawn<Fill, Encrypt>(
+        self,
+        params: &AdvParams,
+        (adv, scan): (&[u8], &[u8]),
+        mut fill: Fill,
+        encrypt: Encrypt,
+    ) -> Result<(), Error>
+    where
+        Fill: FnMut(&mut [u8]),
+        Encrypt: Fn([u8; 16], [u8; 16]) -> [u8; 16] + Copy,
+    {
+        let identity = self.shared.state.lock(|cell| cell.borrow().adv.address);
+        self.advertise_with(params, adv, scan, |key| OnAir {
+            own:    key.map_or(identity, |private_key| new_private_address(private_key, &mut fill, encrypt)),
+            target: self.shared.directed_target_with((params.private, params.kind, params.peer), &mut fill, encrypt),
+        })
+    }
+
     /// [`Self::advertise`] with the addresses on air from `on_air`, given
     /// the local key of the private address the parameters ask for, if any.
     /// `on_air` runs outside the critical section, once the parameters were
@@ -1589,28 +1611,6 @@ impl<'shared> Link<'shared> {
             info!("advertising");
         }
         result
-    }
-
-    /// [`Self::advertise`] with `fill` and `encrypt` in place of the RNG
-    /// and the ECB, for the host tests: our private address is a new one
-    /// each call, not kept for its lifetime, which needs the clock.
-    #[cfg(all(test, feature = "directed-advertising"))]
-    pub(crate) fn advertise_drawn<Fill, Encrypt>(
-        &self,
-        params: &AdvParams,
-        (adv, scan): (&[u8], &[u8]),
-        mut fill: Fill,
-        encrypt: Encrypt,
-    ) -> Result<(), Error>
-    where
-        Fill: FnMut(&mut [u8]),
-        Encrypt: Fn([u8; 16], [u8; 16]) -> [u8; 16] + Copy,
-    {
-        let identity = self.shared.state.lock(|cell| cell.borrow().adv.address);
-        self.advertise_with(params, adv, scan, |key| OnAir {
-            own:    key.map_or(identity, |key| new_private_address(key, &mut fill, encrypt)),
-            target: self.shared.directed_target_with((params.private, params.kind, params.peer), &mut fill, encrypt),
-        })
     }
 
     /// Refuses resolving list changes while advertising resolves addresses.

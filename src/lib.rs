@@ -67,6 +67,10 @@ compile_error!(
 /// Logging, first: its macros serve the modules after it.
 #[macro_use]
 mod log;
+/// The assertions of the tests that hand back the value they check.
+#[cfg(test)]
+#[macro_use]
+mod test_assert;
 /// Connectable advertising.
 pub mod advertiser;
 /// Data channel map and channel selection.

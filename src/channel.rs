@@ -134,6 +134,7 @@ const fn is_set(bits: [u8; 5], channel: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::array::from_fn;
 
     #[test]
     fn hopping_stays_inside_a_sparse_channel_map() {
@@ -142,9 +143,9 @@ mod tests {
         for counter in 0..=u16::MAX {
             assert!(matches!(hopping.channel(&map, counter), 3 | 36));
         }
-        let mut hopping = Hopping::csa2(0x8E89_BED6);
+        let mut csa2 = Hopping::csa2(0x8E89_BED6);
         for counter in 0..=u16::MAX {
-            assert!(matches!(hopping.channel(&map, counter), 3 | 36));
+            assert!(matches!(csa2.channel(&map, counter), 3 | 36));
         }
     }
 
@@ -152,11 +153,11 @@ mod tests {
     fn hopping_with_all_channels_visits_every_channel_in_hop_order() {
         let map = UsedChannels::new([0xFF, 0xFF, 0xFF, 0xFF, 0x1F]);
         let mut hopping = Hopping::new(7);
-        let channels: [u8; 37] = core::array::from_fn(|index| hopping.channel(&map, u16::try_from(index).unwrap()));
+        let channels: [u8; 37] = from_fn(|index| hopping.channel(&map, index.strict_cast()));
         assert_eq!(channels[..3], [7, 14, 21]);
         let mut sorted = channels;
         sorted.sort_unstable();
-        assert_eq!(sorted, core::array::from_fn::<u8, 37, _>(|index| u8::try_from(index).unwrap()));
+        assert_eq!(sorted, from_fn::<u8, 37, _>(|index| index.strict_cast()));
     }
 
     #[test]

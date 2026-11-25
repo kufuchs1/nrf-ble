@@ -10,7 +10,10 @@
 
 use super::*;
 use crate::host::smp::toolbox::tests::hex;
-use core::cell::Cell;
+use core::{
+    cell::Cell,
+    iter::{from_fn, repeat_with},
+};
 
 /// The private key of the debug key pair (Core specification, volume 3,
 /// part H, section 2.3.5.6.1).
@@ -40,31 +43,29 @@ const ONE_PLUS_PRIME: &str = "ffffffff 00000001 00000000 00000000 00000001 00000
 /// One, as a coordinate.
 const ONE: &str = "00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000001";
 
-/// A key pair from `secret`, which must be valid.
-fn key_pair(mut secret: [u8; KEY_LEN]) -> KeyPair {
-    KeyPair::generate(&mut secret, || ()).expect("a valid private key")
-}
+/// A key pair from `secret`, if it is valid.
+fn key_pair(mut secret: [u8; KEY_LEN]) -> Option<KeyPair> { KeyPair::generate(&mut secret, || ()) }
 
 /// The negation of the public key `key`: the same X, and the field prime
 /// less Y.
 fn negated(key: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] {
     let prime = hex::<KEY_LEN>(PRIME);
     let mut out = *key;
-    let (_, y) = out.split_first_chunk_mut::<KEY_LEN>().expect("X then Y");
+    let (_, y) = out.split_array_mut::<KEY_LEN>();
     let mut borrow = false;
     for (octet, prime_octet) in y.iter_mut().zip(prime).rev() {
-        let (difference, first) = prime_octet.overflowing_sub(*octet);
-        let (difference, second) = difference.overflowing_sub(u8::from(borrow));
-        *octet = difference;
+        let (less_octet, first) = prime_octet.overflowing_sub(*octet);
+        let (less_borrow, second) = less_octet.overflowing_sub(u8::from(borrow));
+        *octet = less_borrow;
         borrow = first || second;
     }
     assert!(!borrow, "Y below the field prime");
     out
 }
 
-/// The public key `key`, which must be a point of the curve, without the
-/// checks for the debug key and our own.
-fn point(key: &[u8; PUBLIC_KEY_LEN]) -> PublicKey { PublicKey::from_coordinates(key).expect("a point of the curve") }
+/// The public key `key`, if it is a point of the curve, without the checks
+/// for the debug key and our own.
+fn point(key: &[u8; PUBLIC_KEY_LEN]) -> Option<PublicKey> { PublicKey::from_coordinates(key) }
 
 /// A public key from its two coordinates.
 fn public_key(x: &str, y: &str) -> [u8; PUBLIC_KEY_LEN] {
@@ -76,9 +77,9 @@ fn public_key(x: &str, y: &str) -> [u8; PUBLIC_KEY_LEN] {
 
 /// The scalars of a seeded xorshift generator, 32 octets each.
 fn scalars(mut seed: u64) -> impl Iterator<Item = [u8; KEY_LEN]> {
-    core::iter::repeat_with(move || {
+    repeat_with(move || {
         let mut out = [0; KEY_LEN];
-        for chunk in out.chunks_exact_mut(8) {
+        for chunk in out.as_chunks_mut::<8>().0 {
             seed ^= seed.wrapping_shl(13);
             seed ^= seed.wrapping_shr(7);
             seed ^= seed.wrapping_shl(17);
@@ -92,8 +93,7 @@ fn scalars(mut seed: u64) -> impl Iterator<Item = [u8; KEY_LEN]> {
 fn the_debug_private_key_gives_the_debug_public_key() {
     let calls = Cell::<u32>::new(0);
     let mut secret = hex(DEBUG_PRIVATE_KEY);
-    let pair = KeyPair::generate(&mut secret, || calls.set(calls.get().checked_add(1).expect("few calls")))
-        .expect("a valid key");
+    let pair = assert_some!(KeyPair::generate(&mut secret, || calls.set(calls.get().strict_add(1))), "a valid key");
     assert_eq!(pair.public_key(), &DEBUG_PUBLIC_KEY);
     assert_eq!(secret, [0; KEY_LEN], "the caller's copy is wiped");
     assert_eq!(calls.get(), 1, "the hook is called once, for the one multiplication");
@@ -104,23 +104,23 @@ fn the_debug_private_key_gives_the_debug_public_key() {
 /// `dh_key` makes.
 #[test]
 fn the_debug_key_pair_gives_its_dh_key() {
-    let pair = key_pair(hex(DEBUG_PRIVATE_KEY));
-    assert_eq!(pair.secret.diffie_hellman(&point(&DEBUG_PUBLIC_KEY)), hex(DEBUG_DH_KEY));
+    let pair = assert_some!(key_pair(hex(DEBUG_PRIVATE_KEY)));
+    assert_eq!(point(&DEBUG_PUBLIC_KEY).map(|peer| pair.secret.diffie_hellman(&peer)), Some(hex(DEBUG_DH_KEY)));
 }
 
 /// P-256 data set 1 (Core specification, volume 2, part G, section
 /// 7.1.2.1), whose device A has the debug key pair.
 #[test]
 fn data_set_1_gives_its_keys() {
-    let pair_a = key_pair(hex(DEBUG_PRIVATE_KEY));
-    let pair_b = key_pair(hex("55188b3d 32f6bb9a 900afcfb eed4e72a 59cb9ac2 f19d7cfb 6b4fdd49 f47fc5fd"));
+    let pair_a = assert_some!(key_pair(hex(DEBUG_PRIVATE_KEY)));
+    let pair_b = assert_some!(key_pair(hex("55188b3d 32f6bb9a 900afcfb eed4e72a 59cb9ac2 f19d7cfb 6b4fdd49 f47fc5fd")));
     let public_b = public_key(
         "1ea1f0f0 1faf1d96 09592284 f19e4c00 47b58afd 8615a69f 559077b2 2faaa190",
         "4c55f33e 429dad37 7356703a 9ab85160 472d1130 e28e3676 5f89aff9 15b1214a",
     );
     assert_eq!(pair_b.public_key(), &public_b);
     let calls = Cell::<u32>::new(0);
-    let dh_key = pair_a.dh_key(&public_b, || calls.set(calls.get().checked_add(1).expect("few calls")));
+    let dh_key = pair_a.dh_key(&public_b, || calls.set(assert_some!(calls.get().checked_add(1), "few calls")));
     assert_eq!(dh_key, Ok(hex("ec0234a3 57c8ad05 341010a6 0a397d9b 99796b13 b4f866f1 868d34f3 73bfa698")));
     assert_eq!(calls.get(), 1);
     assert_eq!(pair_b.dh_key(pair_a.public_key(), || ()), Err(KeyError::Debug));
@@ -130,8 +130,8 @@ fn data_set_1_gives_its_keys() {
 /// 7.1.2.2), in both directions.
 #[test]
 fn data_set_2_gives_its_keys() {
-    let pair_a = key_pair(hex("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663"));
-    let pair_b = key_pair(hex("529aa067 0d72cd64 97502ed4 73502b03 7e8803b5 c60829a5 a3caa219 505530ba"));
+    let pair_a = assert_some!(key_pair(hex("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663")));
+    let pair_b = assert_some!(key_pair(hex("529aa067 0d72cd64 97502ed4 73502b03 7e8803b5 c60829a5 a3caa219 505530ba")));
     let public_a = public_key(
         "2c31a47b 5779809e f44cb5ea af5c3e43 d5f8faad 4a8794cb 987e9b03 745c78dd",
         "91951218 3898dfbe cd52e240 8e43871f d0211091 17bd3ed4 eaf84377 43715d4f",
@@ -152,7 +152,7 @@ fn data_set_2_gives_its_keys() {
 /// generator.
 #[test]
 fn the_benchmark_values_match_the_reference() {
-    let pair = key_pair(hex("5a30557a 9fc4e90e 33587da2 c7ec1136 5b80a5ca ef14395e 83a8cdf2 173c6186"));
+    let pair = assert_some!(key_pair(hex("5a30557a 9fc4e90e 33587da2 c7ec1136 5b80a5ca ef14395e 83a8cdf2 173c6186")));
     assert_eq!(
         pair.public_key()[..KEY_LEN],
         hex::<KEY_LEN>("b78d4ac8 17725355 c3139369 9016f0ac ce2d9e82 9a26ed56 5176fd5e f470d5f3")
@@ -172,11 +172,11 @@ fn the_benchmark_values_match_the_reference() {
 /// is all it depends on, which the refusal of our own key by X relies on.
 #[test]
 fn a_negated_key_gives_the_same_dh_key() {
-    let pair_a = key_pair(hex("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663"));
-    let pair_b = key_pair(hex("529aa067 0d72cd64 97502ed4 73502b03 7e8803b5 c60829a5 a3caa219 505530ba"));
+    let pair_a = assert_some!(key_pair(hex("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663")));
+    let pair_b = assert_some!(key_pair(hex("529aa067 0d72cd64 97502ed4 73502b03 7e8803b5 c60829a5 a3caa219 505530ba")));
     let public_b = *pair_b.public_key();
     let expected = pair_a.dh_key(&public_b, || ());
-    assert!(expected.is_ok());
+    assert_eq!(expected.err(), None);
     assert_eq!(pair_a.dh_key(&negated(&public_b), || ()), expected);
     assert_ne!(negated(&public_b), public_b);
 }
@@ -186,28 +186,28 @@ fn a_negated_key_gives_the_same_dh_key() {
 #[test]
 fn random_key_pairs_agree() {
     let mut secrets = scalars(0x5EED_0FB1_EC0D_E000);
-    for _ in 0..16 {
-        let (Some(secret_a), Some(secret_b)) = (secrets.next(), secrets.next()) else { unreachable!() };
+    for (secret_a, secret_b) in from_fn(|| secrets.next().zip(secrets.next())).take(16) {
         let (Some(pair_a), Some(pair_b)) =
             (KeyPair::generate(&mut secret_a.clone(), || ()), KeyPair::generate(&mut secret_b.clone(), || ()))
         else {
             // About one in four billion is not below the order.
             continue;
         };
-        let direct_a = SecretKey::from_bytes(&secret_a).expect("valid");
+        let direct_a = assert_some!(SecretKey::from_bytes(&secret_a), "valid");
         assert_eq!(pair_a.public_key(), &direct_a.public_key());
         let dh_key = pair_a.dh_key(pair_b.public_key(), || ());
-        assert!(dh_key.is_ok());
+        assert_eq!(dh_key.err(), None);
         assert_eq!(pair_b.dh_key(pair_a.public_key(), || ()), dh_key);
-        assert_eq!(dh_key, Ok(direct_a.diffie_hellman(&point(pair_b.public_key()))));
+        let peer_b = assert_some!(point(pair_b.public_key()), "a point of the curve");
+        assert_eq!(dh_key, Ok(direct_a.diffie_hellman(&peer_b)));
     }
 }
 
 #[test]
 fn private_keys_out_of_range_are_refused_without_a_multiplication() {
     let mut above_order = hex::<KEY_LEN>(ORDER);
-    let last = above_order.last_mut().expect("an octet");
-    *last = last.checked_add(1).expect("no carry");
+    let last = assert_some!(above_order.last_mut(), "an octet");
+    *last = assert_some!(last.checked_add(1), "no carry");
     for secret in [[0; KEY_LEN], hex(ORDER), above_order, [0xFF; KEY_LEN]] {
         let called = Cell::new(false);
         let mut copy = secret;
@@ -219,7 +219,7 @@ fn private_keys_out_of_range_are_refused_without_a_multiplication() {
 
 #[test]
 fn central_keys_are_refused_without_a_multiplication() {
-    let pair = key_pair(hex("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663"));
+    let pair = assert_some!(key_pair(hex("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663")));
     let own = *pair.public_key();
     let mut off_curve = public_key(
         "f465e43f f23d3f1b 9dc7dfc0 4da87581 84dbc966 204796ec cf0d6cf5 e16500cc",

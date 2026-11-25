@@ -1,11 +1,13 @@
 //! Tests of the table builder, the example table and the layout hash.
 
 extern crate alloc;
-extern crate std;
+#[cfg(feature = "eatt")] extern crate std;
 
 use super::*;
 use crate::host::example::{self, DB, EATT_SHIFT, PARAMS, REPORT_MAP, REPORT_MAP_LEN};
 use alloc::vec::Vec;
+#[cfg(feature = "eatt")]
+use std::panic::catch_unwind;
 
 /// The example table again, with `$map` as its Report Map.
 macro_rules! example_with {
@@ -56,8 +58,29 @@ const ALTERED_MAP: [u8; REPORT_MAP_LEN] = {
     map
 };
 
+/// The Client and Server Supported Features as `eatt` takes them.
+#[cfg(feature = "eatt")]
+const FEATURES: [Characteristic; 2] = [
+    (CLIENT_SUPPORTED_FEATURES, PROP_READ | PROP_WRITE, Sec::Open, Value::ClientFeatures),
+    (SERVER_SUPPORTED_FEATURES, PROP_READ, Sec::Open, Value::ServerFeatures),
+];
+
 example_with!(SAME, REPORT_MAP);
 example_with!(ALTERED, ALTERED_MAP);
+
+/// A characteristic of [`features_table`]: its UUID, properties and security
+/// and the value it holds.
+type Characteristic = (u16, u8, Sec, Value);
+
+#[cfg(feature = "eatt")]
+#[test]
+fn with_eatt_the_features_are_found_once_each_in_the_gatt_service() {
+    assert!(features_table(GATT_SERVICE, &FEATURES).has_features());
+    assert!(!features_table(GATT_SERVICE, &FEATURES[..1]).has_features());
+    assert!(!features_table(GATT_SERVICE, &FEATURES[1..]).has_features());
+    assert!(!features_table(GATT_SERVICE, &[]).has_features());
+    assert!(!example::DB.attrs().is_empty() && example::DB.has_features());
+}
 
 #[test]
 fn the_example_table_has_its_handles() {
@@ -81,7 +104,7 @@ fn the_example_table_has_its_handles() {
     let services: [u16; 5] = [1, 8, 11 + shift, 15 + shift, 18 + shift];
     let ends: [u16; 5] = [7, 10 + shift, 14 + shift, 17 + shift, 36 + shift];
     for (start, end) in services.into_iter().zip(ends) {
-        assert_eq!(DB.attr(start).unwrap().kind(), Kind::Service);
+        assert_eq!(assert_some!(DB.attr(start)).kind(), Kind::Service);
         assert_eq!(DB.group_end(start), end);
     }
     assert!(DB.attr(0).is_none());
@@ -93,8 +116,8 @@ fn the_example_table_has_its_handles() {
             (example::CLIENT_FEATURES, CLIENT_SUPPORTED_FEATURES, PROP_READ | PROP_WRITE, Value::ClientFeatures),
             (example::SERVER_FEATURES, SERVER_SUPPORTED_FEATURES, PROP_READ, Value::ServerFeatures),
         ] {
-            assert_eq!(DB.attr(handle - 1).unwrap().kind(), Kind::Characteristic(props));
-            let attr = DB.attr(handle).unwrap();
+            assert_eq!(assert_some!(DB.attr(handle - 1)).kind(), Kind::Characteristic(props));
+            let attr = assert_some!(DB.attr(handle));
             assert_eq!((attr.uuid(), attr.value_source()), (Uuid::U16(uuid), value));
             assert_eq!(attr.access(), Access::from_props(props, Sec::Open));
         }
@@ -109,7 +132,13 @@ fn the_example_values_are_as_given() {
     assert_eq!(example::APPEARANCE, 0x03C1_u16.to_le_bytes());
     assert_eq!(REPORT_MAP.len(), 126);
     let ppcp_value = ppcp(PARAMS);
-    let Value::Const(bytes) = DB.attr(7).unwrap().value_source() else { panic!("the PPCP is no constant") };
+    let Value::Const(bytes) = ({
+        let value = assert_some!(DB.attr(7)).value_source();
+        assert!(matches!(value, Value::Const(_)), "the PPCP is no constant");
+        value
+    }) else {
+        return;
+    };
     assert_eq!(bytes, ppcp_value);
 }
 
@@ -120,31 +149,40 @@ fn input_reports(map: &[u8]) -> [(u8, u32); 3] {
     let mut current = None;
     let (mut size, mut count, mut depth) = (0_u32, 0_u32, 0_i32);
     let mut rest = map;
-    while let [prefix, tail @ ..] = rest {
+    while let Some((&prefix, tail)) = rest.split_first() {
         let len = match prefix & 0x03 {
             3 => 4,
             other => usize::from(other),
         };
         // The item's data, 0 to 4 octets, least significant first.
+        let data = tail.get(..len);
+        assert!(data.is_some(), "the data of item {prefix:#04X}");
         let mut octets = [0_u8; 4];
-        octets[..len].copy_from_slice(&tail[..len]);
+        octets.get_mut(..len).unwrap_or_default().copy_from_slice(data.unwrap_or_default());
         let value = u32::from_le_bytes(octets);
         match prefix & 0xFC {
             0x84 => {
-                let slot = reports.iter().position(|&(id, _)| id == 0).unwrap();
-                reports[slot].0 = u8::try_from(value).unwrap();
-                current = Some(slot);
+                current = reports.iter().position(|&(id, _)| id == 0);
+                assert!(current.is_some(), "at most three report IDs");
+                if let Some(report) = current.and_then(|slot| reports.get_mut(slot)) {
+                    report.0 = value.strict_cast();
+                }
             },
             0x74 => size = value,
             0x94 => count = value,
-            0x80 => reports[current.unwrap()].1 += size * count,
-            0xA0 => depth += 1,
-            0xC0 => depth -= 1,
+            0x80 => {
+                assert!(current.is_some(), "an input item after a report ID");
+                if let Some(report) = current.and_then(|slot| reports.get_mut(slot)) {
+                    report.1 = report.1.strict_add(size.strict_mul(count));
+                }
+            },
+            0xA0 => depth = depth.strict_add(1),
+            0xC0 => depth = depth.strict_sub(1),
             _ => {},
         }
-        rest = &tail[len..];
+        rest = tail.get(len..).unwrap_or_default();
     }
-    assert_eq!(depth, 0);
+    assert_eq!(depth, 0_i32);
     reports
 }
 
@@ -200,7 +238,7 @@ fn the_hash_follows_the_layout() {
     }
     let hashes = [ONE.hash(), OTHER_UUID.hash(), OTHER_PROPS.hash(), OTHER_SECURITY.hash(), EXTRA_DESCRIPTOR.hash()];
     for (index, hash) in hashes.iter().enumerate() {
-        for other in &hashes[index + 1..] {
+        for other in hashes.get(index.strict_add(1)..).unwrap_or_default() {
             assert_ne!(hash, other);
         }
     }
@@ -233,18 +271,15 @@ fn notify_and_indicate_only_characteristics_keep_their_security() {
     assert_eq!(SECRET_NOTIFY.sec(), Sec::Encrypted);
     assert_eq!(SECRET_INDICATE.sec(), Sec::Encrypted);
     assert_eq!(OPEN_NOTIFY.sec(), Sec::Open);
-    let value = SILENT.attr(SECRET_NOTIFY.handle()).unwrap();
+    let value = assert_some!(SILENT.attr(SECRET_NOTIFY.handle()));
     assert_eq!(value.kind(), Kind::Value(Access { read: None, write: None }, Sec::Encrypted));
-    let descriptor = SILENT.attr(SECRET_NOTIFY.handle() + 1).unwrap();
+    let descriptor = assert_some!(SILENT.attr(SECRET_NOTIFY.handle().strict_add(1)));
     assert_eq!(descriptor.access(), Access { read: Some(Sec::Encrypted), write: Some(Sec::Encrypted) });
     // The tables differ only in the level of the first characteristic, and
     // their first three attributes only in that of its value, which can
     // be neither read nor written: the hash follows it all the same.
     assert_ne!(SILENT.hash(), OPEN.hash());
-    assert_ne!(
-        hash::layout(&[SILENT.attrs()[0], SILENT.attrs()[1], SILENT.attrs()[2]]),
-        hash::layout(&[OPEN.attrs()[0], OPEN.attrs()[1], OPEN.attrs()[2]]),
-    );
+    assert_ne!(hash::layout(assert_some!(SILENT.attrs().get(..3))), hash::layout(assert_some!(OPEN.attrs().get(..3))),);
 }
 
 #[test]
@@ -269,6 +304,8 @@ fn subscriptions_keep_the_allowed_bits_and_what_this_link_wrote() {
 
 #[test]
 fn uuids_match_their_short_and_long_forms() {
+    static CUSTOM: [u8; 16] = [7; 16];
+
     let short = Uuid::U16(0x2803);
     assert!(short.matches(&[0x03, 0x28]));
     assert!(!short.matches(&[0x03, 0x28, 0x00]));
@@ -277,7 +314,6 @@ fn uuids_match_their_short_and_long_forms() {
     long[13] = 0x28;
     assert!(short.matches(&long));
     assert_eq!(short.to_u128(), long);
-    static CUSTOM: [u8; 16] = [7; 16];
     assert!(Uuid::U128(&CUSTOM).matches(&[7; 16]));
     assert!(!Uuid::U128(&CUSTOM).matches(&[7, 7]));
     assert_eq!(Uuid::U128(&CUSTOM).wire_len(), 16);
@@ -327,7 +363,13 @@ fn a_characteristic_under_cfg_is_in_the_table_only_where_the_condition_holds() {
     assert_eq!(CONDITIONAL.hash(), PLAIN.hash());
     assert_eq!((KEPT.handle(), KEPT.cccd()), (3, None));
     assert_eq!((AFTER.handle(), AFTER.cccd()), (7, Some(0)));
-    let Value::Const(bytes) = CONDITIONAL.attr(5).unwrap().value_source() else { panic!("not the kept value") };
+    let Value::Const(bytes) = ({
+        let value = assert_some!(CONDITIONAL.attr(5)).value_source();
+        assert!(matches!(value, Value::Const(_)), "not the kept value");
+        value
+    }) else {
+        return;
+    };
     assert_eq!(bytes, [3]);
 }
 
@@ -351,7 +393,7 @@ fn the_hash_follows_the_feature_characteristics() {
 /// The table of a GATT service (`service` 0x1801) or another, with the
 /// Database Hash and then `features`, each a characteristic declared with
 /// its UUID, properties and security and holding a value.
-fn features_table(service: u16, features: &[(u16, u8, Sec, Value)]) -> Db {
+fn features_table(service: u16, features: &[Characteristic]) -> Db {
     let mut attrs: Vec<Attr> = Vec::from([
         Attr::service(Uuid::U16(service)),
         Attr::characteristic(Uuid::U16(DATABASE_HASH), PROP_READ),
@@ -370,32 +412,14 @@ fn features_table(service: u16, features: &[(u16, u8, Sec, Value)]) -> Db {
 #[test]
 #[should_panic(expected = "the Client and Server Supported Features characteristics need the feature eatt")]
 fn without_eatt_the_server_supported_features_are_refused() {
-    let _ = features_table(GATT_SERVICE, &[(SERVER_SUPPORTED_FEATURES, PROP_READ, Sec::Open, Value::Const(&[1]))]);
+    features_table(GATT_SERVICE, &[(SERVER_SUPPORTED_FEATURES, PROP_READ, Sec::Open, Value::Const(&[1]))]);
 }
 
 #[cfg(not(feature = "eatt"))]
 #[test]
 #[should_panic(expected = "the Client and Server Supported Features characteristics need the feature eatt")]
 fn without_eatt_the_client_supported_features_are_refused() {
-    let _ =
-        features_table(GATT_SERVICE, &[(CLIENT_SUPPORTED_FEATURES, PROP_READ | PROP_WRITE, Sec::Open, Value::Sink)]);
-}
-
-/// The Client and Server Supported Features as `eatt` takes them.
-#[cfg(feature = "eatt")]
-const FEATURES: [(u16, u8, Sec, Value); 2] = [
-    (CLIENT_SUPPORTED_FEATURES, PROP_READ | PROP_WRITE, Sec::Open, Value::ClientFeatures),
-    (SERVER_SUPPORTED_FEATURES, PROP_READ, Sec::Open, Value::ServerFeatures),
-];
-
-#[cfg(feature = "eatt")]
-#[test]
-fn with_eatt_the_features_are_found_once_each_in_the_gatt_service() {
-    assert!(features_table(GATT_SERVICE, &FEATURES).has_features());
-    assert!(!features_table(GATT_SERVICE, &FEATURES[..1]).has_features());
-    assert!(!features_table(GATT_SERVICE, &FEATURES[1..]).has_features());
-    assert!(!features_table(GATT_SERVICE, &[]).has_features());
-    assert!(!example::DB.attrs().is_empty() && example::DB.has_features());
+    features_table(GATT_SERVICE, &[(CLIENT_SUPPORTED_FEATURES, PROP_READ | PROP_WRITE, Sec::Open, Value::Sink)]);
 }
 
 /// Each way the feature characteristics can break the rules, refused.
@@ -404,7 +428,7 @@ fn with_eatt_the_features_are_found_once_each_in_the_gatt_service() {
 fn with_eatt_the_features_are_checked() {
     let client = FEATURES[0];
     let server = FEATURES[1];
-    let cases: [(u16, Vec<(u16, u8, Sec, Value)>, &str); 8] = [
+    let cases: [(u16, Vec<Characteristic>, &str); 8] = [
         (0x180F, Vec::from(FEATURES), "the Client Supported Features are declared once"),
         (GATT_SERVICE, Vec::from([client, client]), "the Client Supported Features are declared once"),
         (GATT_SERVICE, Vec::from([server, server]), "the Server Supported Features are declared once"),
@@ -415,7 +439,7 @@ fn with_eatt_the_features_are_checked() {
         (GATT_SERVICE, Vec::from([(0x2A19, PROP_READ, Sec::Open, Value::ServerFeatures)]), "belong to their own"),
     ];
     for (service, features, expected) in cases {
-        let caught = std::panic::catch_unwind(|| features_table(service, &features));
+        let caught = catch_unwind(|| features_table(service, &features));
         let message = caught.err().and_then(|payload| payload.downcast_ref::<&str>().copied());
         assert!(message.is_some_and(|text| text.contains(expected)), "{features:?}: {message:?}");
     }
@@ -426,5 +450,5 @@ fn with_eatt_the_features_are_checked() {
         Attr::value(Uuid::U16(0x2A19), PROP_READ, Sec::Open, Value::Const(&[1])),
         Attr::descriptor(Uuid::U16(0x2901), PROP_READ, Sec::Open, Value::ClientFeatures),
     ]);
-    assert!(std::panic::catch_unwind(|| Db::new(attrs.leak())).is_err());
+    assert!(catch_unwind(|| Db::new(attrs.leak())).err().is_some());
 }
