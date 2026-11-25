@@ -8,7 +8,9 @@
 //! selection algorithm 2. This module holds its types and data limits, the
 //! renewal of the advertising set's ADI and secondary channel, its PDUs from
 //! the settings, its event, and the event's timing, checked at compile time
-//! for LE 1M and, on the nRF52 chips, LE 2M on the secondary channel.
+//! for LE 1M and, on the nRF52 chips, LE 2M on the secondary channel, and
+//! with the feature `coded-phy` LE Coded on the primary and the secondary
+//! channels.
 //!
 //! # Timing
 //!
@@ -73,8 +75,9 @@ const ADV_INTERVAL_MIN_US: u32 = 20_000;
 /// it comes into: the header and the largest payload the advertising
 /// channels admit.
 pub const AUX_BUFFER_LEN: usize = HEADER_LEN.strict_add(AUX_PAYLOAD_MAX);
-/// Time from the end of the last primary packet to the start of the
-/// auxiliary packet on air: at least `T_MAFS`, and 12 us into a 30 us unit.
+/// Time from the start of the last primary packet on LE 1M to the start of
+/// the auxiliary packet on air: at least `T_MAFS` after the primary's end,
+/// and 12 us into a 30 us unit.
 pub const AUX_GAP_US: u32 = 462;
 /// Least CPU time between the radio's DISABLED after a packet and the TXEN
 /// of the next.
@@ -175,10 +178,10 @@ const _: () = {
     while channels <= CHANNELS.len() {
         let mut index: usize = 0;
         while index < channels {
-            let offset = u32::from(aux_offset(channels, index)).strict_mul(UNIT_US);
-            assert!(aux_offset(channels, index) <= AUX_OFFSET_MAX, "the Aux Offset overflows its 13 bits");
+            let offset = u32::from(aux_offset(Phy::M1, channels, index)).strict_mul(UNIT_US);
+            assert!(aux_offset(Phy::M1, channels, index) <= AUX_OFFSET_MAX, "the Aux Offset overflows its 13 bits");
             assert!(offset >= PRIMARY_US.strict_add(T_MAFS_US), "an Aux Offset shorter than the packet and T_MAFS");
-            assert!(aux_start_us(channels, index).strict_sub(offset) == residue, "the AuxPtrs disagree");
+            assert!(aux_start_us(Phy::M1, channels, index).strict_sub(offset) == residue, "the AuxPtrs disagree");
             index = index.strict_add(1);
         }
         channels = channels.strict_add(1);
@@ -194,8 +197,63 @@ const _: () = {
             T_IFS_US.strict_add(secondary.address_offset_us()).strict_add(UNIT_US) <= LISTEN_US,
             "the listen ends before a request's access address"
         );
-        assert!(event_us(CHANNELS.len(), secondary, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US, "the event outlasts 20 ms");
+        assert!(
+            event_us(CHANNELS.len(), Phy::M1, secondary, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US,
+            "the event outlasts 20 ms"
+        );
         phys = rest;
+    }
+};
+
+// The timing plan on LE Coded: on every primary PHY, whole units between
+// primaries, at most 10 ms apart, `T_MAFS` and the same residue from every
+// primary, an Aux Offset within its 13 bits, the CPU's time between packets
+// for every secondary PHY, and a listen that outlasts a request's access
+// address on LE Coded.
+#[cfg(feature = "coded-phy")]
+const _: () = {
+    let residue = aux_residue_us();
+    let mut primaries: &[Phy] = &[Phy::M1, Phy::CodedS8, Phy::CodedS2];
+    while let Some((&primary, rest)) = primaries.split_first() {
+        let spacing = primary_spacing_us(primary);
+        let on_air = primary_us(primary);
+        assert!(spacing.strict_rem(UNIT_US) == 0, "the primary spacing is not whole units");
+        assert!(spacing <= 10_000, "primaries more than 10 ms apart (Core, Vol 6, Part B, 4.4.2.7)");
+        assert!(
+            spacing.strict_sub(on_air).strict_sub(DISABLE_US).strict_sub(tx_ready_us(primary)) >= CPU_SLACK_MIN_US,
+            "no time to set the next primary packet up"
+        );
+        assert!(aux_gap_us(primary).strict_sub(on_air) >= T_MAFS_US, "the auxiliary packet starts within T_MAFS");
+        assert!(
+            aux_gap_us(primary).strict_rem(UNIT_US) == residue,
+            "the auxiliary packet starts elsewhere in its unit"
+        );
+        let mut channels: usize = 1;
+        while channels <= CHANNELS.len() {
+            let mut index: usize = 0;
+            while index < channels {
+                let offset = u32::from(aux_offset(primary, channels, index)).strict_mul(UNIT_US);
+                assert!(aux_offset(primary, channels, index) <= AUX_OFFSET_MAX, "the Aux Offset overflows its 13 bits");
+                assert!(aux_start_us(primary, channels, index).strict_sub(offset) == residue, "the AuxPtrs disagree");
+                assert!(offset >= on_air.strict_add(T_MAFS_US), "an Aux Offset shorter than the packet and T_MAFS");
+                index = index.strict_add(1);
+            }
+            channels = channels.strict_add(1);
+        }
+        let mut secondaries: &[Phy] = &[Phy::M1, Phy::M2, Phy::CodedS8, Phy::CodedS2];
+        while let Some((&secondary, others)) = secondaries.split_first() {
+            assert!(
+                aux_gap_us(primary).strict_sub(on_air).strict_sub(DISABLE_US).strict_sub(tx_ready_us(secondary))
+                    >= CPU_SLACK_MIN_US,
+                "no time to set the auxiliary packet up"
+            );
+            assert!(
+                T_IFS_US.strict_add(secondary.address_offset_us()).strict_add(UNIT_US) <= listen_us(secondary),
+                "the listen ends before a request's access address"
+            );
+            secondaries = others;
+        }
+        primaries = rest;
     }
 };
 
@@ -312,8 +370,9 @@ impl Pdus {
         let (channels, count) = primary_channels(settings.channel_map);
         let aux_channel = aux_channel(settings.aux_id, counter);
         let phy = secondary_phy(settings);
+        let primary_phy = primary_phy(settings);
         let primaries = array::from_fn(|index| {
-            let offset = if index < count { aux_offset(count, index) } else { 0 };
+            let offset = if index < count { aux_offset(primary_phy, count, index) } else { 0 };
             primary(settings, AuxPtr::new(aux_channel, offset, phy))
         });
         Self { aux_channel, auxiliary: Buffer(auxiliary(settings).into_buffer()), channels, count, phy, primaries }
@@ -400,10 +459,11 @@ fn arm(radio: &mut Radio<'_>, clock: &mut Clock<'_>, at: At) -> bool {
     false
 }
 
-/// Airtime of a packet with `payload_len` octets of payload on `phy`:
-/// preamble, access address, header, payload and CRC, at 8 us per octet on
-/// LE 1M and 4 us on LE 2M, whose preamble is two octets, and on LE Coded
-/// as [`Phy::pdu_us`] has it.
+/// Airtime of a packet with `payload_len` octets of payload on `phy`.
+///
+/// It is the preamble, access address, header, payload and CRC, at 8 us per
+/// octet on LE 1M and 4 us on LE 2M, whose preamble is two octets, and on LE
+/// Coded as [`Phy::pdu_us`] has it.
 #[inline]
 #[must_use = "the time is only computed"]
 pub const fn airtime_us(phy: Phy, payload_len: usize) -> u32 {
@@ -427,12 +487,13 @@ pub fn aux_channel(aux_id: u16, counter: u16) -> u8 {
     Hopping::Csa2 { identifier: aux_id }.channel(&UsedChannels::new([0xFF, 0xFF, 0xFF, 0xFF, 0x1F]), counter)
 }
 
-/// The Aux Offset of primary `index` of `channels`, in units of 30 us: from
-/// its start to the unit in which the auxiliary packet starts.
+/// The Aux Offset of primary `index` of `channels` on `primary`, in units
+/// of 30 us: from its start to the unit in which the auxiliary packet
+/// starts.
 #[inline]
 #[must_use = "the offset is only computed"]
-pub const fn aux_offset(channels: usize, index: usize) -> u16 {
-    aux_start_us(channels, index).strict_div(UNIT_US).strict_cast()
+pub const fn aux_offset(primary: Phy, channels: usize, index: usize) -> u16 {
+    aux_start_us(primary, channels, index).strict_div(UNIT_US).strict_cast()
 }
 
 /// How far into the unit of its Aux Offset the auxiliary packet starts:
@@ -441,13 +502,13 @@ pub const fn aux_offset(channels: usize, index: usize) -> u16 {
 #[must_use = "the time is only computed"]
 pub const fn aux_residue_us() -> u32 { AUX_GAP_US.strict_rem(UNIT_US) }
 
-/// Time from the start of primary `index` of `channels` to the start of the
-/// auxiliary packet, on air.
+/// Time from the start of primary `index` of `channels` on `primary` to the
+/// start of the auxiliary packet, on air.
 #[inline]
 #[must_use = "the time is only computed"]
-pub const fn aux_start_us(channels: usize, index: usize) -> u32 {
+pub const fn aux_start_us(primary: Phy, channels: usize, index: usize) -> u32 {
     let after: u32 = channels.strict_sub(1).strict_sub(index).strict_cast();
-    after.strict_mul(PRIMARY_SPACING_US).strict_add(AUX_GAP_US)
+    after.strict_mul(primary_spacing_us(primary)).strict_add(aux_gap_us(primary))
 }
 
 /// The `AUX_ADV_IND` of `settings`: undirected, or directed to the target
@@ -466,11 +527,11 @@ pub fn auxiliary(settings: &Settings) -> AuxAdvertisement {
 fn count(counter: &AtomicU32) { counter.store(counter.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed); }
 
 /// The TXEN of the auxiliary packet on `phy` in an event of `channels`
-/// primaries whose first starts on air at `first`.
+/// primaries on `primary` whose first starts on air at `first`.
 #[inline]
 #[must_use = "the time is only computed"]
-pub(crate) const fn aux_txen(first: At, channels: usize, phy: Phy) -> At {
-    first.after(Micros(aux_start_us(channels, 0))).before(Micros(tx_ready_us(phy)))
+pub(crate) const fn aux_txen(first: At, primary: Phy, channels: usize, phy: Phy) -> At {
+    first.after(Micros(aux_start_us(primary, channels, 0))).before(Micros(tx_ready_us(phy)))
 }
 
 /// Runs one advertising event on the enabled channels.
@@ -496,14 +557,18 @@ pub(crate) fn event(
     counters.events = counters.events.wrapping_add(1);
     counters.sent =
         Some(Sent { adi: settings.adi, channels: pdus.count, len: settings.len, phy: pdus.phy });
+    #[cfg(not(feature = "coded-phy"))]
+    let primary = Phy::M1;
+    #[cfg(feature = "coded-phy")]
+    let primary = primary_phy(settings);
     radio.set_access_address(ADV_ACCESS_ADDRESS);
     radio.set_crc_init(ADV_CRC_INIT);
-    radio.set_phy(Phy::M1);
+    radio.set_phy(primary);
     let started = clock.now();
     if pdus.count == 0 {
         return (started, None);
     }
-    let first = started.after(Micros(EVENT_LEAD_US)).after(Micros(tx_ready_us(Phy::M1)));
+    let first = started.after(Micros(EVENT_LEAD_US)).after(Micros(tx_ready_us(primary)));
     // The first and the last primary sent, on air, for a sampled event.
     #[cfg(feature = "defmt")]
     let mut primaries_on_air: Option<(At, At)> = None;
@@ -513,14 +578,14 @@ pub(crate) fn event(
         // event returns, and no turnaround follows it; every path out waits
         // until the radio is disabled.
         unsafe { radio.prepare_send(pdu.as_bytes()) }
-        if !arm(radio, clock, primary_txen(first, index)) {
+        if !arm(radio, clock, primary_txen(first, primary, index)) {
             count(&LATE_STARTS);
             continue;
         }
         radio.wait_disabled();
         #[cfg(feature = "defmt")]
         if sampled {
-            let on_air = clock.address_time().before(Micros(Phy::M1.address_offset_us()));
+            let on_air = clock.address_time().before(Micros(primary.address_offset_us()));
             primaries_on_air = Some((primaries_on_air.map_or(on_air, |(earliest, _)| earliest), on_air));
         }
     }
@@ -530,18 +595,22 @@ pub(crate) fn event(
     // receives the request into it; the buffer lives until the event
     // returns, and every path out waits until the radio is disabled.
     unsafe { radio.prepare(&mut pdus.auxiliary, Turnaround::Receive) }
-    let accepted = if arm(radio, clock, aux_txen(first, pdus.count, pdus.phy)) {
+    let accepted = if arm(radio, clock, aux_txen(first, primary, pdus.count, pdus.phy)) {
         radio.wait_end();
         #[cfg(feature = "defmt")]
         if let Some((earliest, latest)) = primaries_on_air.filter(|_| sampled) {
             let on_air = clock.address_time().before(Micros(pdus.phy.address_offset_us()));
             counters.timing = Some((on_air.since(latest), on_air.since(earliest)));
         }
-        listen(radio, clock, settings, &mut pdus.auxiliary, (&decoy, &mut answer)).map(|(request, end)| Accepted {
-            end: end.0,
-            request,
-            setup: Setup::aux(pdus.phy),
-        })
+        #[cfg(feature = "coded-phy")]
+        let heard = if pdus.phy.is_coded() {
+            listen_coded(radio, clock, settings, &mut pdus.auxiliary, &mut answer, pdus.phy)
+        } else {
+            listen(radio, clock, settings, &mut pdus.auxiliary, (&decoy, &mut answer))
+        };
+        #[cfg(not(feature = "coded-phy"))]
+        let heard = listen(radio, clock, settings, &mut pdus.auxiliary, (&decoy, &mut answer));
+        heard.map(|(request, end)| Accepted { end: end.0, request, setup: Setup::aux(pdus.phy) })
     } else {
         count(&LATE_STARTS);
         None
@@ -558,7 +627,9 @@ pub(crate) fn event(
 /// [`decision_budget_us`], when a refusal no longer stops it and an
 /// accepted request's answer may have gone out twice. A refusal that stops an
 /// answer under way within the budget, of a central the filter policy or the
-/// directed target refuses, is no timing failure and not counted.
+/// directed target refuses, is no timing failure and not counted. On LE
+/// Coded, whose answer is armed once the request ended, also those whose
+/// answer could not be armed in time.
 #[inline]
 #[must_use = "the count is only read"]
 pub fn late_connect_decisions() -> u32 { LATE_CONNECT_DECISIONS.load(Ordering::Relaxed) }
@@ -662,6 +733,99 @@ fn listen(
     request.map(|accepted| (accepted, end))
 }
 
+/// Listens for an `AUX_CONNECT_REQ` after the `AUX_ADV_IND` on LE Coded with
+/// `phy`'s coding that ended, and answers one `settings` accept. Returns it
+/// with the time its packet ended on air, once the `AUX_CONNECT_RSP` was
+/// sent, with the radio disabled.
+///
+/// The answer's turnaround depends on the coding the central chose for its
+/// request, which the radio learns from the request's coding indicator: the
+/// receive chain takes 29.6 us with S=8 and 24.6 us with S=2. So no
+/// turnaround is armed before the request, as [`listen`] arms one; once the
+/// request ended, the answer to its initiator is armed on TIMER0 for one
+/// interframe space after it ([`Phy::response_offset_us`] of the coding
+/// RATEBOOST tells, [`Radio::received`]). The radio stays in the mode of the
+/// advertising's coding, which receives either coding, as Zephyr's
+/// advertiser does. A request whose CRC fails gets no answer, and one whose
+/// answer cannot be armed [`MIN_LEAD_US`] ahead is refused and counted late.
+/// The request's whole check follows, and a refusal cancels or stops the
+/// answer; a check that ends only after the answer did is counted late,
+/// as in [`listen`]. The answer goes out with the advertising's coding.
+///
+/// The request's END comes the receive chain's delay after its end on air,
+/// which the time returned leaves out: the transmit window is timed from
+/// the end on air (Core, Vol 6, Part B, 4.5.3).
+#[cfg(feature = "coded-phy")]
+fn listen_coded(
+    radio: &mut Radio<'_>,
+    clock: &mut Clock<'_>,
+    settings: &Settings,
+    buffer: &mut AuxBuffer,
+    answer: &mut AuxConnectRsp,
+    phy: Phy,
+) -> Option<(ConnectInd, At)> {
+    // SAFETY: `buffer` is borrowed for this event; every path out waits
+    // until the radio is disabled.
+    unsafe { radio.set_buffer(buffer) }
+    radio.wait_switched();
+    radio.set_turnaround(Turnaround::None);
+    radio.clear_address();
+    let deadline = clock.end_time().after(Micros(listen_us(phy)));
+    clock.expire_at(deadline);
+    let heard = radio.wait_address(|| clock.expired(deadline));
+    clock.stop_expiry();
+    if !heard {
+        radio.disable();
+        return None;
+    }
+    radio.wait_end();
+    let end = clock.end_time();
+    let received = radio.received(phy);
+    radio.wait_disabled();
+    let Some(initiator) = radio.crc_ok().then(|| aux_connect_initiator(&buffer.0)).flatten() else {
+        radio.disable();
+        return None;
+    };
+    retarget(answer, initiator);
+    // SAFETY: the radio only reads the answer, which lives until the event
+    // returns; no turnaround is armed, so no reception follows it.
+    unsafe { radio.set_send_buffer(answer.as_bytes()) }
+    if !arm(radio, clock, end.after(Micros(phy.response_offset_us(received)))) {
+        count(&LATE_CONNECT_DECISIONS);
+        return None;
+    }
+    let request = accepted_request(settings, &buffer.0);
+    if radio.is_end() {
+        count(&LATE_CONNECT_DECISIONS);
+    }
+    let Some(accepted) = request else {
+        // Cancels an answer still to start, and stops one under way: cut
+        // short, it fails its CRC.
+        clock.cancel_start();
+        radio.disable();
+        return None;
+    };
+    clock.wait_started();
+    radio.wait_stopped();
+    Some((accepted, end.before(Micros(chip::rx_chain_ns(received).div_ceil(1000)))))
+}
+
+/// Time after the end of an `AUX_ADV_IND` on `phy` until a request's access
+/// address event must have come.
+///
+/// It is [`LISTEN_US`] on LE 1M and LE 2M, and on LE Coded as much longer as
+/// its access address event comes after the packet's start, 636 us.
+#[cfg(feature = "coded-phy")]
+#[inline]
+#[must_use = "the time is only computed"]
+pub const fn listen_us(phy: Phy) -> u32 {
+    if phy.is_coded() {
+        LISTEN_US.strict_sub(Phy::M1.address_offset_us()).strict_add(phy.address_offset_us())
+    } else {
+        LISTEN_US
+    }
+}
+
 /// Time from the end of an `AUX_CONNECT_REQ` on `phy` on air to the end of
 /// our `AUX_CONNECT_RSP`, one interframe space later: 342 us on LE 1M,
 /// 250 us on LE 2M.
@@ -676,17 +840,17 @@ fn listen(
 #[must_use = "the time is only computed"]
 pub const fn decision_budget_us(phy: Phy) -> u32 { T_IFS_US.strict_add(airtime_us(phy, AUX_CONNECT_RSP_LEN)) }
 
-/// The longest an event of `channels` primaries takes with an auxiliary
-/// packet of `aux_len` payload octets on `phy`, from its start until the
-/// end of an `AUX_CONNECT_RSP`.
+/// The longest an event of `channels` primaries on `primary` takes with an
+/// auxiliary packet of `aux_len` payload octets on `phy`, from its start
+/// until the end of an `AUX_CONNECT_RSP`.
 #[inline]
 #[must_use = "the time is only computed"]
-pub const fn event_us(channels: usize, phy: Phy, aux_len: usize) -> u32 {
+pub const fn event_us(channels: usize, primary: Phy, phy: Phy, aux_len: usize) -> u32 {
     let spacing: u32 = channels.strict_sub(1).strict_cast();
     EVENT_LEAD_US
-        .strict_add(tx_ready_us(Phy::M1))
-        .strict_add(spacing.strict_mul(PRIMARY_SPACING_US))
-        .strict_add(AUX_GAP_US)
+        .strict_add(tx_ready_us(primary))
+        .strict_add(spacing.strict_mul(primary_spacing_us(primary)))
+        .strict_add(aux_gap_us(primary))
         .strict_add(airtime_us(phy, aux_len))
         .strict_add(T_IFS_US)
         .strict_add(airtime_us(phy, usize::from(CONNECT_IND_LEN)))
@@ -694,18 +858,113 @@ pub const fn event_us(channels: usize, phy: Phy, aux_len: usize) -> u32 {
         .strict_add(airtime_us(phy, AUX_CONNECT_RSP_LEN))
 }
 
+/// The PHY of the primary channel: LE 1M, the only one without the feature
+/// `coded-phy`.
+#[cfg(not(feature = "coded-phy"))]
+#[inline]
+#[must_use = "the PHY is only read"]
+pub const fn primary_phy(_settings: &Settings) -> Phy { Phy::M1 }
+
+/// The PHY of the primary channel: the settings', LE 1M or LE Coded.
+#[cfg(feature = "coded-phy")]
+#[inline]
+#[must_use = "the PHY is only read"]
+pub const fn primary_phy(settings: &Settings) -> Phy { settings.primary_phy }
+
+/// Time from the start of one primary packet on `primary` to the next on
+/// air: [`PRIMARY_SPACING_US`], the only spacing without the feature
+/// `coded-phy`.
+#[cfg(not(feature = "coded-phy"))]
+#[inline]
+#[must_use = "the time is only computed"]
+pub const fn primary_spacing_us(_primary: Phy) -> u32 { PRIMARY_SPACING_US }
+
+/// Time from the start of one primary packet on `primary` to the next on
+/// air.
+///
+/// It is [`PRIMARY_SPACING_US`] on LE 1M, and on LE Coded the primary's
+/// airtime, the radio's disabling, the ramp-up and [`CPU_SLACK_MIN_US`],
+/// rounded up to whole units of 30 us: 1290 us with S=8, 690 us with S=2.
+#[cfg(feature = "coded-phy")]
+#[inline]
+#[must_use = "the time is only computed"]
+pub const fn primary_spacing_us(primary: Phy) -> u32 {
+    if !primary.is_coded() {
+        return PRIMARY_SPACING_US;
+    }
+    let busy = primary_us(primary).strict_add(DISABLE_US).strict_add(tx_ready_us(primary)).strict_add(CPU_SLACK_MIN_US);
+    busy.div_ceil(UNIT_US).strict_mul(UNIT_US)
+}
+
+/// Airtime of an `ADV_EXT_IND` on `primary`: [`PRIMARY_US`] on LE 1M,
+/// 1168 us on LE Coded with S=8 and 574 us with S=2.
+#[inline]
+#[must_use = "the time is only computed"]
+pub const fn primary_us(primary: Phy) -> u32 { airtime_us(primary, EXT_PRIMARY_LEN) }
+
+/// Time from the start of the last primary packet on `primary` to the
+/// start of the auxiliary packet on air: [`AUX_GAP_US`], the only gap
+/// without the feature `coded-phy`.
+#[cfg(not(feature = "coded-phy"))]
+#[inline]
+#[must_use = "the time is only computed"]
+pub const fn aux_gap_us(_primary: Phy) -> u32 { AUX_GAP_US }
+
+/// Time from the start of the last primary packet on `primary` to the
+/// start of the auxiliary packet on air.
+///
+/// It is [`AUX_GAP_US`] on LE 1M, and on LE Coded 12 us into the first unit
+/// of 30 us that starts at least `T_MAFS` after the primary's end, as on LE
+/// 1M, and leaves the time to set the auxiliary packet up on any PHY: 1482
+/// us with S=8, 912 us with S=2.
+#[cfg(feature = "coded-phy")]
+#[inline]
+#[must_use = "the time is only computed"]
+pub const fn aux_gap_us(primary: Phy) -> u32 {
+    if !primary.is_coded() {
+        return AUX_GAP_US;
+    }
+    let residue = aux_residue_us();
+    let primary_end = primary_us(primary);
+    let frame_space = primary_end.strict_add(T_MAFS_US);
+    let setup = primary_end
+        .strict_add(DISABLE_US)
+        .strict_add(tx_ready_us(Phy::CodedS8))
+        .strict_add(CPU_SLACK_MIN_US)
+        .strict_sub(residue);
+    let unit = if frame_space > setup { frame_space } else { setup };
+    unit.div_ceil(UNIT_US).strict_mul(UNIT_US).strict_add(residue)
+}
+
+/// Raises the interval of `settings` to the longest its event takes.
+///
+/// That is from its start until the end of an `AUX_CONNECT_RSP`
+/// ([`event_us`]), so that one event ends before the next starts and the
+/// random delay between them holds. Only an event on LE Coded can outlast the
+/// shortest interval, 20 ms: with S=8 on both channels, three primaries and 245
+/// octets of data take about 26 ms.
+#[cfg(feature = "coded-phy")]
+#[inline]
+pub fn fit_interval(settings: &mut Settings) {
+    let (_, channels) = primary_channels(settings.channel_map);
+    let aux_len = auxiliary(settings).as_bytes().len().saturating_sub(HEADER_LEN);
+    let event = event_us(channels.max(1), primary_phy(settings), secondary_phy(settings), aux_len);
+    settings.interval = settings.interval.max(event);
+}
+
 /// The `ADV_EXT_IND` of `settings` with the pointer `aux`.
 #[inline]
 #[must_use = "the PDU is only built"]
 pub fn primary(settings: &Settings, aux: AuxPtr) -> ExtPrimary { ext_primary(settings.adi, aux) }
 
-/// The TXEN of primary `index` in an event whose first primary starts on
-/// air at `first`: `index` spacings later, less the LE 1M ramp-up.
+/// The TXEN of primary `index` on `primary` in an event whose first
+/// primary starts on air at `first`: `index` spacings later, less the
+/// ramp-up.
 #[inline]
 #[must_use = "the time is only computed"]
-pub(crate) const fn primary_txen(first: At, index: usize) -> At {
+pub(crate) const fn primary_txen(first: At, primary: Phy, index: usize) -> At {
     let spacings: u32 = index.saturating_cast();
-    first.after(Micros(PRIMARY_SPACING_US).saturating_mul(spacings)).before(Micros(tx_ready_us(Phy::M1)))
+    first.after(Micros(primary_spacing_us(primary)).saturating_mul(spacings)).before(Micros(tx_ready_us(primary)))
 }
 
 /// The enabled primary channels of `channel_map` in order, and how many

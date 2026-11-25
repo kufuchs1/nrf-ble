@@ -76,7 +76,14 @@ async fn interval(settings: &Settings) -> Micros {
 #[cfg(feature = "extended-advertising")]
 fn start_after_aux(setup: Setup, shared: &Shared) {
     shared.set_phys(setup.phy.hci(), setup.phy.hci());
+    #[cfg(not(feature = "coded-phy"))]
     info!("connection from AUX_CONNECT_REQ: window +{} us, csa2, phy {}M", setup.window_delay_us, setup.phy.hci());
+    #[cfg(feature = "coded-phy")]
+    info!(
+        "connection from AUX_CONNECT_REQ: window +{} us, csa2, phy {} (HCI: 1 LE 1M, 2 LE 2M, 3 LE Coded)",
+        setup.window_delay_us,
+        setup.phy.hci()
+    );
 }
 
 /// Runs the link layer forever.

@@ -472,6 +472,34 @@ fn the_secondary_phy_reaches_the_link_layer_where_the_chip_has_it() {
     assert!(params.secondary_phy == expected && params.kind == Kind::ConnectableUndirected && params.private);
 }
 
+/// LE Coded reaches the link layer on the primary and the secondary
+/// channels; LE 2M, which no primary channel takes, keeps the primaries on
+/// LE 1M.
+#[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+#[test]
+fn le_coded_reaches_the_link_layer_on_both_channels() {
+    use crate::radio::Phy;
+    use core::cell::Cell;
+    /// A stand-in that keeps the parameters of the last advertising.
+    struct Params(Cell<Option<AdvParams>>);
+    impl Control for Params {
+        fn call(&self, call: Call<'_>) -> Result<(), link::Error> {
+            if let Call::Advertise { params, adv: _, scan: _ } = call {
+                self.0.set(Some(params));
+            }
+            Ok(())
+        }
+    }
+    let control = Params(Cell::new(None));
+    let advertising = || example::advertising(Mode::Pairing, None);
+    assert!(assert_ok!(advertising()).primary_phy() == Phy::M1);
+    assert!(assert_ok!(advertising()).with_primary_phy(Phy::M2).primary_phy() == Phy::M1);
+    let long_range = assert_ok!(advertising()).with_primary_phy(Phy::CodedS8).with_secondary_phy(Phy::CodedS2);
+    assert_ok!(long_range.start(&control, &example::PHASES[0]));
+    let params = assert_some!(control.0.get());
+    assert!(params.primary_phy == Phy::CodedS8 && params.secondary_phy == Phy::CodedS2);
+}
+
 #[test]
 fn the_name_is_shortened_in_the_advertising_and_complete_in_the_scan_response() {
     use crate::advertiser::SCAN_DATA_MAX;

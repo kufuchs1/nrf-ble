@@ -672,6 +672,27 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
             assert_eq!(link.advertise(&fast, &[2, 1, 6], &[]), Ok(()));
             assert!(assert_some!(shared.advertising()).secondary_phy == Phy::M2);
         }
+        // With the feature `coded-phy` the primary channels go on LE Coded
+        // too, not on LE 2M, and the interval grows to the event on LE
+        // Coded: 0x0030 units are 30 ms, more than the 26 ms of the longest
+        // event, 0x0020 units 20 ms, less.
+        #[cfg(feature = "coded-phy")]
+        {
+            let coded = params.primary_phy(Phy::CodedS8).secondary_phy(Phy::CodedS8);
+            assert_eq!(link.advertise(&params.primary_phy(Phy::M2), &[2, 1, 6], &[]), Err(Error::Invalid));
+            assert_eq!(
+                link.advertise(&coded.interval(0x0030), zeros.get(..undirected).unwrap_or_default(), &[]),
+                Ok(())
+            );
+            let long_range = assert_some!(shared.advertising());
+            assert!(long_range.primary_phy == Phy::CodedS8 && long_range.secondary_phy == Phy::CodedS8);
+            assert_eq!(long_range.interval, 30_000);
+            assert_eq!(
+                link.advertise(&coded.interval(0x0020), zeros.get(..undirected).unwrap_or_default(), &[]),
+                Ok(())
+            );
+            assert_eq!(assert_some!(shared.advertising()).interval, 26_016);
+        }
     }
     link.stop_advertising();
     assert!(shared.advertising().is_none());

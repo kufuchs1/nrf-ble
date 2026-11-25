@@ -2434,7 +2434,12 @@ impl Connection {
             }),
             room: Room { acl: 0, control: 0 },
             peaks: Peaks::default(),
+            #[cfg(not(feature = "coded-phy"))]
             phy: setup.phy,
+            // LE Coded is received in the mode of S=8, whatever coding the
+            // advertising sent with.
+            #[cfg(feature = "coded-phy")]
+            phy: if setup.phy.is_coded() { Phy::CodedS8 } else { setup.phy },
             trace: Trace::default(),
             tx_phy: setup.phy,
             slots: (TxSlot::empty(), TxSlot::empty()),

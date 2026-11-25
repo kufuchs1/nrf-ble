@@ -990,7 +990,7 @@ fn a_link_that_starts_on_le_coded_keeps_the_coding_it_started_with() {
         let setup = Setup { phy: start, window_delay_us: 3750 };
         let mut link = critical_section::with(|_| Connection::new(&REQUEST, 100, setup));
         link.set_coding(if kept == Coding::S8 { Coding::S2 } else { Coding::S8 });
-        assert!(link.coding == kept && link.tx_phy == start);
+        assert!(link.coding == kept && link.tx_phy == start && link.phy == Phy::CodedS8);
         assert_eq!(link.length.effective(), [27, 2704, 27, 2704]);
         // The window starts at 100 + 3750 us, one unit wide: the radio is
         // ready the widening, the ramp-up and the margin before it, and

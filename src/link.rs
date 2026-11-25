@@ -86,6 +86,8 @@
 //! hears it again, as Zephyr does, so a lost anchor costs one interval, not the
 //! whole latency, and a supervision timeout shorter than a few latencies holds.
 
+#[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+use crate::advertiser::extended::fit_interval;
 #[cfg(feature = "nrf52833")]
 use crate::power_control::{CEILING_DBM, LEVELS_DBM, ceiling_level};
 #[cfg(feature = "coded-phy")]
@@ -641,6 +643,12 @@ pub struct AdvParams {
     /// `directed-advertising` and its key in the resolving list, the target
     /// on air is a resolvable private address of it ([`Link::advertise`]).
     pub peer:          Peer,
+    /// PHY of the primary channels' `ADV_EXT_IND`s: LE 1M, or LE Coded with
+    /// either coding for a central that scans on LE Coded, at up to eight
+    /// times the airtime. LE 2M is refused. The advertising interval grows
+    /// to the event's length where that is longer.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    pub primary_phy:   Phy,
     /// Advertise from a resolvable private address made with the local key
     /// in the resolving list, rather than from the identity address.
     pub private:       bool,
@@ -648,6 +656,13 @@ pub struct AdvParams {
     /// `AUX_CONNECT_REQ` and `AUX_CONNECT_RSP`, and of the connection's
     /// start. LE 1M, or LE 2M on the nRF52 chips, half the airtime for a
     /// central that takes it; the nRF51 refuses LE 2M.
+    #[cfg_attr(
+        feature = "coded-phy",
+        doc = "",
+        doc = "With the feature `coded-phy` also LE Coded, with S=8 or S=2, which the `AUX_ADV_IND`, the \
+               `AUX_CONNECT_RSP` and the link go out with. The connection's transmit window then comes 3.75 ms \
+               after the request, and the advertising interval grows to the event's length where that is longer."
+    )]
     #[cfg(feature = "extended-advertising")]
     pub secondary_phy: Phy,
 }
@@ -675,6 +690,10 @@ impl AdvParams {
         if !chip::PHY_2M && matches!(self.secondary_phy, Phy::M2) {
             return false;
         }
+        #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+        if matches!(self.primary_phy, Phy::M2) {
+            return false;
+        }
         interval_valid && (1..=0x07).contains(&self.channel_map) && self.filter_policy <= 3
     }
 
@@ -689,6 +708,8 @@ impl AdvParams {
             interval: 0x0800,
             kind,
             peer: Peer::new([0; 6], false),
+            #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+            primary_phy: Phy::M1,
             private: false,
             #[cfg(feature = "extended-advertising")]
             secondary_phy: Phy::M1,
@@ -699,6 +720,12 @@ impl AdvParams {
     #[inline]
     #[must_use = "the parameters are only built"]
     pub const fn peer(self, peer: Peer) -> Self { Self { peer, ..self } }
+
+    /// With the PHY of the primary channels.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    #[inline]
+    #[must_use = "the parameters are only built"]
+    pub const fn primary_phy(self, primary_phy: Phy) -> Self { Self { primary_phy, ..self } }
 
     /// From a resolvable private address or not.
     #[inline]
@@ -1625,6 +1652,10 @@ impl<'shared> Link<'shared> {
             settings.filter_policy = params.filter_policy;
             #[cfg(feature = "extended-advertising")]
             settings.secondary_phy.clone_from(&params.secondary_phy);
+            #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+            settings.primary_phy.clone_from(&params.primary_phy);
+            #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+            fit_interval(settings);
             settings.own = addresses.own;
             state.adv_enabled = true;
             Ok(())
