@@ -88,6 +88,8 @@
 
 #[cfg(feature = "nrf52833")]
 use crate::power_control::{CEILING_DBM, LEVELS_DBM, ceiling_level};
+#[cfg(feature = "coded-phy")]
+use crate::radio::Coding;
 #[cfg(feature = "extended-advertising")]
 use crate::{advertiser::extended::RENEWAL_LEN, radio::Phy};
 use crate::{
@@ -118,10 +120,19 @@ pub const ACCEPT_LIST_SIZE: usize = FILTER_LIST_SIZE;
 /// Largest ACL fragment each way: 251 octets with the data length extension,
 /// otherwise 27.
 pub const ACL_MAX: usize = if cfg!(feature = "data-length") { 251 } else { 27 };
+/// The PHY bit field of every PHY this side has: LE 1M and LE 2M, and with
+/// the feature `coded-phy` LE Coded.
+const ALL_PHYS: u8 = if cfg!(feature = "coded-phy") { 0b111 } else { 0b11 };
 /// Default data length: payload octets and time in microseconds.
 pub const LENGTH_DEFAULT: [u16; 2] = [27, 328];
-/// Largest data length this side supports: payload octets and time.
-pub const LENGTH_MAX: [u16; 2] = if cfg!(feature = "data-length") { [251, 2120] } else { LENGTH_DEFAULT };
+/// Largest data length this side supports: payload octets and time. The
+/// time is that of 251 octets with a MIC on LE 1M, 2120 us, and with the
+/// feature `coded-phy` on LE Coded with S=8, 17040 us.
+pub const LENGTH_MAX: [u16; 2] = if cfg!(feature = "data-length") {
+    [251, if cfg!(feature = "coded-phy") { 17_040 } else { 2120 }]
+} else {
+    LENGTH_DEFAULT
+};
 /// Fragments from the host the link layer queues for the air.
 pub const ACL_OUT_BUFFERS: usize = if cfg!(feature = "data-length") { 2 } else { 4 };
 /// Received fragments the link layer queues for the host.
@@ -508,7 +519,9 @@ pub enum Event {
     /// timeout.
     PayloadTimeout,
     /// The PHY changed, or a request of the host for one ended with the
-    /// status: the receive and transmit PHY, 1 for LE 1M and 2 for LE 2M.
+    /// status: the receive and transmit PHY, 1 for LE 1M and 2 for LE 2M,
+    /// and with the feature `coded-phy` 3 for LE Coded, as HCI's LE PHY
+    /// Update Complete event has them.
     PhyUpdated {
         /// The receive PHY.
         rx:     u8,
@@ -855,6 +868,10 @@ pub struct Shared {
     acl_taken:       Signal<CriticalSectionRawMutex, ()> = Signal::new(),
     /// Advertising settings changed.
     changed:         Signal<CriticalSectionRawMutex, ()> = Signal::new(),
+    /// Whether the links that start send on LE Coded with S=2 rather than
+    /// S=8.
+    #[cfg(feature = "coded-phy")]
+    coded_s2:        AtomicBool = AtomicBool::new(false),
     /// Data length the host set for the link: payload octets and time.
     data_length:     Signal<CriticalSectionRawMutex, [u16; 2]> = Signal::new(),
     /// Disconnection requested by the host, with the reason.
@@ -941,6 +958,12 @@ impl Shared {
 
     /// Waits until the advertising settings change.
     pub(crate) async fn changed(&self) { self.changed.wait().await; }
+
+    /// The coding a link that starts sends with on LE Coded.
+    #[cfg(feature = "coded-phy")]
+    pub(crate) fn coding(&self) -> Coding {
+        if self.coded_s2.load(Ordering::Relaxed) { Coding::S2 } else { Coding::S8 }
+    }
 
     /// Releases a host query once its result is retained for delivery.
     pub(crate) fn complete_query(&self, bit: u8) { self.state.lock(|cell| cell.borrow_mut().active_queries &= !bit); }
@@ -1793,7 +1816,7 @@ impl<'shared> Link<'shared> {
     }
 
     /// The receive and transmit PHY of the link, 1 for LE 1M and 2 for
-    /// LE 2M.
+    /// LE 2M, and with the feature `coded-phy` 3 for LE Coded.
     ///
     /// # Errors
     ///
@@ -1985,6 +2008,21 @@ impl<'shared> Link<'shared> {
         })
     }
 
+    /// Sets the coding with which the links that start from now on send on
+    /// LE Coded: [`Coding::S8`], the default, for the longest range, or
+    /// [`Coding::S2`] for a quarter of the airtime of each packet's header,
+    /// payload and CRC. It is this side's own choice, which the PHY update
+    /// procedure does not negotiate, as with HCI's `PHY_Options`; the central
+    /// receives either. A link that runs keeps its coding. A link that
+    /// extended advertising on an LE Coded secondary channel starts takes
+    /// the coding of that channel instead, which its `AUX_CONNECT_RSP` went
+    /// out with.
+    ///
+    /// The coding holds across [`Self::reset`].
+    #[cfg(feature = "coded-phy")]
+    #[inline]
+    pub fn set_coding(&self, coding: Coding) { self.shared.coded_s2.store(coding == Coding::S2, Ordering::Relaxed); }
+
     /// Sets the data length the link may send: payload octets and time in
     /// microseconds. [`Event::DataLength`] reports the effective lengths.
     ///
@@ -2005,7 +2043,12 @@ impl<'shared> Link<'shared> {
 
     /// Sets the transmit and receive PHYs new links prefer: bit 0 for LE 1M,
     /// bit 1 for LE 2M, `None` without a preference.
-    ///
+    #[cfg_attr(
+        feature = "coded-phy",
+        doc = "",
+        doc = "With the feature `coded-phy` also bit 2 for LE Coded, whose coding this side sends with is \
+               [`Self::set_coding`]'s."
+    )]
     /// # Errors
     ///
     /// [`Error::Invalid`] for other bits, [`Error::Unsupported`] for LE 2M
@@ -2250,14 +2293,15 @@ const fn data_length(octets: u16, time: u16) -> Result<[u16; 2], Error> {
 }
 
 /// The transmit and receive PHY preferences: bit 0 for LE 1M, bit 1 for
-/// LE 2M, all of them without a preference.
+/// LE 2M, with the feature `coded-phy` bit 2 for LE Coded, all of them
+/// without a preference.
 fn phy_preferences(tx: Option<u8>, rx: Option<u8>) -> Result<[u8; 2], Error> {
     let check = |phys: Option<u8>| match phys {
-        None => Ok(3),
+        None => Ok(ALL_PHYS),
         Some(bits) if bits & !0b111 != 0 || bits == 0 => Err(Error::Invalid),
         // LE 2M and LE Coded are missing on the nRF51.
         Some(bits) if !chip::PHY_2M && bits & 0b110 != 0 => Err(Error::Unsupported),
-        Some(bits) if bits & 0b100 != 0 => Err(Error::Invalid),
+        Some(bits) if bits & 0b100 != 0 && !cfg!(feature = "coded-phy") => Err(Error::Invalid),
         Some(bits) => Ok(bits),
     };
     Ok([check(tx)?, check(rx)?])

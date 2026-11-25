@@ -186,12 +186,39 @@ fn phy_requests_are_validated_and_one_runs_at_a_time() {
     assert_eq!(shared.take_phy_request(), Some([1, 2]));
     assert_eq!(link.set_phy(epoch, Some(1), Some(2)), Err(Error::Disallowed));
     shared.complete_query(QUERY_PHY);
-    assert_eq!(link.set_phy(epoch, Some(4), Some(2)), Err(Error::Invalid));
+    // LE Coded is a PHY only with the feature `coded-phy`.
+    if cfg!(feature = "coded-phy") {
+        assert_eq!(link.set_phy(epoch, Some(4), Some(2)), Ok(()));
+        assert_eq!(shared.take_phy_request(), Some([4, 2]));
+        shared.complete_query(QUERY_PHY);
+    } else {
+        assert_eq!(link.set_phy(epoch, Some(4), Some(2)), Err(Error::Invalid));
+    }
     assert_eq!(link.set_phy(epoch, Some(0), None), Err(Error::Invalid));
+    assert_eq!(link.set_phy(epoch, Some(8), None), Err(Error::Invalid));
     assert_eq!(link.set_default_phy(None, None), Ok(()));
-    assert_eq!(shared.preferred_phys(), [3, 3]);
+    // No preference names every PHY the build has.
+    assert_eq!(shared.preferred_phys(), if cfg!(feature = "coded-phy") { [7, 7] } else { [3, 3] });
     assert_eq!(link.phy(epoch), Ok([1, 1]));
     assert_eq!(link.phy(Epoch(0)), Err(Error::Gone));
+}
+
+/// Links send on LE Coded with S=8 until the firmware asks for S=2, and
+/// the coding holds across a reset.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn the_coding_of_new_links_is_s8_until_the_firmware_chooses() {
+    use crate::radio::Coding;
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    assert!(shared.coding() == Coding::S8);
+    link.set_coding(Coding::S2);
+    assert!(shared.coding() == Coding::S2);
+    shared.signal_reset();
+    shared.complete_reset();
+    assert!(shared.coding() == Coding::S2);
+    link.set_coding(Coding::S8);
+    assert!(shared.coding() == Coding::S8);
 }
 
 #[cfg(feature = "nrf51")]

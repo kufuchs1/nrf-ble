@@ -12,6 +12,8 @@ mod transmit;
 
 #[cfg(feature = "event-timing")]
 use crate::clock::RESTART_EARLY_US;
+#[cfg(feature = "coded-phy")]
+use crate::radio::Coding;
 use crate::{
     advertiser::Setup,
     channel::{Hopping, UsedChannels},
@@ -89,12 +91,14 @@ const PROCEDURE_TIMEOUT_US: Micros = Micros(40_000_000);
 ///
 /// LE encryption, the connection parameters request procedure, the extended
 /// reject indication, the peripheral-initiated feature exchange and LE ping
-/// (bits 0 to 4), the LE 2M PHY (bit 8) where the radio has it, LE extended
-/// advertising (bit 12) with the feature `extended-advertising`, channel
+/// (bits 0 to 4), the LE 2M PHY (bit 8) where the radio has it, the LE Coded
+/// PHY (bit 11) with the feature `coded-phy`, LE extended advertising (bit
+/// 12) with the feature `extended-advertising`, channel
 /// selection algorithm 2 (bit 14) and LE power control (bits 33 and 34).
 pub const FEATURES: [u8; 8] = [
     0x1F | if cfg!(feature = "data-length") { FEATURE_DATA_LENGTH } else { 0 },
     if chip::PHY_2M { 0x41 } else { 0x40 }
+        | if cfg!(feature = "coded-phy") { FEATURE_CODED } else { 0 }
         | if cfg!(feature = "extended-advertising") { FEATURE_EXTENDED_ADVERTISING } else { 0 },
     0,
     0,
@@ -105,10 +109,28 @@ pub const FEATURES: [u8; 8] = [
 ];
 /// Feature bit in the first octet: LE data packet length extension.
 const FEATURE_DATA_LENGTH: u8 = 0x20;
+/// Feature bit in the second octet: the LE Coded PHY (bit 11).
+const FEATURE_CODED: u8 = 0x08;
 /// Feature bit in the second octet: LE extended advertising (bit 12).
 const FEATURE_EXTENDED_ADVERTISING: u8 = 0x10;
 /// Longest time on the air of a data PDU the specification allows.
 const LENGTH_TIME_MAX: u16 = 17_040;
+/// Longest time on the air this side receives a data PDU in: that of
+/// [`LENGTH_MAX`]'s octets on LE 1M.
+#[cfg(not(feature = "coded-phy"))]
+const RX_TIME_MAX: u16 = LENGTH_MAX[1];
+/// Longest time on the air this side receives a data PDU in: that of
+/// [`LENGTH_MAX`]'s octets on LE Coded with S=8, 2704 us for 27 octets and
+/// 17040 us for 251, as Zephyr's controller with LE Coded offers. On LE 1M
+/// and LE 2M the central's packets stay within their PHY's time for as many
+/// octets.
+#[cfg(feature = "coded-phy")]
+const RX_TIME_MAX: u16 = coded_time(LENGTH_MAX[0]);
+/// The least effective time on the air of LE Coded, each way: 2704 us, 27
+/// octets with a MIC with S=8 (Core, Vol 6, Part B, 4.5.10; Zephyr's
+/// `PDU_DC_PAYLOAD_TIME_MIN_CODED`).
+#[cfg(feature = "coded-phy")]
+const CODED_TIME_MIN: u16 = coded_time(LENGTH_DEFAULT[0]);
 /// Length of a message integrity check: [`crypto::MIC_LEN`] as an index.
 const MIC_LEN: usize = usize::from(crypto::MIC_LEN);
 /// Connection parameter change at an instant.
@@ -167,6 +189,10 @@ const OP_PHY_REQ: u8 = 0x16;
 const OP_PHY_RSP: u8 = 0x17;
 /// PHY change at an instant.
 const OP_PHY_UPDATE_IND: u8 = 0x18;
+/// Bits of a PHY bit field that name a PHY this side has, from bit 0: LE
+/// 1M and LE 2M, and with the feature `coded-phy` LE Coded. A central's PHY
+/// preferences without any of them are refused.
+const PHY_BITS: u32 = if cfg!(feature = "coded-phy") { 3 } else { 2 };
 /// PHYs this side prefers for both directions: LE 2M where the radio has
 /// it.
 const PREFERRED_PHYS: u8 = if chip::PHY_2M { 0x02 } else { 0x01 };
@@ -417,6 +443,10 @@ struct DataLength {
     /// Effective values last reported to the host: transmit octets and
     /// time, receive octets and time.
     reported:     [u16; 4],
+    /// The least effective time each way, transmit and receive, on the
+    /// PHY of that direction ([`time_floor`]).
+    #[cfg(feature = "coded-phy")]
+    time_floor:   [u16; 2],
     /// Whether the central answered our `LL_LENGTH_REQ` as unknown.
     unsupported:  bool,
 }
@@ -424,15 +454,19 @@ struct DataLength {
 impl DataLength {
     /// Effective transmit octets and time and receive octets and time.
     const fn effective(&self) -> [u16; 4] {
-        let [default_octets, default_time] = LENGTH_DEFAULT;
-        let [max_octets, max_time] = LENGTH_MAX;
+        let [default_octets, _] = LENGTH_DEFAULT;
+        let [max_octets, _] = LENGTH_MAX;
+        #[cfg(feature = "coded-phy")]
+        let [tx_floor, rx_floor] = self.time_floor;
+        #[cfg(not(feature = "coded-phy"))]
+        let [tx_floor, rx_floor] = [LENGTH_DEFAULT[1]; 2];
         // A host that lowers its length takes effect at once: shorter packets
         // are always allowed.
         [
             self.local_tx[0].min(self.announced_tx[0]).min(self.peer_rx[0]),
-            self.local_tx[1].min(self.announced_tx[1]).min(self.peer_rx[1]).max(default_time),
+            self.local_tx[1].min(self.announced_tx[1]).min(self.peer_rx[1]).max(tx_floor),
             max_octets.min(self.peer_tx[0]).max(default_octets),
-            max_time.min(self.peer_tx[1]).max(default_time),
+            RX_TIME_MAX.min(self.peer_tx[1]).max(rx_floor),
         ]
     }
 
@@ -447,6 +481,8 @@ impl DataLength {
             peer_rx: LENGTH_DEFAULT,
             peer_tx: LENGTH_DEFAULT,
             reported: [octets, time, octets, time],
+            #[cfg(feature = "coded-phy")]
+            time_floor: [time; 2],
             unsupported: false,
         }
     }
@@ -464,7 +500,8 @@ impl DataLength {
     /// effective once the central took it.
     fn pdu(&mut self, code: u8) -> [u8; 9] {
         self.offered_tx = Some(self.local_tx);
-        let [max_octets, max_time] = LENGTH_MAX;
+        let [max_octets, _] = LENGTH_MAX;
+        let max_time = RX_TIME_MAX;
         let [tx_octets, tx_time] = self.local_tx;
         let [[max_octets0, max_octets1], [max_time0, max_time1], [tx_octets0, tx_octets1], [tx_time0, tx_time1]] =
             [max_octets, max_time, tx_octets, tx_time].map(u16::to_le_bytes);
@@ -730,6 +767,9 @@ pub struct Connection {
     central_features:       Option<[u8; 8]>,
     /// Channel map update and its instant.
     channel_update:         Option<(UsedChannels, u16)>,
+    /// The coding this side sends with on LE Coded.
+    #[cfg(feature = "coded-phy")]
+    coding:                 Coding,
     /// ACL packets acknowledged and not yet reported to the host.
     completed:              u16 = 0,
     /// Counter of the next connection event.
@@ -1044,6 +1084,8 @@ impl Connection {
         if let Some((phy, instant)) = self.phy_update
             && instant == self.counter
         {
+            #[cfg(feature = "coded-phy")]
+            self.follow_phys(phy);
             self.phy = phy;
             self.tx_phy = self.next_tx_phy;
             shared.set_phys(self.phy.hci(), self.tx_phy.hci());
@@ -1051,7 +1093,10 @@ impl Connection {
             shared.complete_query(QUERY_PHY);
             self.phy_update = None;
             self.notify(Event::PhyUpdated { rx: phy.hci(), status: STATUS_SUCCESS, tx: self.tx_phy.hci() }, shared);
+            #[cfg(not(feature = "coded-phy"))]
             info!("PHY now {}M", phy.hci());
+            #[cfg(feature = "coded-phy")]
+            info!("PHY now {} in, {} out (HCI: 1 LE 1M, 2 LE 2M, 3 LE Coded)", phy.hci(), self.tx_phy.hci());
         }
         if let Some(update) = self.param_update
             && update.instant == self.counter
@@ -1624,8 +1669,9 @@ impl Connection {
         Window { enable, latest: deadline }: Window,
         shared: &Shared,
     ) -> Option<At> {
-        // Only LE 2M makes the PHYs differ.
-        let asymmetric = chip::PHY_2M && self.phy != self.tx_phy;
+        // Only LE 2M makes the PHYs differ. An answer on LE Coded is timed
+        // the same way, once the coding of the central's packet is known.
+        let asymmetric = chip::PHY_2M && (self.phy != self.tx_phy || self.phy.is_coded());
         // SAFETY: `rx` is a full packet buffer borrowed for this whole
         // exchange, which disables the radio on every path out.
         unsafe { radio.prepare(rx, if asymmetric { Turnaround::None } else { Turnaround::Transmit }) }
@@ -1670,7 +1716,18 @@ impl Connection {
                 {
                     radio.wait_disabled();
                     radio.set_phy(self.tx_phy);
+                    #[cfg(not(feature = "coded-phy"))]
                     if !clock.transmit_at(clock.end_time().after(Micros(self.tx_phy.response_offset_us(self.phy)))) {
+                        crypto::disarm();
+                        self.abort = Some(ERROR_HARDWARE_FAILURE);
+                        return None;
+                    }
+                    // On LE Coded the receive chain's delay depends on the
+                    // coding the central chose for its packet.
+                    #[cfg(feature = "coded-phy")]
+                    if !clock.transmit_at(
+                        clock.end_time().after(Micros(self.tx_phy.response_offset_us(radio.received(self.phy)))),
+                    ) {
                         crypto::disarm();
                         self.abort = Some(ERROR_HARDWARE_FAILURE);
                         return None;
@@ -1738,6 +1795,11 @@ impl Connection {
         // address. The S1 byte in RAM is counted as well, which errs on the
         // long side.
         let packet = |phy: Phy, payload: usize, mic: bool| {
+            #[cfg(feature = "coded-phy")]
+            if phy.is_coded() {
+                let pdu = DATA_HEADER_LEN.saturating_add(payload).saturating_add(if mic { MIC_LEN } else { 0 });
+                return Micros(phy.pdu_us(pdu));
+            }
             let bytes =
                 DATA_HEADER_LEN.saturating_add(payload).saturating_add(if mic { MIC_LEN } else { 0 }).saturating_add(3);
             let octets: u32 = bytes.saturating_cast();
@@ -1860,6 +1922,18 @@ impl Connection {
             }
             self.updates_owed.0 = remaining;
         }
+    }
+
+    /// Takes the PHYs of an update at its instant, receiving on `receive`
+    /// from now on and sending on [`Self::next_tx_phy`]: moves the anchor,
+    /// the time of the central's access address event, which comes 336 us
+    /// later after its packet's start on LE Coded than on LE 1M, and sets the
+    /// least effective time of each direction for its PHY.
+    #[cfg(feature = "coded-phy")]
+    const fn follow_phys(&mut self, receive: Phy) {
+        self.anchor =
+            self.anchor.before(Micros(self.phy.address_offset_us())).after(Micros(receive.address_offset_us()));
+        self.length.time_floor = [time_floor(self.next_tx_phy), time_floor(receive)];
     }
 
     /// Answers a control PDU from the central.
@@ -2066,7 +2140,9 @@ impl Connection {
                 self.enqueue(Llid::Control, &[OP_UNKNOWN_RSP, OP_PHY_REQ]);
                 return;
             }
-            if field::<2>(params, 0).is_none_or(|[tx, rx]| tx.trailing_zeros() >= 2 || rx.trailing_zeros() >= 2) {
+            if field::<2>(params, 0)
+                .is_none_or(|[tx, rx]| tx.trailing_zeros() >= PHY_BITS || rx.trailing_zeros() >= PHY_BITS)
+            {
                 self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_PHY_REQ, ERROR_UNSUPPORTED_VALUE]);
                 return;
             }
@@ -2084,9 +2160,15 @@ impl Connection {
             }
             return;
         }
-        let keep = self.phy.hci();
+        let keep = self.phy.bit();
         let receive = Phy::from_bits(if to_peripheral == 0 { keep } else { to_peripheral });
-        let send = Phy::from_bits(if to_central == 0 { self.tx_phy.hci() } else { to_central });
+        // This side sends on LE Coded with its own coding, which the
+        // procedure leaves to it; it receives either.
+        #[cfg(not(feature = "coded-phy"))]
+        let send = Phy::from_bits(if to_central == 0 { self.tx_phy.bit() } else { to_central });
+        #[cfg(feature = "coded-phy")]
+        let send = Phy::from_bits(if to_central == 0 { self.tx_phy.bit() } else { to_central })
+            .map(|phy| phy.with_coding(self.coding));
         // Each direction keeps its own PHY. Asymmetric exchanges disable
         // the RX-to-TX shortcut and use a compensated TIMER/PPI start.
         let (Some(phy), Some(other)) = (receive, send) else {
@@ -2305,7 +2387,10 @@ impl Connection {
         // firmware for the same values.
         Self {
             acl: None,
+            #[cfg(not(feature = "coded-phy"))]
             length: DataLength::new(LENGTH_DEFAULT),
+            #[cfg(feature = "coded-phy")]
+            length: DataLength { time_floor: [time_floor(setup.phy); 2], ..DataLength::new(LENGTH_DEFAULT) },
             notifications: [None; 3],
             anchor: ended,
             announced_power: [DEFAULT_LEVEL; POWER_PHYS],
@@ -2313,6 +2398,8 @@ impl Connection {
             channel_update: None,
             drift: NO_DRIFT,
             drift_max: NO_DRIFT,
+            #[cfg(feature = "coded-phy")]
+            coding: if matches!(setup.phy, Phy::CodedS2) { Coding::S2 } else { Coding::S8 },
             hopping: if request.csa2 { Hopping::csa2(request.access_address) } else { Hopping::new(request.hop) },
             encryption: Encryption {
                 armed:      false,
@@ -3016,6 +3103,16 @@ impl Connection {
         }
     }
 
+    /// Applies the coding of [`crate::link::Link::set_coding`] when
+    /// establishing a new link, unless the link starts on LE Coded, with the
+    /// coding of the advertising that started it.
+    #[cfg(feature = "coded-phy")]
+    pub(crate) const fn set_coding(&mut self, coding: Coding) {
+        if !self.tx_phy.is_coded() {
+            self.coding = coding;
+        }
+    }
+
     /// Applies the firmware's transmit power ceiling in dBm when
     /// establishing a new link, on every PHY.
     #[cfg(feature = "nrf52833")]
@@ -3038,7 +3135,15 @@ impl Connection {
 
     /// Applies the host's suggested data length when establishing a new
     /// link: the longest payload and time this side may send.
-    pub(crate) const fn set_suggested_length(&mut self, length: [u16; 2]) { self.length = DataLength::new(length); }
+    pub(crate) const fn set_suggested_length(&mut self, length: [u16; 2]) {
+        #[cfg(feature = "coded-phy")]
+        let floor = self.length.time_floor;
+        self.length = DataLength::new(length);
+        #[cfg(feature = "coded-phy")]
+        {
+            self.length.time_floor = floor;
+        }
+    }
 
     /// Passes the events from the current one up to `to` without listening,
     /// as the loop does one at a time: the current event's channel and
@@ -3273,6 +3378,16 @@ impl Connection {
     /// many as fit the effective time on the transmit PHY with the MIC.
     const fn tx_payload_max(&self) -> usize {
         let [octets, time, ..] = self.length.effective();
+        #[cfg(feature = "coded-phy")]
+        if self.tx_phy.is_coded() {
+            let mic = if self.encryption.phase.tx_on() { MIC_LEN } else { 0 };
+            let pdu: usize = self.tx_phy.pdu_octets_within(time.into()).saturating_cast();
+            return pdu
+                .saturating_sub(DATA_HEADER_LEN.strict_sub(1))
+                .saturating_sub(mic)
+                .min(usize::from(octets))
+                .min(ACL_MAX);
+        }
         let per_byte = 8_u32.checked_div(u32::from(self.tx_phy.hci())).unwrap_or(8);
         let mic = if self.encryption.phase.tx_on() { MIC_LEN } else { 0 };
         // Preamble and access address, header and CRC.
@@ -3432,6 +3547,21 @@ const fn for_phy_mut<Value>(values: &mut [Value; POWER_PHYS], phy: Phy) -> &mut 
         Phy::CodedS8 => s8,
         Phy::CodedS2 => s2,
     }
+}
+
+/// Time on the air of a data PDU of `octets` octets of payload and a MIC on
+/// LE Coded with S=8.
+#[cfg(feature = "coded-phy")]
+const fn coded_time(octets: u16) -> u16 {
+    Phy::CodedS8.pdu_us(DATA_HEADER_LEN.strict_sub(1).strict_add(usize::from(octets)).strict_add(MIC_LEN)).strict_cast()
+}
+
+/// The least effective time on the air of a direction on `phy`: 328 us,
+/// and [`CODED_TIME_MIN`] on LE Coded.
+#[cfg(feature = "coded-phy")]
+const fn time_floor(phy: Phy) -> u16 {
+    let [_, default_time] = LENGTH_DEFAULT;
+    if phy.is_coded() { CODED_TIME_MIN } else { default_time }
 }
 
 /// Transmit power in dBm of power control level `level`.

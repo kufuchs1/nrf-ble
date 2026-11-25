@@ -145,6 +145,8 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         #[cfg(feature = "nrf52833")]
         connection.set_max_power(shared.max_power());
         connection.set_suggested_length(shared.suggested_length());
+        #[cfg(feature = "coded-phy")]
+        connection.set_coding(shared.coding());
         let central = request.central();
         let mut shown = central.address;
         shown.reverse();
