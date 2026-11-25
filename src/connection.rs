@@ -213,6 +213,18 @@ const RAMP_UP_US: Micros = Micros(RX_READY_US);
 const RX_MARGIN_US: Micros = Micros(30);
 /// Extra listening after the latest expected access address.
 const RX_TAIL_US: Micros = Micros(30);
+/// Extra listening after the latest expected access address on LE Coded,
+/// 51 us: [`RX_TAIL_US`] and the 21 us, rounded up, by which the receive
+/// chain of S=8, 29.6 us, is longer than that of LE 1M, 9.4 us. The access
+/// address event comes the receive chain's delay after the bits on the
+/// air, and the tail leaves about 20 us beyond LE 1M's. Zephyr's
+/// `lll_peripheral.c` adds the delay of the receive PHY with S=8 to the
+/// timeout of the first packet: `hcto += radio_rx_chain_delay_get(lll->phy_rx,
+/// PHY_FLAGS_S8);`.
+#[cfg(feature = "coded-phy")]
+const RX_TAIL_CODED_US: Micros = Micros(
+    RX_TAIL_US.0.strict_add(chip::rx_chain_ns(Phy::CodedS8).strict_sub(chip::rx_chain_ns(Phy::M1)).div_ceil(1000)),
+);
 /// Microseconds per 10 ms unit.
 const UNIT_10MS_US: u32 = 10_000;
 /// Microseconds per 1.25 ms unit.
@@ -3468,7 +3480,11 @@ impl Connection {
             .before(Micros(self.phy.address_offset_us()))
             .before(RAMP_UP_US)
             .before(RX_MARGIN_US);
-        Window { enable, latest: latest.after(widening).after(RX_TAIL_US) }
+        #[cfg(not(feature = "coded-phy"))]
+        let tail = RX_TAIL_US;
+        #[cfg(feature = "coded-phy")]
+        let tail = if self.phy.is_coded() { RX_TAIL_CODED_US } else { RX_TAIL_US };
+        Window { enable, latest: latest.after(widening).after(tail) }
     }
 }
 

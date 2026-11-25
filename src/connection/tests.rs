@@ -982,7 +982,8 @@ fn an_update_of_one_direction_keeps_the_coding_of_the_other() {
 
 /// A link that extended advertising on LE Coded starts receives on LE Coded,
 /// sends with the advertising's coding, and opens its first receive window
-/// 376 us before the earliest access address event.
+/// 376 us before the earliest access address event. It listens 21 us longer
+/// after the latest than on LE 1M, for the longer receive chain of S=8.
 #[cfg(feature = "coded-phy")]
 #[test]
 fn a_link_that_starts_on_le_coded_keeps_the_coding_it_started_with() {
@@ -994,11 +995,13 @@ fn a_link_that_starts_on_le_coded_keeps_the_coding_it_started_with() {
         assert_eq!(link.length.effective(), [27, 2704, 27, 2704]);
         // The window starts at 100 + 3750 us, one unit wide: the radio is
         // ready the widening, the ramp-up and the margin before it, and
-        // listens until 376 us after its end, the widening and the tail.
+        // listens until 376 us after its end, the widening and the tail of
+        // LE Coded, 30 + 21 us.
         let window = link.window();
         let widening = link.widening(Micros(3850 + 1250 + 376 - 100));
         assert_eq!(window.enable, At(3850).before(widening).before(RAMP_UP_US).before(RX_MARGIN_US));
-        assert_eq!(window.latest, At(3850 + 1250 + 376).after(widening).after(RX_TAIL_US));
+        assert_eq!(RX_TAIL_CODED_US, Micros(51));
+        assert_eq!(window.latest, At(3850 + 1250 + 376 + 51).after(widening));
     }
     let mut link = connection();
     link.set_coding(Coding::S2);

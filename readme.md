@@ -650,7 +650,9 @@ the specification's, not measured with this crate.
 - **Timing:** from Zephyr's `radio_nrf52833.h` (commit 02f236e1): 42.3 µs from TXEN to the first bit on LE Coded, a
   receive chain of 29.6 µs with S=8 and 24.6 µs with S=2 (the header's comment says 19.6), the receiver ready after
   40.3 µs as on LE 1M; the access address event 376 µs after the packet's start (Zephyr's `addr_us_get`). The anchor
-  moves by 336 µs when the receive PHY changes between LE Coded and the others. The answer within the interframe space
+  moves by 336 µs when the receive PHY changes between LE Coded and the others, and the listen for the central's first
+  packet of an event lasts 21 µs longer after its latest access address than on LE 1M, for the longer receive chain
+  (Zephyr's `lll_peripheral.c` adds the receive chain to that timeout). The answer within the interframe space
   is started by TIMER0, 78 µs after the END of a packet sent with S=8 and 83 µs after one with S=2, once the radio's
   RATEBOOST event told the coding, as for different PHYs per direction; a connection event on LE Coded carries one
   exchange. Zephyr's software switch instead arms a second compare for S=2 and cancels the first on RATEBOOST, which
