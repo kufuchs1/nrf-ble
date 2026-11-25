@@ -2,8 +2,9 @@
 //! `p256` used directly: the byte order, the X coordinate as the
 //! Diffie-Hellman key, and the private and public keys that are refused.
 
-use super::*;
-use p256::{NonZeroScalar, ProjectivePoint, ecdh, elliptic_curve::point::AffineCoordinates as _};
+use super::{point::AffineCoordinates as _, *};
+use core::iter::{from_fn, repeat_with};
+use p256::{NonZeroScalar, ProjectivePoint, ecdh};
 
 /// The private key of the debug key pair (Core specification, volume 3,
 /// part H, section 2.3.5.6.1).
@@ -47,12 +48,14 @@ const ONE: &str = "00000000 00000000 00000000 00000000 00000000 00000000 0000000
 
 /// The octets of the hexadecimal `text`, spaces ignored.
 fn hex<const N: usize>(text: &str) -> [u8; N] {
-    let mut digits = text.chars().filter(|c| !c.is_whitespace()).map(|c| c.to_digit(16).expect("a hexadecimal digit"));
+    let mut digits =
+        text.chars().filter(|character| !character.is_whitespace()).map(|character| character.to_digit(16));
     let mut out = [0; N];
     for octet in &mut out {
-        let (Some(high), Some(low)) = (digits.next(), digits.next()) else { panic!("too short: {text}") };
-        let value = high.checked_mul(16).and_then(|shifted| shifted.checked_add(low)).expect("two digits");
-        *octet = u8::try_from(value).expect("an octet");
+        let value =
+            digits.next().flatten().zip(digits.next().flatten()).map(|(high, low)| high.strict_mul(16).strict_add(low));
+        assert!(value.is_some(), "two hexadecimal digits for each octet: {text}");
+        *octet = value.and_then(|both| u8::try_from(both).ok()).unwrap_or_default();
     }
     assert!(digits.next().is_none(), "too long: {text}");
     out
@@ -61,8 +64,11 @@ fn hex<const N: usize>(text: &str) -> [u8; N] {
 /// `octets` with `delta` added to its last, least significant octet, which
 /// must neither carry nor borrow.
 fn last_plus<const N: usize>(mut octets: [u8; N], delta: i8) -> [u8; N] {
-    let last = octets.last_mut().expect("an octet");
-    *last = last.checked_add_signed(delta).expect("no carry or borrow");
+    let sum = octets.last().and_then(|last| last.checked_add_signed(delta));
+    assert!(sum.is_some(), "a last octet, which neither carries nor borrows");
+    if let Some((last, new_last)) = octets.last_mut().zip(sum) {
+        *last = new_last;
+    }
     octets
 }
 
@@ -74,11 +80,16 @@ fn public_key(x: &str, y: &str) -> [u8; PUBLIC_KEY_LEN] {
     key
 }
 
-/// The private key `secret`, which must be valid.
-fn secret_key(secret: &[u8; KEY_LEN]) -> SecretKey { SecretKey::from_bytes(secret).expect("a valid private key") }
+/// The public key of the private key `secret`, if `secret` is valid.
+fn public_of(secret: &[u8; KEY_LEN]) -> Option<[u8; PUBLIC_KEY_LEN]> {
+    SecretKey::from_bytes(secret).map(|key| key.public_key())
+}
 
-/// The public key `key`, which must be valid.
-fn peer(key: &[u8; PUBLIC_KEY_LEN]) -> PublicKey { PublicKey::from_coordinates(key).expect("a valid public key") }
+/// The Diffie-Hellman key of the private key `secret` and the public key
+/// `peer`, if both are valid.
+fn dh_key(secret: &[u8; KEY_LEN], peer: &[u8; PUBLIC_KEY_LEN]) -> Option<[u8; KEY_LEN]> {
+    Some(SecretKey::from_bytes(secret)?.diffie_hellman(&PublicKey::from_coordinates(peer)?))
+}
 
 /// The coordinates of `point`, X then Y, from `p256` directly.
 fn encode(point: &AffinePoint) -> [u8; PUBLIC_KEY_LEN] {
@@ -90,9 +101,9 @@ fn encode(point: &AffinePoint) -> [u8; PUBLIC_KEY_LEN] {
 
 /// The scalars of a seeded xorshift generator, 32 octets each.
 fn scalars(mut seed: u64) -> impl Iterator<Item = [u8; KEY_LEN]> {
-    core::iter::repeat_with(move || {
+    repeat_with(move || {
         let mut out = [0; KEY_LEN];
-        for chunk in out.chunks_exact_mut(8) {
+        for chunk in out.as_chunks_mut::<8>().0 {
             seed ^= seed.wrapping_shl(13);
             seed ^= seed.wrapping_shr(7);
             seed ^= seed.wrapping_shl(17);
@@ -104,34 +115,34 @@ fn scalars(mut seed: u64) -> impl Iterator<Item = [u8; KEY_LEN]> {
 
 #[test]
 fn the_debug_key_pair_gives_its_public_key_and_dh_key() {
-    let secret = secret_key(&hex(DEBUG_PRIVATE_KEY));
+    let secret = hex(DEBUG_PRIVATE_KEY);
     let public = public_key(DEBUG_PUBLIC_X, DEBUG_PUBLIC_Y);
-    assert_eq!(secret.public_key(), public);
-    assert_eq!(secret.diffie_hellman(&peer(&public)), hex(DEBUG_DH_KEY));
+    assert_eq!(public_of(&secret), Some(public));
+    assert_eq!(dh_key(&secret, &public), Some(hex(DEBUG_DH_KEY)));
 }
 
 /// P-256 data set 1 (Core specification, volume 2, part G, section
 /// 7.1.2.1), whose device A has the debug key pair, in both directions.
 #[test]
 fn data_set_1_gives_its_keys() {
-    let secret_a = secret_key(&hex(DEBUG_PRIVATE_KEY));
-    let secret_b = secret_key(&hex("55188b3d 32f6bb9a 900afcfb eed4e72a 59cb9ac2 f19d7cfb 6b4fdd49 f47fc5fd"));
+    let secret_a = hex(DEBUG_PRIVATE_KEY);
+    let secret_b = hex("55188b3d 32f6bb9a 900afcfb eed4e72a 59cb9ac2 f19d7cfb 6b4fdd49 f47fc5fd");
     let public_b = public_key(
         "1ea1f0f0 1faf1d96 09592284 f19e4c00 47b58afd 8615a69f 559077b2 2faaa190",
         "4c55f33e 429dad37 7356703a 9ab85160 472d1130 e28e3676 5f89aff9 15b1214a",
     );
-    assert_eq!(secret_b.public_key(), public_b);
-    let dh_key = hex("ec0234a3 57c8ad05 341010a6 0a397d9b 99796b13 b4f866f1 868d34f3 73bfa698");
-    assert_eq!(secret_a.diffie_hellman(&peer(&public_b)), dh_key);
-    assert_eq!(secret_b.diffie_hellman(&peer(&secret_a.public_key())), dh_key);
+    assert_eq!(public_of(&secret_b), Some(public_b));
+    let shared = hex("ec0234a3 57c8ad05 341010a6 0a397d9b 99796b13 b4f866f1 868d34f3 73bfa698");
+    assert_eq!(dh_key(&secret_a, &public_b), Some(shared));
+    assert_eq!(public_of(&secret_a).and_then(|public_a| dh_key(&secret_b, &public_a)), Some(shared));
 }
 
 /// P-256 data set 2 (Core specification, volume 2, part G, section
 /// 7.1.2.2), in both directions.
 #[test]
 fn data_set_2_gives_its_keys() {
-    let secret_a = secret_key(&hex("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663"));
-    let secret_b = secret_key(&hex("529aa067 0d72cd64 97502ed4 73502b03 7e8803b5 c60829a5 a3caa219 505530ba"));
+    let secret_a = hex("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663");
+    let secret_b = hex("529aa067 0d72cd64 97502ed4 73502b03 7e8803b5 c60829a5 a3caa219 505530ba");
     let public_a = public_key(
         "2c31a47b 5779809e f44cb5ea af5c3e43 d5f8faad 4a8794cb 987e9b03 745c78dd",
         "91951218 3898dfbe cd52e240 8e43871f d0211091 17bd3ed4 eaf84377 43715d4f",
@@ -140,11 +151,11 @@ fn data_set_2_gives_its_keys() {
         "f465e43f f23d3f1b 9dc7dfc0 4da87581 84dbc966 204796ec cf0d6cf5 e16500cc",
         "0201d048 bcbbd899 eeefc424 164e33c2 01c2b010 ca6b4d43 a8a155ca d8ecb279",
     );
-    assert_eq!(secret_a.public_key(), public_a);
-    assert_eq!(secret_b.public_key(), public_b);
-    let dh_key = hex("ab85843a 2f6d883f 62e5684b 38e30733 5fe6e194 5ecd1960 4105c6f2 3221eb69");
-    assert_eq!(secret_a.diffie_hellman(&peer(&public_b)), dh_key);
-    assert_eq!(secret_b.diffie_hellman(&peer(&public_a)), dh_key);
+    assert_eq!(public_of(&secret_a), Some(public_a));
+    assert_eq!(public_of(&secret_b), Some(public_b));
+    let shared = hex("ab85843a 2f6d883f 62e5684b 38e30733 5fe6e194 5ecd1960 4105c6f2 3221eb69");
+    assert_eq!(dh_key(&secret_a, &public_b), Some(shared));
+    assert_eq!(dh_key(&secret_b, &public_a), Some(shared));
 }
 
 /// Scalars at the edges of the digit recoding against `p256` directly: 1 and
@@ -158,15 +169,15 @@ fn edge_scalars_match_p256() {
     let two = last_plus(one, 1);
     for secret in [one, two, order_less_1, order_less_2, [0x88; KEY_LEN], [0x77; KEY_LEN], [0x80; KEY_LEN]] {
         let expected = Point::from_secret_scalar(&NonZeroScalar::from_repr(secret.into()).expect("valid"));
-        assert_eq!(secret_key(&secret).public_key(), encode(expected.as_affine()), "{secret:02x?}");
+        assert_eq!(public_of(&secret), Some(encode(expected.as_affine())), "{secret:02x?}");
     }
     let generator = public_key(GENERATOR_X, GENERATOR_Y);
     assert_eq!(encode(&ProjectivePoint::GENERATOR.to_affine()), generator);
-    assert_eq!(secret_key(&one).public_key(), generator);
+    assert_eq!(public_of(&one), Some(generator));
     let negated = encode(&(-ProjectivePoint::GENERATOR).to_affine());
     assert_eq!(negated[..KEY_LEN], generator[..KEY_LEN]);
     assert_ne!(negated, generator);
-    assert_eq!(secret_key(&order_less_1).public_key(), negated);
+    assert_eq!(public_of(&order_less_1), Some(negated));
 }
 
 /// 64 seeded random key pairs and Diffie-Hellman keys against `p256` used
@@ -174,8 +185,7 @@ fn edge_scalars_match_p256() {
 #[test]
 fn random_scalars_match_p256_ecdh() {
     let mut secrets = scalars(0x5EED_0FB1_EC0D_E000);
-    for _ in 0..64 {
-        let (Some(octets_a), Some(octets_b)) = (secrets.next(), secrets.next()) else { unreachable!() };
+    for (octets_a, octets_b) in from_fn(|| secrets.next().zip(secrets.next())).take(64) {
         let (Some(secret_a), Some(secret_b)) = (SecretKey::from_bytes(&octets_a), SecretKey::from_bytes(&octets_b))
         else {
             // About one in four billion is not below the order.
@@ -188,8 +198,8 @@ fn random_scalars_match_p256_ecdh() {
         assert_eq!(secret_a.public_key(), encode(public_a.as_affine()));
         assert_eq!(secret_b.public_key(), encode(public_b.as_affine()));
         let expected: [u8; KEY_LEN] = (*ecdh::diffie_hellman(scalar_a, public_b.as_affine()).raw_secret_bytes()).into();
-        assert_eq!(secret_a.diffie_hellman(&peer(&secret_b.public_key())), expected);
-        assert_eq!(secret_b.diffie_hellman(&peer(&secret_a.public_key())), expected);
+        assert_eq!(dh_key(&octets_a, &secret_b.public_key()), Some(expected));
+        assert_eq!(dh_key(&octets_b, &secret_a.public_key()), Some(expected));
     }
 }
 
@@ -226,11 +236,12 @@ fn public_keys_off_the_curve_or_out_of_range_are_refused() {
 fn public_keys_at_the_edges_are_taken() {
     let secret = hex::<KEY_LEN>("06a51669 3c9aa31a 6084545d 0c5db641 b48572b9 7203ddff b7ac73f7 d0457663");
     let scalar = NonZeroScalar::from_repr(secret.into()).expect("valid");
-    for key in [public_key(ZERO, Y_OF_ZERO), public_key(X_OF_Y_ONE, ONE), public_key(GENERATOR_X, GENERATOR_Y)] {
-        let x = FieldBytes::from(*key.first_chunk::<KEY_LEN>().expect("X"));
-        let y = FieldBytes::from(*key.last_chunk::<KEY_LEN>().expect("Y"));
+    for (x_text, y_text) in [(ZERO, Y_OF_ZERO), (X_OF_Y_ONE, ONE), (GENERATOR_X, GENERATOR_Y)] {
+        let key = public_key(x_text, y_text);
+        let x = FieldBytes::from(hex::<KEY_LEN>(x_text));
+        let y = FieldBytes::from(hex::<KEY_LEN>(y_text));
         let affine = AffinePoint::from_coordinates(&x, &y).expect("a point of the curve");
         let expected: [u8; KEY_LEN] = (*ecdh::diffie_hellman(scalar, affine).raw_secret_bytes()).into();
-        assert_eq!(secret_key(&secret).diffie_hellman(&peer(&key)), expected, "{key:02x?}");
+        assert_eq!(dh_key(&secret, &key), Some(expected), "{key:02x?}");
     }
 }
