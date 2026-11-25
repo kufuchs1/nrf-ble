@@ -4,7 +4,14 @@
 //! deadlines, the wake-up on room, an advertising call dropped while a
 //! central connects, and the order of the events.
 
+extern crate alloc;
+
 extern crate std;
+
+/// A keyboard's table for the Passkey Entry tests: an input report that
+/// needs an authenticated link.
+#[cfg(feature = "passkey")]
+mod keyboard;
 
 #[cfg(feature = "directed-advertising")]
 use super::adv::{Advertising, DIRECTED_MAX, Phase, Schedule};
@@ -25,22 +32,112 @@ use super::{
     smp::tests::{CENTRAL_ADDRESS, CENTRAL_IDENTITY, CENTRAL_IRK, Central, Device, linux_request, local_rpa, pdu},
     test_aes::Software,
 };
+#[cfg(feature = "directed-advertising")]
+use crate::{
+    advertiser::{self, Settings},
+    crypto::{resolvable_address_with, resolves_with},
+};
 use crate::{
     link::{self, AclIn, ConnectionParams, Epoch, Event, Info, Rx},
     pdu::{IdentityAddress, Peer},
 };
+use alloc::{boxed::Box, collections::VecDeque, vec, vec::Vec};
 use core::{
+    fmt,
     future::{Future, poll_fn},
+    mem,
     pin::{Pin, pin},
     task::{Context, Poll, Waker},
 };
 use embassy_time::Instant;
-use std::{
-    collections::VecDeque,
-    sync::{Mutex, MutexGuard},
-    vec,
-    vec::Vec,
-};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// Sets up the host's tasks as `$tasks`, with a watchdog hook counting its
+/// calls in `$count`.
+macro_rules! tasks {
+    ($host:expr, $tasks:ident, $count:ident) => {
+        let $count = SyncCell::new(0_u32);
+        let mut run_device = Device(0x0123_4567_89AB_CDEF);
+        let mut crypto_device = Device(0x0F1E_2D3C_4B5A_6978);
+        let run = pin!($host.run(&App, &mut run_device));
+        let crypto = pin!($host.crypto(&mut crypto_device, || $count.set($count.get().strict_add(1))));
+        let mut $tasks = Tasks { crypto, run };
+    };
+}
+
+/// Polls `$future` once and returns its output, which must be ready.
+macro_rules! ready {
+    ($future:expr) => {
+        assert_some!(ready_output($future), "the future is not ready")
+    };
+}
+
+/// The event that waits for `conn`'s application.
+macro_rules! next {
+    ($conn:expr) => {
+        ready!(pin!($conn.next()))
+    };
+}
+
+/// Sets up a reconnection of the bonded central, encrypted with the bond's
+/// key, and returns the link.
+macro_rules! reconnected {
+    ($host:expr, $link:expr, $tasks:ident, $conn:ident) => {
+        let identity = identity(1);
+        let bond = bond(&identity);
+        let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
+        let mut advertise = pin!($host.advertise(&advertising, &identity));
+        // No key pair for a reconnection.
+        assert!(poll(advertise.as_mut()).is_pending());
+        $tasks.step();
+        assert!(poll(advertise.as_mut()).is_pending());
+        let calls = $link.calls();
+        assert!(calls.contains(&Seen::AcceptListAdd(bond.peer.peer())));
+        assert_eq!(calls.last(), Some(&Seen::Advertise(32, 3)));
+        // The central connects from a private address the link layer
+        // resolved.
+        $link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
+        $tasks.step();
+        let $conn = assert_ok!(ready!(advertise.as_mut()));
+        assert_eq!($link.calls(), [Seen::Hold(true)]);
+        $link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
+        $tasks.step();
+        assert_eq!($link.calls(), [Seen::Ltk(Some(bond.ltk))]);
+        $link.event(Event::Encryption { on: true, refresh: false, status: 0 });
+        $tasks.step();
+        assert_eq!(next!($conn), ConnEvent::Encrypted { bonded: true });
+    };
+}
+
+/// A directed phase, then the example's first phase.
+#[cfg(feature = "directed-advertising")]
+static DIRECTED_FIRST: [Phase; 2] = [Phase::directed(DIRECTED_MAX), example::PHASES[0]];
+
+/// A schedule that starts with [`DIRECTED_FIRST`]'s directed phase.
+#[cfg(feature = "directed-advertising")]
+static DIRECTED_SCHEDULE: Schedule = Schedule::new(&DIRECTED_FIRST, embassy_time::Duration::from_secs(20));
+
+/// A directed phase, then the example's first two phases.
+#[cfg(feature = "directed-advertising")]
+static DIRECTED_THEN_TWO: [Phase; 3] = [Phase::directed(DIRECTED_MAX), example::PHASES[0], example::PHASES[1]];
+
+/// A schedule that starts with [`DIRECTED_THEN_TWO`]'s directed phase.
+#[cfg(feature = "directed-advertising")]
+static DIRECTED_THEN_TWO_SCHEDULE: Schedule = Schedule::new(&DIRECTED_THEN_TWO, embassy_time::Duration::from_secs(20));
+
+/// Two directed phases, then the example's first phase: directed advertising
+/// for longer than the link layer's 1.28 s.
+#[cfg(feature = "directed-advertising")]
+static TWO_DIRECTED: [Phase; 3] = [Phase::directed(DIRECTED_MAX), Phase::directed(DIRECTED_MAX), example::PHASES[0]];
+
+/// A schedule of [`TWO_DIRECTED`].
+#[cfg(feature = "directed-advertising")]
+static TWO_DIRECTED_SCHEDULE: Schedule = Schedule::new(&TWO_DIRECTED, embassy_time::Duration::from_secs(20));
+
+/// The fallback range of the parameter request tests: 11.25 to 15 ms, a
+/// latency of 30 events, 6 s.
+#[cfg(feature = "param-requests")]
+const FALLBACK: link::ParamRange = link::ParamRange::new(9, 12, 30, 600);
 
 /// A cell the host's tasks may share, as [`Port`] and the hook of
 /// [`Host::crypto`] require: [`core::cell::Cell`] and
@@ -48,17 +145,17 @@ use std::{
 struct SyncCell<T>(Mutex<T>);
 
 impl<T> SyncCell<T> {
+    /// The value, borrowed.
+    fn borrow(&self) -> MutexGuard<'_, T> { self.0.lock().unwrap_or_else(PoisonError::into_inner) }
+
+    /// The value, borrowed mutably.
+    fn borrow_mut(&self) -> MutexGuard<'_, T> { self.0.lock().unwrap_or_else(PoisonError::into_inner) }
+
     /// A cell holding `value`.
     const fn new(value: T) -> Self { Self(Mutex::new(value)) }
 
-    /// The value, borrowed.
-    fn borrow(&self) -> MutexGuard<'_, T> { self.0.lock().unwrap() }
-
-    /// The value, borrowed mutably.
-    fn borrow_mut(&self) -> MutexGuard<'_, T> { self.0.lock().unwrap() }
-
     /// Replaces the value and returns the old one.
-    fn replace(&self, value: T) -> T { core::mem::replace(&mut *self.borrow_mut(), value) }
+    fn replace(&self, value: T) -> T { mem::replace(&mut *self.borrow_mut(), value) }
 
     /// Sets the value.
     fn set(&self, value: T) { *self.borrow_mut() = value; }
@@ -90,41 +187,40 @@ enum Seen {
     StopAdvertising,
 }
 
-impl core::fmt::Debug for Peer {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:02X?}/{}", self.address, self.random)
-    }
+impl fmt::Debug for Peer {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{:02X?}/{}", self.address, self.random) }
 }
 
 /// The link layer and the time, as the host's tasks see them: what the
 /// central sends waits in `rx`, what the host queues in `queue` until the
 /// test takes it for the air.
 struct MockLink {
+    /// The link layer's own state, which every call also reaches while
+    /// [`Self::mirror`] is set, with the RNG and the ECB in software: the
+    /// advertising settings the link layer would put on air.
+    #[cfg(feature = "directed-advertising")]
+    air:       link::Shared,
     /// The calls of the link layer so far.
     calls:     SyncCell<Vec<Seen>>,
     /// Places in the link layer's queue.
     capacity:  SyncCell<usize>,
     /// Whether a link exists.
     connected: SyncCell<bool>,
-    /// The link layer's own state, which every call also reaches while
-    /// [`Self::mirror`] is set, with the RNG and the ECB in software: the
-    /// advertising settings the link layer would put on air.
-    #[cfg(feature = "directed-advertising")]
-    air:       link::Shared,
+    /// Whether the advertising that runs is directed, which a connection
+    /// then answers.
+    directing: SyncCell<bool>,
     /// Random bytes drawn for [`Self::air`] so far: each draw fills its
     /// bytes with their number.
     #[cfg(feature = "directed-advertising")]
     draws:     SyncCell<u8>,
-    /// Whether the calls also reach [`Self::air`].
-    #[cfg(feature = "directed-advertising")]
-    mirror:    SyncCell<bool>,
-    /// Whether the advertising that runs is directed, which a connection
-    /// then answers.
-    directing: SyncCell<bool>,
     /// The current link.
     epoch:     SyncCell<u32>,
     /// The link's information.
     info:      SyncCell<Option<Info>>,
+    /// Whether the calls also reach [`Self::air`].
+    #[cfg(feature = "directed-advertising")]
+    mirror:    SyncCell<bool>,
     /// The time in milliseconds.
     now:       SyncCell<u64>,
     /// The fragments queued and not yet taken for the air.
@@ -140,7 +236,7 @@ struct MockLink {
 /// What the link layer holds for the host, as [`Link::next`] hands it out.
 enum Queued {
     /// A received fragment.
-    Acl(AclIn),
+    Acl(Box<AclIn>),
     /// An event.
     Event(Event),
 }
@@ -152,15 +248,18 @@ impl MockLink {
         self.room.set(true);
     }
 
+    /// The time passes by `millis`.
+    fn advance(&self, millis: u64) { self.now.set(self.now.get().strict_add(millis)); }
+
     /// The calls so far, forgotten.
-    fn calls(&self) -> Vec<Seen> { core::mem::take(&mut *self.calls.borrow_mut()) }
+    fn calls(&self) -> Vec<Seen> { mem::take(&mut *self.calls.borrow_mut()) }
 
     /// A central connects from `peer`, resolved to `identity`, to our
     /// address `local`, answering the advertising that runs, directed or
     /// not.
     fn connect(&self, peer: Peer, identity: Option<Peer>, local: Peer) -> Epoch {
-        let epoch = Epoch::for_test(self.epoch.get() + 1);
-        self.epoch.set(self.epoch.get() + 1);
+        let epoch = Epoch::for_test(self.epoch.get().strict_add(1));
+        self.epoch.set(self.epoch.get().strict_add(1));
         self.connected.set(true);
         self.info.set(Some(Info {
             central_accuracy: 0,
@@ -202,8 +301,31 @@ impl MockLink {
     /// The link layer reports `event`.
     fn event(&self, event: Event) { self.rx.borrow_mut().push_back(Queued::Event(event)); }
 
-    /// The time passes by `millis`.
-    fn advance(&self, millis: u64) { self.now.set(self.now.get() + millis); }
+    /// Makes `call`, recorded as `seen`, of [`Self::air`] too, which must
+    /// take it.
+    #[cfg(feature = "directed-advertising")]
+    fn mirror_call(&self, call: Call<'_>, seen: Seen) {
+        let air = link::Link::new(&self.air);
+        let result = match call {
+            Call::Advertise { adv, params, scan } => {
+                let fill = |bytes: &mut [u8]| {
+                    self.draws.set(self.draws.get().strict_add(1));
+                    bytes.fill(self.draws.get());
+                };
+                air.advertise_drawn(&params, (adv, scan), fill, software)
+            },
+            other @ (Call::AcceptListAdd(_)
+            | Call::AcceptListClear
+            | Call::AddPeer { identity: _, local_irk: _, peer_irk: _ }
+            | Call::ClearPeers
+            | Call::SetAddressResolution(_)
+            | Call::SetIdentity(_)
+            | Call::SetPrivacyMode { device: _, identity: _ }
+            | Call::SetRpaTimeout(_)
+            | Call::StopAdvertising) => air.call(other),
+        };
+        assert_eq!(result, Ok(()), "the link layer refused {seen:?}");
+    }
 
     /// A link layer with four places and no link.
     fn new() -> Self {
@@ -232,22 +354,22 @@ impl MockLink {
     /// octets, `encrypted` or not.
     fn send(&self, cid: u16, payload: &[u8], encrypted: bool) {
         let mut pdu = Vec::new();
-        pdu.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+        pdu.extend_from_slice(&assert_ok!(u16::try_from(payload.len())).to_le_bytes());
         pdu.extend_from_slice(&cid.to_le_bytes());
         pdu.extend_from_slice(payload);
         for (index, chunk) in pdu.chunks(27).enumerate() {
-            self.rx.borrow_mut().push_back(Queued::Acl(AclIn::for_test(index == 0, encrypted, chunk)));
+            self.rx.borrow_mut().push_back(Queued::Acl(Box::new(AclIn::for_test(index == 0, encrypted, chunk))));
         }
     }
 
     /// The central sends `payload` on the security manager channel and
     /// receives what the host answers.
     #[cfg(feature = "passkey")]
-    fn send_and_deliver<R: Future, K: Future>(
-        &self,
-        payload: &[u8],
-        tasks: &mut Tasks<'_, R, K>,
-    ) -> Vec<(Channel, Vec<u8>)> {
+    fn send_and_deliver<R, K>(&self, payload: &[u8], tasks: &mut Tasks<'_, R, K>) -> Vec<(Channel, Vec<u8>)>
+    where
+        R: Future,
+        K: Future,
+    {
         self.send(CID_SECURITY_MANAGER, payload, false);
         tasks.step();
         self.deliver()
@@ -256,7 +378,7 @@ impl MockLink {
     /// The link layer takes every queued fragment for the air.
     fn transmit(&self) -> Vec<(bool, Vec<u8>)> {
         let taken: Vec<_> = self.queue.borrow_mut().drain(..).collect();
-        self.unacked.set(self.unacked.get() + taken.len());
+        self.unacked.set(self.unacked.get().strict_add(taken.len()));
         if !taken.is_empty() {
             self.room.set(true);
         }
@@ -268,7 +390,7 @@ impl Control for MockLink {
     fn call(&self, call: Call<'_>) -> Result<(), link::Error> {
         let seen = match call {
             Call::AcceptListAdd(peer) => Seen::AcceptListAdd(peer),
-            Call::Advertise { params, .. } => {
+            Call::Advertise { params, adv: _, scan: _ } => {
                 if self.connected.get() {
                     return Err(link::Error::Disallowed);
                 }
@@ -283,71 +405,65 @@ impl Control for MockLink {
                 self.directing.set(false);
                 Seen::StopAdvertising
             },
-            _ => Seen::Setup,
+            Call::AcceptListClear
+            | Call::AddPeer { identity: _, local_irk: _, peer_irk: _ }
+            | Call::ClearPeers
+            | Call::SetAddressResolution(_)
+            | Call::SetIdentity(_)
+            | Call::SetPrivacyMode { device: _, identity: _ }
+            | Call::SetRpaTimeout(_) => Seen::Setup,
         };
         #[cfg(feature = "directed-advertising")]
         if self.mirror.get() {
-            let air = link::Link::new(&self.air);
-            let result = match call {
-                Call::Advertise { adv, params, scan } => {
-                    let fill = |bytes: &mut [u8]| {
-                        self.draws.set(self.draws.get() + 1);
-                        bytes.fill(self.draws.get());
-                    };
-                    air.advertise_drawn(&params, (adv, scan), fill, software)
-                },
-                other => air.call(other),
-            };
-            assert_eq!(result, Ok(()), "the link layer refused {seen:?}");
+            self.mirror_call(call, seen);
         }
         self.calls.borrow_mut().push(seen);
         Ok(())
     }
 }
 
-/// Software AES-128 in place of the ECB.
-#[cfg(feature = "directed-advertising")]
-fn software(key: [u8; 16], block: [u8; 16]) -> [u8; 16] { Software.encrypt(key, block) }
-
 impl Port for MockLink {
+    fn answer_ltk(&self, _epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), link::Error> {
+        self.calls.borrow_mut().push(Seen::Ltk(key));
+        Ok(())
+    }
+
     fn end_link(&self, epoch: Epoch, reason: u8) -> Result<(), link::Error> {
-        if !self.connected.get() || self.info.get().unwrap().epoch != epoch {
+        if !self.connected.get() || self.info.get().is_none_or(|info| info.epoch != epoch) {
             return Err(link::Error::Gone);
         }
         self.calls.borrow_mut().push(Seen::Disconnect(reason));
         Ok(())
     }
 
-    fn set_latency_hold(&self, hold: bool) { self.calls.borrow_mut().push(Seen::Hold(hold)); }
-
-    fn fragments_in_flight(&self, _epoch: Epoch) -> usize { self.queue.borrow().len() + self.unacked.get() }
+    fn fragments_in_flight(&self, _epoch: Epoch) -> usize { self.queue.borrow().len().strict_add(self.unacked.get()) }
 
     fn link_info(&self) -> Option<Info> { self.info.get() }
 
-    fn answer_ltk(&self, _epoch: Epoch, key: Option<[u8; 16]>) -> Result<(), link::Error> {
-        self.calls.borrow_mut().push(Seen::Ltk(key));
-        Ok(())
+    fn now(&self) -> Instant { Instant::from_millis(self.now.get()) }
+
+    fn queue_room(&self) -> usize { self.capacity.get().strict_sub(self.queue.borrow().len()) }
+
+    fn queue_room_returned(&self) -> impl Future<Output = ()> {
+        poll_fn(|_| if self.room.replace(false) { Poll::Ready(()) } else { Poll::Pending })
     }
 
     fn receive(&self, acl: &mut AclIn) -> impl Future<Output = Rx> {
-        poll_fn(move |_| match self.rx.borrow_mut().pop_front() {
-            Some(Queued::Acl(fragment)) => {
-                *acl = fragment;
-                Poll::Ready(Rx::Acl)
-            },
-            Some(Queued::Event(event)) => Poll::Ready(Rx::Event(event)),
-            None => Poll::Pending,
+        poll_fn(move |_| {
+            let next = self.rx.borrow_mut().pop_front();
+            match next {
+                Some(Queued::Acl(fragment)) => {
+                    *acl = *fragment;
+                    Poll::Ready(Rx::Acl)
+                },
+                Some(Queued::Event(event)) => Poll::Ready(Rx::Event(event)),
+                None => Poll::Pending,
+            }
         })
     }
 
-    fn now(&self) -> Instant { Instant::from_millis(self.now.get()) }
-
-    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
-        poll_fn(move |_| if self.now() >= deadline { Poll::Ready(()) } else { Poll::Pending })
-    }
-
     fn send_fragment(&self, epoch: Epoch, start: bool, fragment: &[u8]) -> Result<(), link::Error> {
-        if !self.connected.get() || self.info.get().unwrap().epoch != epoch {
+        if !self.connected.get() || self.info.get().is_none_or(|info| info.epoch != epoch) {
             return Err(link::Error::Gone);
         }
         let mut queue = self.queue.borrow_mut();
@@ -355,13 +471,14 @@ impl Port for MockLink {
             return Err(link::Error::Full);
         }
         queue.push_back((start, fragment.to_vec()));
+        drop(queue);
         Ok(())
     }
 
-    fn queue_room(&self) -> usize { self.capacity.get() - self.queue.borrow().len() }
+    fn set_latency_hold(&self, hold: bool) { self.calls.borrow_mut().push(Seen::Hold(hold)); }
 
-    fn queue_room_returned(&self) -> impl Future<Output = ()> {
-        poll_fn(|_| if self.room.replace(false) { Poll::Ready(()) } else { Poll::Pending })
+    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
+        poll_fn(move |_| if self.now() >= deadline { Poll::Ready(()) } else { Poll::Pending })
     }
 }
 
@@ -370,8 +487,7 @@ struct App;
 
 impl Handler for App {
     fn read(&self, id: ValueId, out: &mut [u8]) -> Result<usize, AttError> {
-        assert_eq!(id, example::BATTERY_LEVEL_VALUE);
-        out[0] = 90;
+        *out.first_mut().ok_or(AttError::UNLIKELY_ERROR)? = battery_level(id);
         Ok(1)
     }
 
@@ -381,31 +497,49 @@ impl Handler for App {
 }
 
 /// The host's two tasks, polled by hand.
-struct Tasks<'f, R, K> {
+struct Tasks<'future, R, K> {
     /// [`Host::crypto`].
-    crypto: Pin<&'f mut K>,
+    crypto: Pin<&'future mut K>,
     /// [`Host::run`].
-    run:    Pin<&'f mut R>,
+    run:    Pin<&'future mut R>,
 }
 
 impl<R: Future, K: Future> Tasks<'_, R, K> {
     /// Runs both tasks until neither has anything left to do.
     fn step(&mut self) {
-        for _ in 0..4 {
+        for _ in 0_i32..4_i32 {
             assert!(poll(self.run.as_mut()).is_pending());
             assert!(poll(self.crypto.as_mut()).is_pending());
         }
     }
 }
 
-/// Polls `future` once.
-fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> { future.poll(&mut Context::from_waker(Waker::noop())) }
+/// Software AES-128 in place of the ECB.
+#[cfg(feature = "directed-advertising")]
+fn software(key: [u8; 16], block: [u8; 16]) -> [u8; 16] { Software.encrypt(key, block) }
 
-/// Polls `future` once and returns its output, which must be ready.
-fn ready<F: Future>(future: Pin<&mut F>) -> F::Output {
+/// The battery level, 90 %, the value `id` the host reads must be.
+fn battery_level(id: ValueId) -> u8 {
+    assert_eq!(id, example::BATTERY_LEVEL_VALUE);
+    90
+}
+
+/// Polls `future` once.
+fn poll<F>(future: Pin<&mut F>) -> Poll<F::Output>
+where
+    F: Future,
+{
+    future.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// Polls `future` once: its output, `None` if it is not ready.
+fn ready_output<F>(future: Pin<&mut F>) -> Option<F::Output>
+where
+    F: Future,
+{
     match poll(future) {
-        Poll::Ready(output) => output,
-        Poll::Pending => panic!("the future is not ready"),
+        Poll::Ready(output) => Some(output),
+        Poll::Pending => None,
     }
 }
 
@@ -433,21 +567,12 @@ fn bond(identity: &identity::Local) -> Bond {
     bond
 }
 
-/// Sets up the host's tasks as `$tasks`, with a watchdog hook counting its
-/// calls in `$count`.
-macro_rules! tasks {
-    ($host:expr, $tasks:ident, $count:ident) => {
-        let $count = SyncCell::new(0_u32);
-        let mut run_device = Device(0x0123_4567_89AB_CDEF);
-        let mut crypto_device = Device(0x0F1E_2D3C_4B5A_6978);
-        let run = pin!($host.run(&App, &mut run_device));
-        let crypto = pin!($host.crypto(&mut crypto_device, || $count.set($count.get() + 1)));
-        let mut $tasks = Tasks { crypto, run };
-    };
-}
-
 /// One ATT request, encrypted, and its response.
-fn request<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, pdu: &[u8]) -> Vec<u8> {
+fn request<R, K>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, pdu: &[u8]) -> Vec<u8>
+where
+    R: Future,
+    K: Future,
+{
     link.send(CID_ATT, pdu, true);
     tasks.step();
     let mut pdus = link.deliver();
@@ -466,17 +591,16 @@ fn read(handle: u16) -> [u8; 3] {
 /// The Write Request that enables the notifications of `characteristic`,
 /// whose configuration descriptor follows its value.
 fn enable(characteristic: Char) -> [u8; 5] {
-    let [handle0, handle1] = (characteristic.handle() + 1).to_le_bytes();
+    let [handle0, handle1] = characteristic.handle().strict_add(1).to_le_bytes();
     [0x12, handle0, handle1, 0x01, 0x00]
 }
 
 /// One PDU of the security manager from the central, and ours in answer.
-fn smp<R: Future, K: Future>(
-    link: &MockLink,
-    tasks: &mut Tasks<'_, R, K>,
-    pdu: &[u8],
-    encrypted: bool,
-) -> Vec<Vec<u8>> {
+fn smp<R, K>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, pdu: &[u8], encrypted: bool) -> Vec<Vec<u8>>
+where
+    R: Future,
+    K: Future,
+{
     link.send(CID_SECURITY_MANAGER, pdu, encrypted);
     tasks.step();
     link.deliver()
@@ -488,11 +612,96 @@ fn smp<R: Future, K: Future>(
         .collect()
 }
 
-/// The event that waits for `conn`'s application.
-macro_rules! next {
-    ($conn:expr) => {
-        ready(pin!($conn.next()))
+/// Discovery of the example table as `BlueZ` runs it on an encrypted link,
+/// each answer compared octet for octet, up to the configuration of the
+/// battery and of the first two reports.
+fn discover<R, K>(link: &MockLink, tasks: &mut Tasks<'_, R, K>)
+where
+    R: Future,
+    K: Future,
+{
+    // Discovery as BlueZ runs it, encrypted. With `att-mtu` the ATT MTU
+    // becomes 65.
+    #[cfg(not(feature = "att-mtu"))]
+    assert_eq!(request(link, tasks, &[0x02, 0x05, 0x02]), [0x03, 0x17, 0x00]);
+    #[cfg(feature = "att-mtu")]
+    assert_eq!(request(link, tasks, &[0x02, 0x05, 0x02]), [0x03, 0x41, 0x00]);
+    // The Server Supported Features: none, or with `eatt` EATT at handle
+    // 14.
+    #[cfg(not(feature = "eatt"))]
+    assert_eq!(request(link, tasks, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B]), [0x01, 0x08, 0x01, 0x00, 0x0A]);
+    #[cfg(feature = "eatt")]
+    assert_eq!(request(link, tasks, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B]), [0x09, 0x03, 0x0E, 0x00, 0x01]);
+    // The primary services: three, or with `att-mtu` all five, in two
+    // fragments.
+    let mut services = vec![0x11, 0x06];
+    let shift = example::EATT_SHIFT;
+    let groups = [
+        (1, 7, 0x1800_u16),
+        (8, 10 + shift, 0x1801),
+        (11 + shift, 14 + shift, 0x180F),
+        (15 + shift, 17 + shift, 0x180A),
+        (18 + shift, 36 + shift, 0x1812),
+    ];
+    for &(start, end, uuid) in groups.get(..if cfg!(feature = "att-mtu") { 5 } else { 3 }).unwrap_or_default() {
+        services.extend([start.to_le_bytes(), end.to_le_bytes(), uuid.to_le_bytes()].concat());
+    }
+    assert_eq!(request(link, tasks, &[0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), services);
+    assert_eq!(request(link, tasks, &read(example::BATTERY_LEVEL.handle())), [0x0B, 90]);
+    #[cfg(not(feature = "att-mtu"))]
+    let report_map = request(link, tasks, &read(22 + shift));
+    #[cfg(not(feature = "att-mtu"))]
+    assert_eq!(report_map.get(1..), Some(&example::REPORT_MAP[..22]));
+    // With `att-mtu` the Read Response holds 64 octets of the Report Map:
+    // with the L2CAP header, three fragments of 27, 27 and 15 octets.
+    #[cfg(feature = "att-mtu")]
+    let pdu: Vec<u8> = {
+        link.send(CID_ATT, &read(22 + shift), true);
+        tasks.step();
+        let fragments = link.transmit();
+        link.ack();
+        let lengths: Vec<_> = fragments.iter().map(|entry| (entry.0, entry.1.len())).collect();
+        assert_eq!(lengths, [(true, 27), (false, 27), (false, 15)]);
+        fragments.into_iter().flat_map(|(_, fragment)| fragment).collect()
     };
+    #[cfg(feature = "att-mtu")]
+    assert_eq!(pdu, [&[65, 0x00, 0x04, 0x00, 0x0B][..], &example::REPORT_MAP[..64]].concat());
+    // The input reports need the encryption, which the request had.
+    assert_eq!(request(link, tasks, &read(example::KEYBOARD.handle())), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // The configuration of the battery and of the three reports: the bond
+    // takes it.
+    for characteristic in [example::BATTERY_LEVEL, example::KEYBOARD, example::CONSUMER] {
+        assert_eq!(request(link, tasks, &enable(characteristic)), [0x13]);
+    }
+}
+
+/// The Just Works pairing of a Linux central with the host of `link` on
+/// its first connection, to our address `local`, octet for octet up to our
+/// `DHKey` check: the central, with the keys.
+fn pair_first<R, K>(
+    link: &MockLink,
+    tasks: &mut Tasks<'_, R, K>,
+    multiplications: &SyncCell<u32>,
+    local: Peer,
+) -> Central
+where
+    R: Future,
+    K: Future,
+{
+    let mut central = Central::new(linux_request(true, true), local);
+    let response = smp(link, tasks, &central.request, false);
+    assert_eq!(response, [vec![0x02, 0x03, 0x00, 0x09, 0x10, 0x02, 0x02]]);
+    let answer = smp(link, tasks, &central.public_key(), false);
+    assert_eq!(answer.len(), 2);
+    central.take_public_key(answer.first().map_or(&[][..], Vec::as_slice));
+    central.take_confirm(answer.get(1).map_or(&[][..], Vec::as_slice));
+    // The Diffie-Hellman job ran once both went out.
+    assert_eq!(multiplications.get(), 2);
+    let random = smp(link, tasks, &central.random(), false);
+    central.take_random(random.first().map_or(&[][..], Vec::as_slice));
+    let check = central.check();
+    assert_eq!(smp(link, tasks, &check, false), [central.expected_check().to_vec()]);
+    central
 }
 
 #[test]
@@ -501,12 +710,12 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
 
     // Pairable advertising waits for the key pair, made at once.
     assert!(poll(advertise.as_mut()).is_pending());
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     tasks.step();
     assert_eq!(multiplications.get(), 1);
     assert!(poll(advertise.as_mut()).is_pending());
@@ -516,28 +725,15 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
 
     // A Linux central connects from its public address to our private one.
     let local = local_rpa();
-    let central_address = Peer::new(CENTRAL_ADDRESS, false);
-    let epoch = link.connect(central_address, None, local);
+    let epoch = link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     assert_eq!(conn.epoch(), epoch);
     assert_eq!(link.calls(), [Seen::Hold(true)]);
     assert_eq!(conn.security(), Some(super::gatt::Sec::Open));
 
     // The pairing, against the reference central, octet for octet.
-    let mut central = Central::new(linux_request(true, true), local);
-    let response = smp(link, &mut tasks, &central.request, false);
-    assert_eq!(response, [vec![0x02, 0x03, 0x00, 0x09, 0x10, 0x02, 0x02]]);
-    let answer = smp(link, &mut tasks, &central.public_key(), false);
-    assert_eq!(answer.len(), 2);
-    central.take_public_key(&answer[0]);
-    central.take_confirm(&answer[1]);
-    // The Diffie-Hellman job ran once both went out.
-    assert_eq!(multiplications.get(), 2);
-    let random = smp(link, &mut tasks, &central.random(), false);
-    central.take_random(&random[0]);
-    let check = central.check();
-    assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
+    let central = pair_first(link, &mut tasks, &multiplications, local);
 
     // The link layer asks for the key: the pairing's, least significant
     // octet first.
@@ -556,81 +752,41 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     let mut address = vec![0x09, 0x01];
     address.extend_from_slice(&identity.address());
     assert_eq!(keys, [(Channel::SecurityManager, info), (Channel::SecurityManager, address)]);
-    assert!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true).is_empty());
+    assert_eq!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true), Vec::<Vec<u8>>::new());
     let mut central_identity = [0x09, 0x00, 0, 0, 0, 0, 0, 0];
     central_identity[2..].copy_from_slice(&CENTRAL_IDENTITY);
-    assert!(smp(link, &mut tasks, &central_identity, true).is_empty());
+    assert_eq!(smp(link, &mut tasks, &central_identity, true), Vec::<Vec<u8>>::new());
 
     assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
-    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
-    assert!(bond.peer.peer() == Peer::new(CENTRAL_IDENTITY, false));
+    let ConnEvent::Bonded(bond) = ({
+        let value = next!(conn);
+        assert!(matches!(value, ConnEvent::Bonded(_)), "no bond");
+        value
+    }) else {
+        return;
+    };
+    assert_eq!(bond.peer.peer(), Peer::new(CENTRAL_IDENTITY, false));
     assert_eq!(bond.peer_irk, Some(CENTRAL_IRK));
     assert_eq!(bond.ltk, ltk);
     assert_eq!(bond.local, identity.variant());
     assert_eq!(bond.cccd, 0);
     // The stored form gives the same bond back.
-    assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond.clone()));
+    assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond));
     assert!(poll(pin!(conn.next())).is_pending());
 
-    // Discovery as BlueZ runs it, encrypted. With `att-mtu` the ATT MTU
-    // becomes 65.
-    #[cfg(not(feature = "att-mtu"))]
-    assert_eq!(request(link, &mut tasks, &[0x02, 0x05, 0x02]), [0x03, 0x17, 0x00]);
-    #[cfg(feature = "att-mtu")]
-    assert_eq!(request(link, &mut tasks, &[0x02, 0x05, 0x02]), [0x03, 0x41, 0x00]);
-    // The Server Supported Features: none, or with `eatt` EATT at handle
-    // 14.
-    #[cfg(not(feature = "eatt"))]
-    assert_eq!(request(link, &mut tasks, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B]), [0x01, 0x08, 0x01, 0x00, 0x0A]);
-    #[cfg(feature = "eatt")]
-    assert_eq!(request(link, &mut tasks, &[0x08, 0x01, 0x00, 0xFF, 0xFF, 0x3A, 0x2B]), [0x09, 0x03, 0x0E, 0x00, 0x01]);
-    // The primary services: three, or with `att-mtu` all five, in two
-    // fragments.
-    let mut services = vec![0x11, 0x06];
-    let shift = example::EATT_SHIFT;
-    let groups = [
-        (1, 7, 0x1800_u16),
-        (8, 10 + shift, 0x1801),
-        (11 + shift, 14 + shift, 0x180F),
-        (15 + shift, 17 + shift, 0x180A),
-        (18 + shift, 36 + shift, 0x1812),
-    ];
-    for (start, end, uuid) in &groups[..if cfg!(feature = "att-mtu") { 5 } else { 3 }] {
-        services.extend([start.to_le_bytes(), end.to_le_bytes(), uuid.to_le_bytes()].concat());
-    }
-    assert_eq!(request(link, &mut tasks, &[0x10, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x28]), services);
-    assert_eq!(request(link, &mut tasks, &read(example::BATTERY_LEVEL.handle())), [0x0B, 90]);
-    #[cfg(not(feature = "att-mtu"))]
-    {
-        let report_map = request(link, &mut tasks, &read(22 + shift));
-        assert_eq!(&report_map[1..], &example::REPORT_MAP[..22]);
-    }
-    // With `att-mtu` the Read Response holds 64 octets of the Report Map:
-    // with the L2CAP header, three fragments of 27, 27 and 15 octets.
-    #[cfg(feature = "att-mtu")]
-    {
-        link.send(CID_ATT, &read(22 + shift), true);
-        tasks.step();
-        let fragments = link.transmit();
-        link.ack();
-        let lengths: Vec<_> = fragments.iter().map(|(start, fragment)| (*start, fragment.len())).collect();
-        assert_eq!(lengths, [(true, 27), (false, 27), (false, 15)]);
-        let pdu: Vec<u8> = fragments.into_iter().flat_map(|(_, fragment)| fragment).collect();
-        assert_eq!(pdu, [&[65, 0x00, 0x04, 0x00, 0x0B][..], &example::REPORT_MAP[..64]].concat());
-    }
-    // The input reports need the encryption, which the request had.
-    assert_eq!(request(link, &mut tasks, &read(example::KEYBOARD.handle())), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
-    // The configuration of the battery and of the three reports: the bond
-    // takes it.
-    for characteristic in [example::BATTERY_LEVEL, example::KEYBOARD, example::CONSUMER] {
-        assert_eq!(request(link, &mut tasks, &enable(characteristic)), [0x13]);
-    }
+    discover(link, &mut tasks);
     // The last input report's: its Write Response goes on the air, and
     // the central does not acknowledge it yet.
     link.send(CID_ATT, &enable(example::MOUSE), true);
     tasks.step();
     assert_eq!(link.transmit().len(), 1);
-    let ConnEvent::BondUpdated(updated) = next!(conn) else { panic!("no update") };
+    let ConnEvent::BondUpdated(updated) = ({
+        let value = next!(conn);
+        assert!(matches!(value, ConnEvent::BondUpdated(_)), "no update");
+        value
+    }) else {
+        return;
+    };
     assert_eq!(updated.cccd, 0b0101_0101);
     assert!(poll(pin!(conn.next())).is_pending());
 
@@ -638,7 +794,7 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     // been idle for 100 ms since it was queued.
     link.advance(200);
     tasks.step();
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     link.ack();
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(false)]);
@@ -648,7 +804,7 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     // same as the table's preferred ones.
     link.advance(1299);
     tasks.step();
-    assert!(link.deliver().is_empty());
+    assert_eq!(link.deliver(), []);
     link.advance(1);
     tasks.step();
     let request = link.deliver();
@@ -663,7 +819,7 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
 
     // A report goes out as one fragment.
     let report = [0, 0, 0x4B, 0, 0, 0, 0, 0];
-    assert_eq!(ready(pin!(conn.notify(example::KEYBOARD, &report))), Ok(()));
+    assert_eq!(ready!(pin!(conn.notify(example::KEYBOARD, &report))), Ok(()));
     let mut notification = vec![0x1B];
     notification.extend_from_slice(&example::KEYBOARD.handle().to_le_bytes());
     notification.extend_from_slice(&report);
@@ -674,38 +830,8 @@ fn a_first_connection_pairs_discovers_and_asks_for_the_parameters() {
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x13));
     assert_eq!(link.calls(), [Seen::Hold(false)]);
-    assert_eq!(ready(pin!(conn.notify(example::KEYBOARD, &report))), Err(NotifyError::Disconnected));
+    assert_eq!(ready!(pin!(conn.notify(example::KEYBOARD, &report))), Err(NotifyError::Disconnected));
     assert_eq!(multiplications.get(), 2);
-}
-
-/// Sets up a reconnection of the bonded central, encrypted with the bond's
-/// key, and returns the link.
-macro_rules! reconnected {
-    ($host:expr, $link:expr, $tasks:ident, $conn:ident) => {
-        let identity = identity(1);
-        let bond = bond(&identity);
-        let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
-        let mut advertise = pin!($host.advertise(&advertising, &identity));
-        // No key pair for a reconnection.
-        assert!(poll(advertise.as_mut()).is_pending());
-        $tasks.step();
-        assert!(poll(advertise.as_mut()).is_pending());
-        let calls = $link.calls();
-        assert!(calls.contains(&Seen::AcceptListAdd(bond.peer.peer())));
-        assert_eq!(calls.last(), Some(&Seen::Advertise(32, 3)));
-        // The central connects from a private address the link layer
-        // resolved.
-        $link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
-        $tasks.step();
-        let $conn = ready(advertise.as_mut()).unwrap();
-        assert_eq!($link.calls(), [Seen::Hold(true)]);
-        $link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
-        $tasks.step();
-        assert_eq!($link.calls(), [Seen::Ltk(Some(bond.ltk))]);
-        $link.event(Event::Encryption { on: true, refresh: false, status: 0 });
-        $tasks.step();
-        assert_eq!(next!($conn), ConnEvent::Encrypted { bonded: true });
-    };
 }
 
 #[test]
@@ -715,7 +841,7 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -726,7 +852,7 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
     assert_eq!(calls.last(), Some(&Seen::Advertise(32, 3)));
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     assert_eq!(link.calls(), [Seen::Hold(true)]);
 
     // Before the encryption the bond's subscriptions are not the link's:
@@ -735,7 +861,7 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
     assert!(!conn.is_subscribed(example::KEYBOARD));
     assert_eq!(conn.try_notify(example::BATTERY_LEVEL, &[50]), Err(NotifyError::NotSubscribed));
     assert!(conn.try_notify(example::KEYBOARD, &[0; 8]).is_err());
-    assert!(link.deliver().is_empty());
+    assert_eq!(link.deliver(), []);
 
     // Only EDIV 0 and Rand 0 get the bond's key.
     link.event(Event::LtkRequest { ediv: 0x1234, rand: [0; 8] });
@@ -750,8 +876,8 @@ fn a_reconnection_encrypts_with_the_bond_and_restores_its_subscriptions() {
 
     // An encrypted request that overtakes the encryption event is served
     // as encrypted, with the bond's subscriptions restored.
-    assert_eq!(request(link, &mut tasks, &read(example::KEYBOARD.handle() + 1)), [0x0B, 0x01, 0x00]);
-    assert_eq!(request(link, &mut tasks, &read(example::BATTERY_LEVEL.handle() + 1)), [0x0B, 0x01, 0x00]);
+    assert_eq!(request(link, &mut tasks, &read(example::KEYBOARD.handle().strict_add(1))), [0x0B, 0x01, 0x00]);
+    assert_eq!(request(link, &mut tasks, &read(example::BATTERY_LEVEL.handle().strict_add(1))), [0x0B, 0x01, 0x00]);
     assert!(conn.is_subscribed(example::KEYBOARD));
     assert!(!conn.is_subscribed(example::MOUSE));
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
@@ -777,14 +903,14 @@ fn only_the_bonded_central_gets_the_bond_s_key() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.calls();
     // Another central, which the link layer did not resolve.
     link.connect(Peer::new([9, 9, 9, 9, 9, 0xC9], true), None, local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(true), Seen::Ltk(None)]);
@@ -803,11 +929,11 @@ fn only_the_bonded_central_gets_the_bond_s_key() {
     link.disconnect_link(0x13);
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x13));
-    let mut advertise = pin!(host.advertise(&advertising, &identity));
-    assert!(poll(advertise.as_mut()).is_pending());
+    let mut readvertise = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(readvertise.as_mut()).is_pending());
     link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
-    let _conn = ready(advertise.as_mut()).unwrap();
+    let _conn = assert_ok!(ready!(readvertise.as_mut()));
     link.calls();
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     tasks.step();
@@ -838,7 +964,7 @@ fn notifications_keep_two_in_flight_and_one_place_free() {
     assert!(poll(notify.as_mut()).is_pending());
     link.ack();
     tasks.step();
-    assert_eq!(ready(notify.as_mut()), Ok(()));
+    assert_eq!(ready!(notify.as_mut()), Ok(()));
     assert_eq!(link.deliver().len(), 1);
 
     // One place of the link layer's queue stays for the responses: with
@@ -900,7 +1026,11 @@ fn a_depth_of_zero_is_one() {
 
 /// Sends an ATT request and returns how many fragments the link layer's
 /// queue then holds.
-fn request_queued<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, pdu: &[u8]) -> usize {
+fn request_queued<R, K>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, pdu: &[u8]) -> usize
+where
+    R: Future,
+    K: Future,
+{
     link.send(CID_ATT, pdu, true);
     tasks.step();
     link.queue.borrow().len()
@@ -926,7 +1056,7 @@ fn output_waiting_for_room_goes_out_when_the_link_layer_takes_a_fragment() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -934,7 +1064,7 @@ fn output_waiting_for_room_goes_out_when_the_link_layer_takes_a_fragment() {
     let local = local_rpa();
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let _conn = ready(advertise.as_mut()).unwrap();
+    let _conn = assert_ok!(ready!(advertise.as_mut()));
     let mut central = Central::new(linux_request(true, true), local);
     smp(link, &mut tasks, &central.request, false);
 
@@ -954,11 +1084,11 @@ fn output_waiting_for_room_goes_out_when_the_link_layer_takes_a_fragment() {
     let pdus: Vec<Vec<u8>> = first
         .iter()
         .chain(&second)
-        .filter_map(|(start, fragment)| reassembly.push(*start, false, fragment).map(|pdu| pdu.payload.to_vec()))
+        .filter_map(|entry| reassembly.push(entry.0, false, &entry.1).map(|pdu| pdu.payload.to_vec()))
         .collect();
     assert_eq!(pdus.len(), 2);
-    central.take_public_key(&pdus[0]);
-    central.take_confirm(&pdus[1]);
+    central.take_public_key(assert_some!(pdus.first()));
+    central.take_confirm(assert_some!(pdus.get(1)));
     assert_eq!(multiplications.get(), 2);
 }
 
@@ -969,17 +1099,17 @@ fn a_link_not_encrypted_in_time_ends_with_an_authentication_failure() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     // The reconnection schedule gives the central 20 s.
     link.advance(19_999);
     tasks.step();
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     link.advance(1);
     tasks.step();
     assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
@@ -997,7 +1127,7 @@ fn a_pairing_that_stalls_times_out_and_a_failed_one_ends_once_flushed() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let local = local_rpa();
 
     // A central that stops after the Pairing Request: 30 s later the
@@ -1008,13 +1138,13 @@ fn a_pairing_that_stalls_times_out_and_a_failed_one_ends_once_flushed() {
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     let central = Central::new(linux_request(true, true), local);
     assert_eq!(smp(link, &mut tasks, &central.request, false).len(), 1);
     link.advance(29_999);
     tasks.step();
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     link.advance(1);
     tasks.step();
     assert_eq!(link.calls(), [Seen::Disconnect(0x13)]);
@@ -1026,13 +1156,13 @@ fn a_pairing_that_stalls_times_out_and_a_failed_one_ends_once_flushed() {
 
     // A central whose request lacks Secure Connections: our Pairing Failed
     // goes out, and the link ends once it was acknowledged.
-    let mut advertise = pin!(host.advertise(&advertising, &identity));
-    assert!(poll(advertise.as_mut()).is_pending());
+    let mut refused_call = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(refused_call.as_mut()).is_pending());
     tasks.step();
-    assert!(poll(advertise.as_mut()).is_pending());
+    assert!(poll(refused_call.as_mut()).is_pending());
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let refused_conn = assert_ok!(ready!(refused_call.as_mut()));
     link.calls();
     link.send(CID_SECURITY_MANAGER, &[0x01, 0x04, 0x00, 0x05, 0x10, 0x07, 0x07], false);
     tasks.step();
@@ -1041,7 +1171,7 @@ fn a_pairing_that_stalls_times_out_and_a_failed_one_ends_once_flushed() {
     assert_eq!(failed, [(Channel::SecurityManager, vec![0x05, 0x03])]);
     tasks.step();
     assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
-    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::AUTHENTICATION_REQUIREMENTS));
+    assert_eq!(next!(refused_conn), ConnEvent::PairingFailed(super::smp::Reason::AUTHENTICATION_REQUIREMENTS));
     // One key pair served both links: the first pairing never used it.
     assert_eq!(multiplications.get(), 1);
 }
@@ -1052,14 +1182,14 @@ fn a_pairing_failed_that_is_never_acknowledged_ends_the_link_after_a_second() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     // A request without Secure Connections; our Pairing Failed goes on the
     // air and the central never acknowledges it.
@@ -1068,7 +1198,7 @@ fn a_pairing_failed_that_is_never_acknowledged_ends_the_link_after_a_second() {
     assert_eq!(link.transmit(), [(true, vec![2, 0, 6, 0, 0x05, 0x03])]);
     link.advance(999);
     tasks.step();
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     link.advance(1);
     tasks.step();
     assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
@@ -1082,7 +1212,7 @@ fn a_pairing_failed_from_the_central_ends_the_link_at_once() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1090,12 +1220,12 @@ fn a_pairing_failed_from_the_central_ends_the_link_at_once() {
     let local = local_rpa();
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     let central = Central::new(linux_request(true, true), local);
     assert_eq!(smp(link, &mut tasks, &central.request, false).len(), 1);
     // The central gives up: never answered, and the link ends.
-    assert!(smp(link, &mut tasks, &[0x05, 0x08], false).is_empty());
+    assert_eq!(smp(link, &mut tasks, &[0x05, 0x08], false), Vec::<Vec<u8>>::new());
     assert_eq!(link.calls(), [Seen::Disconnect(0x05)]);
     assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::UNSPECIFIED));
     assert_eq!(multiplications.get(), 1);
@@ -1107,7 +1237,7 @@ fn a_pairing_request_soon_after_a_failed_pairing_gets_repeated_attempts() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let local = local_rpa();
     let central = Central::new(linux_request(true, true), local);
     // The first attempt fails, the user mistyped; the second, 1.5 s later on
@@ -1119,12 +1249,12 @@ fn a_pairing_request_soon_after_a_failed_pairing_gets_repeated_attempts() {
         assert!(poll(advertise.as_mut()).is_pending());
         link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
         tasks.step();
-        let conn = ready(advertise.as_mut()).unwrap();
+        let conn = assert_ok!(ready!(advertise.as_mut()));
         link.calls();
         let response = smp(link, &mut tasks, &central.request, false);
-        assert_eq!(response[0][0], answer, "attempt {attempt}");
+        assert_eq!(response.first().and_then(|pdu| pdu.first()), Some(&answer), "attempt {attempt}");
         if answer == 0x02 {
-            assert!(smp(link, &mut tasks, &[0x05, 0x04], false).is_empty());
+            assert_eq!(smp(link, &mut tasks, &[0x05, 0x04], false), Vec::<Vec<u8>>::new());
             assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::CONFIRM_VALUE_FAILED));
         } else {
             assert_eq!(response, [vec![0x05, 0x09]]);
@@ -1147,12 +1277,12 @@ fn a_pairing_request_while_reconnecting_is_refused_and_ends_the_link() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     // The bonded central lost its keys and pairs again: the slot is taken.
     let central = Central::new(linux_request(true, true), local_rpa());
@@ -1187,8 +1317,8 @@ fn a_rejected_parameter_request_is_not_repeated() {
     tasks.step();
     link.advance(60_000);
     tasks.step();
-    assert!(link.deliver().is_empty());
-    assert!(link.calls().is_empty());
+    assert_eq!(link.deliver(), []);
+    assert_eq!(link.calls(), []);
     #[cfg(feature = "param-requests")]
     assert_eq!(next!(conn), ConnEvent::ParamsRejected);
     assert!(poll(pin!(conn.next())).is_pending());
@@ -1202,7 +1332,7 @@ fn a_bond_is_reported_only_once_the_central_has_our_identity() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let local = local_rpa();
     for acknowledged in [false, true] {
         let mut advertise = pin!(host.advertise(&advertising, &identity));
@@ -1211,15 +1341,15 @@ fn a_bond_is_reported_only_once_the_central_has_our_identity() {
         assert!(poll(advertise.as_mut()).is_pending());
         link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
         tasks.step();
-        let conn = ready(advertise.as_mut()).unwrap();
+        let conn = assert_ok!(ready!(advertise.as_mut()));
         // BlueZ's default: the central distributes no identity of its own.
         let mut central = Central::new(linux_request(false, true), local);
         smp(link, &mut tasks, &central.request, false);
         let answer = smp(link, &mut tasks, &central.public_key(), false);
-        central.take_public_key(&answer[0]);
-        central.take_confirm(&answer[1]);
+        central.take_public_key(assert_some!(answer.first()));
+        central.take_confirm(assert_some!(answer.get(1)));
         let random = smp(link, &mut tasks, &central.random(), false);
-        central.take_random(&random[0]);
+        central.take_random(assert_some!(random.first()));
         smp(link, &mut tasks, &central.check(), false);
         link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
         link.event(Event::Encryption { on: true, refresh: false, status: 0 });
@@ -1231,8 +1361,14 @@ fn a_bond_is_reported_only_once_the_central_has_our_identity() {
         if acknowledged {
             link.ack();
             tasks.step();
-            let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
-            assert!(bond.peer.peer() == Peer::new(CENTRAL_ADDRESS, false));
+            let ConnEvent::Bonded(bond) = ({
+                let value = next!(conn);
+                assert!(matches!(value, ConnEvent::Bonded(_)), "no bond");
+                value
+            }) else {
+                return;
+            };
+            assert_eq!(bond.peer.peer(), Peer::new(CENTRAL_ADDRESS, false));
         } else {
             // The link ends first: the central may never have learned our
             // identity, and nothing is to be stored.
@@ -1248,17 +1384,21 @@ fn a_bond_is_reported_only_once_the_central_has_our_identity() {
 }
 
 /// Runs a Just Works pairing of a Linux central that sends its identity,
-/// its PDUs `encrypted` or not, up to our DHKey check, and returns the
+/// its PDUs `encrypted` or not, up to our `DHKey` check, and returns the
 /// long term key, least significant octet first.
-fn pair_just_works<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, encrypted: bool) -> [u8; 16] {
+fn pair_just_works<R, K>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, encrypted: bool) -> [u8; 16]
+where
+    R: Future,
+    K: Future,
+{
     let mut central = Central::new(linux_request(true, true), local_rpa());
     assert_eq!(smp(link, tasks, &central.request, encrypted).len(), 1);
     let answer = smp(link, tasks, &central.public_key(), encrypted);
     assert_eq!(answer.len(), 2);
-    central.take_public_key(&answer[0]);
-    central.take_confirm(&answer[1]);
+    central.take_public_key(answer.first().map_or(&[][..], Vec::as_slice));
+    central.take_confirm(answer.get(1).map_or(&[][..], Vec::as_slice));
     let random = smp(link, tasks, &central.random(), encrypted);
-    central.take_random(&random[0]);
+    central.take_random(random.first().map_or(&[][..], Vec::as_slice));
     let check = central.check();
     assert_eq!(smp(link, tasks, &check, encrypted), [central.expected_check().to_vec()]);
     let mut ltk = central.ltk;
@@ -1268,16 +1408,20 @@ fn pair_just_works<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, 
 
 /// Takes our identity keys and sends the central's, as the end of
 /// [`pair_just_works`]'s pairing once the link is encrypted with its key.
-fn exchange_identities<R: Future, K: Future>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, identity: &identity::Local) {
+fn exchange_identities<R, K>(link: &MockLink, tasks: &mut Tasks<'_, R, K>, identity: &identity::Local)
+where
+    R: Future,
+    K: Future,
+{
     let mut info = vec![0x08];
     info.extend_from_slice(&identity.irk());
     let mut address = vec![0x09, 0x01];
     address.extend_from_slice(&identity.address());
     assert_eq!(link.deliver(), [(Channel::SecurityManager, info), (Channel::SecurityManager, address)]);
-    assert!(smp(link, tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true).is_empty());
+    assert_eq!(smp(link, tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true), Vec::<Vec<u8>>::new());
     let mut central_identity = [0x09, 0x00, 0, 0, 0, 0, 0, 0];
     central_identity[2..].copy_from_slice(&CENTRAL_IDENTITY);
-    assert!(smp(link, tasks, &central_identity, true).is_empty());
+    assert_eq!(smp(link, tasks, &central_identity, true), Vec::<Vec<u8>>::new());
 }
 
 #[test]
@@ -1286,14 +1430,14 @@ fn a_pairing_on_a_link_encrypted_with_the_bond_s_key_completes_with_the_key_refr
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
 
     // The first pairing, on the plain link, makes the bond.
@@ -1304,7 +1448,13 @@ fn a_pairing_on_a_link_encrypted_with_the_bond_s_key_completes_with_the_key_refr
     assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
     exchange_identities(link, &mut tasks, &identity);
     assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
-    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
+    let ConnEvent::Bonded(bond) = ({
+        let value = next!(conn);
+        assert!(matches!(value, ConnEvent::Bonded(_)), "no bond");
+        value
+    }) else {
+        return;
+    };
     assert_eq!(bond.ltk, first);
 
     // The central pairs again on the link, still encrypted with the bond's
@@ -1319,8 +1469,14 @@ fn a_pairing_on_a_link_encrypted_with_the_bond_s_key_completes_with_the_key_refr
     assert_eq!(link.calls(), [Seen::Ltk(Some(second))]);
     exchange_identities(link, &mut tasks, &identity);
     // The link stayed encrypted: no second Encrypted, only the new bond.
-    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no second bond") };
-    assert_eq!(bond.ltk, second);
+    let ConnEvent::Bonded(new_bond) = ({
+        let value = next!(conn);
+        assert!(matches!(value, ConnEvent::Bonded(_)), "no second new_bond");
+        value
+    }) else {
+        return;
+    };
+    assert_eq!(new_bond.ltk, second);
     assert!(poll(pin!(conn.next())).is_pending());
 
     // The pairing is over: its timer does not end the link.
@@ -1337,7 +1493,7 @@ fn a_refresh_with_the_bond_s_key_never_completes_a_pairing_on_its_link() {
         let link = host.port();
         tasks!(host, tasks, multiplications);
         let identity = identity(1);
-        let advertising = example::advertising(Mode::Pairing, None).unwrap();
+        let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
         let mut advertise = pin!(host.advertise(&advertising, &identity));
         assert!(poll(advertise.as_mut()).is_pending());
         tasks.step();
@@ -1346,7 +1502,7 @@ fn a_refresh_with_the_bond_s_key_never_completes_a_pairing_on_its_link() {
         // key is given to it.
         link.connect(Peer::new(CENTRAL_ADDRESS, false), Some(Peer::new(CENTRAL_IDENTITY, false)), local_rpa());
         tasks.step();
-        let conn = ready(advertise.as_mut()).unwrap();
+        let conn = assert_ok!(ready!(advertise.as_mut()));
         link.calls();
         let first = pair_just_works(link, &mut tasks, false);
         link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
@@ -1362,10 +1518,10 @@ fn a_refresh_with_the_bond_s_key_never_completes_a_pairing_on_its_link() {
         let mut central = Central::new(linux_request(true, true), local_rpa());
         assert_eq!(smp(link, &mut tasks, &central.request, true).len(), 1);
         let answer = smp(link, &mut tasks, &central.public_key(), true);
-        central.take_public_key(&answer[0]);
-        central.take_confirm(&answer[1]);
+        central.take_public_key(assert_some!(answer.first()));
+        central.take_confirm(assert_some!(answer.get(1)));
         let random = smp(link, &mut tasks, &central.random(), true);
-        central.take_random(&random[0]);
+        central.take_random(assert_some!(random.first()));
         link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
         tasks.step();
         assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
@@ -1404,25 +1560,24 @@ fn a_call_waits_for_a_link_the_run_task_has_not_taken_yet() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let pairing = example::advertising(Mode::Pairing, None).unwrap();
-    {
-        let mut advertise = pin!(host.advertise(&pairing, &identity));
-        assert!(poll(advertise.as_mut()).is_pending());
-        tasks.step();
-        assert!(poll(advertise.as_mut()).is_pending());
-    }
+    let pairing = assert_ok!(example::advertising(Mode::Pairing, None));
+    let mut dropped_call = Box::pin(host.advertise(&pairing, &identity));
+    assert!(poll(dropped_call.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(dropped_call.as_mut()).is_pending());
+    drop(dropped_call);
     link.calls();
     // A central connected to the dropped call; the run task has not read
     // the event when the application asks for reconnection.
     let epoch = link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     let bond = bond(&identity);
-    let reconnect = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let reconnect = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
     let mut advertise = pin!(host.advertise(&reconnect, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     // The link from the pairing call comes back, and nothing was set up
     // for the new call under it.
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     assert_eq!(conn.epoch(), epoch);
     assert_eq!(link.calls(), [Seen::Hold(true)]);
     assert_eq!(multiplications.get(), 1);
@@ -1434,7 +1589,7 @@ fn advertising_starts_again_when_a_link_ends_before_the_host_took_it() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1450,7 +1605,7 @@ fn advertising_starts_again_when_a_link_ends_before_the_host_took_it() {
     // The next central is served.
     let epoch = link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     tasks.step();
-    assert_eq!(ready(advertise.as_mut()).unwrap().epoch(), epoch);
+    assert_eq!(assert_ok!(ready!(advertise.as_mut())).epoch(), epoch);
     assert_eq!(multiplications.get(), 1);
 }
 
@@ -1460,39 +1615,37 @@ fn a_central_that_connects_after_the_advertising_call_was_dropped_is_kept() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
-    {
-        let mut advertise = pin!(host.advertise(&advertising, &identity));
-        assert!(poll(advertise.as_mut()).is_pending());
-        tasks.step();
-        assert!(poll(advertise.as_mut()).is_pending());
-        assert!(link.calls().contains(&Seen::Advertise(32, 0)));
-    }
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
+    let mut dropped_call = Box::pin(host.advertise(&advertising, &identity));
+    assert!(poll(dropped_call.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(dropped_call.as_mut()).is_pending());
+    assert!(link.calls().contains(&Seen::Advertise(32, 0)));
+    drop(dropped_call);
     // The dropped call stopped advertising, but a central had connected.
     assert_eq!(link.calls(), [Seen::StopAdvertising]);
     let epoch = link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(true)]);
     // The next call returns it without advertising.
-    let conn = ready(pin!(host.advertise(&advertising, &identity))).unwrap();
+    let conn = assert_ok!(ready!(pin!(host.advertise(&advertising, &identity))));
     assert_eq!(conn.epoch(), epoch);
     assert_eq!(link.calls(), []);
     // A second call while it exists is refused.
-    assert!(matches!(ready(pin!(host.advertise(&advertising, &identity))), Err(AdvertiseError::Connected)));
+    assert!(matches!(ready!(pin!(host.advertise(&advertising, &identity))), Err(AdvertiseError::Connected)));
 
     // A link that arrived for a call that was dropped before it took it is
     // kept too.
     link.disconnect_link(0x13);
     tasks.step();
-    {
-        let mut advertise = pin!(host.advertise(&advertising, &identity));
-        assert!(poll(advertise.as_mut()).is_pending());
-        link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
-        tasks.step();
-    }
+    let mut second_call = Box::pin(host.advertise(&advertising, &identity));
+    assert!(poll(second_call.as_mut()).is_pending());
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    tasks.step();
+    drop(second_call);
     let calls = link.calls();
     assert!(!calls.iter().any(|call| matches!(call, Seen::Disconnect(_))));
-    assert!(ready(pin!(host.advertise(&advertising, &identity))).is_ok());
+    assert_eq!(ready!(pin!(host.advertise(&advertising, &identity))).err(), None);
     assert_eq!(multiplications.get(), 1);
 }
 
@@ -1502,37 +1655,34 @@ fn a_central_that_connects_after_the_advertising_call_was_dropped_can_be_ended()
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
-    {
-        let mut advertise = pin!(host.advertise(&advertising, &identity));
-        assert!(poll(advertise.as_mut()).is_pending());
-        tasks.step();
-        assert!(poll(advertise.as_mut()).is_pending());
-    }
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
+    let mut dropped_call = Box::pin(host.advertise(&advertising, &identity));
+    assert!(poll(dropped_call.as_mut()).is_pending());
+    tasks.step();
+    assert!(poll(dropped_call.as_mut()).is_pending());
+    drop(dropped_call);
     link.calls();
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(true), Seen::Disconnect(0x13)]);
     // The link is nobody's: the next call waits for its end, then
     // advertises.
-    {
-        let mut advertise = pin!(host.advertise(&advertising, &identity));
-        assert!(poll(advertise.as_mut()).is_pending());
-        assert!(link.calls().is_empty());
-        link.disconnect_link(0x16);
-        tasks.step();
-        assert!(poll(advertise.as_mut()).is_pending());
-        assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 0)));
-    }
+    let mut waiting_call = Box::pin(host.advertise(&advertising, &identity));
+    assert!(poll(waiting_call.as_mut()).is_pending());
+    assert_eq!(link.calls(), []);
+    link.disconnect_link(0x16);
+    tasks.step();
+    assert!(poll(waiting_call.as_mut()).is_pending());
+    assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 0)));
+    drop(waiting_call);
     link.calls();
 
     // The same when the link arrived before the call's future was dropped.
-    {
-        let mut advertise = pin!(host.advertise(&advertising, &identity));
-        assert!(poll(advertise.as_mut()).is_pending());
-        link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
-        tasks.step();
-    }
+    let mut late_call = Box::pin(host.advertise(&advertising, &identity));
+    assert!(poll(late_call.as_mut()).is_pending());
+    link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
+    tasks.step();
+    drop(late_call);
     tasks.step();
     let calls = link.calls();
     assert!(calls.contains(&Seen::Disconnect(0x13)), "{calls:?}");
@@ -1545,7 +1695,7 @@ fn advertising_runs_its_phases_and_then_times_out() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1558,17 +1708,10 @@ fn advertising_runs_its_phases_and_then_times_out() {
     assert!(poll(advertise.as_mut()).is_pending());
     assert_eq!(link.calls(), [Seen::Advertise(640, 0)]);
     link.advance(45_000);
-    assert!(matches!(ready(advertise.as_mut()), Err(AdvertiseError::Timeout)));
+    assert!(matches!(ready!(advertise.as_mut()), Err(AdvertiseError::Timeout)));
     assert_eq!(link.calls(), [Seen::StopAdvertising]);
     assert_eq!(multiplications.get(), 1);
 }
-
-/// A directed phase, then the example's first phase.
-#[cfg(feature = "directed-advertising")]
-static DIRECTED_FIRST: [Phase; 2] = [Phase::directed(DIRECTED_MAX), example::PHASES[0]];
-/// A schedule that starts with [`DIRECTED_FIRST`]'s directed phase.
-#[cfg(feature = "directed-advertising")]
-static DIRECTED_SCHEDULE: Schedule = Schedule::new(&DIRECTED_FIRST, embassy_time::Duration::from_secs(20));
 
 #[cfg(feature = "directed-advertising")]
 #[test]
@@ -1580,14 +1723,14 @@ fn a_reconnection_advertises_directed_to_the_bonded_central_first() {
     // A central without host privacy, which sent no key.
     let mut bond = bond(&identity);
     bond.peer_irk = None;
-    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_SCHEDULE, &example::CONTENT).unwrap();
+    let advertising = assert_ok!(Advertising::new(Mode::Reconnect(&bond), &DIRECTED_SCHEDULE, &example::CONTENT));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     link.advance(1_279);
     assert!(poll(advertise.as_mut()).is_pending());
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     // The link layer ends it; the undirected phase follows (1.28 s is a
     // tick more in the 32 768 Hz ticks of the time).
     link.event(Event::AdvertisingTimeout);
@@ -1596,24 +1739,17 @@ fn a_reconnection_advertises_directed_to_the_bonded_central_first() {
     assert!(poll(advertise.as_mut()).is_pending());
     assert_eq!(link.calls(), [Seen::Advertise(32, 3)]);
     link.advance(3_000);
-    assert!(matches!(ready(advertise.as_mut()), Err(AdvertiseError::Timeout)));
+    assert!(matches!(ready!(advertise.as_mut()), Err(AdvertiseError::Timeout)));
     // The central connects during the directed phase of the next call.
-    let mut advertise = pin!(host.advertise(&advertising, &identity));
-    assert!(poll(advertise.as_mut()).is_pending());
+    let mut next_call = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(next_call.as_mut()).is_pending());
     assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     link.advance(10);
     link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
-    let _conn = ready(advertise.as_mut()).unwrap();
+    let _conn = assert_ok!(ready!(next_call.as_mut()));
     assert_eq!(multiplications.get(), 0);
 }
-
-/// A directed phase, then the example's first two phases.
-#[cfg(feature = "directed-advertising")]
-static DIRECTED_THEN_TWO: [Phase; 3] = [Phase::directed(DIRECTED_MAX), example::PHASES[0], example::PHASES[1]];
-/// A schedule that starts with [`DIRECTED_THEN_TWO`]'s directed phase.
-#[cfg(feature = "directed-advertising")]
-static DIRECTED_THEN_TWO_SCHEDULE: Schedule = Schedule::new(&DIRECTED_THEN_TWO, embassy_time::Duration::from_secs(20));
 
 /// Runs a reconnection of `bond` on [`DIRECTED_THEN_TWO_SCHEDULE`] whose
 /// central connects from a private address of its key `phase` phases after
@@ -1625,7 +1761,9 @@ fn reconnect_after_directed(bond: &Bond, phase: usize) -> Option<Bond> {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::new(Mode::Reconnect(bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let built = Advertising::new(Mode::Reconnect(bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).ok();
+    assert!(built.is_some(), "the advertising fits");
+    let advertising = built?;
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1648,18 +1786,21 @@ fn reconnect_after_directed(bond: &Bond, phase: usize) -> Option<Bond> {
     link.advance(10);
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let connected = ready_output(advertise.as_mut()).and_then(Result::ok);
+    assert!(connected.is_some(), "connected");
+    let conn = connected?;
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(true), Seen::Ltk(Some(bond.ltk))]);
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
     tasks.step();
-    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
+    assert_eq!(ready_output(pin!(conn.next())), Some(ConnEvent::Encrypted { bonded: true }));
     assert_eq!(multiplications.get(), 0);
-    match poll(pin!(conn.next())) {
+    let event = poll(pin!(conn.next()));
+    assert!(matches!(event, Poll::Ready(ConnEvent::BondUpdated(_)) | Poll::Pending), "unexpected event {event:?}");
+    match event {
         Poll::Ready(ConnEvent::BondUpdated(updated)) => Some(updated),
-        Poll::Ready(other) => panic!("unexpected event {other:?}"),
-        Poll::Pending => None,
+        Poll::Ready(_) | Poll::Pending => None,
     }
 }
 
@@ -1683,10 +1824,10 @@ fn a_central_that_connects_right_after_an_unanswered_directed_phase_is_no_longer
     // Its controller does not resolve the target: it connects to the
     // undirected advertising right after the directed phase, and the host
     // reports the bond to store with directed advertising off.
-    let updated = reconnect_after_directed(&bond, 1).unwrap();
+    let updated = assert_some!(reconnect_after_directed(&bond, 1));
     assert!(!updated.directed_works);
     assert!(updated.ltk == bond.ltk && updated.peer.peer() == bond.peer.peer() && updated.cccd == bond.cccd);
-    let stored = Bond::from_bytes(&updated.to_bytes()).unwrap();
+    let stored = assert_some!(Bond::from_bytes(&updated.to_bytes()));
     assert!(!stored.directed_works);
     // Its next reconnection skips the directed phase: it starts with the
     // undirected phase after it, from the accept list, and goes on to the
@@ -1695,15 +1836,15 @@ fn a_central_that_connects_right_after_an_unanswered_directed_phase_is_no_longer
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let advertising =
-        Advertising::new(Mode::Reconnect(&stored), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
-    assert!(advertising.mode().skips(&DIRECTED_THEN_TWO[0]));
+        assert_ok!(Advertising::new(Mode::Reconnect(&stored), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT));
+    assert!(advertising.mode().skips(assert_some!(DIRECTED_THEN_TWO.first())));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 3)));
     link.advance(1_281);
     assert!(poll(advertise.as_mut()).is_pending());
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     link.advance(1_719);
     assert!(poll(advertise.as_mut()).is_pending());
     assert_eq!(link.calls(), [Seen::Advertise(80, 3)]);
@@ -1711,7 +1852,7 @@ fn a_central_that_connects_right_after_an_unanswered_directed_phase_is_no_longer
     // report.
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(stored.peer.peer()), local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
     tasks.step();
@@ -1731,7 +1872,8 @@ fn a_late_answer_to_the_directed_phase_keeps_directed_advertising() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let advertising =
+        assert_ok!(Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1741,9 +1883,9 @@ fn a_late_answer_to_the_directed_phase_keeps_directed_advertising() {
     link.advance(2);
     // The link layer refuses the next phase: it is connected.
     assert!(poll(advertise.as_mut()).is_pending());
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     assert!(conn.info().is_some_and(|info| info.directed));
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
@@ -1754,14 +1896,6 @@ fn a_late_answer_to_the_directed_phase_keeps_directed_advertising() {
     assert!(host.with(|state| state.engine.bond().is_some_and(|kept| kept.directed_works)));
     assert_eq!(multiplications.get(), 0);
 }
-
-/// Two directed phases, then the example's first phase: directed advertising
-/// for longer than the link layer's 1.28 s.
-#[cfg(feature = "directed-advertising")]
-static TWO_DIRECTED: [Phase; 3] = [Phase::directed(DIRECTED_MAX), Phase::directed(DIRECTED_MAX), example::PHASES[0]];
-/// A schedule of [`TWO_DIRECTED`].
-#[cfg(feature = "directed-advertising")]
-static TWO_DIRECTED_SCHEDULE: Schedule = Schedule::new(&TWO_DIRECTED, embassy_time::Duration::from_secs(20));
 
 /// Runs a reconnection of a bond on [`TWO_DIRECTED_SCHEDULE`] whose central
 /// connects during the second directed phase if `second`, otherwise in the
@@ -1774,33 +1908,40 @@ fn reconnect_after_two_directed(second: bool) -> Option<Bond> {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = Advertising::new(Mode::Reconnect(&bond), &TWO_DIRECTED_SCHEDULE, &example::CONTENT).unwrap();
+    let built = Advertising::new(Mode::Reconnect(&bond), &TWO_DIRECTED_SCHEDULE, &example::CONTENT).ok();
+    assert!(built.is_some(), "the advertising fits");
+    let advertising = built?;
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
     let mut expected = [Seen::Directed(bond.peer.peer()), Seen::Advertise(32, 3)].into_iter();
-    for _ in 0..if second { 1 } else { 2 } {
+    for _ in 0_i32..if second { 1_i32 } else { 2_i32 } {
         link.advance(1_279);
         link.event(Event::AdvertisingTimeout);
         link.advance(2);
         tasks.step();
         assert!(poll(advertise.as_mut()).is_pending());
-        assert_eq!(link.calls(), [expected.next().unwrap()]);
+        let next = expected.next();
+        assert!(next.is_some(), "a call to expect");
+        assert_eq!(link.calls(), [next?]);
     }
     link.advance(10);
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let connected = ready_output(advertise.as_mut()).and_then(Result::ok);
+    assert!(connected.is_some(), "connected");
+    let conn = connected?;
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
     tasks.step();
-    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
+    assert_eq!(ready_output(pin!(conn.next())), Some(ConnEvent::Encrypted { bonded: true }));
     assert_eq!(multiplications.get(), 0);
-    match poll(pin!(conn.next())) {
+    let event = poll(pin!(conn.next()));
+    assert!(matches!(event, Poll::Ready(ConnEvent::BondUpdated(_)) | Poll::Pending), "unexpected event {event:?}");
+    match event {
         Poll::Ready(ConnEvent::BondUpdated(updated)) => Some(updated),
-        Poll::Ready(other) => panic!("unexpected event {other:?}"),
-        Poll::Pending => None,
+        Poll::Ready(_) | Poll::Pending => None,
     }
 }
 
@@ -1834,7 +1975,8 @@ fn an_unanswered_directed_phase_needs_the_bond_s_key_to_count() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let advertising =
+        assert_ok!(Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1843,7 +1985,7 @@ fn an_unanswered_directed_phase_needs_the_bond_s_key_to_count() {
     link.calls();
     link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.event(Event::LtkRequest { ediv: 0, rand: [1; 8] });
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(true), Seen::Ltk(None)]);
@@ -1859,7 +2001,7 @@ fn pairing_advertises_a_directed_phase_undirected_at_20_ms() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = Advertising::new(Mode::Pairing, &DIRECTED_SCHEDULE, &example::CONTENT).unwrap();
+    let advertising = assert_ok!(Advertising::new(Mode::Pairing, &DIRECTED_SCHEDULE, &example::CONTENT));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -1867,7 +2009,7 @@ fn pairing_advertises_a_directed_phase_undirected_at_20_ms() {
     assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 0)));
     link.advance(1_279);
     assert!(poll(advertise.as_mut()).is_pending());
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     // The directed phase's time is over: the next phase, also at 20 ms.
     link.advance(2);
     assert!(poll(advertise.as_mut()).is_pending());
@@ -1875,31 +2017,27 @@ fn pairing_advertises_a_directed_phase_undirected_at_20_ms() {
     link.advance(2_998);
     assert!(poll(advertise.as_mut()).is_pending());
     link.advance(2);
-    assert!(matches!(ready(advertise.as_mut()), Err(AdvertiseError::Timeout)));
+    assert!(matches!(ready!(advertise.as_mut()), Err(AdvertiseError::Timeout)));
     assert_eq!(multiplications.get(), 1);
 }
 
 /// A resolvable private address of `irk` from `prand`, in software.
 #[cfg(feature = "directed-advertising")]
-fn rpa(irk: [u8; 16], prand: [u8; 3]) -> Peer {
-    Peer::new(crate::crypto::resolvable_address_with(irk, prand, software), true)
-}
+fn rpa(irk: [u8; 16], prand: [u8; 3]) -> Peer { Peer::new(resolvable_address_with(irk, prand, software), true) }
 
 /// Whether `address` resolves with `irk`, in software.
 #[cfg(feature = "directed-advertising")]
-fn resolves(irk: [u8; 16], address: [u8; 6]) -> bool { crate::crypto::resolves_with(irk, address, software) }
-
-/// The advertising settings the link layer runs, which [`MockLink::air`]
-/// took from the host's calls.
-#[cfg(feature = "directed-advertising")]
-fn on_air(link: &MockLink) -> crate::advertiser::Settings { link.air.advertising().unwrap() }
+fn resolves(irk: [u8; 16], address: [u8; 6]) -> bool { resolves_with(irk, address, software) }
 
 /// Whether the advertising of `settings` accepts a connection request
 /// from `central`, as the advertising event parses and checks it, resolving
 /// in software: an `AUX_CONNECT_REQ`, or a `CONNECT_IND` without the feature
 /// `extended-advertising`.
 #[cfg(feature = "directed-advertising")]
-fn accepts(settings: &crate::advertiser::Settings, central: Peer) -> bool {
+fn accepts(settings: &Settings, central: Peer) -> bool {
+    #[cfg(not(feature = "extended-advertising"))]
+    use crate::pdu::ConnectInd;
+
     let mut request = [0; 36];
     // ChSel set, as a CONNECT_IND of BlueZ has it; reserved and ignored in an
     // AUX_CONNECT_REQ.
@@ -1914,36 +2052,36 @@ fn accepts(settings: &crate::advertiser::Settings, central: Peer) -> bool {
     request[30..35].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F]);
     request[35] = 5;
     #[cfg(feature = "extended-advertising")]
-    let accepted = crate::advertiser::extended::accepted_request_with(settings, &request, |central| {
-        settings.accepts_connection_with(central, resolves)
+    let accepted = advertiser::extended::accepted_request_with(settings, &request, |candidate| {
+        settings.accepts_connection_with(candidate, resolves)
     });
     #[cfg(not(feature = "extended-advertising"))]
-    let accepted = crate::pdu::ConnectInd::parse(&request, settings.own)
+    let accepted = ConnectInd::parse(&request, settings.own)
         .filter(|parsed| settings.accepts_connection_with(parsed.central(), resolves));
     accepted.is_some_and(|parsed| parsed.central() == central)
 }
 
 /// The directed PDU of `settings` as it goes on air: its header's first
-/// octet, our address and the target. An `AUX_ADV_IND` with `AdvA`,
-/// `TargetA` and the ADI, connectable, or without the feature
-/// `extended-advertising` an `ADV_DIRECT_IND`.
+/// octet, our address and the target; `None` if it is too short. An
+/// `AUX_ADV_IND` with `AdvA`, `TargetA` and the ADI, connectable, or without
+/// the feature `extended-advertising` an `ADV_DIRECT_IND`.
 #[cfg(feature = "directed-advertising")]
-fn directed_pdu(settings: &crate::advertiser::Settings) -> (u8, [u8; 6], [u8; 6]) {
+fn directed_pdu(settings: &Settings) -> Option<(u8, [u8; 6], [u8; 6])> {
     #[cfg(feature = "extended-advertising")]
     let (pdu, ext_header) = {
-        let pdu = crate::advertiser::extended::auxiliary(settings);
+        let pdu = advertiser::extended::auxiliary(settings);
         let bytes = pdu.as_bytes();
         // Extended header of 15 octets, AdvMode connectable; AdvA, TargetA
         // and the ADI; the ADI, then the data.
-        assert_eq!(bytes[2..4], [0x4F, 0x0B]);
-        assert_eq!(bytes[16..18], settings.adi.to_bytes());
+        assert_eq!(bytes.get(2..4), Some(&[0x4F, 0x0B][..]));
+        assert_eq!(bytes.get(16..18), Some(&settings.adi.to_bytes()[..]));
         (pdu, 4)
     };
     #[cfg(not(feature = "extended-advertising"))]
-    let (pdu, ext_header) = (crate::advertiser::legacy::pdus(settings).0, 2);
+    let (pdu, ext_header) = (advertiser::legacy::pdus(settings).0, 2);
     let bytes = pdu.as_bytes();
-    let field = |at: usize| <[u8; 6]>::try_from(&bytes[at..at + 6]).unwrap();
-    (bytes[0], field(ext_header), field(ext_header + 6))
+    let field = |at: usize| bytes.get(at..at.strict_add(6))?.try_into().ok();
+    Some((*bytes.first()?, field(ext_header)?, field(ext_header.strict_add(6))?))
 }
 
 /// A reconnection of a bond whose central sent its key: the directed phase
@@ -1962,24 +2100,25 @@ fn a_reconnection_targets_a_private_address_of_the_central_s_key_until_it_goes_u
     let identity = identity(1);
     let bond = bond(&identity);
     assert!(bond.peer_irk == Some(CENTRAL_IRK) && bond.directed_works);
-    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let advertising =
+        assert_ok!(Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
-    let directed = on_air(&link);
+    let directed = assert_some!(link.air.advertising());
     assert!(directed.kind.is_directed() && directed.peer == bond.peer.peer());
     // Low duty cycle at the phase's 20 ms with extended advertising; the
     // link layer's 3.75 ms of high duty cycle without.
     #[cfg(feature = "extended-advertising")]
-    assert!(directed.kind == crate::advertiser::Kind::DirectedLowDuty && directed.interval == 20_000);
+    assert!(directed.kind == advertiser::Kind::DirectedLowDuty && directed.interval == 20_000);
     #[cfg(not(feature = "extended-advertising"))]
     assert!(directed.kind.is_high_duty());
     // On air: from our private address to a private address of the
     // central's key (RxAdd), not its identity, each made from random bytes
     // this call drew: our address from the first draw, the target from the
     // second, so a new directed phase targets a new address.
-    let (header, adv_a, target_a) = directed_pdu(&directed);
+    let (header, adv_a, target_a) = assert_some!(directed_pdu(&directed));
     #[cfg(feature = "extended-advertising")]
     assert_eq!(header, 0x07 | 0x40 | 0x80);
     // ADV_DIRECT_IND with ChSel, channel selection algorithm 2.
@@ -1988,16 +2127,16 @@ fn a_reconnection_targets_a_private_address_of_the_central_s_key_until_it_goes_u
     assert!(adv_a == directed.own.address && resolves(identity.irk(), adv_a));
     assert!(target_a == directed.target.address && directed.target.random);
     assert!(resolves(CENTRAL_IRK, target_a) && !resolves(identity.irk(), target_a));
-    assert!(target_a != CENTRAL_IDENTITY);
+    assert_ne!(target_a, CENTRAL_IDENTITY);
     assert_eq!(link.draws.get(), 2);
     assert!(adv_a == rpa(identity.irk(), [1; 3]).address && target_a == rpa(CENTRAL_IRK, [2; 3]).address);
     // The link layer task renews the advertising set before the first
     // event, from random octets that are the same each renewal here.
     #[cfg(feature = "extended-advertising")]
     let directed_adi = {
-        let renewed = ready(pin!(link.air.renewed_advertising_with(async |bytes: &mut [u8]| bytes.fill(0x5A))));
-        assert!(renewed.is_some_and(|renewed| !renewed.stale) && !on_air(&link).stale);
-        on_air(&link).adi
+        let renewed = ready!(pin!(link.air.renewed_advertising_with(async |bytes: &mut [u8]| bytes.fill(0x5A))));
+        assert!(renewed.is_some_and(|fresh| !fresh.stale) && !assert_some!(link.air.advertising()).stale);
+        assert_some!(link.air.advertising()).adi
     };
     // Only the central connects: from another private address of its key,
     // as Linux initiates, or from its identity (device privacy mode); not
@@ -2017,20 +2156,24 @@ fn a_reconnection_targets_a_private_address_of_the_central_s_key_until_it_goes_u
     tasks.step();
     assert!(poll(advertise.as_mut()).is_pending());
     assert_eq!(link.calls(), [Seen::Advertise(32, 3)]);
-    let undirected = on_air(&link);
+    let undirected = assert_some!(link.air.advertising());
     assert!(!undirected.kind.is_directed() && undirected.interval == 20_000 && undirected.filter_policy == 0x03);
     assert!(undirected.own.random && resolves(identity.irk(), undirected.own.address));
+    // AdvA and the ADI, no TargetA; the set waits for its renewal, which
+    // gives it a new advertising data ID even from the same random octets.
     #[cfg(feature = "extended-advertising")]
-    {
-        let pdu = crate::advertiser::extended::auxiliary(&undirected);
-        // AdvA and the ADI, no TargetA; the set waits for its renewal,
-        // which gives it a new advertising data ID even from the same random
-        // octets.
-        assert_eq!(pdu.as_bytes()[..4], [0x47, pdu.as_bytes()[1], 0x49, 0x09]);
-        assert!(undirected.stale);
-        let renewed = ready(pin!(link.air.renewed_advertising_with(async |bytes: &mut [u8]| bytes.fill(0x5A))));
-        assert!(renewed.is_some_and(|renewed| !renewed.stale && renewed.adi.did() != directed_adi.did()));
-    }
+    let undirected_pdu = advertiser::extended::auxiliary(&undirected);
+    #[cfg(feature = "extended-advertising")]
+    assert_eq!(
+        undirected_pdu.as_bytes().get(..4),
+        Some(&[0x47, *assert_some!(undirected_pdu.as_bytes().get(1)), 0x49, 0x09][..])
+    );
+    #[cfg(feature = "extended-advertising")]
+    assert!(undirected.stale);
+    #[cfg(feature = "extended-advertising")]
+    let undirected_renewed = ready!(pin!(link.air.renewed_advertising_with(async |bytes: &mut [u8]| bytes.fill(0x5A))));
+    #[cfg(feature = "extended-advertising")]
+    assert!(undirected_renewed.is_some_and(|renewed| !renewed.stale && renewed.adi.did() != directed_adi.did()));
     assert!(accepts(&undirected, rpa(CENTRAL_IRK, [0x12, 0x34, 0x56])));
     assert!(!accepts(&undirected, rpa([0x77; 16], [0x12, 0x34, 0x56])));
     // It connects to that from a private address and encrypts with the
@@ -2039,34 +2182,38 @@ fn a_reconnection_targets_a_private_address_of_the_central_s_key_until_it_goes_u
     link.advance(10);
     link.connect(rpa(CENTRAL_IRK, [0x12, 0x34, 0x56]), Some(bond.peer.peer()), local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     assert!(conn.info().is_some_and(|info| !info.directed));
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: true });
-    let Poll::Ready(ConnEvent::BondUpdated(updated)) = poll(pin!(conn.next())) else {
-        panic!("no bond to store");
+    let Poll::Ready(ConnEvent::BondUpdated(updated)) = ({
+        let value = poll(pin!(conn.next()));
+        assert!(matches!(value, Poll::Ready(ConnEvent::BondUpdated(_))), "no bond to store");
+        value
+    }) else {
+        return;
     };
-    let stored = Bond::from_bytes(&updated.to_bytes()).unwrap();
+    let stored = assert_some!(Bond::from_bytes(&updated.to_bytes()));
     assert!(!stored.directed_works && stored.peer_irk == Some(CENTRAL_IRK));
     assert_eq!(multiplications.get(), 0);
     // The next reconnection skips the directed phase: undirected advertising
     // from the start, and nothing directed on air.
-    let host = self::host(Unclaimed::Keep);
-    let link = host.port();
-    link.mirror.set(true);
-    tasks!(host, tasks, multiplications);
-    let advertising =
-        Advertising::new(Mode::Reconnect(&stored), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
-    let mut advertise = pin!(host.advertise(&advertising, &identity));
-    assert!(poll(advertise.as_mut()).is_pending());
+    let next_host = self::host(Unclaimed::Keep);
+    let next_link = next_host.port();
+    next_link.mirror.set(true);
+    tasks!(next_host, tasks, multiplications);
+    let skipping =
+        assert_ok!(Advertising::new(Mode::Reconnect(&stored), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT));
+    let mut next_call = pin!(next_host.advertise(&skipping, &identity));
+    assert!(poll(next_call.as_mut()).is_pending());
     tasks.step();
-    assert!(poll(advertise.as_mut()).is_pending());
-    let calls = link.calls();
+    assert!(poll(next_call.as_mut()).is_pending());
+    let calls = next_link.calls();
     assert!(!calls.iter().any(|call| matches!(call, Seen::Directed(_))), "{calls:?}");
     assert_eq!(calls.last(), Some(&Seen::Advertise(32, 3)));
-    let skipped = on_air(&link);
+    let skipped = assert_some!(next_link.air.advertising());
     assert!(!skipped.kind.is_directed() && skipped.filter_policy == 0x03);
     assert_eq!(multiplications.get(), 0);
 }
@@ -2083,13 +2230,14 @@ fn a_reconnection_targets_the_identity_of_a_central_without_a_key() {
     let identity = identity(1);
     let mut bond = bond(&identity);
     bond.peer_irk = None;
-    let advertising = Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT).unwrap();
+    let advertising =
+        assert_ok!(Advertising::new(Mode::Reconnect(&bond), &DIRECTED_THEN_TWO_SCHEDULE, &example::CONTENT));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     assert_eq!(link.calls().last(), Some(&Seen::Directed(bond.peer.peer())));
-    let directed = on_air(&link);
-    let (header, adv_a, target_a) = directed_pdu(&directed);
+    let directed = assert_some!(link.air.advertising());
+    let (header, adv_a, target_a) = assert_some!(directed_pdu(&directed));
     // TxAdd for our private address, no RxAdd: the public identity.
     assert_eq!(header & 0xC0, 0x40);
     assert!(resolves(identity.irk(), adv_a) && target_a == CENTRAL_IDENTITY && directed.target == bond.peer.peer());
@@ -2122,12 +2270,12 @@ fn disconnected_comes_after_every_other_event_of_its_link() {
     // A link that ended before the next one still tells its reason.
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
-    let next = ready(advertise.as_mut()).unwrap();
+    let next = assert_ok!(ready!(advertise.as_mut()));
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x08));
     assert!(poll(pin!(next.next())).is_pending());
     assert_eq!(conn.try_notify(example::KEYBOARD, &[0; 8]), Err(NotifyError::Disconnected));
@@ -2149,9 +2297,9 @@ fn the_battery_level_is_notified_when_it_changes() {
     let mut out = [0; 2];
     assert_eq!(battery.read(&mut out), Ok(1));
     assert_eq!(out[0], 90);
-    assert_eq!(ready(pin!(battery.update(&conn, 90))), Ok(()));
-    assert!(link.deliver().is_empty());
-    assert_eq!(ready(pin!(battery.update(&conn, 89))), Ok(()));
+    assert_eq!(ready!(pin!(battery.update(&conn, 90))), Ok(()));
+    assert_eq!(link.deliver(), []);
+    assert_eq!(ready!(pin!(battery.update(&conn, 89))), Ok(()));
     let [handle0, handle1] = example::BATTERY_LEVEL.handle().to_le_bytes();
     assert_eq!(link.deliver(), [(Channel::Att, vec![0x1B, handle0, handle1, 89])]);
     assert_eq!(battery.level(), 89);
@@ -2168,14 +2316,20 @@ fn several_values_go_out_in_one_multiple_notification() {
     tasks!(host, tasks, multiplications);
     reconnected!(host, link, tasks, conn);
     let values: [(Char, &[u8]); 2] = [(example::BATTERY_LEVEL, &[80]), (example::KEYBOARD, &[0; 8])];
-    assert_eq!(ready(pin!(conn.notify_multiple(&values))), Err(NotifyError::Unsupported));
+    assert_eq!(ready!(pin!(conn.notify_multiple(&values))), Err(NotifyError::Unsupported));
     assert_eq!(conn.try_notify(example::BATTERY_LEVEL, &[80]), Ok(()));
     assert_eq!(link.deliver().len(), 1);
     let [handle0, handle1] = example::CLIENT_FEATURES.to_le_bytes();
     assert_eq!(request(link, &mut tasks, &[0x12, handle0, handle1, 0x04]), [0x13]);
-    let ConnEvent::BondUpdated(bond) = next!(conn) else { panic!("no update") };
+    let ConnEvent::BondUpdated(bond) = ({
+        let value = next!(conn);
+        assert!(matches!(value, ConnEvent::BondUpdated(_)), "no update");
+        value
+    }) else {
+        return;
+    };
     assert_eq!(bond.client_features, 0x04);
-    assert_eq!(ready(pin!(conn.notify_multiple(&values))), Ok(()));
+    assert_eq!(ready!(pin!(conn.notify_multiple(&values))), Ok(()));
     let mut expected = vec![0x23];
     expected.extend_from_slice(&example::BATTERY_LEVEL.handle().to_le_bytes());
     expected.extend_from_slice(&[0x01, 0x00, 80]);
@@ -2183,9 +2337,9 @@ fn several_values_go_out_in_one_multiple_notification() {
     expected.extend_from_slice(&[0x08, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(link.deliver(), [(Channel::Att, expected)]);
     // The mouse's notifications are off.
-    let values: [(Char, &[u8]); 2] = [(example::BATTERY_LEVEL, &[80]), (example::MOUSE, &[0; 5])];
-    assert_eq!(ready(pin!(conn.notify_multiple(&values))), Err(NotifyError::NotSubscribed));
-    assert!(link.deliver().is_empty());
+    let unsubscribed: [(Char, &[u8]); 2] = [(example::BATTERY_LEVEL, &[80]), (example::MOUSE, &[0; 5])];
+    assert_eq!(ready!(pin!(conn.notify_multiple(&unsubscribed))), Err(NotifyError::NotSubscribed));
+    assert_eq!(link.deliver(), []);
     assert_eq!(multiplications.get(), 0);
 }
 
@@ -2203,23 +2357,29 @@ fn an_execute_write_of_the_last_input_configuration_ends_discovery() {
         assert_eq!(request(link, &mut tasks, &enable(characteristic)), [0x13]);
     }
     // The mouse's configuration as a long write in two parts.
-    let [handle0, handle1] = (example::MOUSE.handle() + 1).to_le_bytes();
+    let [handle0, handle1] = example::MOUSE.handle().strict_add(1).to_le_bytes();
     for (offset, part) in [(0x00, 0x01), (0x01, 0x00)] {
         let prepare = [0x16, handle0, handle1, offset, 0x00, part];
         let mut response = prepare.to_vec();
-        response[0] = 0x17;
+        *assert_some!(response.first_mut()) = 0x17;
         assert_eq!(request(link, &mut tasks, &prepare), response);
     }
     link.send(CID_ATT, &[0x18, 0x01], true);
     tasks.step();
     assert_eq!(link.transmit().len(), 1);
-    let ConnEvent::BondUpdated(updated) = next!(conn) else { panic!("no update") };
+    let ConnEvent::BondUpdated(updated) = ({
+        let value = next!(conn);
+        assert!(matches!(value, ConnEvent::BondUpdated(_)), "no update");
+        value
+    }) else {
+        return;
+    };
     assert_eq!(updated.cccd, 0b0101_0101);
     // The latency goes once the central has the Execute Write Response and
     // ATT has been idle for 100 ms, not after the fallback of 1 s.
     link.advance(200);
     tasks.step();
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     link.ack();
     tasks.step();
     assert_eq!(link.calls(), [Seen::Hold(false)]);
@@ -2249,11 +2409,6 @@ fn software_aes_matches_fips_197() {
     let cipher = [0x69, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30, 0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4, 0xC5, 0x5A];
     assert_eq!(Software.encrypt(key, plain), cipher);
 }
-
-/// The fallback range of the parameter request tests: 11.25 to 15 ms, a
-/// latency of 30 events, 6 s.
-#[cfg(feature = "param-requests")]
-const FALLBACK: link::ParamRange = link::ParamRange::new(9, 12, 30, 600);
 
 #[cfg(feature = "param-requests")]
 #[test]
@@ -2304,7 +2459,7 @@ fn the_application_asks_for_parameters_and_learns_of_a_rejection() {
     assert_eq!(conn.request_params(link::ParamRange::new(12, 9, 30, 600)), Err(RequestError::Invalid));
     assert_eq!(conn.request_params(link::ParamRange::new(5, 12, 30, 600)), Err(RequestError::Invalid));
     assert_eq!(conn.request_params(link::ParamRange::new(12, 12, 30, 10)), Err(RequestError::Invalid));
-    assert!(link.deliver().is_empty());
+    assert_eq!(link.deliver(), []);
     assert_eq!(multiplications.get(), 0);
 }
 
@@ -2327,12 +2482,12 @@ fn the_end_of_the_link_clears_a_pending_parameter_request() {
     // of the old link's request would be dropped.
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(bond.peer.peer(), None, local_rpa());
     tasks.step();
-    let next = ready(advertise.as_mut()).unwrap();
+    let next = assert_ok!(ready!(advertise.as_mut()));
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
     tasks.step();
@@ -2384,12 +2539,12 @@ fn a_reconnection_without_the_bond_s_key_ends_at_once() {
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
     let bond = bond(&identity);
-    let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     // The central asks for a key of another pairing: the negative reply,
     // which the link layer reports as a failed encryption, and the link
@@ -2405,7 +2560,7 @@ fn a_reconnection_without_the_bond_s_key_ends_at_once() {
     // Once only, and the end of the link follows.
     link.advance(20_000);
     tasks.step();
-    assert!(link.calls().is_empty());
+    assert_eq!(link.calls(), []);
     link.disconnect_link(0x16);
     tasks.step();
     assert_eq!(next!(conn), ConnEvent::Disconnected(0x16));
@@ -2419,14 +2574,14 @@ fn a_pairable_link_without_a_key_waits_for_a_pairing() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
     assert!(poll(advertise.as_mut()).is_pending());
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local_rpa());
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     // A central with a stale key of ours: in pairing mode it may still pair,
     // so the link goes on.
@@ -2438,41 +2593,6 @@ fn a_pairable_link_without_a_key_waits_for_a_pairing() {
     let central = Central::new(linux_request(true, true), local_rpa());
     assert_eq!(smp(link, &mut tasks, &central.request, false).len(), 1);
     assert_eq!(multiplications.get(), 1);
-}
-
-/// A keyboard's table for the Passkey Entry tests: an input report that
-/// needs an authenticated link.
-#[cfg(feature = "passkey")]
-mod keyboard {
-    use crate::host::gatt::Value;
-
-    #[cfg(not(feature = "eatt"))]
-    crate::gatt! {
-        /// The table.
-        pub const DB;
-        service 0x1812 {
-            /// The keyboard input report.
-            char KEYS: 0x2A4D [read, notify; authenticated] = Value::Zeros(8);
-            ccc;
-        }
-    }
-
-    // With `eatt` the host needs the feature characteristics too: after the
-    // report, so that its handles stay.
-    #[cfg(feature = "eatt")]
-    crate::gatt! {
-        /// The table.
-        pub const DB;
-        service 0x1812 {
-            /// The keyboard input report.
-            char KEYS: 0x2A4D [read, notify; authenticated] = Value::Zeros(8);
-            ccc;
-        }
-        service 0x1801 {
-            char 0x2B29 [read, write] = Value::ClientFeatures;
-            char 0x2B3A [read] = Value::ServerFeatures;
-        }
-    }
 }
 
 /// A keyboard's host: Passkey Entry only.
@@ -2490,7 +2610,7 @@ fn a_keyboard_pairs_with_the_passkey_the_user_types_and_its_link_is_authenticate
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -2498,7 +2618,7 @@ fn a_keyboard_pairs_with_the_passkey_the_user_types_and_its_link_is_authenticate
     let local = local_rpa();
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     // Nothing to enter before the pairing asks for it.
     assert_eq!(conn.enter_passkey(Some(1)), Err(PasskeyError::NotWaiting));
@@ -2508,12 +2628,12 @@ fn a_keyboard_pairs_with_the_passkey_the_user_types_and_its_link_is_authenticate
     assert_eq!(smp(link, &mut tasks, &central.request, false), [vec![0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]]);
     let answer = smp(link, &mut tasks, &central.public_key(), false);
     assert_eq!(answer.len(), 1, "our public key alone");
-    central.take_public_key(&answer[0]);
+    central.take_public_key(assert_some!(answer.first()));
     assert_eq!(next!(conn), ConnEvent::PasskeyRequested);
     // The Diffie-Hellman key is computed while the user types.
     assert_eq!(multiplications.get(), 2);
     // The central's first confirm value comes first; then the passkey.
-    assert!(smp(link, &mut tasks, &central.round_confirm(0, passkey), false).is_empty());
+    assert_eq!(smp(link, &mut tasks, &central.round_confirm(0, passkey), false), Vec::<Vec<u8>>::new());
     assert_eq!(conn.enter_passkey(Some(1_000_000)), Err(PasskeyError::Invalid));
     assert_eq!(conn.enter_passkey(Some(passkey)), Ok(()));
     assert_eq!(conn.enter_passkey(Some(passkey)), Err(PasskeyError::NotWaiting));
@@ -2523,9 +2643,9 @@ fn a_keyboard_pairs_with_the_passkey_the_user_types_and_its_link_is_authenticate
         assert_eq!(confirm.len(), 1, "round {round}");
         central.take_confirm(&confirm.remove(0).1);
         let random = smp(link, &mut tasks, &central.random(), false);
-        central.take_round_random(&random[0], round, passkey);
+        central.take_round_random(assert_some!(random.first()), round, passkey);
         if round < 19 {
-            confirm = link.send_and_deliver(&central.round_confirm(round + 1, passkey), &mut tasks);
+            confirm = link.send_and_deliver(&central.round_confirm(round.strict_add(1), passkey), &mut tasks);
         }
     }
     let check = central.check();
@@ -2541,12 +2661,18 @@ fn a_keyboard_pairs_with_the_passkey_the_user_types_and_its_link_is_authenticate
     assert_eq!(link.deliver().len(), 2);
     // The report that needs authentication is served on this link.
     assert_eq!(request(link, &mut tasks, &[0x0A, 0x03, 0x00]), [0x0B, 0, 0, 0, 0, 0, 0, 0, 0]);
-    assert!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true).is_empty());
+    assert_eq!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true), Vec::<Vec<u8>>::new());
     let mut central_identity = [0x09, 0x00, 0, 0, 0, 0, 0, 0];
     central_identity[2..].copy_from_slice(&CENTRAL_IDENTITY);
-    assert!(smp(link, &mut tasks, &central_identity, true).is_empty());
+    assert_eq!(smp(link, &mut tasks, &central_identity, true), Vec::<Vec<u8>>::new());
     assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
-    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
+    let ConnEvent::Bonded(bond) = ({
+        let value = next!(conn);
+        assert!(matches!(value, ConnEvent::Bonded(_)), "no bond");
+        value
+    }) else {
+        return;
+    };
     assert!(bond.authenticated);
     assert!(Bond::from_bytes(&bond.to_bytes()).is_some_and(|stored| stored.authenticated));
     assert_eq!(conn.security(), Some(Sec::Authenticated));
@@ -2562,7 +2688,7 @@ fn a_passkey_refused_by_the_user_fails_the_pairing_and_ends_the_link() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -2570,7 +2696,7 @@ fn a_passkey_refused_by_the_user_fails_the_pairing_and_ends_the_link() {
     let local = local_rpa();
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     let central = Central::new(request_with_io(0x04), local);
     smp(link, &mut tasks, &central.request, false);
@@ -2590,17 +2716,17 @@ fn a_passkey_refused_by_the_user_fails_the_pairing_and_ends_the_link() {
     link.advance(2_000);
 
     // A central without input or output is refused at its request.
-    let mut advertise = pin!(host.advertise(&advertising, &identity));
-    assert!(poll(advertise.as_mut()).is_pending());
+    let mut refused_call = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(refused_call.as_mut()).is_pending());
     tasks.step();
-    assert!(poll(advertise.as_mut()).is_pending());
+    assert!(poll(refused_call.as_mut()).is_pending());
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
-    let central = Central::new(request_with_io(0x03), local);
-    assert_eq!(smp(link, &mut tasks, &central.request, false), [vec![0x05, 0x03]]);
+    let refused_conn = assert_ok!(ready!(refused_call.as_mut()));
+    let refused_central = Central::new(request_with_io(0x03), local);
+    assert_eq!(smp(link, &mut tasks, &refused_central.request, false), [vec![0x05, 0x03]]);
     tasks.step();
-    assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::AUTHENTICATION_REQUIREMENTS));
+    assert_eq!(next!(refused_conn), ConnEvent::PairingFailed(super::smp::Reason::AUTHENTICATION_REQUIREMENTS));
     assert!(multiplications.get() >= 1);
 }
 
@@ -2622,12 +2748,12 @@ fn a_reconnection_is_authenticated_only_with_an_authenticated_bond() {
         );
         bond.authenticated = authenticated;
         bond.cccd = 0b01;
-        let advertising = example::advertising(Mode::Reconnect(&bond), None).unwrap();
+        let advertising = assert_ok!(example::advertising(Mode::Reconnect(&bond), None));
         let mut advertise = pin!(host.advertise(&advertising, &identity));
         assert!(poll(advertise.as_mut()).is_pending());
         link.connect(Peer::new([1, 2, 3, 4, 5, 0x45], true), Some(bond.peer.peer()), local_rpa());
         tasks.step();
-        let conn = ready(advertise.as_mut()).unwrap();
+        let conn = assert_ok!(ready!(advertise.as_mut()));
         link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
         link.event(Event::Encryption { on: true, refresh: false, status: 0 });
         tasks.step();
@@ -2661,7 +2787,7 @@ fn a_just_works_key_stays_unauthenticated_when_a_passkey_pairing_starts_on_its_l
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -2669,7 +2795,7 @@ fn a_just_works_key_stays_unauthenticated_when_a_passkey_pairing_starts_on_its_l
     let local = local_rpa();
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     // A central without input or output: Just Works.
     let mut central = Central::new(request_with_io(0x03), local);
@@ -2677,10 +2803,10 @@ fn a_just_works_key_stays_unauthenticated_when_a_passkey_pairing_starts_on_its_l
     assert_eq!(smp(link, &mut tasks, &central.request, false), [vec![0x02, 0x02, 0x00, 0x0D, 0x10, 0x02, 0x02]]);
     let answer = smp(link, &mut tasks, &central.public_key(), false);
     assert_eq!(answer.len(), 2);
-    central.take_public_key(&answer[0]);
-    central.take_confirm(&answer[1]);
+    central.take_public_key(assert_some!(answer.first()));
+    central.take_confirm(assert_some!(answer.get(1)));
     let random = smp(link, &mut tasks, &central.random(), false);
-    central.take_random(&random[0]);
+    central.take_random(assert_some!(random.first()));
     let check = central.check();
     assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
@@ -2722,7 +2848,7 @@ fn a_refresh_with_a_just_works_bond_s_key_is_never_raised_by_a_passkey_pairing()
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -2730,17 +2856,17 @@ fn a_refresh_with_a_just_works_bond_s_key_is_never_raised_by_a_passkey_pairing()
     let local = local_rpa();
     link.connect(Peer::new(CENTRAL_ADDRESS, false), Some(Peer::new(CENTRAL_IDENTITY, false)), local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
     // A Just Works bond first, from a central without input or output.
     let mut central = Central::new(request_with_io(0x03), local);
     central.io_cap_b = [0x0D, 0x00, 0x02];
     smp(link, &mut tasks, &central.request, false);
     let answer = smp(link, &mut tasks, &central.public_key(), false);
-    central.take_public_key(&answer[0]);
-    central.take_confirm(&answer[1]);
+    central.take_public_key(assert_some!(answer.first()));
+    central.take_confirm(assert_some!(answer.get(1)));
     let random = smp(link, &mut tasks, &central.random(), false);
-    central.take_random(&random[0]);
+    central.take_random(assert_some!(random.first()));
     let check = central.check();
     assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
     let mut first = central.ltk;
@@ -2751,7 +2877,13 @@ fn a_refresh_with_a_just_works_bond_s_key_is_never_raised_by_a_passkey_pairing()
     assert_eq!(link.calls(), [Seen::Ltk(Some(first))]);
     exchange_identities(link, &mut tasks, &identity);
     assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
-    let ConnEvent::Bonded(bond) = next!(conn) else { panic!("no bond") };
+    let ConnEvent::Bonded(bond) = ({
+        let value = next!(conn);
+        assert!(matches!(value, ConnEvent::Bonded(_)), "no bond");
+        value
+    }) else {
+        return;
+    };
     assert!(!bond.authenticated);
     assert_eq!(conn.security(), Some(Sec::Encrypted));
 
@@ -2761,16 +2893,16 @@ fn a_refresh_with_a_just_works_bond_s_key_is_never_raised_by_a_passkey_pairing()
     let mut display = Central::new(request_with_io(0x04), local).with_passkey(passkey);
     smp(link, &mut tasks, &display.request, true);
     let key = smp(link, &mut tasks, &display.public_key(), true);
-    display.take_public_key(&key[0]);
+    display.take_public_key(assert_some!(key.first()));
     assert_eq!(next!(conn), ConnEvent::PasskeyRequested);
     assert_eq!(conn.enter_passkey(Some(passkey)), Ok(()));
     let mut confirm = link.send_and_deliver(&display.round_confirm(0, passkey), &mut tasks);
     for round in 0..20 {
         display.take_confirm(&confirm.remove(0).1);
         let nonce = smp(link, &mut tasks, &display.random(), true);
-        display.take_round_random(&nonce[0], round, passkey);
+        display.take_round_random(assert_some!(nonce.first()), round, passkey);
         if round < 19 {
-            confirm = link.send_and_deliver(&display.round_confirm(round + 1, passkey), &mut tasks);
+            confirm = link.send_and_deliver(&display.round_confirm(round.strict_add(1), passkey), &mut tasks);
         }
     }
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
@@ -2806,11 +2938,23 @@ fn a_table_with_authenticated_attributes_needs_passkey_entry() {
 #[test]
 fn the_host_s_futures_over_the_link_layer_are_send() {
     /// Takes a future that is [`Send`].
-    fn send<F: Future + Send>(_future: F) {}
+    fn send<F>(_future: F)
+    where
+        F: Future + Send,
+    {
+    }
     /// Takes an async function whose future is [`Send`].
-    fn send_fn<A, F: Future + Send>(_function: fn(A) -> F) {}
+    fn send_fn<A, F>(_function: fn(A) -> F)
+    where
+        F: Future + Send,
+    {
+    }
     /// Takes an async method with two arguments whose future is [`Send`].
-    fn send_fn3<A, B, C, F: Future + Send>(_function: fn(A, B, C) -> F) {}
+    fn send_fn3<A, B, C, F>(_function: fn(A, B, C) -> F)
+    where
+        F: Future + Send,
+    {
+    }
     static SHARED: link::Shared = link::Shared::new();
     static HOST: Host<link::Link<'static>> =
         Host::new(link::Link::new(&SHARED), &example::DB, Config::new(Some(example::PARAMS), Unclaimed::Keep));
@@ -2819,7 +2963,7 @@ fn the_host_s_futures_over_the_link_layer_are_send() {
     send(HOST.run(&App, &mut run_device));
     send(HOST.crypto(&mut crypto_device, || {}));
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     send(HOST.advertise(&advertising, &identity));
     let next: fn(&'static super::Conn<'static, link::Link<'static>>) -> _ = super::Conn::next;
     send_fn(next);
@@ -2837,7 +2981,7 @@ fn a_failed_pairing_is_followed_by_a_new_key_pair_and_a_bond_by_none() {
     let link = host.port();
     tasks!(host, tasks, multiplications);
     let identity = identity(1);
-    let advertising = example::advertising(Mode::Pairing, None).unwrap();
+    let advertising = assert_ok!(example::advertising(Mode::Pairing, None));
     let mut advertise = pin!(host.advertise(&advertising, &identity));
     assert!(poll(advertise.as_mut()).is_pending());
     tasks.step();
@@ -2845,7 +2989,7 @@ fn a_failed_pairing_is_followed_by_a_new_key_pair_and_a_bond_by_none() {
     let local = local_rpa();
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let conn = assert_ok!(ready!(advertise.as_mut()));
     link.calls();
 
     // The central fails the pairing once it has our public key; the link
@@ -2854,7 +2998,7 @@ fn a_failed_pairing_is_followed_by_a_new_key_pair_and_a_bond_by_none() {
     smp(link, &mut tasks, &central.request, false);
     let first = smp(link, &mut tasks, &central.public_key(), false);
     assert_eq!(multiplications.get(), 2);
-    assert!(smp(link, &mut tasks, &[0x05, 0x04], false).is_empty());
+    assert_eq!(smp(link, &mut tasks, &[0x05, 0x04], false), Vec::<Vec<u8>>::new());
     assert_eq!(next!(conn), ConnEvent::PairingFailed(super::smp::Reason::CONFIRM_VALUE_FAILED));
     // The key pair it saw is dropped, and a new one made in idle time.
     assert_eq!(multiplications.get(), 3);
@@ -2867,26 +3011,26 @@ fn a_failed_pairing_is_followed_by_a_new_key_pair_and_a_bond_by_none() {
 
     // The next pairable call advertises at once, and its pairing computes
     // only the Diffie-Hellman key, with a public key never shown before.
-    let mut advertise = pin!(host.advertise(&advertising, &identity));
-    assert!(poll(advertise.as_mut()).is_pending());
+    let mut next_call = pin!(host.advertise(&advertising, &identity));
+    assert!(poll(next_call.as_mut()).is_pending());
     assert_eq!(link.calls().last(), Some(&Seen::Advertise(32, 0)));
     link.connect(Peer::new(CENTRAL_ADDRESS, false), None, local);
     tasks.step();
-    let conn = ready(advertise.as_mut()).unwrap();
+    let next_conn = assert_ok!(ready!(next_call.as_mut()));
     link.calls();
-    let mut central = Central::new(linux_request(true, true), local);
-    smp(link, &mut tasks, &central.request, false);
-    let answer = smp(link, &mut tasks, &central.public_key(), false);
+    let mut next_central = Central::new(linux_request(true, true), local);
+    smp(link, &mut tasks, &next_central.request, false);
+    let answer = smp(link, &mut tasks, &next_central.public_key(), false);
     assert_eq!(answer.len(), 2);
-    assert_ne!(answer[0], first[0]);
+    assert_ne!(assert_some!(answer.first()), assert_some!(first.first()));
     assert_eq!(multiplications.get(), 4);
-    central.take_public_key(&answer[0]);
-    central.take_confirm(&answer[1]);
-    let random = smp(link, &mut tasks, &central.random(), false);
-    central.take_random(&random[0]);
-    let check = central.check();
-    assert_eq!(smp(link, &mut tasks, &check, false), [central.expected_check().to_vec()]);
-    let mut ltk = central.ltk;
+    next_central.take_public_key(assert_some!(answer.first()));
+    next_central.take_confirm(assert_some!(answer.get(1)));
+    let random = smp(link, &mut tasks, &next_central.random(), false);
+    next_central.take_random(assert_some!(random.first()));
+    let check = next_central.check();
+    assert_eq!(smp(link, &mut tasks, &check, false), [next_central.expected_check().to_vec()]);
+    let mut ltk = next_central.ltk;
     ltk.reverse();
     link.event(Event::LtkRequest { ediv: 0, rand: [0; 8] });
     link.event(Event::Encryption { on: true, refresh: false, status: 0 });
@@ -2894,13 +3038,13 @@ fn a_failed_pairing_is_followed_by_a_new_key_pair_and_a_bond_by_none() {
     assert_eq!(link.calls(), [Seen::Ltk(Some(ltk))]);
     assert_eq!(link.deliver().len(), 2);
     link.ack();
-    assert!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true).is_empty());
+    assert_eq!(smp(link, &mut tasks, &pdu::<17>(0x08, &CENTRAL_IRK), true), Vec::<Vec<u8>>::new());
     let mut central_identity = [0x09, 0x00, 0, 0, 0, 0, 0, 0];
     central_identity[2..].copy_from_slice(&CENTRAL_IDENTITY);
-    assert!(smp(link, &mut tasks, &central_identity, true).is_empty());
-    assert_eq!(next!(conn), ConnEvent::Encrypted { bonded: false });
-    assert!(matches!(next!(conn), ConnEvent::Bonded(_)));
-    // Nothing is computed after the bond, while the central discovers the
+    assert_eq!(smp(link, &mut tasks, &central_identity, true), Vec::<Vec<u8>>::new());
+    assert_eq!(next!(next_conn), ConnEvent::Encrypted { bonded: false });
+    assert!(matches!(next!(next_conn), ConnEvent::Bonded(_)));
+    // Nothing is computed after the bond, while the next_central discovers the
     // table and the application sends its input.
     link.advance(5_000);
     tasks.step();

@@ -57,15 +57,15 @@ fn every_field_survives_the_round_trip() {
     assert_eq!(bytes[1], 0x0F);
     assert_eq!(bytes[8..24], IRK);
     assert_eq!(bytes[46..], CHANGED_DB.hash()[..4]);
-    let decoded = Bond::from_bytes(&bytes).unwrap();
+    let decoded = assert_some!(Bond::from_bytes(&bytes));
     assert!(decoded == bond);
-    assert!(decoded.peer.peer() == Peer::new([9, 8, 7, 6, 5, 0xC4], true));
+    assert_eq!(decoded.peer.peer(), Peer::new([9, 8, 7, 6, 5, 0xC4], true));
     assert_eq!(decoded.peer_irk, Some(IRK));
     assert_eq!(decoded.ltk, LTK);
     assert_eq!(decoded.local, Variant::new(2, 255));
     assert!(decoded.authenticated);
     assert_eq!(decoded.cccd, 0b10_01);
-    assert_eq!(decoded.layout, Some(u32::from_le_bytes(CHANGED_DB.hash()[..4].try_into().unwrap())));
+    assert_eq!(decoded.layout, Some(u32::from_le_bytes(assert_ok!(CHANGED_DB.hash()[..4].try_into()))));
     assert!(decoded.directed_works);
 }
 
@@ -76,14 +76,14 @@ fn directed_advertising_that_went_unanswered_is_stored_in_bit_4() {
     bond.directed_works = false;
     let bytes = bond.to_bytes();
     assert_eq!(bytes[1], 0x10);
-    let decoded = Bond::from_bytes(&bytes).unwrap();
+    let decoded = assert_some!(Bond::from_bytes(&bytes));
     assert!(!decoded.directed_works);
     assert!(decoded == bond);
     // A record with the bit clear: directed advertising works, as for a new
     // bond.
     let mut clear = bytes;
     clear[1] = 0;
-    assert!(Bond::from_bytes(&clear).unwrap().directed_works);
+    assert!(assert_some!(Bond::from_bytes(&clear)).directed_works);
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn client_features_are_stored_in_bits_5_to_7() {
         bond.client_features = features;
         let bytes = bond.to_bytes();
         assert_eq!(bytes[1], features.strict_mul(0x20));
-        let decoded = Bond::from_bytes(&bytes).unwrap();
+        let decoded = assert_some!(Bond::from_bytes(&bytes));
         assert_eq!(decoded.client_features, features);
         assert!(decoded == bond);
         // The other flags keep their bits beside them.
@@ -113,9 +113,9 @@ fn client_features_are_stored_in_bits_5_to_7() {
         other.authenticated = true;
         other.directed_works = false;
         other.client_features = features;
-        let bytes = other.to_bytes();
-        assert_eq!(bytes[1], 0x1F | features.strict_mul(0x20));
-        assert!(Bond::from_bytes(&bytes) == Some(other));
+        let other_bytes = other.to_bytes();
+        assert_eq!(other_bytes[1], 0x1F | features.strict_mul(0x20));
+        assert!(Bond::from_bytes(&other_bytes) == Some(other));
     }
 }
 
@@ -125,7 +125,7 @@ fn client_features_past_bit_2_are_not_stored() {
     bond.client_features = 0xFF;
     let bytes = bond.to_bytes();
     assert_eq!(bytes[1], 0xE0);
-    assert_eq!(Bond::from_bytes(&bytes).unwrap().client_features, 0x07);
+    assert_eq!(assert_some!(Bond::from_bytes(&bytes)).client_features, 0x07);
     bond.client_features = 0xF8;
     assert_eq!(bond.to_bytes()[1], 0x00);
 }
@@ -144,9 +144,9 @@ fn a_record_from_before_client_features_reads_none() {
     record[40..42].copy_from_slice(&[0x02, 0x01]);
     record[42..46].copy_from_slice(&[0x05, 0, 0, 0]);
     record[46..].copy_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4]);
-    let decoded = Bond::from_bytes(&record).unwrap();
+    let decoded = assert_some!(Bond::from_bytes(&record));
     assert_eq!(decoded.client_features, 0);
-    assert!(decoded.peer.peer() == Peer::new([9, 8, 7, 6, 5, 0xC4], true));
+    assert_eq!(decoded.peer.peer(), Peer::new([9, 8, 7, 6, 5, 0xC4], true));
     assert_eq!(decoded.peer_irk, Some(IRK));
     assert!(decoded.authenticated && !decoded.directed_works);
     assert_eq!(decoded.layout, Some(0xD4C3_B2A1));
@@ -207,7 +207,7 @@ fn contradicting_fields_are_refused() {
     // A layout flagged with zeros is a layout of zero.
     let mut bytes = good;
     bytes[1] |= FLAG_LAYOUT;
-    assert_eq!(Bond::from_bytes(&bytes).unwrap().layout, Some(0));
+    assert_eq!(assert_some!(Bond::from_bytes(&bytes)).layout, Some(0));
 }
 
 #[test]

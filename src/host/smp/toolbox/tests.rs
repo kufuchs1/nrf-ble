@@ -4,24 +4,7 @@
 
 use super::*;
 use crate::host::test_aes::Software;
-
-/// The octets of `text`, hexadecimal digits with any spaces between them.
-pub(crate) fn hex<const N: usize>(text: &str) -> [u8; N] {
-    let mut out = [0; N];
-    let mut digits = text.bytes().filter(|byte| !byte.is_ascii_whitespace()).map(|byte| match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => panic!("not a hexadecimal digit: {byte}"),
-    });
-    for octet in &mut out {
-        let high = digits.next().expect("too few digits");
-        let low = digits.next().expect("too few digits");
-        *octet = high.wrapping_shl(4) | low;
-    }
-    assert!(digits.next().is_none(), "too many digits");
-    out
-}
+use core::array::from_fn;
 
 /// The key of the RFC 4493 examples.
 const RFC_KEY: &str = "2b7e1516 28aed2a6 abf71588 09cf4f3c";
@@ -49,7 +32,7 @@ const SAMPLE_N1: &str = "d5cb8454 d177733e ffffb2ec 712baeab";
 const SAMPLE_N2: &str = "a6e8e7cc 25a75f6e 216583f7 ff3dc4cf";
 /// The Diffie-Hellman key W of the f5 sample.
 const SAMPLE_W: &str = "ec0234a3 57c8ad05 341010a6 0a397d9b 99796b13 b4f866f1 868d34f3 73bfa698";
-/// The MacKey of the f5 sample, the W of the f6 sample.
+/// The `MacKey` of the f5 sample, the W of the f6 sample.
 const SAMPLE_MAC_KEY: &str = "2965f176 a1084a02 fd3f6a20 ce636e20";
 
 /// A1 of the samples: public device address 56:12:37:37:BF:CE.
@@ -71,6 +54,20 @@ fn the_keyed_aes_gives_l_of_rfc_4493() {
     assert_eq!(<[u8; 16]>::from(block), expected);
 }
 
+/// The octets of `text`, hexadecimal digits with any spaces between them.
+pub fn hex<const N: usize>(text: &str) -> [u8; N] {
+    let mut out = [0; N];
+    let mut digits =
+        text.chars().filter(|character| !character.is_ascii_whitespace()).map(|character| character.to_digit(16));
+    for octet in &mut out {
+        let value = digits.next().flatten().zip(digits.next().flatten()).map(|(high, low)| high.strict_shl(4) | low);
+        assert!(value.is_some(), "two hexadecimal digits for each octet: {text}");
+        *octet = value.and_then(|both| u8::try_from(both).ok()).unwrap_or_default();
+    }
+    assert!(digits.next().is_none(), "too many digits");
+    out
+}
+
 /// The example of FIPS 197, appendix C.1, through every method of the
 /// block cipher traits.
 #[test]
@@ -83,23 +80,23 @@ fn the_keyed_aes_matches_fips_197_in_every_method() {
     let mut block = plain;
     BlockCipherEncrypt::encrypt_block(&cipher, &mut block);
     assert_eq!(block, expected, "encrypt_block");
-    let mut block = plain;
-    cipher.encrypt_block_inplace(&mut block);
-    assert_eq!(block, expected, "encrypt_block_inplace");
+    let mut in_place = plain;
+    cipher.encrypt_block_inplace(&mut in_place);
+    assert_eq!(in_place, expected, "encrypt_block_inplace");
     let mut out = Block::<KeyedAes<'_, Software>>::default();
     cipher.encrypt_block_b2b(&plain, &mut out);
     assert_eq!(out, expected, "encrypt_block_b2b");
-    let mut out = Block::<KeyedAes<'_, Software>>::default();
-    cipher.encrypt_block_inout((&plain, &mut out).into());
-    assert_eq!(out, expected, "encrypt_block_inout");
+    let mut in_out = Block::<KeyedAes<'_, Software>>::default();
+    cipher.encrypt_block_inout((&plain, &mut in_out).into());
+    assert_eq!(in_out, expected, "encrypt_block_inout");
 
     let mut blocks = [plain; 3];
     cipher.encrypt_blocks(&mut blocks);
     assert_eq!(blocks, [expected; 3], "encrypt_blocks");
-    let mut out = [Block::<KeyedAes<'_, Software>>::default(); 3];
-    assert!(cipher.encrypt_blocks_b2b(&[plain; 3], &mut out).is_ok());
-    assert_eq!(out, [expected; 3], "encrypt_blocks_b2b");
-    assert!(cipher.encrypt_blocks_b2b(&[plain; 3], &mut out[..2]).is_err(), "lengths differ");
+    let mut outs = [Block::<KeyedAes<'_, Software>>::default(); 3];
+    assert!(matches!(cipher.encrypt_blocks_b2b(&[plain; 3], &mut outs), Ok(())));
+    assert_eq!(outs, [expected; 3], "encrypt_blocks_b2b");
+    assert!(cipher.encrypt_blocks_b2b(&[plain; 3], &mut outs[..2]).is_err(), "lengths differ");
     // A tail is shorter than the width of one block, so empty, the only
     // length the trait allows.
     let mut none: [Block<KeyedAes<'_, Software>>; 0] = [];
@@ -125,21 +122,26 @@ fn a_tail_of_a_whole_block_is_refused_in_a_debug_build() {
 fn cmac_matches_rfc_4493_however_the_message_is_split() {
     let key = hex::<16>(RFC_KEY);
     let message = hex::<64>(RFC_MESSAGE);
-    for (len, expected) in RFC_EXAMPLES {
-        let expected = hex::<16>(expected);
-        let message = &message[..len];
-        assert_eq!(cmac(&Software, key, &[message]), expected, "{len} octets in one part");
+    for (len, expected_hex) in RFC_EXAMPLES {
+        let expected = hex::<16>(expected_hex);
+        let prefix = message.get(..len).unwrap_or_default();
+        assert_eq!(cmac(&Software, key, &[prefix]), expected, "{len} octets in one part");
         assert_eq!(cmac(&Software, key, &[]), hex(RFC_EXAMPLES[0].1), "no parts at all");
         // Every split into two and three parts, empty parts included.
         for first in 0..=len {
             for second in first..=len {
-                let parts = [&message[..first], &message[first..second], &message[second..]];
+                let parts = [
+                    prefix.get(..first).unwrap_or_default(),
+                    prefix.get(first..second).unwrap_or_default(),
+                    prefix.get(second..).unwrap_or_default(),
+                ];
                 assert_eq!(cmac(&Software, key, &parts), expected, "{len} octets split at {first} and {second}");
             }
         }
         // One octet at a time.
-        let octets: [&[u8]; 64] = core::array::from_fn(|index| &message[index.min(len)..(index + 1).min(len)]);
-        assert_eq!(cmac(&Software, key, &octets[..len]), expected, "{len} octets one at a time");
+        let octets: [&[u8]; 64] =
+            from_fn(|index| prefix.get(index.min(len)..index.strict_add(1).min(len)).unwrap_or_default());
+        assert_eq!(cmac(&Software, key, octets.get(..len).unwrap_or_default()), expected, "{len} octets one at a time");
     }
 }
 

@@ -1419,7 +1419,7 @@ pub(crate) mod test_aes {
     };
 
     /// Software AES-128 from the `aes` crate.
-    pub(crate) struct Software;
+    pub struct Software;
 
     impl Aes for Software {
         fn encrypt(&self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] {

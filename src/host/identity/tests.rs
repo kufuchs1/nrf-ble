@@ -2,13 +2,19 @@
 
 use super::*;
 use crate::host::test_aes::Software;
+use core::array::from_fn;
+
+/// The address [`the_derivation_is_pinned`] expects, computed with another
+/// AES implementation (Python's `cryptography`): its top two bits happen to
+/// be set already.
+const PINNED_ADDRESS: [u8; 6] = [0x9E, 0xB1, 0xB6, 0x3C, 0x7E, 0xFE];
+/// The key [`the_derivation_is_pinned`] expects, computed the same way.
+const PINNED_IRK: [u8; 16] =
+    [0xFC, 0x62, 0xD8, 0x0E, 0x67, 0x73, 0xA8, 0x77, 0x1A, 0xD0, 0xF2, 0xB6, 0x9E, 0x53, 0xB8, 0xD2];
 
 /// A device secret with the roots 0 to 15 and 16 to 31.
 fn secret() -> DeviceSecret {
-    DeviceSecret::new(
-        core::array::from_fn(|index| u8::try_from(index).unwrap()),
-        core::array::from_fn(|index| u8::try_from(index + 16).unwrap()),
-    )
+    DeviceSecret::new(from_fn(|index| index.strict_cast()), from_fn(|index| index.strict_add(16).strict_cast()))
 }
 
 #[test]
@@ -40,21 +46,14 @@ fn the_identity_is_the_roots_encrypting_the_variant() {
     let variant = Variant::new(0, 1);
     let identity = Local::derive(&Software, &secret(), variant);
     let block = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    let mut address = *Software.encrypt(secret().er, block).first_chunk::<6>().unwrap();
+    let encrypted = Software.encrypt(secret().er, block);
+    let mut address = *encrypted.split_array_ref::<6>().0;
     address[5] |= 0xC0;
     assert_eq!(identity.address(), address);
     assert_eq!(identity.irk(), Software.encrypt(secret().ir, block));
     assert_eq!(identity.variant(), variant);
-    assert!(identity.peer() == Peer::new(address, true));
+    assert_eq!(identity.peer(), Peer::new(address, true));
 }
-
-/// The address [`the_derivation_is_pinned`] expects, computed with another
-/// AES implementation (Python's `cryptography`): its top two bits happen to
-/// be set already.
-const PINNED_ADDRESS: [u8; 6] = [0x9E, 0xB1, 0xB6, 0x3C, 0x7E, 0xFE];
-/// The key [`the_derivation_is_pinned`] expects, computed the same way.
-const PINNED_IRK: [u8; 16] =
-    [0xFC, 0x62, 0xD8, 0x0E, 0x67, 0x73, 0xA8, 0x77, 0x1A, 0xD0, 0xF2, 0xB6, 0x9E, 0x53, 0xB8, 0xD2];
 
 #[test]
 fn the_derivation_is_pinned() {
@@ -70,14 +69,19 @@ fn every_variant_gives_a_static_random_identity_of_its_own() {
     let secret = secret();
     let mut seen = [([0; 6], [0; 16]); 64];
     for (index, entry) in seen.iter_mut().enumerate() {
-        let index = u8::try_from(index).unwrap();
-        let identity = Local::derive(&Software, &secret, Variant::new(index % 4, index / 4));
+        let number: u8 = index.strict_cast();
+        let identity = Local::derive(&Software, &secret, Variant::new(number.strict_rem(4), number.strict_div(4)));
         assert_eq!(identity.address()[5] & 0xC0, 0xC0);
         assert_ne!(identity.irk(), [0; 16]);
         *entry = (identity.address(), identity.irk());
     }
     for (index, entry) in seen.iter().enumerate() {
-        assert!(seen[index + 1..].iter().all(|other| other.0 != entry.0 && other.1 != entry.1));
+        assert!(
+            seen.get(index.strict_add(1)..)
+                .unwrap_or_default()
+                .iter()
+                .all(|other| other.0 != entry.0 && other.1 != entry.1)
+        );
     }
 }
 

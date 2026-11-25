@@ -2,6 +2,11 @@
 //! the order of its calls of the link layer, and notifications against a
 //! PDU of several fragments.
 
+extern crate alloc;
+
+#[cfg(feature = "eatt")] mod bearers;
+#[cfg(feature = "eatt")] mod sim;
+
 use super::*;
 use crate::{
     host::{
@@ -18,13 +23,15 @@ use crate::{
     },
     pdu::Peer,
 };
+use alloc::{vec, vec::Vec};
 
 /// The application's side of the table: a battery level of 90 %.
 struct App;
 
 impl Handler for App {
     fn read(&self, _id: ValueId, out: &mut [u8]) -> Result<usize, AttError> {
-        out[0] = 90;
+        let level = out.first_mut().ok_or(AttError::UNLIKELY_ERROR)?;
+        *level = 90;
         Ok(1)
     }
 
@@ -62,8 +69,8 @@ fn receive(engine: &mut Engine, device: &mut Device, cid: u16, payload: &[u8], n
 /// `payload` on `cid` as the fragments of a received PDU, `encrypted` or
 /// not.
 fn receive_as(engine: &mut Engine, device: &mut Device, cid: u16, payload: &[u8], encrypted: bool, now: Instant) {
-    let mut pdu = std::vec::Vec::new();
-    pdu.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+    let mut pdu = Vec::new();
+    pdu.extend_from_slice(&assert_ok!(u16::try_from(payload.len())).to_le_bytes());
     pdu.extend_from_slice(&cid.to_le_bytes());
     pdu.extend_from_slice(payload);
     for (index, chunk) in pdu.chunks(27).enumerate() {
@@ -71,11 +78,9 @@ fn receive_as(engine: &mut Engine, device: &mut Device, cid: u16, payload: &[u8]
     }
 }
 
-extern crate std;
-
 /// The Write Request that enables the battery level's notifications.
 fn enable_battery() -> [u8; 5] {
-    let [handle0, handle1] = (example::BATTERY_LEVEL.handle() + 1).to_le_bytes();
+    let [handle0, handle1] = example::BATTERY_LEVEL.handle().strict_add(1).to_le_bytes();
     [0x12, handle0, handle1, 0x01, 0x00]
 }
 
@@ -87,8 +92,8 @@ fn battery_50() -> [u8; 8] {
 
 /// Queues every fragment the engine has, with room for `room`, and
 /// returns them.
-fn drain(engine: &mut Engine, room: usize, now: Instant) -> std::vec::Vec<Fragment> {
-    let mut fragments = std::vec::Vec::new();
+fn drain(engine: &mut Engine, room: usize, now: Instant) -> Vec<Fragment> {
+    let mut fragments = Vec::new();
     while let Some(fragment) = engine.next_fragment(room) {
         fragments.push(fragment);
         engine.fragment_sent(now);
@@ -101,15 +106,15 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_public_key() {
     let mut engine = Engine::new(&example::DB, example::CONFIG);
     let mut device = Device(5);
     engine.advertise(true, &identity(), None, Duration::from_secs(60));
-    let job = engine.take_job().unwrap();
+    let job = assert_some!(engine.take_job());
     let result = job.run(&mut device.clone(), || ());
     engine.job_done(&mut device, result, at(0));
     engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
     // The battery's notifications are open: enabled before any pairing.
     receive(&mut engine, &mut device, 4, &enable_battery(), at(0));
     assert_eq!(drain(&mut engine, 4, at(0)).len(), 1);
-    let epoch = engine.epoch().unwrap();
-    assert!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]).is_ok());
+    let epoch = assert_some!(engine.epoch());
+    assert_eq!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]).err(), None);
 
     let central = Central::new(linux_request(true, true), local_rpa());
     receive(&mut engine, &mut device, 6, &central.request, at(1));
@@ -117,17 +122,17 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_public_key() {
     receive(&mut engine, &mut device, 6, &central.public_key(), at(2));
     // The first fragment of our public key is queued: the rest must follow
     // before anything else starts.
-    let first = engine.next_fragment(4).unwrap();
+    let first = assert_some!(engine.next_fragment(4));
     assert!(first.start());
     engine.fragment_sent(at(2));
     assert_eq!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]), Err(NotifyError::Busy));
     let rest = drain(&mut engine, 4, at(2));
-    assert_eq!(rest.iter().map(|fragment| (fragment.start(), fragment.bytes().len())).collect::<std::vec::Vec<_>>(), [
+    assert_eq!(rest.iter().map(|fragment| (fragment.start(), fragment.bytes().len())).collect::<Vec<_>>(), [
         (false, 27),
         (false, 15),
         (true, 21)
     ]);
-    let fragment = engine.notification(epoch, example::BATTERY_LEVEL, &[50]).unwrap();
+    let fragment = assert_ok!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]));
     assert_eq!(fragment.bytes(), battery_50());
     // The input reports need the encryption the link lacks.
     assert_eq!(engine.notification(epoch, example::KEYBOARD, &[0; 8]), Err(NotifyError::NotSubscribed));
@@ -144,19 +149,19 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_long_response() {
     engine.connected(&info(Peer::new(CENTRAL_ADDRESS, false), None), at(0));
     receive(&mut engine, &mut device, 4, &enable_battery(), at(0));
     assert_eq!(drain(&mut engine, 4, at(0)).len(), 1);
-    let epoch = engine.epoch().unwrap();
+    let epoch = assert_some!(engine.epoch());
     receive(&mut engine, &mut device, 4, &[0x02, 0x05, 0x02], at(1));
     let answer = drain(&mut engine, 4, at(1));
-    assert_eq!(answer.iter().map(Fragment::bytes).collect::<std::vec::Vec<_>>(), [[3, 0, 4, 0, 0x03, 0x41, 0x00]]);
+    assert_eq!(answer.iter().map(Fragment::bytes).collect::<Vec<_>>(), [[3, 0, 4, 0, 0x03, 0x41, 0x00]]);
     // Find Information over the whole table: 15 entries, 62 octets, in
     // three fragments.
     receive(&mut engine, &mut device, 4, &[0x04, 0x01, 0x00, 0xFF, 0xFF], at(2));
-    let first = engine.next_fragment(4).unwrap();
+    let first = assert_some!(engine.next_fragment(4));
     assert!(first.start());
-    assert_eq!(first.bytes()[..6], [62, 0, 4, 0, 0x05, 0x01]);
+    assert_eq!(first.bytes().get(..6), Some(&[62, 0, 4, 0, 0x05, 0x01][..]));
     engine.fragment_sent(at(2));
     assert_eq!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]), Err(NotifyError::Busy));
-    let second = engine.next_fragment(4).unwrap();
+    let second = assert_some!(engine.next_fragment(4));
     engine.fragment_sent(at(2));
     assert_eq!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]), Err(NotifyError::Busy));
     let rest = drain(&mut engine, 4, at(2));
@@ -165,10 +170,10 @@ fn a_notification_never_interleaves_with_the_fragments_of_a_long_response() {
             .into_iter()
             .chain(&rest)
             .map(|fragment| (fragment.start(), fragment.bytes().len()))
-            .collect::<std::vec::Vec<_>>(),
+            .collect::<Vec<_>>(),
         [(true, 27), (false, 27), (false, 12)]
     );
-    let fragment = engine.notification(epoch, example::BATTERY_LEVEL, &[50]).unwrap();
+    let fragment = assert_ok!(engine.notification(epoch, example::BATTERY_LEVEL, &[50]));
     assert_eq!(fragment.bytes(), battery_50());
 }
 
@@ -198,7 +203,7 @@ fn a_dropped_pdu_leaves_no_copy_in_the_reassembly_buffer() {
     receive(&mut engine, &mut device, 7, &[0x5A; 40], at(0));
     assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
     // A PDU with more octets than its header announces.
-    let mut overlong = std::vec![2, 0, 6, 0];
+    let mut overlong = vec![2, 0, 6, 0];
     overlong.extend_from_slice(&[0x5A; 20]);
     engine.on_acl(&mut device, &App, &AclIn::for_test(true, false, &overlong), at(0));
     assert_eq!(engine.rx.buffer(), &[0; RX_MAX]);
@@ -225,7 +230,7 @@ fn the_parameter_request_leaves_the_last_place_to_responses() {
     engine.advertise(false, &identity, Some(bond), Duration::from_secs(20));
     assert!(!engine.has_job(), "no key pair for a reconnection");
     engine.connected(&info(Peer::new([3; 6], true), Some(Peer::new(CENTRAL_IDENTITY, false))), at(0));
-    let epoch = engine.epoch().unwrap();
+    let epoch = assert_some!(engine.epoch());
     engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, at(0));
     // The latency hold, then the key.
     assert_eq!(engine.take_command(0, at(0)), Some(Command::HoldLatency(true)));
@@ -242,8 +247,8 @@ fn the_parameter_request_leaves_the_last_place_to_responses() {
     engine.on_time(at(1510));
     assert!(engine.has_output());
     assert_eq!(engine.next_fragment(1), None);
-    let request = engine.next_fragment(2).unwrap();
-    assert_eq!(request.bytes()[..6], [12, 0, 5, 0, 0x12, 0x01]);
+    let request = assert_some!(engine.next_fragment(2));
+    assert_eq!(request.bytes().get(..6), Some(&[12, 0, 5, 0, 0x12, 0x01][..]));
     engine.fragment_sent(at(1510));
     // The response has 30 s.
     assert_eq!(engine.next_deadline(), Some(at(31_510)));
@@ -268,20 +273,26 @@ fn pair(
     central_id: bool,
 ) -> (Epoch, [u8; 16]) {
     engine.advertise(true, identity, None, Duration::from_secs(60));
-    let job = engine.take_job().unwrap();
-    let result = job.run(&mut device.clone(), || ());
-    engine.job_done(device, result, at(0));
+    let job = engine.take_job();
+    assert!(job.is_some(), "the key pair to make");
+    if let Some(key_pair) = job {
+        let result = key_pair.run(&mut device.clone(), || ());
+        engine.job_done(device, result, at(0));
+    }
     engine.connected(&info(peer, None), at(0));
-    let epoch = engine.epoch().unwrap();
+    let epoch = engine.epoch();
+    assert!(epoch.is_some(), "connected");
     assert_eq!(engine.take_command(0, at(0)), Some(Command::HoldLatency(true)));
-    (epoch, pair_link(engine, device, central_id, at(0)))
+    (epoch.unwrap_or(Epoch::for_test(0)), pair_link(engine, device, central_id, at(0)))
 }
 
 /// Pairs the link of `engine` with a Linux central at the link's address on
 /// the air that is to send its identity keys if `central_id`, at `now`, up to
 /// the encryption; returns the key.
 fn pair_link(engine: &mut Engine, device: &mut Device, central_id: bool, now: Instant) -> [u8; 16] {
-    let epoch = engine.epoch().unwrap();
+    let connected = engine.epoch();
+    assert!(connected.is_some(), "a link");
+    let Some(epoch) = connected else { return [0; 16] };
     let mut central = Central::new(linux_request(central_id, true), local_rpa());
     if let Some(link) = engine.link.as_ref() {
         central.address = link.info.peer;
@@ -291,20 +302,23 @@ fn pair_link(engine: &mut Engine, device: &mut Device, central_id: bool, now: In
     receive(engine, device, 6, &central.public_key(), now);
     let fragments = drain(engine, 4, now);
     let mut reassembly = Reassembly::new();
-    let pdus: std::vec::Vec<std::vec::Vec<u8>> = fragments
+    let pdus: Vec<Vec<u8>> = fragments
         .iter()
         .filter_map(|fragment| {
             reassembly.push(fragment.start(), false, fragment.bytes()).map(|pdu| pdu.payload.to_vec())
         })
         .collect();
-    central.take_public_key(&pdus[0]);
-    central.take_confirm(&pdus[1]);
-    let job = engine.take_job().unwrap();
-    let result = job.run(&mut device.clone(), || ());
-    engine.job_done(device, result, now);
+    central.take_public_key(pdus.first().map_or(&[][..], Vec::as_slice));
+    central.take_confirm(pdus.get(1).map_or(&[][..], Vec::as_slice));
+    let job = engine.take_job();
+    assert!(job.is_some(), "the Diffie-Hellman key to compute");
+    if let Some(dh_key) = job {
+        let result = dh_key.run(&mut device.clone(), || ());
+        engine.job_done(device, result, now);
+    }
     receive(engine, device, 6, &central.random(), now);
     let random = drain(engine, 4, now);
-    central.take_random(&random[0].bytes()[4..]);
+    central.take_random(random.first().and_then(|fragment| fragment.bytes().get(4..)).unwrap_or_default());
     receive(engine, device, 6, &central.check(), now);
     drain(engine, 4, now);
     engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, now);
@@ -333,8 +347,14 @@ fn the_bond_is_built_from_the_address_on_the_air_without_the_central_s_identity(
     assert_eq!(engine.take_event(epoch), None);
     assert_eq!(engine.take_command(0, at(0)), None);
     assert!(!engine.has_output());
-    let Some(ConnEvent::Bonded(bond)) = engine.take_event(epoch) else { panic!("no bond") };
-    assert!(bond.peer.peer() == peer);
+    let Some(ConnEvent::Bonded(bond)) = ({
+        let value = engine.take_event(epoch);
+        assert!(matches!(value, Some(ConnEvent::Bonded(_))), "no bond");
+        value
+    }) else {
+        return;
+    };
+    assert_eq!(bond.peer.peer(), peer);
     assert_eq!(bond.peer_irk, None);
     assert_eq!(bond.ltk, ltk);
     assert_eq!(bond.local, identity.variant());
@@ -379,6 +399,9 @@ fn an_all_zero_identity_address_is_no_identity_address() {
 
 #[test]
 fn an_all_zero_key_from_the_central_is_no_key() {
+    #[cfg(feature = "directed-advertising")]
+    use crate::host::adv::{DIRECTED_MAX, Mode, Phase};
+
     // A central without an identity resolving key may send its identity
     // address with an all-zero key: it scans from its identity address.
     let mut engine = Engine::new(&example::DB, example::CONFIG);
@@ -393,19 +416,22 @@ fn an_all_zero_key_from_the_central_is_no_key() {
     receive_as(&mut engine, &mut device, 6, &address, true, at(0));
     assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: false }));
     assert_eq!(engine.take_command(0, at(0)), None);
-    let Some(ConnEvent::Bonded(bond)) = engine.take_event(epoch) else { panic!("no bond") };
-    assert!(bond.peer.peer() == Peer::new(CENTRAL_IDENTITY, false));
+    let Some(ConnEvent::Bonded(bond)) = ({
+        let value = engine.take_event(epoch);
+        assert!(matches!(value, Some(ConnEvent::Bonded(_))), "no bond");
+        value
+    }) else {
+        return;
+    };
+    assert_eq!(bond.peer.peer(), Peer::new(CENTRAL_IDENTITY, false));
     assert_eq!(bond.peer_irk, None);
     assert_eq!(bond.ltk, ltk);
     // It is stored and read back, where a key flagged but all zero is
     // refused.
-    assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond.clone()));
+    assert!(Bond::from_bytes(&bond.to_bytes()).as_ref() == Some(&bond));
     // A reconnection is directed to its identity.
     #[cfg(feature = "directed-advertising")]
-    assert!(
-        crate::host::adv::Mode::Reconnect(&bond)
-            .directs(&crate::host::adv::Phase::directed(crate::host::adv::DIRECTED_MAX))
-    );
+    assert!(Mode::Reconnect(&bond).directs(&Phase::directed(DIRECTED_MAX)));
 }
 
 #[test]
@@ -417,18 +443,18 @@ fn the_input_reports_are_the_notifying_hid_reports() {
 
 /// A Write Request of `features` to the Client Supported Features.
 #[cfg(feature = "eatt")]
-fn write_features(features: &[u8]) -> std::vec::Vec<u8> {
+fn write_features(features: &[u8]) -> Vec<u8> {
     let [handle0, handle1] = example::CLIENT_FEATURES.to_le_bytes();
     [&[0x12, handle0, handle1][..], features].concat()
 }
 
 /// The ATT PDUs among `fragments`, each a fragment of its own.
 #[cfg(feature = "eatt")]
-fn att_pdus(fragments: &[Fragment]) -> std::vec::Vec<std::vec::Vec<u8>> {
+fn att_pdus(fragments: &[Fragment]) -> Vec<Vec<u8>> {
     fragments
         .iter()
-        .filter(|fragment| fragment.bytes()[2..4] == [4, 0])
-        .map(|fragment| fragment.bytes()[4..].to_vec())
+        .filter(|fragment| fragment.bytes().get(2..4) == Some(&[4, 0][..]))
+        .filter_map(|fragment| fragment.bytes().get(4..).map(<[u8]>::to_vec))
         .collect()
 }
 
@@ -439,7 +465,9 @@ fn reconnect(bond: Bond) -> (Engine, Epoch) {
     let mut engine = Engine::new(&example::DB, example::CONFIG);
     engine.advertise(false, &identity(), Some(bond), Duration::from_secs(20));
     engine.connected(&info(Peer::new([3; 6], true), Some(Peer::new(CENTRAL_IDENTITY, false))), at(0));
-    let epoch = engine.epoch().unwrap();
+    let connected = engine.epoch();
+    assert!(connected.is_some(), "connected");
+    let epoch = connected.unwrap_or(Epoch::for_test(0));
     engine.on_event(&Event::LtkRequest { ediv: 0, rand: [0; 8] }, at(0));
     assert_eq!(engine.take_command(0, at(0)), Some(Command::HoldLatency(true)));
     assert_eq!(engine.take_command(0, at(0)), Some(Command::LtkReply { epoch, key: Some([0x77; 16]) }));
@@ -480,14 +508,20 @@ fn the_bond_takes_the_client_features_written_while_pairing() {
         if !before {
             receive_as(&mut engine, &mut device, 4, &write_features(&[0x07]), true, at(0));
         }
-        let fragments = [fragments, drain(&mut engine, 4, at(0))].concat();
-        assert_eq!(att_pdus(&fragments), [[0x13]]);
+        let all = [fragments, drain(&mut engine, 4, at(0))].concat();
+        assert_eq!(att_pdus(&all), [[0x13]]);
         assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: false }));
         assert_eq!(engine.take_command(0, at(0)), None);
-        let Some(ConnEvent::Bonded(bond)) = engine.take_event(epoch) else { panic!("no bond") };
+        let Some(ConnEvent::Bonded(bond)) = ({
+            let value = engine.take_event(epoch);
+            assert!(matches!(value, Some(ConnEvent::Bonded(_))), "no bond");
+            value
+        }) else {
+            return;
+        };
         assert_eq!(bond.client_features, if before { 0x05 } else { 0x07 });
         assert_eq!(engine.take_event(epoch), None, "no update besides the bond");
-        assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond.clone()));
+        assert!(Bond::from_bytes(&bond.to_bytes()) == Some(bond));
     }
 }
 
@@ -505,7 +539,13 @@ fn a_reconnection_adds_the_bond_s_client_features_and_stores_only_changes() {
     assert_eq!(engine.take_event(epoch), None, "nothing stored before the encryption");
     engine.on_event(&Event::Encryption { on: true, refresh: false, status: 0 }, at(10));
     assert_eq!(engine.take_event(epoch), Some(ConnEvent::Encrypted { bonded: true }));
-    let Some(ConnEvent::BondUpdated(bond)) = engine.take_event(epoch) else { panic!("no update") };
+    let Some(ConnEvent::BondUpdated(bond)) = ({
+        let value = engine.take_event(epoch);
+        assert!(matches!(value, Some(ConnEvent::BondUpdated(_))), "no update");
+        value
+    }) else {
+        return;
+    };
     assert_eq!(bond.client_features, 0x05);
     assert_eq!(engine.take_event(epoch), None);
     let [handle0, handle1] = example::CLIENT_FEATURES.to_le_bytes();
@@ -522,14 +562,20 @@ fn a_reconnection_adds_the_bond_s_client_features_and_stores_only_changes() {
     // A new bit is stored.
     receive_as(&mut engine, &mut device, 4, &write_features(&[0x07]), true, at(50));
     assert_eq!(att_pdus(&drain(&mut engine, 4, at(50))), [[0x13]]);
-    let Some(ConnEvent::BondUpdated(bond)) = engine.take_event(epoch) else { panic!("no update") };
-    assert_eq!(bond.client_features, 0x07);
-    assert_eq!(engine.bond().map(|bond| bond.client_features), Some(0x07));
+    let Some(ConnEvent::BondUpdated(updated)) = ({
+        let value = engine.take_event(epoch);
+        assert!(matches!(value, Some(ConnEvent::BondUpdated(_))), "no update");
+        value
+    }) else {
+        return;
+    };
+    assert_eq!(updated.client_features, 0x07);
+    assert_eq!(engine.bond().map(|stored| stored.client_features), Some(0x07));
 }
 
-/// BlueZ writes its features on every connection, after the encryption on
+/// `BlueZ` writes its features on every connection, after the encryption on
 /// a bonded reconnection: the bond's value again stores nothing, and a
-/// value with fewer bits, after BlueZ went back to one channel, is refused.
+/// value with fewer bits, after `BlueZ` went back to one channel, is refused.
 #[cfg(feature = "eatt")]
 #[test]
 fn bluez_writing_the_bond_s_client_features_again_stores_nothing() {
@@ -542,13 +588,10 @@ fn bluez_writing_the_bond_s_client_features_again_stores_nothing() {
         receive_as(&mut engine, &mut device, 4, &write_features(&[written]), true, at(20));
         let mut expected = answer.to_vec();
         if expected.len() > 1 {
-            expected[2..4].copy_from_slice(&example::CLIENT_FEATURES.to_le_bytes());
+            expected.get_mut(2..4).unwrap_or_default().copy_from_slice(&example::CLIENT_FEATURES.to_le_bytes());
         }
         assert_eq!(att_pdus(&drain(&mut engine, 4, at(20))), [expected]);
         assert_eq!(engine.take_event(epoch), None);
         assert_eq!(engine.bond().map(|bond| bond.client_features), Some(bond_features));
     }
 }
-
-#[cfg(feature = "eatt")] mod bearers;
-#[cfg(feature = "eatt")] mod sim;
