@@ -663,8 +663,9 @@ the specification's, not measured with this crate.
   `nrf_ble::PPI_CHANNELS` holds channel 18.
 - **Data length:** on LE Coded each direction's effective time is at least 2704 µs, 27 octets with a MIC with S=8
   (Core, Vol 6, Part B, 4.5.10), the link layer announces the time of its longest reception with S=8, and with
-  `data-length` `link::LENGTH_MAX` allows 17040 µs, 251 octets with S=8. On LE 1M and LE 2M the effective time stays
-  within the 2120 µs of 251 octets there.
+  `data-length` `link::LENGTH_MAX` allows 17040 µs, 251 octets with S=8. On LE 1M and LE 2M the effective time has
+  only the least of 328 µs, as in 4.5.10 and in Zephyr: with a central that announces 17040 µs it is 17040 µs, more
+  than the 2120 µs that 251 octets take there, and the octets bound the packets.
 - **Power control:** one control per PHY of the power control procedures, LE Coded with S=8 and with S=2 being PHYs 3
   and 4. Its targets are those of LE 1M; LE Coded's better sensitivity is not taken into account.
 - **Extended advertising** (with `extended-advertising`): `AdvParams::primary_phy` and `Advertising::with_primary_phy`

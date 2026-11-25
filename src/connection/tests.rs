@@ -1875,8 +1875,9 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
 
 /// On LE Coded the effective time is at least 2704 us each way, which with
 /// a MIC carries 27 octets with S=8 and 136 with S=2; a central that
-/// receives 17040 us takes 251 octets with S=8. On LE 1M the time stops at
-/// 2120 us.
+/// receives 17040 us takes 251 octets with S=8. On LE 1M the time follows
+/// both sides up to 17040 us too, as Core, Vol 6, Part B, 4.5.10 sets no
+/// most there, and the octets bound the packets.
 #[test]
 #[cfg(all(feature = "data-length", feature = "coded-phy"))]
 fn the_data_length_on_le_coded_follows_the_coded_time_on_the_air() {
@@ -1885,10 +1886,11 @@ fn the_data_length_on_le_coded_follows_the_coded_time_on_the_air() {
     link.length.local_tx = LENGTH_MAX;
     link.length.offer_taken();
     link.length.announced_tx = LENGTH_MAX;
-    // On LE 1M a central that takes 17040 us each way still gets 2120 us,
-    // the time of 251 octets with a MIC there.
+    // On LE 1M a central that takes 17040 us each way gets 17040 us, and
+    // 251 octets.
     link.length.take_peer(&[251, 0, 0x90, 0x42, 251, 0, 0x90, 0x42]);
-    assert_eq!(link.length.effective(), [251, 2120, 251, 2120]);
+    assert_eq!(link.length.effective(), [251, 17_040, 251, 17_040]);
+    assert_eq!(link.tx_payload_max(), 251);
     // The central receives 251 octets in 2120 us, as on LE 1M.
     link.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
     link.handle_control(&[OP_PHY_UPDATE_IND, 4, 4, 10, 0], true);
@@ -2126,10 +2128,12 @@ fn without_the_data_length_feature_the_link_stays_at_27_octets() {
     let response = *assert_some!(link.queue.front());
     // The longest reception takes 328 us on LE 1M, and with the feature
     // `coded-phy` 2704 us, 0x0A90, on LE Coded with S=8, which the link
-    // announces; on LE 1M the effective receive time stays 328 us.
+    // announces. The effective receive time is then the central's 2120 us,
+    // the less of the two (Core, Vol 6, Part B, 4.5.10); 27 octets stay.
     let [rx_time0, rx_time1] = if cfg!(feature = "coded-phy") { [0x90, 0x0A] } else { [0x48, 0x01] };
     assert_eq!(response.data[..9], [OP_LENGTH_RSP, 27, 0, rx_time0, rx_time1, 27, 0, 0x48, 0x01]);
-    assert_eq!(link.length.effective(), [27, 328, 27, 328]);
+    let rx_time = if cfg!(feature = "coded-phy") { 2120 } else { 328 };
+    assert_eq!(link.length.effective(), [27, 328, 27, rx_time]);
     assert_eq!(link.tx_payload_max(), 27);
 }
 

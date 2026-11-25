@@ -121,9 +121,8 @@ const LENGTH_TIME_MAX: u16 = 17_040;
 const RX_TIME_MAX: u16 = LENGTH_MAX[1];
 /// Longest time on the air this side receives a data PDU in: that of
 /// [`LENGTH_MAX`]'s octets on LE Coded with S=8, 2704 us for 27 octets and
-/// 17040 us for 251, as Zephyr's controller with LE Coded offers. On LE 1M
-/// and LE 2M the central's packets stay within their PHY's time for as many
-/// octets.
+/// 17040 us for 251, as Zephyr's `dle_max_time_get` offers to a central
+/// with LE Coded, on every PHY.
 #[cfg(feature = "coded-phy")]
 const RX_TIME_MAX: u16 = coded_time(LENGTH_MAX[0]);
 /// The least effective time on the air of LE Coded, each way: 2704 us, 27
@@ -443,10 +442,10 @@ struct DataLength {
     /// Effective values last reported to the host: transmit octets and
     /// time, receive octets and time.
     reported:     [u16; 4],
-    /// The least and the most effective time each way, transmit and
-    /// receive, on the PHY of that direction ([`time_range`]).
+    /// The least effective time each way, transmit and receive, on the PHY
+    /// of that direction ([`time_floor`]).
     #[cfg(feature = "coded-phy")]
-    time_range:   [[u16; 2]; 2],
+    time_floor:   [u16; 2],
     /// Whether the central answered our `LL_LENGTH_REQ` as unknown.
     unsupported:  bool,
 }
@@ -468,19 +467,22 @@ impl DataLength {
     }
 
     /// Effective transmit octets and time and receive octets and time, each
-    /// time within the range of its direction's PHY ([`Self::time_range`]).
+    /// time at least the least of its direction's PHY ([`Self::time_floor`]),
+    /// as Core, Vol 6, Part B, 4.5.10 computes them, and Zephyr's
+    /// `ull_dle_update_eff_tx` and `ull_dle_update_eff_rx`: `MAX(MIN(local,
+    /// remote), min_eff_time)`.
     #[cfg(feature = "coded-phy")]
     const fn effective(&self) -> [u16; 4] {
         let [default_octets, _] = LENGTH_DEFAULT;
         let [max_octets, _] = LENGTH_MAX;
-        let [[tx_floor, tx_ceiling], [rx_floor, rx_ceiling]] = self.time_range;
+        let [tx_floor, rx_floor] = self.time_floor;
         // A host that lowers its length takes effect at once: shorter packets
         // are always allowed.
         [
             self.local_tx[0].min(self.announced_tx[0]).min(self.peer_rx[0]),
-            self.local_tx[1].min(self.announced_tx[1]).min(self.peer_rx[1]).min(tx_ceiling).max(tx_floor),
+            self.tx_time(tx_floor),
             max_octets.min(self.peer_tx[0]).max(default_octets),
-            RX_TIME_MAX.min(self.peer_tx[1]).min(rx_ceiling).max(rx_floor),
+            RX_TIME_MAX.min(self.peer_tx[1]).max(rx_floor),
         ]
     }
 
@@ -496,7 +498,7 @@ impl DataLength {
             peer_tx: LENGTH_DEFAULT,
             reported: [octets, time, octets, time],
             #[cfg(feature = "coded-phy")]
-            time_range: [time_range(Phy::M1); 2],
+            time_floor: [time_floor(Phy::M1); 2],
             unsupported: false,
         }
     }
@@ -539,6 +541,13 @@ impl DataLength {
         let time = |value: u16| value.clamp(default_time, LENGTH_TIME_MAX);
         self.peer_rx = [octets(rx_octets), time(rx_time)];
         self.peer_tx = [octets(tx_octets), time(tx_time)];
+    }
+
+    /// Effective transmit time on a PHY whose least effective time is
+    /// `floor`.
+    #[cfg(feature = "coded-phy")]
+    const fn tx_time(&self, floor: u16) -> u16 {
+        self.local_tx[1].min(self.announced_tx[1]).min(self.peer_rx[1]).max(floor)
     }
 }
 
@@ -1950,7 +1959,7 @@ impl Connection {
     const fn follow_phys(&mut self, receive: Phy) {
         self.anchor =
             self.anchor.before(Micros(self.phy.address_offset_us())).after(Micros(receive.address_offset_us()));
-        self.length.time_range = [time_range(self.next_tx_phy), time_range(receive)];
+        self.length.time_floor = [time_floor(self.next_tx_phy), time_floor(receive)];
     }
 
     /// Answers a control PDU from the central.
@@ -2407,7 +2416,7 @@ impl Connection {
             #[cfg(not(feature = "coded-phy"))]
             length: DataLength::new(LENGTH_DEFAULT),
             #[cfg(feature = "coded-phy")]
-            length: DataLength { time_range: [time_range(setup.phy); 2], ..DataLength::new(LENGTH_DEFAULT) },
+            length: DataLength { time_floor: [time_floor(setup.phy); 2], ..DataLength::new(LENGTH_DEFAULT) },
             notifications: [None; 3],
             anchor: ended,
             announced_power: [DEFAULT_LEVEL; POWER_PHYS],
@@ -3159,11 +3168,11 @@ impl Connection {
     /// link: the longest payload and time this side may send.
     pub(crate) const fn set_suggested_length(&mut self, length: [u16; 2]) {
         #[cfg(feature = "coded-phy")]
-        let range = self.length.time_range;
+        let floor = self.length.time_floor;
         self.length = DataLength::new(length);
         #[cfg(feature = "coded-phy")]
         {
-            self.length.time_range = range;
+            self.length.time_floor = floor;
         }
     }
 
@@ -3578,21 +3587,15 @@ const fn coded_time(octets: u16) -> u16 {
     Phy::CodedS8.pdu_us(DATA_HEADER_LEN.strict_sub(1).strict_add(usize::from(octets)).strict_add(MIC_LEN)).strict_cast()
 }
 
-/// The least and the most effective time on the air of a direction on
-/// `phy`: on LE 1M and LE 2M 328 us and the time of [`LENGTH_MAX`]'s octets
-/// with a MIC on LE 1M, 2120 us with the feature `data-length`, and on LE
-/// Coded [`CODED_TIME_MIN`] and [`RX_TIME_MAX`], 17040 us with the feature
-/// `data-length` (Core, Vol 6, Part B, 4.5.10; Zephyr's `ull_dle_max_time_get`
-/// takes the time of the longest PDU on the PHY in use).
+/// The least effective time on the air of a direction on `phy` (Core, Vol
+/// 6, Part B, 4.5.10): 328 us on LE 1M and LE 2M, [`CODED_TIME_MIN`] on LE
+/// Coded. The specification sets no most per PHY, so on LE 1M and LE 2M the
+/// effective time may exceed the time of 251 octets there, which the octets
+/// bound.
 #[cfg(feature = "coded-phy")]
-const fn time_range(phy: Phy) -> [u16; 2] {
+const fn time_floor(phy: Phy) -> u16 {
     let [_, default_time] = LENGTH_DEFAULT;
-    if phy.is_coded() {
-        return [CODED_TIME_MIN, RX_TIME_MAX];
-    }
-    let [max_octets, _] = LENGTH_MAX;
-    let longest = DATA_HEADER_LEN.strict_sub(1).strict_add(usize::from(max_octets)).strict_add(MIC_LEN);
-    [default_time, Phy::M1.pdu_us(longest).strict_cast()]
+    if phy.is_coded() { CODED_TIME_MIN } else { default_time }
 }
 
 /// Transmit power in dBm of power control level `level`.
