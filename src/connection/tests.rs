@@ -991,6 +991,7 @@ fn a_power_control_request_moves_the_power_and_reports_it() {
     assert_eq!(response.data[3].cast_signed(), 4);
 }
 
+#[cfg(feature = "nrf52833")]
 #[test]
 fn a_power_request_stops_at_the_ceiling_the_firmware_chose() {
     let highest = LEVELS_DBM[LEVELS_DBM.len() - 1];
@@ -999,7 +1000,7 @@ fn a_power_request_stops_at_the_ceiling_the_firmware_chose() {
     link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 0x7F, 0], true);
     let response = *link.queue.front().unwrap();
     assert_eq!(response.data[..4], [OP_POWER_CONTROL_RSP, 0x02, highest.cast_unsigned(), highest.cast_unsigned()]);
-    assert_eq!(highest, if cfg!(feature = "nrf52833") { 8 } else { 4 });
+    assert_eq!(highest, 8);
     // A lower ceiling is the maximum the central learns of.
     let mut link = encrypted();
     link.set_max_power(1);

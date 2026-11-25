@@ -3008,6 +3008,7 @@ impl Connection {
 
     /// Applies the firmware's transmit power ceiling in dBm when
     /// establishing a new link, on both PHYs.
+    #[cfg(feature = "nrf52833")]
     pub(crate) const fn set_max_power(&mut self, dbm: i8) {
         let &mut [ref mut one, ref mut two] = &mut self.power;
         one.set_ceiling(dbm);

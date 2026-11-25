@@ -86,6 +86,8 @@
 //! hears it again, as Zephyr does, so a lost anchor costs one interval, not the
 //! whole latency, and a supervision timeout shorter than a few latencies holds.
 
+#[cfg(feature = "nrf52833")]
+use crate::power_control::{CEILING_DBM, LEVELS_DBM, ceiling_level};
 #[cfg(feature = "extended-advertising")]
 use crate::{advertiser::extended::RENEWAL_LEN, radio::Phy};
 use crate::{
@@ -94,7 +96,6 @@ use crate::{
     clock::Micros,
     crypto,
     pdu::{Llid, ParamCheck, Peer},
-    power_control::{CEILING_DBM, LEVELS_DBM, ceiling_level},
     rng,
 };
 #[cfg(feature = "extended-advertising")]
@@ -866,6 +867,7 @@ pub struct Shared {
     host_decides:    AtomicBool = AtomicBool::new(false),
     /// Highest transmit power in dBm of the links that start, one of
     /// [`LEVELS_DBM`].
+    #[cfg(feature = "nrf52833")]
     max_power:       AtomicI8 = AtomicI8::new(CEILING_DBM),
     /// Connection parameters the host asks the central for.
     param_request:   Signal<CriticalSectionRawMutex, [u16; 4]> = Signal::new(),
@@ -1015,6 +1017,7 @@ impl Shared {
     pub(crate) fn latency_held(&self) -> bool { self.hold_latency.load(Ordering::Relaxed) }
 
     /// Highest transmit power in dBm of a link that starts.
+    #[cfg(feature = "nrf52833")]
     pub(crate) fn max_power(&self) -> i8 { self.max_power.load(Ordering::Relaxed) }
 
     /// Creates the shared state.
@@ -1931,8 +1934,8 @@ impl<'shared> Link<'shared> {
     }
 
     /// Resets the link layer: ends the link and advertising and forgets
-    /// every setting and key the host gave, but for the transmit power
-    /// ceiling ([`Self::set_max_tx_power`]). Returns once the radio stopped.
+    /// every setting and key the host gave. Returns once the radio stopped.
+    #[cfg_attr(feature = "nrf52833", doc = "", doc = "The transmit power ceiling ([`Self::set_max_tx_power`]) holds.")]
     #[inline]
     pub async fn reset(&self) {
         self.shared.reset_done.reset();
@@ -2041,17 +2044,19 @@ impl<'shared> Link<'shared> {
     /// advertising and of a link's start. A link that runs keeps its
     /// ceiling.
     ///
-    /// Until it is called the ceiling is [`CEILING_DBM`], +4 dBm, the
-    /// highest level of the nRF52832 and the nRF51. Only the nRF52833 goes
-    /// higher, up to +8 dBm. Above +4 dBm the radio needs supply headroom
-    /// that the board must provide, and the product's regulatory approval
-    /// has to cover the power, so the firmware decides whether to raise it.
+    /// Until it is called the ceiling is [`CEILING_DBM`], +4 dBm. The
+    /// nRF52833 goes up to +8 dBm. Above +4 dBm the radio needs supply
+    /// headroom that the board must provide, and the product's regulatory
+    /// approval has to cover the power, so the firmware decides whether to
+    /// raise it. The method exists only on the nRF52833: on the nRF52832 and
+    /// the nRF51 +4 dBm is the highest level, and the ceiling is fixed there.
     /// Power control and a central's power requests stay at or below the
     /// ceiling, and a central learns that the ceiling is this side's
     /// maximum.
     ///
     /// The ceiling holds across [`Self::reset`]: it belongs to the device,
     /// not to a link.
+    #[cfg(feature = "nrf52833")]
     #[inline]
     #[must_use = "the ceiling may lie below the power asked for"]
     pub fn set_max_tx_power(&self, dbm: i8) -> i8 {

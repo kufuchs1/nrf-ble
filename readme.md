@@ -324,11 +324,12 @@ code as the nRF52832; its costs have not been measured separately.
   every packet from the central and, taking the path as symmetric, lowers the power from 0 dBm in steps down to -20 dBm
   (-40 dBm on the nRF52833) while the central would still hear the device well, and raises it again, up to the ceiling
   (by way of +3 dBm on the nRF52832, and of +2 and +3 dBm on the nRF52833), when the signal weakens or the central does
-  not acknowledge a packet that went out in time; after that it waits 64 packets before stepping down. It steps down
-  only to a level at which the central would still hear the device within the window, so the 20 dB between the
-  nRF52833's -40 and -20 dBm do not make it step back and forth. The ceiling is +4 dBm, the highest level of the
-  nRF52832 and the nRF51; `Link::set_max_tx_power` sets another for the links that start afterwards, between 0 dBm and
-  the chip's highest level, +8 dBm on the nRF52833 (see [nRF52833](#nrf52833)), and a central's requests stop at it too.
+  not acknowledge a packet that went out in time; after that it waits 64 packets before stepping down. On the nRF52833
+  it steps down only to a level at which the central would still hear the device within the window, so the 20 dB
+  between -40 and -20 dBm do not make it step back and forth. The ceiling is +4 dBm, the highest level of the nRF52832
+  and the nRF51, and a central's requests stop at it too. Only the nRF52833 has `Link::set_max_tx_power`, which sets
+  another ceiling for the links that start afterwards, between 0 dBm and +8 dBm (see [nRF52833](#nrf52833)); on the
+  other chips the ceiling is fixed and costs nothing at run time.
   A power a central asked for is kept as a floor for 1024 received packets (about 8 s of traffic at 7.5 ms); then the
   link layer decides again and reports each change to a central that asked for reports. Some centrals ask for the
   maximum once and never again. Advertising always uses 0 dBm.
@@ -612,8 +613,9 @@ LE 2M, the fast ramp-up and the TIMER1 turnarounds, as described above. What dif
   event takes 1 µs less. The values are Zephyr's, not measured with this crate.
 - **Transmit power:** the levels are the radio's, -40 dBm and -20 to +8 dBm; the deprecated -30 dBm setting, which the
   chip sends at -40 dBm, is left out. The power stays at or below +4 dBm, as on the nRF52832, until the firmware raises
-  the ceiling with `link.set_max_tx_power(8)`. Above +4 dBm the radio needs supply headroom on the board, and the
-  product's regulatory approval must cover the power, so each firmware chooses its ceiling.
+  the ceiling with `link.set_max_tx_power(8)`, a method only the nRF52833 build has. Above +4 dBm the radio needs
+  supply headroom on the board, and the product's regulatory approval must cover the power, so each firmware chooses
+  its ceiling.
 - **Registers:** TIFS has ten bits. The CCM's `MAXPACKETSIZE`, `RATEOVERRIDE` and `HEADERMASK`, which the nRF52832
   lacks, keep their reset values, as do the radio's fields for LE Coded, direction finding and IEEE 802.15.4.
 - **Not supported:** LE Coded (long range), direction finding with a constant tone extension and IEEE 802.15.4, which

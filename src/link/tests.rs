@@ -56,18 +56,18 @@ fn reset_waits_for_radio_shutdown_and_clears_old_queues() {
     assert!(!shared.state.lock(|cell| cell.borrow().connected));
 }
 
+#[cfg(feature = "nrf52833")]
 #[test]
 fn the_transmit_power_ceiling_is_a_level_and_outlives_a_reset() {
     let shared = Shared::new();
     let link = Link::new(&shared);
     assert_eq!(shared.max_power(), 4);
     assert_eq!(link.set_max_tx_power(-10), 0);
-    assert_eq!(link.set_max_tx_power(3), if cfg!(feature = "nrf51") { 0 } else { 3 });
-    let highest = if cfg!(feature = "nrf52833") { 8 } else { 4 };
-    assert_eq!(link.set_max_tx_power(i8::MAX), highest);
-    assert_eq!(shared.max_power(), highest);
+    assert_eq!(link.set_max_tx_power(3), 3);
+    assert_eq!(link.set_max_tx_power(i8::MAX), 8);
+    assert_eq!(shared.max_power(), 8);
     shared.complete_reset();
-    assert_eq!(shared.max_power(), highest);
+    assert_eq!(shared.max_power(), 8);
 }
 
 #[test]
