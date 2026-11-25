@@ -31,20 +31,20 @@ fn the_primaries_point_to_the_same_auxiliary_packet_12_us_into_its_unit() {
         if cfg!(feature = "nrf51") { [&[15], &[28, 15], &[41, 28, 15]] } else { [&[15], &[24, 15], &[33, 24, 15]] };
     for (channels, offsets) in (1..=3).zip(expected) {
         for (index, &offset) in offsets.iter().enumerate() {
-            assert_eq!(aux_offset(Phy::M1, channels, index), offset);
+            assert_eq!(aux_offset(channels, index), offset);
             // The auxiliary packet starts 12 us into the unit, seen from
             // every primary; on every secondary PHY, whose ramp-up only
             // moves its TXEN.
-            assert_eq!(aux_start_us(Phy::M1, channels, index) - u32::from(offset) * UNIT_US, 12);
+            assert_eq!(aux_start_us(channels, index) - u32::from(offset) * UNIT_US, 12);
             for phy in SECONDARY_PHYS {
-                let txen = aux_start_us(Phy::M1, channels, index) - tx_ready_us(phy);
+                let txen = aux_start_us(channels, index) - tx_ready_us(phy);
                 assert_eq!(txen + tx_ready_us(phy) - u32::from(offset) * UNIT_US, aux_residue_us());
             }
         }
     }
     // The first primary to the auxiliary packet with three channels: 1002 us
     // on the nRF52 chips, 1242 us on the nRF51.
-    assert_eq!(aux_start_us(Phy::M1, 3, 0), if cfg!(feature = "nrf51") { 1242 } else { 1002 });
+    assert_eq!(aux_start_us(3, 0), if cfg!(feature = "nrf51") { 1242 } else { 1002 });
 }
 
 #[test]
@@ -56,12 +56,12 @@ fn the_auxiliary_packet_keeps_the_minimum_aux_frame_space() {
     // packet itself starts 326 us after the primary's end.
     for channels in 1..=3 {
         let last = channels - 1;
-        assert!(u32::from(aux_offset(Phy::M1, channels, last)) * UNIT_US >= PRIMARY_US + T_MAFS_US);
-        assert_eq!(aux_start_us(Phy::M1, channels, last) - PRIMARY_US, 326);
+        assert!(u32::from(aux_offset(channels, last)) * UNIT_US >= PRIMARY_US + T_MAFS_US);
+        assert_eq!(aux_start_us(channels, last) - PRIMARY_US, 326);
     }
     assert_eq!(AUX_GAP_US - PRIMARY_US, 326);
     // Primaries at most 10 ms apart, all within 2 x the spacing.
-    assert!(aux_start_us(Phy::M1, 3, 0) - aux_start_us(Phy::M1, 3, 2) <= 10_000);
+    assert!(aux_start_us(3, 0) - aux_start_us(3, 2) <= 10_000);
 }
 
 #[test]
@@ -78,16 +78,16 @@ fn airtimes_and_the_longest_event_fit_the_shortest_interval() {
     assert_eq!(airtime_us(Phy::M1, 34), 352);
     assert_eq!(airtime_us(Phy::M1, 14), 192);
     for phy in SECONDARY_PHYS {
-        assert!(event_us(3, Phy::M1, phy, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US);
+        assert!(event_us(3, phy, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US);
     }
     // Reconnection data on LE 1M: 60 + 41 + 540 + 462 + 264 + 150 + 352 +
     // 150 + 192 on the nRF52832; the nRF52833's LE 1M ramp-up rounds to
     // 40 us, one less.
     if cfg!(feature = "nrf52832") {
-        assert_eq!(event_us(3, Phy::M1, Phy::M1, AUX_HEADER_LEN + 13), 2211);
+        assert_eq!(event_us(3, Phy::M1, AUX_HEADER_LEN + 13), 2211);
     }
     if cfg!(feature = "nrf52833") {
-        assert_eq!(event_us(3, Phy::M1, Phy::M1, AUX_HEADER_LEN + 13), 2210);
+        assert_eq!(event_us(3, Phy::M1, AUX_HEADER_LEN + 13), 2210);
     }
     // The CPU gets time between two packets: 87 us on the nRF52832, 88 on
     // the nRF52833, 108 on the nRF51.
@@ -288,7 +288,7 @@ fn an_event_s_pdus_point_to_the_auxiliary_packet_on_its_channel_and_phy() {
     // Each primary points with its own offset to the one auxiliary packet:
     // channel, offset and PHY in its AuxPtr.
     for (index, pdu) in pdus.primaries.iter().take(2).enumerate() {
-        let expected = primary(&settings, AuxPtr::new(pdus.aux_channel, aux_offset(Phy::M1, 2, index), phy));
+        let expected = primary(&settings, AuxPtr::new(pdus.aux_channel, aux_offset(2, index), phy));
         assert_eq!(pdu.as_bytes(), expected.as_bytes());
         let Some(&[channel, offset0, offset1]) = ({
             let value = pdu.as_bytes().get(6..9);
@@ -299,7 +299,7 @@ fn an_event_s_pdus_point_to_the_auxiliary_packet_on_its_channel_and_phy() {
         };
         assert_eq!(channel, pdus.aux_channel);
         let field = u16::from_le_bytes([offset0, offset1]);
-        assert_eq!(field & 0x1FFF, aux_offset(Phy::M1, 2, index));
+        assert_eq!(field & 0x1FFF, aux_offset(2, index));
         assert_eq!(field >> 13_i32, u16::from(phy == Phy::M2));
     }
     // The auxiliary packet in its buffer, which also takes the request.
@@ -324,7 +324,7 @@ fn the_event_plan_keeps_its_times_and_budgets_on_every_secondary_phy() {
                 // Seen from each primary, the auxiliary packet starts 12 us
                 // into the unit its Aux Offset names, on either PHY.
                 let aux_on_air = aux_txen(At(first), Phy::M1, channels, phy).0 + tx_ready_us(phy);
-                assert_eq!(aux_on_air - on_air - u32::from(aux_offset(Phy::M1, channels, index)) * UNIT_US, 12);
+                assert_eq!(aux_on_air - on_air - u32::from(aux_offset(channels, index)) * UNIT_US, 12);
             }
             // The CPU's time from the last primary's DISABLED to the
             // auxiliary packet's TXEN.
@@ -364,14 +364,14 @@ fn the_event_plan_keeps_its_times_and_budgets_on_every_secondary_phy() {
     // on the nRF51 its longer spacing and ramp-up.
     let reconnect = AUX_HEADER_LEN + 13;
     if cfg!(feature = "nrf51") {
-        assert_eq!(event_us(3, Phy::M1, Phy::M1, reconnect), 120 + 140 + 780 + 462 + 264 + 150 + 352 + 150 + 192);
+        assert_eq!(event_us(3, Phy::M1, reconnect), 120 + 140 + 780 + 462 + 264 + 150 + 352 + 150 + 192);
     } else {
-        assert_eq!(event_us(3, Phy::M1, Phy::M1, reconnect), if cfg!(feature = "nrf52833") { 2210 } else { 2211 });
-        assert_eq!(event_us(3, Phy::M1, Phy::M2, reconnect), if cfg!(feature = "nrf52833") { 1818 } else { 1819 });
+        assert_eq!(event_us(3, Phy::M1, reconnect), if cfg!(feature = "nrf52833") { 2210 } else { 2211 });
+        assert_eq!(event_us(3, Phy::M2, reconnect), if cfg!(feature = "nrf52833") { 1818 } else { 1819 });
     }
     // The longest, 20 ms at the shortest interval, on every PHY.
     for phy in SECONDARY_PHYS {
-        assert!(event_us(3, Phy::M1, phy, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US);
+        assert!(event_us(3, phy, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US);
     }
 }
 
@@ -410,6 +410,21 @@ fn nothing_is_late_before_the_first_event() {
     assert!(counters.sent.is_none() && counters.shown.is_none());
 }
 
+/// The timing functions without a primary PHY are those of primaries on LE
+/// 1M.
+#[test]
+fn the_timing_without_a_primary_phy_is_that_of_le_1m() {
+    for channels in 1..=3 {
+        for index in 0..channels {
+            assert_eq!(aux_offset(channels, index), aux_offset_on(Phy::M1, channels, index));
+            assert_eq!(aux_start_us(channels, index), aux_start_us_on(Phy::M1, channels, index));
+        }
+        for phy in SECONDARY_PHYS {
+            assert_eq!(event_us(channels, phy, AUX_PAYLOAD_MAX), event_us_on(channels, Phy::M1, phy, AUX_PAYLOAD_MAX));
+        }
+    }
+}
+
 /// The plan on LE Coded primaries: their airtime, 1168 us with S=8 and
 /// 574 us with S=2, the spacing in whole units with the CPU's time after
 /// each, and the auxiliary packet `T_MAFS` after the last, 12 us into its
@@ -430,7 +445,7 @@ fn the_event_plan_on_le_coded_keeps_its_times() {
                     let spacings = assert_ok!(u32::try_from(index));
                     assert_eq!(on_air, first + spacings * primary_spacing_us(primary));
                     let aux_on_air = aux_txen(At(first), primary, channels, secondary).0 + tx_ready_us(secondary);
-                    let offset = u32::from(aux_offset(primary, channels, index)) * UNIT_US;
+                    let offset = u32::from(aux_offset_on(primary, channels, index)) * UNIT_US;
                     assert_eq!(aux_on_air - on_air - offset, 12);
                     assert!(offset >= primary_us(primary) + T_MAFS_US);
                 }
@@ -446,7 +461,7 @@ fn the_event_plan_on_le_coded_keeps_its_times() {
 #[test]
 fn an_event_on_le_coded_sets_the_least_interval() {
     let longest = 60 + 42 + 2 * 1290 + 1482 + 17_040 + 150 + 2896 + 150 + 1616;
-    assert_eq!(event_us(3, Phy::CodedS8, Phy::CodedS8, AUX_PAYLOAD_MAX), longest);
+    assert_eq!(event_us_on(3, Phy::CodedS8, Phy::CodedS8, AUX_PAYLOAD_MAX), longest);
     assert_eq!(longest, 26_016);
     let mut settings = undirected();
     settings.interval = 20_000;
@@ -456,7 +471,7 @@ fn an_event_on_le_coded_sets_the_least_interval() {
     settings.primary_phy = Phy::CodedS8;
     settings.secondary_phy = Phy::CodedS8;
     fit_interval(&mut settings);
-    assert_eq!(settings.interval, event_us(3, Phy::CodedS8, Phy::CodedS8, AUX_HEADER_LEN + DATA_MAX));
+    assert_eq!(settings.interval, event_us_on(3, Phy::CodedS8, Phy::CodedS8, AUX_HEADER_LEN + DATA_MAX));
     assert_eq!(settings.interval, longest);
     // A longer interval stays.
     settings.interval = 100_000;
@@ -478,7 +493,7 @@ fn an_event_on_le_coded_points_to_the_auxiliary_packet_on_le_coded() {
     let pdus = Pdus::new(&settings, 3);
     assert!(pdus.phy == Phy::CodedS2 && primary_phy(&settings) == Phy::CodedS8);
     for (index, pdu) in pdus.primaries.iter().take(3).enumerate() {
-        let offset = aux_offset(Phy::CodedS8, 3, index);
+        let offset = aux_offset_on(Phy::CodedS8, 3, index);
         let expected = primary(&settings, AuxPtr::new(pdus.aux_channel, offset, Phy::CodedS2));
         assert_eq!(pdu.as_bytes(), expected.as_bytes());
         let [offset0, offset1] = (offset | (2 << 13)).to_le_bytes();

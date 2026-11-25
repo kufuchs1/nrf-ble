@@ -178,10 +178,10 @@ const _: () = {
     while channels <= CHANNELS.len() {
         let mut index: usize = 0;
         while index < channels {
-            let offset = u32::from(aux_offset(Phy::M1, channels, index)).strict_mul(UNIT_US);
-            assert!(aux_offset(Phy::M1, channels, index) <= AUX_OFFSET_MAX, "the Aux Offset overflows its 13 bits");
+            let offset = u32::from(aux_offset(channels, index)).strict_mul(UNIT_US);
+            assert!(aux_offset(channels, index) <= AUX_OFFSET_MAX, "the Aux Offset overflows its 13 bits");
             assert!(offset >= PRIMARY_US.strict_add(T_MAFS_US), "an Aux Offset shorter than the packet and T_MAFS");
-            assert!(aux_start_us(Phy::M1, channels, index).strict_sub(offset) == residue, "the AuxPtrs disagree");
+            assert!(aux_start_us(channels, index).strict_sub(offset) == residue, "the AuxPtrs disagree");
             index = index.strict_add(1);
         }
         channels = channels.strict_add(1);
@@ -197,10 +197,7 @@ const _: () = {
             T_IFS_US.strict_add(secondary.address_offset_us()).strict_add(UNIT_US) <= LISTEN_US,
             "the listen ends before a request's access address"
         );
-        assert!(
-            event_us(CHANNELS.len(), Phy::M1, secondary, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US,
-            "the event outlasts 20 ms"
-        );
+        assert!(event_us(CHANNELS.len(), secondary, AUX_PAYLOAD_MAX) < ADV_INTERVAL_MIN_US, "the event outlasts 20 ms");
         phys = rest;
     }
 };
@@ -232,9 +229,15 @@ const _: () = {
         while channels <= CHANNELS.len() {
             let mut index: usize = 0;
             while index < channels {
-                let offset = u32::from(aux_offset(primary, channels, index)).strict_mul(UNIT_US);
-                assert!(aux_offset(primary, channels, index) <= AUX_OFFSET_MAX, "the Aux Offset overflows its 13 bits");
-                assert!(aux_start_us(primary, channels, index).strict_sub(offset) == residue, "the AuxPtrs disagree");
+                let offset = u32::from(aux_offset_on(primary, channels, index)).strict_mul(UNIT_US);
+                assert!(
+                    aux_offset_on(primary, channels, index) <= AUX_OFFSET_MAX,
+                    "the Aux Offset overflows its 13 bits"
+                );
+                assert!(
+                    aux_start_us_on(primary, channels, index).strict_sub(offset) == residue,
+                    "the AuxPtrs disagree"
+                );
                 assert!(offset >= on_air.strict_add(T_MAFS_US), "an Aux Offset shorter than the packet and T_MAFS");
                 index = index.strict_add(1);
             }
@@ -372,7 +375,7 @@ impl Pdus {
         let phy = secondary_phy(settings);
         let primary_phy = primary_phy(settings);
         let primaries = array::from_fn(|index| {
-            let offset = if index < count { aux_offset(primary_phy, count, index) } else { 0 };
+            let offset = if index < count { aux_offset_on(primary_phy, count, index) } else { 0 };
             primary(settings, AuxPtr::new(aux_channel, offset, phy))
         });
         Self { aux_channel, auxiliary: Buffer(auxiliary(settings).into_buffer()), channels, count, phy, primaries }
@@ -487,13 +490,20 @@ pub fn aux_channel(aux_id: u16, counter: u16) -> u8 {
     Hopping::Csa2 { identifier: aux_id }.channel(&UsedChannels::new([0xFF, 0xFF, 0xFF, 0xFF, 0x1F]), counter)
 }
 
+/// The Aux Offset of primary `index` of `channels`, in units of 30 us: from
+/// its start to the unit in which the auxiliary packet starts. The primaries
+/// are on LE 1M; [`aux_offset_on`] takes their PHY.
+#[inline]
+#[must_use = "the offset is only computed"]
+pub const fn aux_offset(channels: usize, index: usize) -> u16 { aux_offset_on(Phy::M1, channels, index) }
+
 /// The Aux Offset of primary `index` of `channels` on `primary`, in units
 /// of 30 us: from its start to the unit in which the auxiliary packet
 /// starts.
 #[inline]
 #[must_use = "the offset is only computed"]
-pub const fn aux_offset(primary: Phy, channels: usize, index: usize) -> u16 {
-    aux_start_us(primary, channels, index).strict_div(UNIT_US).strict_cast()
+pub const fn aux_offset_on(primary: Phy, channels: usize, index: usize) -> u16 {
+    aux_start_us_on(primary, channels, index).strict_div(UNIT_US).strict_cast()
 }
 
 /// How far into the unit of its Aux Offset the auxiliary packet starts:
@@ -502,11 +512,18 @@ pub const fn aux_offset(primary: Phy, channels: usize, index: usize) -> u16 {
 #[must_use = "the time is only computed"]
 pub const fn aux_residue_us() -> u32 { AUX_GAP_US.strict_rem(UNIT_US) }
 
+/// Time from the start of primary `index` of `channels` to the start of the
+/// auxiliary packet, on air. The primaries are on LE 1M; [`aux_start_us_on`]
+/// takes their PHY.
+#[inline]
+#[must_use = "the time is only computed"]
+pub const fn aux_start_us(channels: usize, index: usize) -> u32 { aux_start_us_on(Phy::M1, channels, index) }
+
 /// Time from the start of primary `index` of `channels` on `primary` to the
 /// start of the auxiliary packet, on air.
 #[inline]
 #[must_use = "the time is only computed"]
-pub const fn aux_start_us(primary: Phy, channels: usize, index: usize) -> u32 {
+pub const fn aux_start_us_on(primary: Phy, channels: usize, index: usize) -> u32 {
     let after: u32 = channels.strict_sub(1).strict_sub(index).strict_cast();
     after.strict_mul(primary_spacing_us(primary)).strict_add(aux_gap_us(primary))
 }
@@ -531,7 +548,7 @@ fn count(counter: &AtomicU32) { counter.store(counter.load(Ordering::Relaxed).wr
 #[inline]
 #[must_use = "the time is only computed"]
 pub(crate) const fn aux_txen(first: At, primary: Phy, channels: usize, phy: Phy) -> At {
-    first.after(Micros(aux_start_us(primary, channels, 0))).before(Micros(tx_ready_us(phy)))
+    first.after(Micros(aux_start_us_on(primary, channels, 0))).before(Micros(tx_ready_us(phy)))
 }
 
 /// Runs one advertising event on the enabled channels.
@@ -840,12 +857,21 @@ pub const fn listen_us(phy: Phy) -> u32 {
 #[must_use = "the time is only computed"]
 pub const fn decision_budget_us(phy: Phy) -> u32 { T_IFS_US.strict_add(airtime_us(phy, AUX_CONNECT_RSP_LEN)) }
 
+/// The longest an event of `channels` primaries on LE 1M takes with an
+/// auxiliary packet of `aux_len` payload octets on `phy`.
+///
+/// It lasts from its start until the end of an `AUX_CONNECT_RSP`.
+/// [`event_us_on`] takes the primaries' PHY.
+#[inline]
+#[must_use = "the time is only computed"]
+pub const fn event_us(channels: usize, phy: Phy, aux_len: usize) -> u32 { event_us_on(channels, Phy::M1, phy, aux_len) }
+
 /// The longest an event of `channels` primaries on `primary` takes with an
 /// auxiliary packet of `aux_len` payload octets on `phy`, from its start
 /// until the end of an `AUX_CONNECT_RSP`.
 #[inline]
 #[must_use = "the time is only computed"]
-pub const fn event_us(channels: usize, primary: Phy, phy: Phy, aux_len: usize) -> u32 {
+pub const fn event_us_on(channels: usize, primary: Phy, phy: Phy, aux_len: usize) -> u32 {
     let spacing: u32 = channels.strict_sub(1).strict_cast();
     EVENT_LEAD_US
         .strict_add(tx_ready_us(primary))
@@ -948,7 +974,7 @@ pub const fn aux_gap_us(primary: Phy) -> u32 {
 pub fn fit_interval(settings: &mut Settings) {
     let (_, channels) = primary_channels(settings.channel_map);
     let aux_len = auxiliary(settings).as_bytes().len().saturating_sub(HEADER_LEN);
-    let event = event_us(channels.max(1), primary_phy(settings), secondary_phy(settings), aux_len);
+    let event = event_us_on(channels.max(1), primary_phy(settings), secondary_phy(settings), aux_len);
     settings.interval = settings.interval.max(event);
 }
 
