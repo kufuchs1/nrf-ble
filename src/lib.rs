@@ -57,6 +57,8 @@ compile_error!(
 compile_error!("the chip features nrf52833 and nrf51 exclude each other: enable one chip feature only");
 #[cfg(not(any(feature = "nrf52832", feature = "nrf52833", feature = "nrf51")))]
 compile_error!("enable a chip feature: nrf52832, the default, nrf52833 or nrf51");
+#[cfg(all(feature = "_nrf52", not(any(feature = "nrf52832", feature = "nrf52833"))))]
+compile_error!("_nrf52 is internal: enable the chip feature nrf52832 or nrf52833 instead");
 #[cfg(all(feature = "nrf51", feature = "data-length"))]
 compile_error!(
     "the nRF51 CCM encrypts payloads of up to 27 octets: the data-length feature needs the nRF52832 or the nRF52833"

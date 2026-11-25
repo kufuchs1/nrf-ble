@@ -49,11 +49,18 @@
 //!   Zephyr's Bluetooth controller does not correct it either; the power
 //!   control's 12 dB between stepping down and up absorbs a few dB, and
 //!   `Link::rssi` reports the uncorrected value.
+//! - Outside the link layer: the other errata with an nRF52833 branch in nrfx
+//!   concern peripherals this crate does not use, according to nrfx's
+//!   `doc/errata.dox` and the code that works around them: I2S (55, 194, 196),
+//!   GPIO and GPIOTE (173, 210), TWIM (219), SAADC (212, 237, 241), NFCT (190,
+//!   218), USBD (187, 211, 223), NVMC (233), RESETREAS (136) and the system
+//!   (246).
 //! - Open: the errata with an nRF52833 branch in nrfx whose subject the sources
-//!   above do not name, 20, 87, 176, 183, 184, 228, 236, 243, 248, 250, 251,
-//!   252, 258, 259, 263, 266, 267, 268 and 271 (20, 87, 183, 252 and 266 also
-//!   concern the nRF52832). Whether one of them touches RADIO, TIMER, RTC,
-//!   CLOCK, PPI or CCM is to be read in Nordic's errata document.
+//!   above do not name, 20, 87, 170, 176, 183, 184, 228, 236 (first revision
+//!   only), 243, 245, 248, 250, 251, 252, 258, 259, 263, 266, 267, 268 and 271
+//!   (20, 87, 176, 183, 245, 252 and 266 also concern the nRF52832). Whether
+//!   one of them touches RADIO, TIMER, RTC, CLOCK, PPI or CCM is to be read in
+//!   Nordic's errata document.
 
 use crate::radio::Phy;
 use embassy_nrf::pac::RADIO;
@@ -113,7 +120,8 @@ pub const fn tx_ready_ns(phy: Phy) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{ANOMALY_182, ANOMALY_192, LEVELS_DBM};
-    use crate::radio::Phy;
+    use crate::{chip::txpower, radio::Phy};
+    use embassy_nrf::pac::radio::vals::Txpower;
 
     #[test]
     fn no_nrf52832_workaround_writes_an_undocumented_register() {
@@ -140,5 +148,32 @@ mod tests {
         assert!(!LEVELS_DBM.contains(&-30));
         assert_eq!(LEVELS_DBM.first(), Some(&-40));
         assert_eq!(LEVELS_DBM.last(), Some(&8));
+    }
+
+    /// The register takes the level in dBm, so the power control's own
+    /// compile-time check cannot tell a level the radio lacks from one it
+    /// has; this compares each level with the PAC's TXPOWER settings.
+    #[test]
+    fn every_level_is_a_txpower_setting_of_the_pac() {
+        let settings = [
+            Txpower::Neg40dBm,
+            Txpower::Neg20dBm,
+            Txpower::Neg16dBm,
+            Txpower::Neg12dBm,
+            Txpower::Neg8dBm,
+            Txpower::Neg4dBm,
+            Txpower::_0dBm,
+            Txpower::Pos2dBm,
+            Txpower::Pos3dBm,
+            Txpower::Pos4dBm,
+            Txpower::Pos5dBm,
+            Txpower::Pos6dBm,
+            Txpower::Pos7dBm,
+            Txpower::Pos8dBm,
+        ];
+        assert_eq!(LEVELS_DBM.len(), settings.len());
+        for (&level, setting) in LEVELS_DBM.iter().zip(settings) {
+            assert!(txpower(level) == setting, "{level} dBm is not the PAC's setting");
+        }
     }
 }

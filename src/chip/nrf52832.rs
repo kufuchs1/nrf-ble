@@ -51,7 +51,9 @@ pub const fn tx_ready_ns(phy: Phy) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::radio::Phy;
+    use super::LEVELS_DBM;
+    use crate::{chip::txpower, radio::Phy};
+    use embassy_nrf::pac::radio::vals::Txpower;
 
     #[test]
     fn turnaround_offsets_match_nrf52832_hal_timing_vectors() {
@@ -62,5 +64,26 @@ mod tests {
         // Ready 8 us before the earliest packet: 150 - 41 - 8.
         assert_eq!(Phy::M1.listen_offset_us(), 101);
         assert_eq!(Phy::M2.listen_offset_us(), 101);
+    }
+
+    /// The register takes the level in dBm, so the power control's own
+    /// compile-time check cannot tell a level the radio lacks from one it
+    /// has; this compares each level with the PAC's TXPOWER settings.
+    #[test]
+    fn every_level_is_a_txpower_setting_of_the_pac() {
+        let settings = [
+            Txpower::Neg20dBm,
+            Txpower::Neg16dBm,
+            Txpower::Neg12dBm,
+            Txpower::Neg8dBm,
+            Txpower::Neg4dBm,
+            Txpower::_0dBm,
+            Txpower::Pos3dBm,
+            Txpower::Pos4dBm,
+        ];
+        assert_eq!(LEVELS_DBM.len(), settings.len());
+        for (&level, setting) in LEVELS_DBM.iter().zip(settings) {
+            assert!(txpower(level) == setting, "{level} dBm is not the PAC's setting");
+        }
     }
 }

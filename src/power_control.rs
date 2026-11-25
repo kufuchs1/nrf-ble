@@ -46,7 +46,10 @@ pub const DEFAULT_LEVEL: usize = level_at_most(0);
 pub const CEILING_DBM: i8 = 4;
 
 // Every level is a setting of the radio's TXPOWER register, the levels
-// ascend, the default is 0 dBm and the default ceiling +4 dBm.
+// ascend, the default is 0 dBm and the default ceiling +4 dBm. The first
+// check holds for any level on the nRF52 chips, whose register takes the
+// level in dBm; their chip modules' tests compare each level with the
+// PAC's settings instead.
 const _: () = {
     let mut rest = LEVELS_DBM.as_slice();
     while let Some((&level, tail)) = rest.split_first() {
