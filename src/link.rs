@@ -86,8 +86,14 @@
 //! hears it again, as Zephyr does, so a lost anchor costs one interval, not the
 //! whole latency, and a supervision timeout shorter than a few latencies holds.
 
+#[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+use crate::advertiser::extended::fit_interval;
 #[cfg(feature = "nrf52833")]
 use crate::power_control::{CEILING_DBM, LEVELS_DBM, ceiling_level};
+#[cfg(feature = "coded-phy")]
+use crate::radio::Coding;
+#[cfg(all(feature = "coded-phy", not(feature = "extended-advertising")))]
+use crate::radio::Phy;
 #[cfg(feature = "extended-advertising")]
 use crate::{advertiser::extended::RENEWAL_LEN, radio::Phy};
 use crate::{
@@ -118,10 +124,19 @@ pub const ACCEPT_LIST_SIZE: usize = FILTER_LIST_SIZE;
 /// Largest ACL fragment each way: 251 octets with the data length extension,
 /// otherwise 27.
 pub const ACL_MAX: usize = if cfg!(feature = "data-length") { 251 } else { 27 };
+/// The PHY bit field of every PHY this side has: LE 1M and LE 2M, and with
+/// the feature `coded-phy` LE Coded.
+const ALL_PHYS: u8 = if cfg!(feature = "coded-phy") { 0b111 } else { 0b11 };
 /// Default data length: payload octets and time in microseconds.
 pub const LENGTH_DEFAULT: [u16; 2] = [27, 328];
-/// Largest data length this side supports: payload octets and time.
-pub const LENGTH_MAX: [u16; 2] = if cfg!(feature = "data-length") { [251, 2120] } else { LENGTH_DEFAULT };
+/// Largest data length this side supports: payload octets and time. The
+/// time is that of 251 octets with a MIC on LE 1M, 2120 us, and with the
+/// feature `coded-phy` on LE Coded with S=8, 17040 us.
+pub const LENGTH_MAX: [u16; 2] = if cfg!(feature = "data-length") {
+    [251, if cfg!(feature = "coded-phy") { 17_040 } else { 2120 }]
+} else {
+    LENGTH_DEFAULT
+};
 /// Fragments from the host the link layer queues for the air.
 pub const ACL_OUT_BUFFERS: usize = if cfg!(feature = "data-length") { 2 } else { 4 };
 /// Received fragments the link layer queues for the host.
@@ -508,7 +523,9 @@ pub enum Event {
     /// timeout.
     PayloadTimeout,
     /// The PHY changed, or a request of the host for one ended with the
-    /// status: the receive and transmit PHY, 1 for LE 1M and 2 for LE 2M.
+    /// status: the receive and transmit PHY, 1 for LE 1M and 2 for LE 2M,
+    /// and with the feature `coded-phy` 3 for LE Coded, as HCI's LE PHY
+    /// Update Complete event has them.
     PhyUpdated {
         /// The receive PHY.
         rx:     u8,
@@ -628,6 +645,12 @@ pub struct AdvParams {
     /// `directed-advertising` and its key in the resolving list, the target
     /// on air is a resolvable private address of it ([`Link::advertise`]).
     pub peer:          Peer,
+    /// PHY of the primary channels' `ADV_EXT_IND`s: LE 1M, or LE Coded with
+    /// either coding for a central that scans on LE Coded, at up to eight
+    /// times the airtime. LE 2M is refused. The advertising interval grows
+    /// to the event's length where that is longer.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    pub primary_phy:   Phy,
     /// Advertise from a resolvable private address made with the local key
     /// in the resolving list, rather than from the identity address.
     pub private:       bool,
@@ -635,6 +658,16 @@ pub struct AdvParams {
     /// `AUX_CONNECT_REQ` and `AUX_CONNECT_RSP`, and of the connection's
     /// start. LE 1M, or LE 2M on the nRF52 chips, half the airtime for a
     /// central that takes it; the nRF51 refuses LE 2M.
+    #[cfg_attr(
+        feature = "coded-phy",
+        doc = "",
+        doc = "With the feature `coded-phy` also LE Coded, with S=8 or S=2, which the `AUX_ADV_IND`, the \
+               `AUX_CONNECT_RSP` and the link go out with. The connection's transmit window then comes 3.75 ms \
+               after the request, and the advertising interval grows to the event's length where that is longer. \
+               Such a link prefers LE Coded alone both ways, so that a central that names every PHY in its \
+               `LL_PHY_REQ` keeps it on LE Coded, unless the host set other preferences with \
+               [`Link::set_default_phy`]."
+    )]
     #[cfg(feature = "extended-advertising")]
     pub secondary_phy: Phy,
 }
@@ -662,6 +695,10 @@ impl AdvParams {
         if !chip::PHY_2M && matches!(self.secondary_phy, Phy::M2) {
             return false;
         }
+        #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+        if matches!(self.primary_phy, Phy::M2) {
+            return false;
+        }
         interval_valid && (1..=0x07).contains(&self.channel_map) && self.filter_policy <= 3
     }
 
@@ -676,6 +713,8 @@ impl AdvParams {
             interval: 0x0800,
             kind,
             peer: Peer::new([0; 6], false),
+            #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+            primary_phy: Phy::M1,
             private: false,
             #[cfg(feature = "extended-advertising")]
             secondary_phy: Phy::M1,
@@ -686,6 +725,12 @@ impl AdvParams {
     #[inline]
     #[must_use = "the parameters are only built"]
     pub const fn peer(self, peer: Peer) -> Self { Self { peer, ..self } }
+
+    /// With the PHY of the primary channels.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    #[inline]
+    #[must_use = "the parameters are only built"]
+    pub const fn primary_phy(self, primary_phy: Phy) -> Self { Self { primary_phy, ..self } }
 
     /// From a resolvable private address or not.
     #[inline]
@@ -764,7 +809,12 @@ struct HostState {
     /// Current receive and transmit PHY, updated at the instant.
     phys:             [u8; 2],
     /// Default transmit and receive PHY preferences.
+    #[cfg(not(feature = "coded-phy"))]
     preferred_phys:   [u8; 2],
+    /// Default transmit and receive PHY preferences the host set with
+    /// [`Link::set_default_phy`], if it did: LE 2M both ways otherwise.
+    #[cfg(feature = "coded-phy")]
+    preferred_phys:   Option<[u8; 2]>,
     /// The last resolvable private address, the key it was made with and
     /// when it expires. Advertising keeps it until then.
     private_address:  Option<(Peer, [u8; 16], Instant)>,
@@ -834,7 +884,10 @@ impl HostState {
             payload_timeout: DEFAULT_PAYLOAD_TIMEOUT,
             phy_pending: None,
             phys: [1, 1],
+            #[cfg(not(feature = "coded-phy"))]
             preferred_phys: [2, 2],
+            #[cfg(feature = "coded-phy")]
+            preferred_phys: None,
             private_address: None,
             private_timeout: PRIVATE_ADDRESS_TIMEOUT,
             queries: 0,
@@ -855,6 +908,10 @@ pub struct Shared {
     acl_taken:       Signal<CriticalSectionRawMutex, ()> = Signal::new(),
     /// Advertising settings changed.
     changed:         Signal<CriticalSectionRawMutex, ()> = Signal::new(),
+    /// Whether the links that start send on LE Coded with S=2 rather than
+    /// S=8.
+    #[cfg(feature = "coded-phy")]
+    coded_s2:        AtomicBool = AtomicBool::new(false),
     /// Data length the host set for the link: payload octets and time.
     data_length:     Signal<CriticalSectionRawMutex, [u16; 2]> = Signal::new(),
     /// Disconnection requested by the host, with the reason.
@@ -941,6 +998,12 @@ impl Shared {
 
     /// Waits until the advertising settings change.
     pub(crate) async fn changed(&self) { self.changed.wait().await; }
+
+    /// The coding a link that starts sends with on LE Coded.
+    #[cfg(feature = "coded-phy")]
+    pub(crate) fn coding(&self) -> Coding {
+        if self.coded_s2.load(Ordering::Relaxed) { Coding::S2 } else { Coding::S8 }
+    }
 
     /// Releases a host query once its result is retained for delivery.
     pub(crate) fn complete_query(&self, bit: u8) { self.state.lock(|cell| cell.borrow_mut().active_queries &= !bit); }
@@ -1072,7 +1135,29 @@ impl Shared {
     }
 
     /// Default PHY preference for new connections.
+    #[cfg(not(feature = "coded-phy"))]
     pub(crate) fn preferred_phys(&self) -> [u8; 2] { self.state.lock(|cell| cell.borrow().preferred_phys) }
+
+    /// Default PHY preference for new connections: the host's, or LE 2M
+    /// both ways.
+    #[cfg(feature = "coded-phy")]
+    pub(crate) fn preferred_phys(&self) -> [u8; 2] {
+        self.state.lock(|cell| cell.borrow().preferred_phys).unwrap_or([2, 2])
+    }
+
+    /// PHY preference of a new connection that starts on `start`: the
+    /// default, and LE Coded alone both ways on a link that starts on LE
+    /// Coded unless the host set the default with [`Link::set_default_phy`].
+    /// A central that names every PHY in its `LL_PHY_REQ` then keeps such a
+    /// link on LE Coded, whose range it was started for, rather than moving
+    /// it to LE 2M.
+    #[cfg(feature = "coded-phy")]
+    pub(crate) fn preferred_phys_on(&self, start: Phy) -> [u8; 2] {
+        if start.is_coded() && self.state.lock(|cell| cell.borrow().preferred_phys.is_none()) {
+            return [start.bit(); 2];
+        }
+        self.preferred_phys()
+    }
 
     /// The key of the resolvable private address the current advertising
     /// settings ask for, if any.
@@ -1602,6 +1687,10 @@ impl<'shared> Link<'shared> {
             settings.filter_policy = params.filter_policy;
             #[cfg(feature = "extended-advertising")]
             settings.secondary_phy.clone_from(&params.secondary_phy);
+            #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+            settings.primary_phy.clone_from(&params.primary_phy);
+            #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+            fit_interval(settings);
             settings.own = addresses.own;
             state.adv_enabled = true;
             Ok(())
@@ -1793,7 +1882,7 @@ impl<'shared> Link<'shared> {
     }
 
     /// The receive and transmit PHY of the link, 1 for LE 1M and 2 for
-    /// LE 2M.
+    /// LE 2M, and with the feature `coded-phy` 3 for LE Coded.
     ///
     /// # Errors
     ///
@@ -1985,6 +2074,21 @@ impl<'shared> Link<'shared> {
         })
     }
 
+    /// Sets the coding with which the links that start from now on send on
+    /// LE Coded: [`Coding::S8`], the default, for the longest range, or
+    /// [`Coding::S2`] for a quarter of the airtime of each packet's header,
+    /// payload and CRC. It is this side's own choice, which the PHY update
+    /// procedure does not negotiate, as with HCI's `PHY_Options`; the central
+    /// receives either. A link that runs keeps its coding. A link that
+    /// extended advertising on an LE Coded secondary channel starts takes
+    /// the coding of that channel instead, which its `AUX_CONNECT_RSP` went
+    /// out with.
+    ///
+    /// The coding holds across [`Self::reset`].
+    #[cfg(feature = "coded-phy")]
+    #[inline]
+    pub fn set_coding(&self, coding: Coding) { self.shared.coded_s2.store(coding == Coding::S2, Ordering::Relaxed); }
+
     /// Sets the data length the link may send: payload octets and time in
     /// microseconds. [`Event::DataLength`] reports the effective lengths.
     ///
@@ -2005,7 +2109,15 @@ impl<'shared> Link<'shared> {
 
     /// Sets the transmit and receive PHYs new links prefer: bit 0 for LE 1M,
     /// bit 1 for LE 2M, `None` without a preference.
-    ///
+    #[cfg_attr(
+        feature = "coded-phy",
+        doc = "",
+        doc = "With the feature `coded-phy` also bit 2 for LE Coded, whose coding this side sends with is \
+               [`Self::set_coding`]'s. A link that extended advertising on LE Coded starts prefers LE Coded alone \
+               both ways until the host calls this function; from then on it takes these preferences like any \
+               other, and with LE 2M among them a central that names every PHY moves it to LE 2M.",
+        doc = ""
+    )]
     /// # Errors
     ///
     /// [`Error::Invalid`] for other bits, [`Error::Unsupported`] for LE 2M
@@ -2013,7 +2125,10 @@ impl<'shared> Link<'shared> {
     #[inline]
     pub fn set_default_phy(&self, tx: Option<u8>, rx: Option<u8>) -> Result<(), Error> {
         let preferences = phy_preferences(tx, rx)?;
+        #[cfg(not(feature = "coded-phy"))]
         self.shared.state.lock(|cell| cell.borrow_mut().preferred_phys = preferences);
+        #[cfg(feature = "coded-phy")]
+        self.shared.state.lock(|cell| cell.borrow_mut().preferred_phys = Some(preferences));
         Ok(())
     }
 
@@ -2250,14 +2365,15 @@ const fn data_length(octets: u16, time: u16) -> Result<[u16; 2], Error> {
 }
 
 /// The transmit and receive PHY preferences: bit 0 for LE 1M, bit 1 for
-/// LE 2M, all of them without a preference.
+/// LE 2M, with the feature `coded-phy` bit 2 for LE Coded, all of them
+/// without a preference.
 fn phy_preferences(tx: Option<u8>, rx: Option<u8>) -> Result<[u8; 2], Error> {
     let check = |phys: Option<u8>| match phys {
-        None => Ok(3),
+        None => Ok(ALL_PHYS),
         Some(bits) if bits & !0b111 != 0 || bits == 0 => Err(Error::Invalid),
         // LE 2M and LE Coded are missing on the nRF51.
         Some(bits) if !chip::PHY_2M && bits & 0b110 != 0 => Err(Error::Unsupported),
-        Some(bits) if bits & 0b100 != 0 => Err(Error::Invalid),
+        Some(bits) if bits & 0b100 != 0 && !cfg!(feature = "coded-phy") => Err(Error::Invalid),
         Some(bits) => Ok(bits),
     };
     Ok([check(tx)?, check(rx)?])

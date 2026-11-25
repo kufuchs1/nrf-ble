@@ -6,7 +6,8 @@ central as a peripheral. Three firmwares use it from its main branch: those of t
 MX Keys S keyboard on the nRF52832, and that of a presentation remote on an nRF51802. The nRF51 path runs on hardware
 with BlueZ in the presentation remote (see [nRF51](#nrf51)), the nRF52832 path in the mouse: extended and directed
 advertising on LE 2M, pairing, reconnection and EATT with BlueZ 5.88 on Linux 7.3. The nRF52833 builds and passes the
-host tests, but nothing has run on one yet (see [nRF52833](#nrf52833)). Where this readme says "the nRF52 chips", it
+host tests, but nothing has run on one yet (see [nRF52833](#nrf52833)), and neither has its optional LE Coded (long
+range, the feature `coded-phy`, see [LE Coded](#le-coded)). Where this readme says "the nRF52 chips", it
 means the nRF52832 and the nRF52833, which share the link layer's code.
 
 ## Status
@@ -204,6 +205,9 @@ Each is off by default, so a device without it builds exactly as without the fea
   fragment queued then still goes out at that event (see [The typed link API](#the-typed-link-api)), for a firmware
   that takes its input just before an event, such as a mouse that reads its sensor in time for the report to ride
   the coming event. The link layer then plans each event in `link::Shared`.
+- **`coded-phy`** (nRF52833 only; the build stops without the chip feature `nrf52833`): LE Coded, long range with
+  S=8 and S=2, on links and with `extended-advertising` on the primary and secondary advertising channels. See
+  [LE Coded](#le-coded). Not yet tried on hardware.
 
 A firmware enables the features it needs: a mouse, for example, `param-requests` and `key-missing`, a keyboard also
 `passkey`.
@@ -221,6 +225,9 @@ code as the nRF52832; its costs have not been measured separately.
 | `att-mtu` | +0.3 to 0.5 KB flash, +40 B RAM | +0.3 to 0.5 KB flash, +40 B RAM |
 | `eatt` | +296 B RAM, +80 B per further bearer | the same |
 | `event-timing` | +0.5 KB flash, +32 B RAM | +0.4 KB flash, +32 B RAM |
+
+`coded-phy` exists on the nRF52833 alone; its flash has not been measured, and a `Connection` grows by the power
+controls of LE Coded's two codings and a few bytes of state, 104 bytes in the 64-bit host build.
 
 ## The typed link API
 
@@ -315,7 +322,8 @@ code as the nRF52832; its costs have not been measured separately.
   armed, as in Zephyr, instead of at radio READY.
 - **LE 2M PHY** (nRF52 chips only) when the central supports it, which halves the airtime of every packet: the link
   layer asks for it once the link is encrypted and answers the central's own request. Both directions use the same PHY,
-  as the radio switches PHYs only while it is disabled.
+  as the radio switches PHYs only while it is disabled. With the feature `coded-phy` on the nRF52833, also LE Coded
+  (see [LE Coded](#le-coded)).
 - **Features and parameters:** once the link is encrypted it asks for the central's features; a connection parameter
   request from the host goes out with the connection parameters request procedure if the central supports it, on an
   encrypted link or not.
@@ -336,8 +344,8 @@ code as the nRF52832; its costs have not been measured separately.
 - **Connection events with several packets:** the event goes on while the central or the link layer has more data
   (MD) and another exchange fits before the next event. Received payloads wait in plain text and are handled after
   the event, so the answer within the 150 µs interframe space stays short. A control PDU, a CRC error, a payload
-  without room towards the host, a running encryption or termination procedure, or different PHYs per direction
-  close the event after the answer.
+  without room towards the host, a running encryption or termination procedure, different PHYs per direction, or LE
+  Coded close the event after the answer.
 - **The answer within the interframe space:** two transmit slots hold the PDU on the air until the central
   acknowledges it and the next one, which is copied, and on an encrypted link sealed by the CCM, before the event
   (`src/connection/transmit.rs`, `src/connection.rs`); preparing only peeks at the control queue and the host's
@@ -534,15 +542,17 @@ On the nRF52 chips the radio uses the fast ramp-up of 40 µs instead of 140 µs,
 turnaround by 100 µs. The radio's own interframe timing works only with the slow ramp-up, so TIMER1 times the 150 µs
 between two packets as in Zephyr's software switch: PPI channel 4 starts it at the end of a packet, and its compare
 enables the radio through PPI channel 5. Pass `TIMER1` to `Radio::new` and keep the `TIMER1` interrupt disabled in the
-NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5, the fixed channels 20, 21, 25, 26 and 27
-and the channel groups 0 and 1; leave them to it. `nrf_ble::PPI_CHANNELS` and `nrf_ble::PPI_GROUPS` hold them as bit
-masks for the chip built for, so a firmware that uses PPI checks its own channels and groups against them in a const
-assert. TIMER0 and TIMER1 are shut down, not only stopped, between uses, which avoids the standby current of anomaly 78
-of the nRF52832 and the nRF52833. The nRF51 differs: see [nRF51](#nrf51).
+NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5 (and 18 with `coded-phy`), the fixed channels
+20, 21, 25, 26 and 27 and the channel groups 0 and 1; leave them to it. `nrf_ble::PPI_CHANNELS` and
+`nrf_ble::PPI_GROUPS` hold them as bit masks for the chip built for, so a firmware that uses PPI checks its own
+channels and groups against them in a const assert. TIMER0 and TIMER1 are shut down, not only stopped, between uses,
+which avoids the standby current of anomaly 78 of the nRF52832 and the nRF52833. The nRF51 differs: see
+[nRF51](#nrf51).
 
 The link layer also takes Embassy's tokens of its PPI channels and groups, so no Embassy driver can have them:
 `clock::Ppi` for `Clock::new` (channels 0, 1, 20, 21, 26 and 27 and group 1), `clock::CalibrationPpi` for
-`clock::calibrate_rc` (channel 3 and group 0) and `radio::Ppi` for `Radio::new` (channels 4, 5 and 25). `Radio::new`
+`clock::calibrate_rc` (channel 3 and group 0) and `radio::Ppi` for `Radio::new` (channels 4, 5 and 25, and 18 with
+the feature `coded-phy`, see [LE Coded](#le-coded)). `Radio::new`
 takes the `RNG` too, which `rng` drives for the link layer and the host:
 
 ```rust
@@ -616,10 +626,83 @@ LE 2M, the fast ramp-up and the TIMER1 turnarounds, as described above. What dif
   the ceiling with `link.set_max_tx_power(8)`, a method only the nRF52833 build has. Above +4 dBm the radio needs
   supply headroom on the board, and the product's regulatory approval must cover the power, so each firmware chooses
   its ceiling.
-- **Registers:** TIFS has ten bits. The CCM's `MAXPACKETSIZE`, `RATEOVERRIDE` and `HEADERMASK`, which the nRF52832
-  lacks, keep their reset values, as do the radio's fields for LE Coded, direction finding and IEEE 802.15.4.
-- **Not supported:** LE Coded (long range), direction finding with a constant tone extension and IEEE 802.15.4, which
-  the nRF52833's radio has: the link layer neither claims nor uses them.
+- **Registers:** TIFS has ten bits. The CCM's `MAXPACKETSIZE` and `HEADERMASK`, which the nRF52832 lacks, keep their
+  reset values, as do the radio's fields for direction finding and IEEE 802.15.4, and without the feature `coded-phy`
+  the CCM's `RATEOVERRIDE` and the radio's fields for LE Coded.
+- **Not supported:** direction finding with a constant tone extension and IEEE 802.15.4, which the nRF52833's radio
+  has: the link layer neither claims nor uses them. LE Coded comes with the feature `coded-phy`.
+
+### LE Coded
+
+Build with `default-features = false, features = ["nrf52833", "coded-phy"]`; `coded-phy` without `nrf52833` stops the
+build. LE Coded sends every packet's preamble, access address, coding indicator and TERM1 with S=8, 376 µs, and the
+header, payload, CRC and TERM2 with S=8 at 125 kbit/s or with S=2 at 500 kbit/s: an empty PDU takes 720 µs with S=8
+and 462 µs with S=2, 27 octets with a MIC 2704 and 958 µs, against 80 and 328 µs on LE 1M. The receiver decodes either
+coding, by the coding indicator of each packet. **Nothing of it has run on hardware**: every time below is Zephyr's or
+the specification's, not measured with this crate.
+
+- **Links:** the link layer sets feature bit 11, answers a central's `LL_PHY_REQ` that names LE Coded alone with its
+  preferences, takes LE Coded each way in `LL_PHY_UPDATE_IND`, and asks for it when the host does
+  (`Link::set_phy` and `Link::set_default_phy` take bit 2). Events and `Link::phy` report LE Coded as 3, HCI's value.
+  A link receives LE Coded in the radio's mode of S=8 and sends with its own coding, which the procedure leaves to each
+  side: `Link::set_coding(Coding::S8)`, the default, or `Coding::S2`, for the links that start afterwards. A link that
+  extended advertising on LE Coded starts sends with the advertising's coding, and prefers LE Coded alone both ways
+  until the host calls `Link::set_default_phy`: a central that names every PHY in its `LL_PHY_REQ` would otherwise
+  move it to LE 2M, which a link at long range is likely to lose.
+- **Timing:** from Zephyr's `radio_nrf52833.h` (commit 02f236e1): 42.3 µs from TXEN to the first bit on LE Coded, a
+  receive chain of 29.6 µs with S=8 and 24.6 µs with S=2 (the header's comment says 19.6), the receiver ready after
+  40.3 µs as on LE 1M; the access address event 376 µs after the packet's start (Zephyr's `addr_us_get`). The anchor
+  moves by 336 µs when the receive PHY changes between LE Coded and the others, and the listen for the central's first
+  packet of an event lasts 21 µs longer after its latest access address than on LE 1M, for the longer receive chain
+  (Zephyr's `lll_peripheral.c` adds the receive chain to that timeout). The answer within the interframe space
+  is started by TIMER0, 78 µs after the END of a packet sent with S=8 and 83 µs after one with S=2, once the radio's
+  RATEBOOST event told the coding, as for different PHYs per direction; a connection event on LE Coded carries one
+  exchange. Zephyr's software switch instead arms a second compare for S=2 and cancels the first on RATEBOOST, which
+  takes more PPI channels and groups; this crate leaves that out. The end of a packet is the radio's END event, as in
+  Zephyr's HAL on this chip without direction finding, which calls PHYEND without a constant tone extension "generated
+  in the same instant as EVENTS_END"; PHYEND is not used.
+- **Encryption:** the CCM decrypts at 125 kbit/s and PPI channel 18 routes the radio's RATEBOOST to the CCM's
+  RATEOVERRIDE task, with `RATEOVERRIDE` at 500 kbit/s, as Zephyr does with its channel 14; the PDUs sealed ahead of
+  their event are encrypted at 2 Mbit/s. `radio::Ppi::new` takes `PPI_CH18` as its fourth token, and
+  `nrf_ble::PPI_CHANNELS` holds channel 18.
+- **Data length:** on LE Coded each direction's effective time is at least 2704 µs, 27 octets with a MIC with S=8
+  (Core, Vol 6, Part B, 4.5.10), the link layer announces the time of its longest reception with S=8, and with
+  `data-length` `link::LENGTH_MAX` allows 17040 µs, 251 octets with S=8. On LE 1M and LE 2M the effective time has
+  only the least of 328 µs, as in 4.5.10 and in Zephyr: with a central that announces 17040 µs it is 17040 µs, more
+  than the 2120 µs that 251 octets take there, and the octets bound the packets. From an `LL_PHY_RSP` or `LL_PHY_REQ`
+  of ours that offers LE Coded to a central that receives it, or an `LL_PHY_UPDATE_IND` that names it for our side,
+  until the instant, the PDUs this side prepares also fit its effective time on LE Coded, 27 octets with a MIC at the
+  least time, as one unacknowledged at the instant goes out again with S=8 or S=2 (Zephyr restricts the time likewise
+  in `pu_select_phy_timing_restrict`). A PDU already on the air when the procedure starts keeps its length; one that
+  is still unacknowledged at the instant can then outlast the effective time there.
+- **Power control:** one control per PHY of the power control procedures, LE Coded with S=8 and with S=2 being PHYs 3
+  and 4. Its targets are those of LE 1M; LE Coded's better sensitivity is not taken into account.
+- **Extended advertising** (with `extended-advertising`): `AdvParams::primary_phy` and `Advertising::with_primary_phy`
+  put the `ADV_EXT_IND`s on LE Coded, `secondary_phy` and `with_secondary_phy` the `AUX_ADV_IND`, the
+  `AUX_CONNECT_RSP` and the link's start. On LE Coded the primaries are 1290 µs apart with S=8 and 690 µs with S=2,
+  and the `AUX_ADV_IND` follows the last after 1482 and 912 µs, 12 µs into a unit of 30 µs from every `AuxPtr` as on
+  LE 1M. The `AUX_CONNECT_RSP` is armed on TIMER0 once the request ended, by its coding, and a request whose answer
+  cannot be armed in time is refused and counted as a late decision. The link's transmit window opens 3.75 ms after
+  the request (Zephyr's `WIN_DELAY_CODED`). An event on LE Coded may outlast 20 ms, 26 ms with S=8 on both channels
+  and 245 octets of data: `Link::advertise` raises the interval to the event's length, rounded up to a whole multiple
+  of 0.625 ms (26.25 ms there). On an LE Coded secondary channel the event counts the `AUX_CONNECT_REQ` with S=8, as
+  its coding is the central's choice.
+
+What has to be measured on an nRF52833 before a firmware relies on LE Coded, with a sniffer that decodes LE Coded and
+a central that supports it (BlueZ with a Bluetooth 5 controller that has LE Coded):
+
+- the interframe space of our answers to packets sent with S=8 and with S=2, 150 ± 2 µs, which tests the ready time,
+  both receive chains (S=2's 24.6 or 19.6 µs) and the END event's place relative to TERM2;
+- the access address event's time after a coded packet's start, 376 µs, against the anchor and the receive windows;
+- the CPU's time from END until TIMER0 is armed, within 78 µs (a late one ends the link with 0x03, Hardware Failure),
+  in the 10 s report's answer times;
+- decryption of packets sent with S=2 (RATEBOOST to RATEOVERRIDE) and with S=8, without MIC failures, and the
+  seal at 2 Mbit/s;
+- reception of S=8 packets in the mode of S=2 (the advertiser's listen), and the `AUX_CONNECT_RSP`'s timing and the
+  late decision counter;
+- the window widening and the crystal over events that last milliseconds, the sensitivity and range gained, the
+  current of an event at up to eight times the airtime, and the power control's targets on LE Coded;
+- whether one of the nRF52833 errata whose subject is still open touches LE Coded.
 
 ## nRF51
 
@@ -882,8 +965,11 @@ cargo test                                         # host tests, also with --fea
                                                    # extended-advertising (with and without directed-advertising),
                                                    # att-mtu, eatt, eatt-bearers-5
 cargo test --no-default-features --features nrf52833  # host tests for the nRF52833, also with the
-                                                      # features of the first line
+                                                      # features of the first line, and all of that
+                                                      # again with coded-phy
 cargo test --no-default-features --features nrf51  # host tests for the nRF51
+cargo check --features coded-phy                   # stops with "the coded-phy feature needs the chip feature
+                                                   # nrf52833", as does the nRF51 with coded-phy
 ALL=defmt,param-requests,key-missing,passkey,event-timing,directed-advertising,extended-advertising,att-mtu,eatt,\
 eatt-bearers-2,eatt-bearers-3,eatt-bearers-4,eatt-bearers-5
 cargo clippy --workspace --all-targets --no-default-features --features nrf52832,data-length,$ALL
@@ -892,6 +978,9 @@ cargo clippy --workspace --lib --bins --target thumbv7em-none-eabihf --no-defaul
 cargo clippy --workspace --all-targets --no-default-features --features nrf52833,data-length,$ALL
 cargo clippy --workspace --lib --bins --target thumbv7em-none-eabihf --no-default-features \
     --features nrf52833,data-length,$ALL
+cargo clippy --workspace --all-targets --no-default-features --features nrf52833,coded-phy,data-length,$ALL
+cargo clippy --workspace --lib --bins --target thumbv7em-none-eabihf --no-default-features \
+    --features nrf52833,coded-phy,data-length,$ALL
 cargo clippy --workspace --all-targets --no-default-features --features nrf51,$ALL
 cargo clippy --workspace --lib --bins --target thumbv6m-none-eabi --no-default-features --features nrf51,$ALL
                                                    # each also with the chip feature alone, with defmt, and on the
@@ -899,10 +988,12 @@ cargo clippy --workspace --lib --bins --target thumbv6m-none-eabi --no-default-f
                                                    # and with defmt
 cargo build --release --target thumbv7em-none-eabihf
 cargo build --release --target thumbv7em-none-eabihf --no-default-features --features nrf52833
+cargo build --release --target thumbv7em-none-eabihf --no-default-features --features nrf52833,coded-phy
 cargo build --release --target thumbv6m-none-eabi --no-default-features --features nrf51
 cargo fmt --check
 cargo doc --no-deps                                # rustdoc lints are errors too
 cargo doc --no-deps --no-default-features --features nrf52833
+cargo doc --no-deps --no-default-features --features nrf52833,coded-phy,extended-advertising
 ```
 
 Clippy runs on every crate of the workspace and every target, the tests included: what
@@ -910,7 +1001,7 @@ Clippy runs on every crate of the workspace and every target, the tests included
 exclude each other. For each chip it runs with every other feature (`data-length` only on the nRF52 chips; of the
 bearer counts the highest takes effect) on the host for all targets, and on the chip's target for the libraries, as the
 tests need `std`; then the same with the chip feature alone, with `defmt`, and on the nRF52 chips with each feature set
-of the tests' first line, without and with `defmt`.
+of the tests' first line, without and with `defmt`; and all of that for the nRF52833 again with `coded-phy`.
 
 The tests hold to the same lints as the library. A test takes a value it needs out of an `Option` or a `Result` with
 `assert_some!` or `assert_ok!` (`src/test_assert.rs`), which assert that it is there, and compares an `Option` or a

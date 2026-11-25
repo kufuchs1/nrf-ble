@@ -14,21 +14,26 @@
 //! - RADIO PCNF0: `CILEN`, `TERMLEN`, `CRCINC` and the second bit of `PLEN` are
 //!   0 after `Radio::new` writes the register, which is LE 1M and LE 2M without
 //!   a length field that counts the CRC; [`set_phy`] and [`set_packet_layout`]
-//!   modify the register and keep them.
+//!   modify the register and keep them. With the feature `coded-phy`,
+//!   [`set_phy`] writes `PLEN`, `CILEN` and `TERMLEN` for LE Coded and clears
+//!   `CILEN` and `TERMLEN` for the other PHYs.
 //! - RADIO CRCCNF: `SKIPADDR` has two bits, and `Radio::new` writes `Skip`.
 //! - RADIO SHORTS: the shortcuts the nRF52832 lacks stay 0, as every write of
 //!   the register leaves them.
 //! - RADIO TIFS: ten bits, see [`set_tifs`].
-//! - CCM MODE: `DATARATE` has two bits, and [`ccm_mode`] writes 1M or 2M.
-//! - CCM `MAXPACKETSIZE`, `RATEOVERRIDE` and `HEADERMASK`: never written, so
-//!   they keep their reset values. `HEADERMASK` masks NESN, SN and MD out of
-//!   the MIC, as BLE requires: Zephyr's `radio.c` writes 0xE3 for data PDUs and
-//!   calls it the reset value. `MAXPACKETSIZE` is expected to reset to 251
-//!   octets, the value nrfx's workaround of nRF52840 erratum 103 restores and
-//!   the one Zephyr's `radio.c` derives from a MAXLEN of 255; the nRF52833's
-//!   product specification has not been checked for it. nrf-pac's `Default` for
-//!   these registers is 0, not the reset value, so they must not be written
-//!   with `write`.
+//! - CCM MODE: `DATARATE` has two bits, and [`ccm_mode`] writes 1M or 2M, and
+//!   with the feature `coded-phy` 125 kbit/s for a decryption on LE Coded.
+//! - CCM `RATEOVERRIDE`: written only with the feature `coded-phy`, with 500
+//!   kbit/s before a decryption on LE Coded.
+//! - CCM `MAXPACKETSIZE` and `HEADERMASK`: never written, so they keep their
+//!   reset values. `HEADERMASK` masks NESN, SN and MD out of the MIC, as BLE
+//!   requires: Zephyr's `radio.c` writes 0xE3 for data PDUs and calls it the
+//!   reset value. `MAXPACKETSIZE` is expected to reset to 251 octets, the value
+//!   nrfx's workaround of nRF52840 erratum 103 restores and the one Zephyr's
+//!   `radio.c` derives from a MAXLEN of 255; the nRF52833's product
+//!   specification has not been checked for it. nrf-pac's `Default` for these
+//!   registers is 0, not the reset value, so they must not be written with
+//!   `write`.
 //! - CCM ERROR: the nRF52833 PAC calls the event deprecated. The link layer
 //!   only clears it and counts an operation without it as complete, which holds
 //!   whether the event comes or not.
@@ -50,6 +55,8 @@ use crate::{
     radio::{LENGTH_BITS, Phy},
 };
 use core::ptr::{read_volatile, with_exposed_provenance_mut, write_volatile};
+#[cfg(feature = "coded-phy")]
+use embassy_nrf::pac::ccm::vals::Rateoverride;
 use embassy_nrf::pac::{
     CCM,
     PPI,
@@ -59,6 +66,14 @@ use embassy_nrf::pac::{
     radio::vals::{Mode, Plen, Ru, S1incl, Txpower},
 };
 
+/// Length of the coding indicator in bits, in RADIO PCNF0 on LE Coded:
+/// Zephyr's `radio_pkt_configure` writes 2.
+#[cfg(feature = "coded-phy")]
+const CODED_CILEN: u8 = 2;
+/// Length of the TERM field in bits, in RADIO PCNF0 on LE Coded: Zephyr's
+/// `radio_pkt_configure` writes 3, the three bits of TERM1 and TERM2.
+#[cfg(feature = "coded-phy")]
+const CODED_TERMLEN: u8 = 3;
 /// AMLI RAM priority register of the radio.
 const AMLI_RAMPRI_RADIO: usize = 0x4000_0E08;
 /// AMLI RAM priority register of the CCM.
@@ -121,20 +136,41 @@ pub const TX_CHAIN_NS: u32 = 600;
 pub const SCRATCH_LEN: usize = 16_usize.strict_add(255);
 
 /// Sets the CCM mode for a packet on `phy`, in the extended length mode.
+#[cfg_attr(
+    feature = "coded-phy",
+    doc = "",
+    doc = "On LE Coded a decryption runs at 125 kbit/s, and `RATEOVERRIDE` holds 500 kbit/s for the RATEBOOST of a \
+           packet sent with S=2 (`crate::crypto::PPI_RATE`), as Zephyr's `radio_ccm_ext_rx_pkt_set` sets them. An \
+           encryption, which runs ahead of the packet, runs at 2 Mbit/s, the fastest rate, as Zephyr's \
+           `radio_ccm_ext_tx_pkt_set` does on every PHY (\"use fastest data rate as tx data needs to be prepared \
+           before radio Tx on any PHY\")."
+)]
 #[inline]
 pub fn ccm_mode(mode: CcmMode, phy: Phy) {
+    #[cfg(feature = "coded-phy")]
+    let rate_phy = if phy.is_coded() && mode == CcmMode::Encryption { Phy::M2 } else { phy };
+    #[cfg(not(feature = "coded-phy"))]
+    let rate_phy = phy;
+    #[cfg(feature = "coded-phy")]
+    if rate_phy.is_coded() {
+        CCM.rateoverride().write(|w| w.set_rateoverride(Rateoverride::_500kbps));
+    }
     CCM.mode().write(|w| {
         w.set_mode(mode);
-        w.set_datarate(datarate(phy));
+        w.set_datarate(datarate(rate_phy));
         w.set_length(Length::Extended);
     });
 }
 
-/// The CCM data rate matching `phy`, for decryption on the fly.
+/// The CCM data rate matching `phy`, for decryption on the fly: on LE
+/// Coded the rate of S=8, which the coding indicator of each packet comes
+/// with.
 const fn datarate(phy: Phy) -> Datarate {
     match phy {
         Phy::M1 => Datarate::_1mbit,
         Phy::M2 => Datarate::_2mbit,
+        #[cfg(feature = "coded-phy")]
+        Phy::CodedS8 | Phy::CodedS2 => Datarate::_125kbps,
     }
 }
 
@@ -236,19 +272,39 @@ pub fn set_packet_layout(data_channel: bool) {
 }
 
 /// Sets the radio mode and preamble of `phy`. The radio must be disabled.
+#[cfg_attr(
+    feature = "coded-phy",
+    doc = "",
+    doc = "LE Coded sends with S=8 in `Ble_LR125Kbit` and with S=2 in `Ble_LR500Kbit`, and receives either coding in \
+           both (\"Long range 125 kbps TX, 125 kbps and 500 kbps RX\" in the PAC), with the long range preamble, a \
+           coding indicator of two bits and a TERM field of three, the values of Zephyr's `radio_pkt_configure` \
+           (`CILEN` 2, `TERMLEN` 3). LE 1M and LE 2M clear `CILEN` and `TERMLEN`."
+)]
 #[inline]
 pub fn set_phy(phy: Phy) {
     RADIO.mode().write(|w| {
         w.set_mode(match phy {
             Phy::M1 => Mode::Ble1mbit,
             Phy::M2 => Mode::Ble2mbit,
+            #[cfg(feature = "coded-phy")]
+            Phy::CodedS8 => Mode::BleLr125kbit,
+            #[cfg(feature = "coded-phy")]
+            Phy::CodedS2 => Mode::BleLr500kbit,
         });
     });
     RADIO.pcnf0().modify(|w| {
         w.set_plen(match phy {
             Phy::M1 => Plen::_8bit,
             Phy::M2 => Plen::_16bit,
+            #[cfg(feature = "coded-phy")]
+            Phy::CodedS8 | Phy::CodedS2 => Plen::LongRange,
         });
+        #[cfg(feature = "coded-phy")]
+        {
+            let (indicator, term) = if phy.is_coded() { (CODED_CILEN, CODED_TERMLEN) } else { (0, 0) };
+            w.set_cilen(indicator);
+            w.set_termlen(term);
+        }
     });
 }
 

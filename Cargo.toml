@@ -14,6 +14,10 @@ nrf51 = ["embassy-nrf/nrf51"]
 # What the nRF52832 and the nRF52833 share; set by their chip features, not
 # meant to be enabled on its own.
 _nrf52 = []
+# LE Coded (long range, S=8 and S=2) on the nRF52833: connections, the PHY
+# update procedure and extended advertising. It needs the chip feature
+# nrf52833.
+coded-phy = []
 defmt = ["dep:defmt", "embassy-time/defmt"]
 data-length = []
 param-requests = []

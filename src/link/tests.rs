@@ -186,12 +186,62 @@ fn phy_requests_are_validated_and_one_runs_at_a_time() {
     assert_eq!(shared.take_phy_request(), Some([1, 2]));
     assert_eq!(link.set_phy(epoch, Some(1), Some(2)), Err(Error::Disallowed));
     shared.complete_query(QUERY_PHY);
-    assert_eq!(link.set_phy(epoch, Some(4), Some(2)), Err(Error::Invalid));
+    // LE Coded is a PHY only with the feature `coded-phy`.
+    if cfg!(feature = "coded-phy") {
+        assert_eq!(link.set_phy(epoch, Some(4), Some(2)), Ok(()));
+        assert_eq!(shared.take_phy_request(), Some([4, 2]));
+        shared.complete_query(QUERY_PHY);
+    } else {
+        assert_eq!(link.set_phy(epoch, Some(4), Some(2)), Err(Error::Invalid));
+    }
     assert_eq!(link.set_phy(epoch, Some(0), None), Err(Error::Invalid));
+    assert_eq!(link.set_phy(epoch, Some(8), None), Err(Error::Invalid));
     assert_eq!(link.set_default_phy(None, None), Ok(()));
-    assert_eq!(shared.preferred_phys(), [3, 3]);
+    // No preference names every PHY the build has.
+    assert_eq!(shared.preferred_phys(), if cfg!(feature = "coded-phy") { [7, 7] } else { [3, 3] });
     assert_eq!(link.phy(epoch), Ok([1, 1]));
     assert_eq!(link.phy(Epoch(0)), Err(Error::Gone));
+}
+
+/// Links send on LE Coded with S=8 until the firmware asks for S=2, and
+/// the coding holds across a reset.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn the_coding_of_new_links_is_s8_until_the_firmware_chooses() {
+    use crate::radio::Coding;
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    assert!(shared.coding() == Coding::S8);
+    link.set_coding(Coding::S2);
+    assert!(shared.coding() == Coding::S2);
+    shared.signal_reset();
+    shared.complete_reset();
+    assert!(shared.coding() == Coding::S2);
+    link.set_coding(Coding::S8);
+    assert!(shared.coding() == Coding::S8);
+}
+
+/// A link that starts on LE Coded prefers LE Coded alone until the host
+/// sets the default preferences, which then hold for it as for any link,
+/// until a reset; the other links take the default.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn a_link_that_starts_on_le_coded_prefers_it_until_the_host_chooses() {
+    use crate::radio::Phy;
+    let shared = Shared::new();
+    let link = Link::new(&shared);
+    for start in [Phy::CodedS8, Phy::CodedS2] {
+        assert_eq!(shared.preferred_phys_on(start), [4, 4]);
+    }
+    assert_eq!(shared.preferred_phys_on(Phy::M1), [2, 2]);
+    assert_eq!(shared.preferred_phys_on(Phy::M2), [2, 2]);
+    assert_eq!(link.set_default_phy(Some(2), Some(2)), Ok(()));
+    assert_eq!(shared.preferred_phys_on(Phy::CodedS8), [2, 2]);
+    assert_eq!(link.set_default_phy(None, None), Ok(()));
+    assert_eq!(shared.preferred_phys_on(Phy::CodedS2), [7, 7]);
+    shared.signal_reset();
+    shared.complete_reset();
+    assert_eq!(shared.preferred_phys_on(Phy::CodedS8), [4, 4]);
 }
 
 #[cfg(feature = "nrf51")]
@@ -644,6 +694,27 @@ fn advertising_needs_an_identity_valid_parameters_and_no_link() {
         } else {
             assert_eq!(link.advertise(&fast, &[2, 1, 6], &[]), Ok(()));
             assert!(assert_some!(shared.advertising()).secondary_phy == Phy::M2);
+        }
+        // With the feature `coded-phy` the primary channels go on LE Coded
+        // too, not on LE 2M, and the interval grows to the event on LE
+        // Coded: 0x0030 units are 30 ms, more than the 26 ms of the longest
+        // event, 0x0020 units 20 ms, less, which grows to 42 units, 26.25 ms.
+        #[cfg(feature = "coded-phy")]
+        {
+            let coded = params.primary_phy(Phy::CodedS8).secondary_phy(Phy::CodedS8);
+            assert_eq!(link.advertise(&params.primary_phy(Phy::M2), &[2, 1, 6], &[]), Err(Error::Invalid));
+            assert_eq!(
+                link.advertise(&coded.interval(0x0030), zeros.get(..undirected).unwrap_or_default(), &[]),
+                Ok(())
+            );
+            let long_range = assert_some!(shared.advertising());
+            assert!(long_range.primary_phy == Phy::CodedS8 && long_range.secondary_phy == Phy::CodedS8);
+            assert_eq!(long_range.interval, 30_000);
+            assert_eq!(
+                link.advertise(&coded.interval(0x0020), zeros.get(..undirected).unwrap_or_default(), &[]),
+                Ok(())
+            );
+            assert_eq!(assert_some!(shared.advertising()).interval, 26_250);
         }
     }
     link.stop_advertising();

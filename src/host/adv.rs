@@ -235,6 +235,9 @@ pub struct Advertising<'bond> {
     data:          Data,
     /// The mode.
     mode:          Mode<'bond>,
+    /// The PHY of the primary channels.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    primary_phy:   Phy,
     /// The scan response data.
     #[cfg(not(feature = "extended-advertising"))]
     scan:          Data,
@@ -465,6 +468,8 @@ impl<'bond> Advertising<'bond> {
         Ok(Self {
             data,
             mode,
+            #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+            primary_phy: Phy::M1,
             #[cfg(not(feature = "extended-advertising"))]
             scan,
             schedule,
@@ -475,8 +480,21 @@ impl<'bond> Advertising<'bond> {
 
     /// The link layer's parameters for `phase`: the mode's
     /// ([`Mode::params`]), on the secondary channel's PHY.
-    #[cfg(feature = "extended-advertising")]
+    #[cfg(all(feature = "extended-advertising", not(feature = "coded-phy")))]
     const fn params(&self, phase: &Phase) -> AdvParams { self.mode.params(phase).secondary_phy(self.secondary_phy) }
+
+    /// The link layer's parameters for `phase`: the mode's
+    /// ([`Mode::params`]), on the primary and the secondary channel's PHYs.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    const fn params(&self, phase: &Phase) -> AdvParams {
+        self.mode.params(phase).primary_phy(self.primary_phy).secondary_phy(self.secondary_phy)
+    }
+
+    /// The PHY of the primary channels.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    #[inline]
+    #[must_use = "the PHY is only read"]
+    pub const fn primary_phy(&self) -> Phy { self.primary_phy }
 
     /// The scan response data.
     #[cfg(not(feature = "extended-advertising"))]
@@ -527,6 +545,16 @@ impl<'bond> Advertising<'bond> {
         #[cfg(feature = "extended-advertising")]
         let params = self.params(phase);
         Ok(control.call(Call::Advertise { adv: self.data.as_bytes(), params, scan: self.scan().as_bytes() })?)
+    }
+
+    /// With `phy` on the primary channels, LE 1M by default: LE Coded, with
+    /// either coding, for centrals that scan on it, at up to eight times the
+    /// airtime. LE 2M, which no primary channel takes, keeps LE 1M.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    #[inline]
+    #[must_use = "the advertising is only built"]
+    pub const fn with_primary_phy(self, phy: Phy) -> Self {
+        Self { primary_phy: if matches!(phy, Phy::M2) { Phy::M1 } else { phy }, ..self }
     }
 
     /// With `phy` on the secondary channel, LE 1M by default: the

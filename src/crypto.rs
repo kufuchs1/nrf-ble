@@ -48,6 +48,13 @@ const IV_OFFSET: usize = 25;
 pub(crate) const MIC_LEN: u8 = 4;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
 pub(crate) const PPI_CRYPT: usize = 25;
+/// Programmable PPI channel: RADIO RATEBOOST to CCM RATEOVERRIDE, which
+/// moves a decryption on the fly from 125 to 500 kbit/s once a packet on LE
+/// Coded announced S=2, as Zephyr's `HAL_TRIGGER_RATEOVERRIDE_PPI` does.
+/// Zephyr takes channel 14; this crate takes 18, which the firmwares of
+/// this crate's users leave free.
+#[cfg(feature = "coded-phy")]
+pub(crate) const PPI_RATE: usize = 18;
 /// Scratch space for every length the CCM may take from a packet.
 pub(crate) const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
 
@@ -118,6 +125,14 @@ pub(crate) unsafe fn arm_decrypt(
     CCM.enable().write(|w| w.set_enable(Enable::Disabled));
     CCM.enable().write(|w| w.set_enable(Enable::Enabled));
     chip::ccm_mode(Mode::Decryption, phy);
+    // On LE Coded the decryption starts at 125 kbit/s, and RATEBOOST moves
+    // it to 500 kbit/s for a packet sent with S=2.
+    #[cfg(feature = "coded-phy")]
+    if phy.is_coded() {
+        PPI.chenset().write(|w| w.set_ch(PPI_RATE, true));
+    } else {
+        PPI.chenclr().write(|w| w.set_ch(PPI_RATE, true));
+    }
     set_pointers(config, input, &mut output.0, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(false));
     CCM.events_endksgen().write_value(0);
@@ -294,12 +309,23 @@ pub(crate) const fn config(key: [u8; 16], iv: [u8; 8], central_to_peripheral: bo
     config
 }
 
-/// Stops starting the CCM from the radio.
+/// Stops starting the CCM from the radio, and with the feature `coded-phy`
+/// moving its rate.
 #[inline]
 pub(crate) fn disarm() {
-    PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
+    PPI.chenclr().write(|w| {
+        w.set_ch(PPI_CRYPT, true);
+        #[cfg(feature = "coded-phy")]
+        w.set_ch(PPI_RATE, true);
+    });
     CCM.shorts().write(|w| w.set_endksgen_crypt(false));
 }
+
+/// The address of the CCM's RATEOVERRIDE task, for [`PPI_RATE`].
+#[cfg(feature = "coded-phy")]
+#[inline]
+#[must_use = "the address is only computed"]
+pub(crate) fn rate_override_task() -> u32 { CCM.tasks_rateoverride().as_ptr().addr().strict_cast() }
 
 /// Enables the CCM.
 #[inline]

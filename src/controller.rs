@@ -76,7 +76,14 @@ async fn interval(settings: &Settings) -> Micros {
 #[cfg(feature = "extended-advertising")]
 fn start_after_aux(setup: Setup, shared: &Shared) {
     shared.set_phys(setup.phy.hci(), setup.phy.hci());
+    #[cfg(not(feature = "coded-phy"))]
     info!("connection from AUX_CONNECT_REQ: window +{} us, csa2, phy {}M", setup.window_delay_us, setup.phy.hci());
+    #[cfg(feature = "coded-phy")]
+    info!(
+        "connection from AUX_CONNECT_REQ: window +{} us, csa2, phy {} (HCI: 1 LE 1M, 2 LE 2M, 3 LE Coded)",
+        setup.window_delay_us,
+        setup.phy.hci()
+    );
 }
 
 /// Runs the link layer forever.
@@ -141,10 +148,15 @@ pub async fn run<const SLOT_GUARD: bool>(radio: &mut Radio<'_>, clock: &mut Cloc
         radio.set_access_address(request.access_address);
         radio.set_crc_init(request.crc_init);
         let mut connection = Connection::new(&request, end, setup);
+        #[cfg(not(feature = "coded-phy"))]
         connection.set_preferred_phys(shared.preferred_phys());
+        #[cfg(feature = "coded-phy")]
+        connection.set_preferred_phys(shared.preferred_phys_on(setup.phy));
         #[cfg(feature = "nrf52833")]
         connection.set_max_power(shared.max_power());
         connection.set_suggested_length(shared.suggested_length());
+        #[cfg(feature = "coded-phy")]
+        connection.set_coding(shared.coding());
         let central = request.central();
         let mut shown = central.address;
         shown.reverse();

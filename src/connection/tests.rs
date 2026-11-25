@@ -153,8 +153,10 @@ fn a_connection_from_an_aux_connect_req_starts_2_5_ms_later_with_csa2_on_the_sec
 fn the_extended_advertising_feature_bit_follows_the_feature() {
     // Bit 12 (Core, Vol 6, Part B, 4.6): LE Extended Advertising, octet 1.
     assert_eq!(FEATURES[1] & 0x10 != 0, cfg!(feature = "extended-advertising"));
+    // Bit 11: LE Coded, with the feature `coded-phy`.
+    assert_eq!(FEATURES[1] & 0x08 != 0, cfg!(feature = "coded-phy"));
     // The rest of octet 1: LE 2M where the radio has it, CSA #2.
-    assert_eq!(FEATURES[1] & !0x10, if cfg!(feature = "nrf51") { 0x40 } else { 0x41 });
+    assert_eq!(FEATURES[1] & !0x18, if cfg!(feature = "nrf51") { 0x40 } else { 0x41 });
 }
 
 #[test]
@@ -831,7 +833,10 @@ fn phy_updates_without_a_change_asymmetric_or_coded_are_handled() {
     link.handle_control(&[OP_PHY_UPDATE_IND, 0, 0, 10, 0], true);
     assert_eq!(link.abort, None);
     assert!(link.phy_update.is_none());
-    for (to_peripheral, to_central) in [(4, 4), (3, 3)] {
+    // Two PHYs at once name none; LE Coded is one only with the feature
+    // `coded-phy`.
+    let refused: &[(u8, u8)] = if cfg!(feature = "coded-phy") { &[(3, 3), (6, 4)] } else { &[(4, 4), (3, 3)] };
+    for &(to_peripheral, to_central) in refused {
         link = encrypted();
         link.handle_control(&[OP_PHY_UPDATE_IND, to_peripheral, to_central, 10, 0], true);
         assert_eq!(link.abort, Some(ERROR_UNSUPPORTED_VALUE));
@@ -899,6 +904,140 @@ fn the_peripheral_asks_for_2m_once_encrypted_and_answers_a_central_request() {
     link.handle_control(&[OP_PHY_REQ, 3, 3], true);
     assert_eq!(link.queue.front().copied().map(|queued| queued.data[..3] == [OP_PHY_RSP, 2, 2]), Some(true));
     assert!(matches!(link.phy_request, Request::Requested(_)));
+}
+
+#[cfg(feature = "coded-phy")]
+#[test]
+fn le_coded_is_a_feature_and_a_phy_the_peripheral_offers_and_takes() {
+    assert_eq!(FEATURES[1] & FEATURE_CODED, 0x08);
+    // A central that prefers LE Coded alone gets our preferences.
+    let mut link = encrypted();
+    link.preferred_phys = [4, 4];
+    link.handle_control(&[OP_PHY_REQ, 4, 4], true);
+    assert_eq!(link.queue.front().copied().map(|queued| queued.data[..3] == [OP_PHY_RSP, 4, 4]), Some(true));
+    // Our own request names LE Coded as the host asked.
+    let shared = Shared::new();
+    link = encrypted();
+    link.central_features = Some([0x1F, 0x08, 0, 0, 0, 0, 0, 0]);
+    link.host_phy = Some([4, 4]);
+    link.preferred_phys = [4, 4];
+    link.start_procedures(At(0), &shared);
+    assert_eq!(link.queue.front().copied().map(|queued| queued.data[..3] == [OP_PHY_REQ, 4, 4]), Some(true));
+}
+
+/// At the instant of a change to LE Coded the link receives in the mode of
+/// S=8, which decodes either coding, sends with its own coding, moves its
+/// anchor by the 336 us the access address event comes later after the
+/// packet's start, and takes the least effective time of LE Coded, 2704 us,
+/// each way.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn a_phy_update_to_le_coded_moves_the_anchor_and_the_least_time() {
+    for (coding, transmit) in [(Coding::S8, Phy::CodedS8), (Coding::S2, Phy::CodedS2)] {
+        let shared = Shared::with_all_events();
+        let mut link = connection();
+        link.set_coding(coding);
+        link.anchor = At(10_000);
+        link.handle_control(&[OP_PHY_UPDATE_IND, 4, 4, 10, 0], false);
+        assert_eq!(link.abort, None);
+        assert!(link.phy_update == Some((Phy::CodedS8, 10)));
+        assert!(link.next_tx_phy == transmit);
+        link.counter = 10;
+        link.apply_instants(&shared);
+        assert!(link.phy == Phy::CodedS8 && link.tx_phy == transmit);
+        assert_eq!(link.anchor, At(10_336));
+        assert_eq!(shared.take_event(), Some(Event::PhyUpdated { rx: 3, status: 0, tx: 3 }));
+        assert_eq!(link.length.effective(), [27, 2704, 27, 2704]);
+        // 27 octets with a MIC take exactly 2704 us with S=8; with S=2 the
+        // octets bound the payload.
+        link.encryption.phase = Phase::Encrypted;
+        assert_eq!(link.tx_payload_max(), 27);
+        // Back to LE 1M, the anchor and the least time return.
+        link.handle_control(&[OP_PHY_UPDATE_IND, 1, 1, 20, 0], true);
+        link.counter = 20;
+        link.apply_instants(&shared);
+        assert_eq!(link.anchor, At(10_000));
+        assert_eq!(link.length.effective(), [27, 328, 27, 328]);
+    }
+}
+
+/// A central that keeps the transmit PHY on LE Coded keeps this side's
+/// coding.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn an_update_of_one_direction_keeps_the_coding_of_the_other() {
+    let shared = Shared::with_all_events();
+    let mut link = connection();
+    link.set_coding(Coding::S2);
+    link.handle_control(&[OP_PHY_UPDATE_IND, 0, 4, 10, 0], false);
+    link.counter = 10;
+    link.apply_instants(&shared);
+    assert!(link.phy == Phy::M1 && link.tx_phy == Phy::CodedS2);
+    link.handle_control(&[OP_PHY_UPDATE_IND, 2, 0, 20, 0], false);
+    link.counter = 20;
+    link.apply_instants(&shared);
+    assert!(link.phy == Phy::M2 && link.tx_phy == Phy::CodedS2);
+    assert_eq!(link.length.effective(), [27, 2704, 27, 328]);
+}
+
+/// A link that extended advertising on LE Coded starts receives on LE Coded,
+/// sends with the advertising's coding, and opens its first receive window
+/// 376 us before the earliest access address event. It listens 21 us longer
+/// after the latest than on LE 1M, for the longer receive chain of S=8.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn a_link_that_starts_on_le_coded_keeps_the_coding_it_started_with() {
+    for (start, kept) in [(Phy::CodedS8, Coding::S8), (Phy::CodedS2, Coding::S2)] {
+        let setup = Setup { phy: start, window_delay_us: 3750 };
+        let mut link = critical_section::with(|_| Connection::new(&REQUEST, 100, setup));
+        link.set_coding(if kept == Coding::S8 { Coding::S2 } else { Coding::S8 });
+        assert!(link.coding == kept && link.tx_phy == start && link.phy == Phy::CodedS8);
+        assert_eq!(link.length.effective(), [27, 2704, 27, 2704]);
+        // The window starts at 100 + 3750 us, one unit wide: the radio is
+        // ready the widening, the ramp-up and the margin before it, and
+        // listens until 376 us after its end, the widening and the tail of
+        // LE Coded, 30 + 21 us.
+        let window = link.window();
+        let widening = link.widening(Micros(3850 + 1250 + 376 - 100));
+        assert_eq!(window.enable, At(3850).before(widening).before(RAMP_UP_US).before(RX_MARGIN_US));
+        assert_eq!(RX_TAIL_CODED_US, Micros(51));
+        assert_eq!(window.latest, At(3850 + 1250 + 376 + 51).after(widening));
+    }
+    let mut link = connection();
+    link.set_coding(Coding::S2);
+    assert!(link.coding == Coding::S2);
+}
+
+/// A link that LE Coded advertising started, with the preferences such a
+/// link gets by default, answers a central that names every PHY with LE
+/// Coded alone, so the central keeps it on LE Coded.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn a_link_started_on_le_coded_answers_a_request_for_every_phy_with_le_coded() {
+    let shared = Shared::new();
+    let setup = Setup { phy: Phy::CodedS8, window_delay_us: 3750 };
+    let mut link = critical_section::with(|_| Connection::new(&REQUEST, 100, setup));
+    link.set_preferred_phys(shared.preferred_phys_on(setup.phy));
+    link.handle_control(&[OP_PHY_REQ, 7, 7], false);
+    let answer = *assert_some!(link.queue.front());
+    assert_eq!(answer.data[..3], [OP_PHY_RSP, 4, 4]);
+}
+
+/// The air time of an exchange on LE Coded: our longest answer twice and the
+/// central's longest packet, 27 octets with S=8, with three interframe
+/// spaces, each packet with the S1 octet in RAM counted, which errs on the
+/// long side as on the other PHYs.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn the_exchange_on_le_coded_takes_the_coded_air_times() {
+    let shared = Shared::with_all_events();
+    let mut link = connection();
+    link.handle_control(&[OP_PHY_UPDATE_IND, 4, 4, 10, 0], false);
+    link.counter = 10;
+    link.apply_instants(&shared);
+    // The answer counts the longest payload this side may send.
+    let answer = Phy::CodedS8.pdu_us(3 + link.tx_payload_max());
+    assert_eq!(link.exchange_us(), Micros(answer * 2 + Phy::CodedS8.pdu_us(3 + 27) + 450));
 }
 
 /// A connection parameter request PDU: interval 12 to 24, latency 4,
@@ -1321,7 +1460,9 @@ fn power_requests_for_2m_are_refused_and_round_up_without_3_dbm() {
 #[cfg(feature = "_nrf52")]
 #[test]
 fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
-    for phy in [0, 3, 4, 8, 255] {
+    // LE Coded's 3 and 4 name a PHY with the feature `coded-phy` only.
+    let refused: &[u8] = if cfg!(feature = "coded-phy") { &[0, 5, 8, 255] } else { &[0, 3, 4, 8, 255] };
+    for &phy in refused {
         let mut link = connection();
         link.handle_control(&[OP_POWER_CONTROL_REQ, phy, 0, 0], false);
         assert_eq!(assert_some!(link.queue.front()).data[..3], [
@@ -1340,6 +1481,36 @@ fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
     link.queue.clear();
     link.handle_control(&[OP_POWER_CONTROL_REQ, 2, 0x7F, 0], false);
     assert_eq!(tx_power(link.power[1].level()), 4);
+}
+
+/// LE Coded with S=8 and with S=2 are the power control's PHYs 3 and 4,
+/// each with a power of its own, and bits 2 and 3 of the PHYs whose changes
+/// the central learns.
+#[cfg(feature = "coded-phy")]
+#[test]
+fn each_coding_of_le_coded_has_a_power_control_of_its_own() {
+    let mut link = connection();
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 3, (-6_i8).cast_unsigned(), 0], false);
+    assert_eq!(assert_some!(link.queue.front()).data[0], OP_POWER_CONTROL_RSP);
+    link.queue.clear();
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 4, 0x7F, 0], false);
+    // -6 dBm rounds up to -4 dBm; the maximum stops at the ceiling.
+    let powers = link.power.map(|control| tx_power(control.level()));
+    assert_eq!(powers, [0, 0, -4, 4]);
+    assert_eq!(link.power_reporting, 0b1100);
+    // A change on S=2 is announced with bit 3.
+    let shared = Shared::new();
+    link = encrypted();
+    link.phy_request = Request::Done;
+    link.features_request = Request::Done;
+    link.central_features = Some([0x1F, 0, 0, 0, 0x06, 0, 0, 0]);
+    link.tx_phy = Phy::CodedS2;
+    link.power_reporting = 0b1000;
+    link.power[3].on_loss();
+    link.start_procedures(At(0), &shared);
+    let raised = LEVELS_DBM[DEFAULT_LEVEL + 1].cast_unsigned();
+    let indication = *assert_some!(link.queue.front());
+    assert_eq!(indication.data[..5], [OP_POWER_CHANGE_IND, 0b1000, 0, raised, raised]);
 }
 
 #[test]
@@ -1682,8 +1853,11 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     // The central receives and sends 251 octets in 2120 us.
     link.handle_control(&[OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
     let response = *assert_some!(link.queue.front());
-    // We receive 251 octets but send only what the host allowed so far.
-    assert_eq!(response.data[..9], [OP_LENGTH_RSP, 251, 0, 0x48, 0x08, 27, 0, 0x48, 0x01]);
+    // We receive 251 octets but send only what the host allowed so far. The
+    // longest reception takes 2120 us on LE 1M, and with the feature
+    // `coded-phy` 17040 us on LE Coded.
+    let [rx0, rx1] = RX_TIME_MAX.to_le_bytes();
+    assert_eq!(response.data[..9], [OP_LENGTH_RSP, 251, 0, rx0, rx1, 27, 0, 0x48, 0x01]);
     assert_eq!(link.length.effective(), [27, 328, 251, 2120]);
     link.drive_length(&shared);
     assert_eq!(link.length.reported, [27, 328, 251, 2120]);
@@ -1695,10 +1869,10 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     shared.set_connected(true);
     assert_eq!(Link::new(&shared).set_data_length(Epoch::for_test(1), 251, 0x0848), Ok(()));
     link.drive_length(&shared);
-    assert_eq!(link.length.local_tx, LENGTH_MAX);
+    assert_eq!(link.length.local_tx, [251, 0x0848]);
     assert_eq!(link.tx_payload_max(), 27);
     let request = link.length.pdu(OP_LENGTH_REQ);
-    assert_eq!(request, [OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+    assert_eq!(request, [OP_LENGTH_REQ, 251, 0, rx0, rx1, 251, 0, 0x48, 0x08]);
     assert_eq!(link.tx_payload_max(), 27);
     link.handle_control(&[OP_LENGTH_RSP, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
     assert_eq!(link.tx_payload_max(), 251);
@@ -1715,6 +1889,107 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     // On LE 2M the same time holds twice the octets, less the overhead.
     link.tx_phy = Phy::M2;
     assert_eq!(link.tx_payload_max(), 1000_usize.strict_div(4) - 11 - 4);
+}
+
+/// On LE Coded the effective time is at least 2704 us each way, which with
+/// a MIC carries 27 octets with S=8 and 136 with S=2; a central that
+/// receives 17040 us takes 251 octets with S=8. On LE 1M the time follows
+/// both sides up to 17040 us too, as Core, Vol 6, Part B, 4.5.10 sets no
+/// most there, and the octets bound the packets.
+#[test]
+#[cfg(all(feature = "data-length", feature = "coded-phy"))]
+fn the_data_length_on_le_coded_follows_the_coded_time_on_the_air() {
+    let shared = Shared::with_all_events();
+    let mut link = encrypted();
+    link.length.local_tx = LENGTH_MAX;
+    link.length.offer_taken();
+    link.length.announced_tx = LENGTH_MAX;
+    // On LE 1M a central that takes 17040 us each way gets 17040 us, and
+    // 251 octets.
+    link.length.take_peer(&[251, 0, 0x90, 0x42, 251, 0, 0x90, 0x42]);
+    assert_eq!(link.length.effective(), [251, 17_040, 251, 17_040]);
+    assert_eq!(link.tx_payload_max(), 251);
+    // The central receives 251 octets in 2120 us, as on LE 1M.
+    link.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+    link.handle_control(&[OP_PHY_UPDATE_IND, 4, 4, 10, 0], true);
+    link.counter = 10;
+    link.apply_instants(&shared);
+    assert_eq!(link.length.effective(), [251, 2704, 251, 2704]);
+    assert_eq!(link.tx_payload_max(), 27);
+    link.tx_phy = Phy::CodedS2;
+    assert_eq!(link.tx_payload_max(), 136);
+    // A central that receives the longest time on LE Coded.
+    link.length.take_peer(&[251, 0, 0x90, 0x42, 251, 0, 0x90, 0x42]);
+    assert_eq!(link.length.effective(), [251, 17_040, 251, 17_040]);
+    assert_eq!(link.tx_payload_max(), 251);
+    link.tx_phy = Phy::CodedS8;
+    assert_eq!(link.tx_payload_max(), 251);
+}
+
+/// While a PHY procedure may move this side's transmissions to LE Coded,
+/// the PDUs it prepares fit the effective time there as well, 2704 us, 27
+/// octets with a MIC with S=8: one still unacknowledged at the instant goes
+/// out again with S=8. This holds from our `LL_PHY_RSP` that offers LE
+/// Coded to a central that receives it, or our `LL_PHY_REQ` that names it,
+/// until the instant, and ends with an update that leaves our transmit PHY
+/// or a rejection of our request.
+#[test]
+#[cfg(all(feature = "data-length", feature = "coded-phy"))]
+fn the_pdus_before_a_move_to_le_coded_fit_its_time() {
+    let shared = Shared::with_all_events();
+    shared.set_connected(true);
+    let mut link = encrypted();
+    link.length.local_tx = [251, 2120];
+    link.length.announced_tx = [251, 2120];
+    link.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+    link.preferred_phys = [7, 7];
+    assert_eq!(link.tx_payload_max(), 251);
+    // A central that receives on LE 1M and LE 2M alone cannot move us to LE
+    // Coded.
+    link.handle_control(&[OP_PHY_REQ, 7, 3], true);
+    assert!(link.phy_ahead.is_none());
+    assert_eq!(link.tx_payload_max(), 251);
+    link.handle_control(&[OP_PHY_UPDATE_IND, 0, 0, 10, 0], true);
+    send_queue(&mut link, &shared);
+    // A central that receives LE Coded may: from our answer on, the host's
+    // data goes out in fragments of 27 octets.
+    link.handle_control(&[OP_PHY_REQ, 4, 4], true);
+    assert!(link.phy_ahead == Some(Phy::CodedS8));
+    assert_eq!(link.tx_payload_max(), 27);
+    assert_eq!(send_queue(&mut link, &shared).first().map(|&(opcode, _)| opcode), Some(OP_PHY_RSP));
+    let data = [0x5A; 100];
+    assert!(shared.queue_acl_for_test(&data));
+    link.load_next(&shared);
+    assert!(link.tx_kind == TxKind::AclPart);
+    assert_eq!(link.current().plain.0[..DATA_HEADER_LEN], [Llid::Start.bits(), 27, 0]);
+    // The update names LE Coded for our side: the restriction holds until
+    // the instant, and after it the effective time of LE Coded bounds the
+    // PDUs.
+    link.handle_control(&[OP_PHY_UPDATE_IND, 0, 4, 10, 0], true);
+    assert!(link.phy_ahead == Some(Phy::CodedS8));
+    assert_eq!(link.tx_payload_max(), 27);
+    link.counter = 10;
+    link.apply_instants(&shared);
+    assert!(link.tx_phy == Phy::CodedS8 && link.phy_ahead.is_none());
+    assert_eq!(link.tx_payload_max(), 27);
+    // Back on LE 1M, our own request that names LE Coded restricts the
+    // PDUs until the central rejects it.
+    link.handle_control(&[OP_PHY_UPDATE_IND, 0, 1, 20, 0], true);
+    assert!(link.phy_ahead.is_none());
+    link.counter = 20;
+    link.apply_instants(&shared);
+    assert_eq!(link.tx_payload_max(), 251);
+    send_queue(&mut link, &shared);
+    link.central_features = Some([0x1F, 0x08, 0, 0, 0, 0, 0, 0]);
+    link.phy_request = Request::NotStarted;
+    link.host_phy = Some([5, 5]);
+    link.preferred_phys = [5, 5];
+    link.start_procedures(At(0), &shared);
+    assert_eq!(link.queue.front().copied().map(|queued| queued.data[..3] == [OP_PHY_REQ, 5, 5]), Some(true));
+    assert_eq!(link.tx_payload_max(), 27);
+    link.handle_control(&[OP_REJECT_EXT_IND, OP_PHY_REQ, ERROR_UNSUPPORTED_VALUE], true);
+    assert!(link.phy_ahead.is_none());
+    assert_eq!(link.tx_payload_max(), 251);
 }
 
 #[test]
@@ -1758,11 +2033,13 @@ fn the_link_asks_for_a_longer_data_length_only_when_the_host_allows_it() {
     assert!(link.queue.is_empty());
     link.length.local_tx = LENGTH_MAX;
     link.start_procedures(At(0), &shared);
+    let [rx0, rx1] = RX_TIME_MAX.to_le_bytes();
+    let [tx0, tx1] = LENGTH_MAX[1].to_le_bytes();
     assert_eq!(
         link.queue
             .front()
             .copied()
-            .map(|queued| queued.data[..9] == [OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]),
+            .map(|queued| queued.data[..9] == [OP_LENGTH_REQ, 251, 0, rx0, rx1, 251, 0, tx0, tx1]),
         Some(true)
     );
     assert!(matches!(link.length_request, Request::Requested(_)));
@@ -1933,8 +2210,14 @@ fn without_the_data_length_feature_the_link_stays_at_27_octets() {
     let mut link = connection();
     link.handle_control(&[OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
     let response = *assert_some!(link.queue.front());
-    assert_eq!(response.data[..9], [OP_LENGTH_RSP, 27, 0, 0x48, 0x01, 27, 0, 0x48, 0x01]);
-    assert_eq!(link.length.effective(), [27, 328, 27, 328]);
+    // The longest reception takes 328 us on LE 1M, and with the feature
+    // `coded-phy` 2704 us, 0x0A90, on LE Coded with S=8, which the link
+    // announces. The effective receive time is then the central's 2120 us,
+    // the less of the two (Core, Vol 6, Part B, 4.5.10); 27 octets stay.
+    let [rx_time0, rx_time1] = if cfg!(feature = "coded-phy") { [0x90, 0x0A] } else { [0x48, 0x01] };
+    assert_eq!(response.data[..9], [OP_LENGTH_RSP, 27, 0, rx_time0, rx_time1, 27, 0, 0x48, 0x01]);
+    let rx_time = if cfg!(feature = "coded-phy") { 2120 } else { 328 };
+    assert_eq!(link.length.effective(), [27, 328, 27, rx_time]);
     assert_eq!(link.tx_payload_max(), 27);
 }
 

@@ -59,6 +59,8 @@ compile_error!("the chip features nrf52833 and nrf51 exclude each other: enable 
 compile_error!("enable a chip feature: nrf52832, the default, nrf52833 or nrf51");
 #[cfg(all(feature = "_nrf52", not(any(feature = "nrf52832", feature = "nrf52833"))))]
 compile_error!("_nrf52 is internal: enable the chip feature nrf52832 or nrf52833 instead");
+#[cfg(all(feature = "coded-phy", not(feature = "nrf52833")))]
+compile_error!("LE Coded needs the nRF52833's radio: the coded-phy feature needs the chip feature nrf52833");
 #[cfg(all(feature = "nrf51", feature = "data-length"))]
 compile_error!(
     "the nRF51 CCM encrypts payloads of up to 27 octets: the data-length feature needs the nRF52832 or the nRF52833"
@@ -113,13 +115,30 @@ mod sleep;
 
 /// The PPI channels of the link layer on the nRF52 chips: those of the clock,
 /// the turnaround and the CCM.
-#[cfg(feature = "_nrf52")]
+#[cfg(all(feature = "_nrf52", not(feature = "coded-phy")))]
 const LINK_PPI_CHANNELS: [usize; 10] = [
     clock::PPI_RESUME,
     clock::PPI_SYNC,
     clock::PPI_CALIBRATE,
     radio::PPI_SWITCH_START,
     radio::PPI_SWITCH_ENABLE,
+    clock::PPI_TXEN,
+    clock::PPI_RXEN,
+    crypto::PPI_CRYPT,
+    clock::PPI_ADDRESS,
+    clock::PPI_END,
+];
+/// The PPI channels of the link layer on the nRF52833 with LE Coded: those
+/// of the clock, the turnaround and the CCM, and the channel that moves the
+/// CCM's rate on LE Coded.
+#[cfg(feature = "coded-phy")]
+const LINK_PPI_CHANNELS: [usize; 11] = [
+    clock::PPI_RESUME,
+    clock::PPI_SYNC,
+    clock::PPI_CALIBRATE,
+    radio::PPI_SWITCH_START,
+    radio::PPI_SWITCH_ENABLE,
+    crypto::PPI_RATE,
     clock::PPI_TXEN,
     clock::PPI_RXEN,
     crypto::PPI_CRYPT,
@@ -150,7 +169,9 @@ const LINK_PPI_GROUPS: [usize; 2] = [clock::PPI_GROUP_CALIBRATE, clock::PPI_GROU
 ///
 /// They are programmable channels and fixed channels between TIMER0, RTC0,
 /// the clock, the radio and the CCM, and on the nRF52 chips the two
-/// programmable channels of the turnaround timer. On the nRF51 they include
+/// programmable channels of the turnaround timer. With the feature
+/// `coded-phy` they include channel 18, from the radio's RATEBOOST to the
+/// CCM's RATEOVERRIDE. On the nRF51 they include
 /// the programmable channels that stand in for the FORK registers it lacks.
 ///
 /// The link layer programs these channels and enables and disables them,
@@ -234,6 +255,12 @@ mod tests {
             token!(PPI_GROUP0),
         );
         #[cfg(feature = "_nrf52")]
-        let _radio = crate::radio::Ppi::new(token!(PPI_CH4), token!(PPI_CH5), token!(PPI_CH25));
+        let _radio = crate::radio::Ppi::new(
+            token!(PPI_CH4),
+            token!(PPI_CH5),
+            token!(PPI_CH25),
+            #[cfg(feature = "coded-phy")]
+            token!(PPI_CH18),
+        );
     }
 }

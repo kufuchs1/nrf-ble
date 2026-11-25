@@ -102,6 +102,10 @@ pub struct Settings {
     /// Target of directed advertising: its identity, which a connection
     /// request is checked against.
     pub peer:               Peer,
+    /// PHY of the `ADV_EXT_IND`s on the primary channels: LE 1M, or LE Coded
+    /// for centrals that scan on it.
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    pub primary_phy:        Phy,
     /// The host asked for a resolvable private address.
     pub private:            bool,
     /// Whether address resolution is enabled by the host.
@@ -113,7 +117,8 @@ pub struct Settings {
     pub scan_data:          [u8; SCAN_DATA_MAX],
     /// PHY of the `AUX_ADV_IND`, of the `AUX_CONNECT_REQ` and
     /// `AUX_CONNECT_RSP`, and of the connection's start: LE 1M, or LE 2M on
-    /// the nRF52 chips. The nRF51 takes LE 1M whatever it holds.
+    /// the nRF52 chips, or with the feature `coded-phy` LE Coded. The nRF51
+    /// takes LE 1M whatever it holds.
     #[cfg(feature = "extended-advertising")]
     pub secondary_phy:      Phy,
     /// Length of [`Self::scan_data`].
@@ -179,6 +184,8 @@ impl Settings {
             len: 0,
             own: Peer::new([0; 6], true),
             peer: Peer::new([0; 6], false),
+            #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+            primary_phy: Phy::M1,
             private: false,
             resolving: ResolvingList::new(),
             resolution_enabled: false,
@@ -264,10 +271,19 @@ impl Setup {
     /// After an `AUX_CONNECT_REQ` on `phy`: 2.5 ms from the end of the
     /// request on LE 1M and LE 2M (Core, Vol 6, Part B, 4.5.3), and the
     /// connection starts on `phy` both ways (4.5).
-    #[cfg(feature = "extended-advertising")]
+    #[cfg(all(feature = "extended-advertising", not(feature = "coded-phy")))]
     #[inline]
     #[must_use = "the setup is only built"]
     pub const fn aux(phy: Phy) -> Self { Self { phy, window_delay_us: 2500 } }
+
+    /// After an `AUX_CONNECT_REQ` on `phy`: 2.5 ms from the end of the
+    /// request on LE 1M and LE 2M, 3.75 ms on LE Coded (Core, Vol 6, Part B,
+    /// 4.5.3; Zephyr's `WIN_DELAY_UNCODED` and `WIN_DELAY_CODED`), and the
+    /// connection starts on `phy` both ways (4.5).
+    #[cfg(all(feature = "extended-advertising", feature = "coded-phy"))]
+    #[inline]
+    #[must_use = "the setup is only built"]
+    pub const fn aux(phy: Phy) -> Self { Self { phy, window_delay_us: if phy.is_coded() { 3750 } else { 2500 } } }
 }
 
 /// Runs one advertising event on the enabled channels.

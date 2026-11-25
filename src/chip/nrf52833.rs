@@ -89,12 +89,27 @@ pub const LEVELS_DBM: [i8; 14] = [-40, -20, -16, -12, -8, -4, 0, 2, 3, 4, 5, 6, 
 /// `HAL_RADIO_NRF52833_RX_CHAIN_DELAY_1M_NS` 9400 ("9.4") and
 /// `HAL_RADIO_NRF52833_RX_CHAIN_DELAY_2M_NS` 5000 ("5.0"). Not measured on
 /// an nRF52833.
+#[cfg_attr(
+    feature = "coded-phy",
+    doc = "",
+    doc = "On LE Coded `HAL_RADIO_NRF52833_RX_CHAIN_DELAY_S8_NS` 29600 (\"29.6\") and \
+           `HAL_RADIO_NRF52833_RX_CHAIN_DELAY_S2_NS` 24600, whose comment says \"19.6\" and whose `_S2_US` is 25 \
+           (\"ceil(19.6)\"): the value is taken, as Zephyr's timing uses it, and which of the two is right is to \
+           be measured. The END event of a packet on LE Coded comes this long after its last bit on air, TERM2 \
+           included, as Zephyr times its turnarounds from END on this chip without direction finding \
+           (`HAL_RADIO_IFS_EVENTS_END` in `radio_nrf5_resources.h`, whose comment calls PHYEND without a constant \
+           tone extension \"generated in the same instant as EVENTS_END\")."
+)]
 #[inline]
 #[must_use = "the delay is only computed"]
 pub const fn rx_chain_ns(phy: Phy) -> u32 {
     match phy {
         Phy::M1 => 9400,
         Phy::M2 => 5000,
+        #[cfg(feature = "coded-phy")]
+        Phy::CodedS8 => 29_600,
+        #[cfg(feature = "coded-phy")]
+        Phy::CodedS2 => 24_600,
     }
 }
 
@@ -108,12 +123,19 @@ pub fn set_tifs(us: u8) { RADIO.tifs().write(|w| w.set_tifs(u16::from(us))); }
 /// (`radio_nrf52833.h`): `HAL_RADIO_NRF52833_TXEN_TXIDLE_TX_1M_FAST_NS`
 /// 40900 ("40.1 + 0.8") and `HAL_RADIO_NRF52833_TXEN_TXIDLE_TX_2M_FAST_NS`
 /// 40000 ("40.1 - 0.1"). Not measured on an nRF52833.
+#[cfg_attr(
+    feature = "coded-phy",
+    doc = "",
+    doc = "On LE Coded `HAL_RADIO_NRF52833_TXEN_TXIDLE_TX_S8_FAST_NS` and `_S2_FAST_NS` 42300 (\"40.1 + 2.2\")."
+)]
 #[inline]
 #[must_use = "the time is only computed"]
 pub const fn tx_ready_ns(phy: Phy) -> u32 {
     match phy {
         Phy::M1 => 40_900,
         Phy::M2 => 40_000,
+        #[cfg(feature = "coded-phy")]
+        Phy::CodedS8 | Phy::CodedS2 => 42_300,
     }
 }
 
@@ -141,6 +163,37 @@ mod tests {
         // Ready 8 us before the earliest packet: 150 - 41 - 8.
         assert_eq!(Phy::M1.listen_offset_us(), 101);
         assert_eq!(Phy::M2.listen_offset_us(), 101);
+    }
+
+    /// The answer to a packet on LE Coded, after its coding: 42.3 us ready
+    /// time on LE Coded and 29.6 us receive chain after S=8 round to 72 us,
+    /// after S=2 24.6 us to 67 us. An answer on LE 1M or LE 2M to a packet on
+    /// LE Coded takes their ready times. The receiver is ready as on LE 1M.
+    #[cfg(feature = "coded-phy")]
+    #[test]
+    fn turnaround_offsets_on_le_coded_follow_the_received_coding() {
+        for tx in [Phy::CodedS8, Phy::CodedS2] {
+            assert_eq!(tx.response_offset_us(Phy::CodedS8), 78);
+            assert_eq!(tx.response_offset_us(Phy::CodedS2), 83);
+            assert_eq!(tx.listen_offset_us(), 101);
+        }
+        // 40.9 + 29.6 = 70.5 rounds to 71; 40.0 + 24.6 = 64.6 to 65.
+        assert_eq!(Phy::M1.response_offset_us(Phy::CodedS8), 79);
+        assert_eq!(Phy::M2.response_offset_us(Phy::CodedS2), 85);
+        // 42.3 + 9.4 = 51.7 rounds to 52.
+        assert_eq!(Phy::CodedS8.response_offset_us(Phy::M1), 98);
+    }
+
+    /// A decryption on LE Coded starts at 125 kbit/s, the rate of S=8.
+    #[cfg(feature = "coded-phy")]
+    #[test]
+    fn the_ccm_decrypts_le_coded_at_the_rate_of_s8() {
+        use super::super::datarate;
+        use embassy_nrf::pac::ccm::vals::Datarate;
+        assert!(datarate(Phy::CodedS8) == Datarate::_125kbps);
+        assert!(datarate(Phy::CodedS2) == Datarate::_125kbps);
+        assert!(datarate(Phy::M1) == Datarate::_1mbit);
+        assert!(datarate(Phy::M2) == Datarate::_2mbit);
     }
 
     #[test]
