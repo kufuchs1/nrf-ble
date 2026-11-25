@@ -669,7 +669,12 @@ the specification's, not measured with this crate.
   (Core, Vol 6, Part B, 4.5.10), the link layer announces the time of its longest reception with S=8, and with
   `data-length` `link::LENGTH_MAX` allows 17040 µs, 251 octets with S=8. On LE 1M and LE 2M the effective time has
   only the least of 328 µs, as in 4.5.10 and in Zephyr: with a central that announces 17040 µs it is 17040 µs, more
-  than the 2120 µs that 251 octets take there, and the octets bound the packets.
+  than the 2120 µs that 251 octets take there, and the octets bound the packets. From an `LL_PHY_RSP` or `LL_PHY_REQ`
+  of ours that offers LE Coded to a central that receives it, or an `LL_PHY_UPDATE_IND` that names it for our side,
+  until the instant, the PDUs this side prepares also fit its effective time on LE Coded, 27 octets with a MIC at the
+  least time, as one unacknowledged at the instant goes out again with S=8 or S=2 (Zephyr restricts the time likewise
+  in `pu_select_phy_timing_restrict`). A PDU already on the air when the procedure starts keeps its length; one that
+  is still unacknowledged at the instant can then outlast the effective time there.
 - **Power control:** one control per PHY of the power control procedures, LE Coded with S=8 and with S=2 being PHYs 3
   and 4. Its targets are those of LE 1M; LE Coded's better sensitivity is not taken into account.
 - **Extended advertising** (with `extended-advertising`): `AdvParams::primary_phy` and `Advertising::with_primary_phy`

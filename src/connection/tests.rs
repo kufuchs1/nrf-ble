@@ -1926,6 +1926,72 @@ fn the_data_length_on_le_coded_follows_the_coded_time_on_the_air() {
     assert_eq!(link.tx_payload_max(), 251);
 }
 
+/// While a PHY procedure may move this side's transmissions to LE Coded,
+/// the PDUs it prepares fit the effective time there as well, 2704 us, 27
+/// octets with a MIC with S=8: one still unacknowledged at the instant goes
+/// out again with S=8. This holds from our `LL_PHY_RSP` that offers LE
+/// Coded to a central that receives it, or our `LL_PHY_REQ` that names it,
+/// until the instant, and ends with an update that leaves our transmit PHY
+/// or a rejection of our request.
+#[test]
+#[cfg(all(feature = "data-length", feature = "coded-phy"))]
+fn the_pdus_before_a_move_to_le_coded_fit_its_time() {
+    let shared = Shared::with_all_events();
+    shared.set_connected(true);
+    let mut link = encrypted();
+    link.length.local_tx = [251, 2120];
+    link.length.announced_tx = [251, 2120];
+    link.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+    link.preferred_phys = [7, 7];
+    assert_eq!(link.tx_payload_max(), 251);
+    // A central that receives on LE 1M and LE 2M alone cannot move us to LE
+    // Coded.
+    link.handle_control(&[OP_PHY_REQ, 7, 3], true);
+    assert!(link.phy_ahead.is_none());
+    assert_eq!(link.tx_payload_max(), 251);
+    link.handle_control(&[OP_PHY_UPDATE_IND, 0, 0, 10, 0], true);
+    send_queue(&mut link, &shared);
+    // A central that receives LE Coded may: from our answer on, the host's
+    // data goes out in fragments of 27 octets.
+    link.handle_control(&[OP_PHY_REQ, 4, 4], true);
+    assert!(link.phy_ahead == Some(Phy::CodedS8));
+    assert_eq!(link.tx_payload_max(), 27);
+    assert_eq!(send_queue(&mut link, &shared).first().map(|&(opcode, _)| opcode), Some(OP_PHY_RSP));
+    let data = [0x5A; 100];
+    assert!(shared.queue_acl_for_test(&data));
+    link.load_next(&shared);
+    assert!(link.tx_kind == TxKind::AclPart);
+    assert_eq!(link.current().plain.0[..DATA_HEADER_LEN], [Llid::Start.bits(), 27, 0]);
+    // The update names LE Coded for our side: the restriction holds until
+    // the instant, and after it the effective time of LE Coded bounds the
+    // PDUs.
+    link.handle_control(&[OP_PHY_UPDATE_IND, 0, 4, 10, 0], true);
+    assert!(link.phy_ahead == Some(Phy::CodedS8));
+    assert_eq!(link.tx_payload_max(), 27);
+    link.counter = 10;
+    link.apply_instants(&shared);
+    assert!(link.tx_phy == Phy::CodedS8 && link.phy_ahead.is_none());
+    assert_eq!(link.tx_payload_max(), 27);
+    // Back on LE 1M, our own request that names LE Coded restricts the
+    // PDUs until the central rejects it.
+    link.handle_control(&[OP_PHY_UPDATE_IND, 0, 1, 20, 0], true);
+    assert!(link.phy_ahead.is_none());
+    link.counter = 20;
+    link.apply_instants(&shared);
+    assert_eq!(link.tx_payload_max(), 251);
+    send_queue(&mut link, &shared);
+    link.central_features = Some([0x1F, 0x08, 0, 0, 0, 0, 0, 0]);
+    link.phy_request = Request::NotStarted;
+    link.host_phy = Some([5, 5]);
+    link.preferred_phys = [5, 5];
+    link.start_procedures(At(0), &shared);
+    assert_eq!(link.queue.front().copied().map(|queued| queued.data[..3] == [OP_PHY_REQ, 5, 5]), Some(true));
+    assert_eq!(link.tx_payload_max(), 27);
+    link.handle_control(&[OP_REJECT_EXT_IND, OP_PHY_REQ, ERROR_UNSUPPORTED_VALUE], true);
+    assert!(link.phy_ahead.is_none());
+    assert_eq!(link.tx_payload_max(), 251);
+}
+
 #[test]
 #[cfg(feature = "data-length")]
 fn host_data_is_sent_in_fragments_the_central_receives() {

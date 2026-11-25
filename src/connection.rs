@@ -885,6 +885,15 @@ pub struct Connection {
     pending:                Ring<Pending, RX_SLOTS>,
     /// PHY both ways.
     phy:                    Phy,
+    /// LE Coded with this side's coding while the running PHY procedure may
+    /// move this side's transmissions to it at its instant: from our
+    /// `LL_PHY_REQ` or `LL_PHY_RSP` that offers it, or the central's
+    /// `LL_PHY_UPDATE_IND` that names it, until the instant or the
+    /// procedure's end. The PDUs prepared meanwhile fit its effective time as
+    /// well ([`Self::tx_payload_max`]), as one unacknowledged at the instant
+    /// goes out again on it.
+    #[cfg(feature = "coded-phy")]
+    phy_ahead:              Option<Phy> = None,
     /// The PHY update this side asks for.
     phy_request:            Request = Request::NotStarted,
     /// PHY procedure completion awaiting notification.
@@ -1881,6 +1890,17 @@ impl Connection {
         self.expect = Expect::Anchor;
     }
 
+    /// Notes the PHYs of the bit field `phys` the running PHY procedure may
+    /// move this side's transmissions to: LE Coded with this side's coding
+    /// if bit 2 is among them and this side does not send on it yet, which
+    /// [`Self::tx_payload_max`] then fits the PDUs to as well; none
+    /// otherwise.
+    #[cfg(feature = "coded-phy")]
+    const fn expect_tx_phys(&mut self, phys: u8) {
+        let coded = Phy::coded(self.coding);
+        self.phy_ahead = if phys & coded.bit() != 0 && !self.tx_phy.is_coded() { Some(coded) } else { None };
+    }
+
     /// Access address time expected at the current event from the last
     /// anchor.
     const fn expected_anchor(&self) -> At {
@@ -1965,10 +1985,12 @@ impl Connection {
     /// Takes the PHYs of an update at its instant, receiving on `receive`
     /// from now on and sending on [`Self::next_tx_phy`]: moves the anchor,
     /// the time of the central's access address event, which comes 336 us
-    /// later after its packet's start on LE Coded than on LE 1M, and sets the
-    /// least effective time of each direction for its PHY.
+    /// later after its packet's start on LE Coded than on LE 1M, sets the
+    /// least effective time of each direction for its PHY, and ends the
+    /// procedure's hold on the PDUs' length ([`Self::phy_ahead`]).
     #[cfg(feature = "coded-phy")]
     const fn follow_phys(&mut self, receive: Phy) {
+        self.phy_ahead = None;
         self.anchor =
             self.anchor.before(Micros(self.phy.address_offset_us())).after(Micros(receive.address_offset_us()));
         self.length.time_floor = [time_floor(self.next_tx_phy), time_floor(receive)];
@@ -2187,11 +2209,17 @@ impl Connection {
             // The central's procedure takes the place of ours.
             self.phy_request = Request::Requested(self.last_valid.after(PROCEDURE_TIMEOUT_US));
             let [tx, rx] = self.preferred_phys;
+            // The central may send to us on LE Coded if both name it.
+            #[cfg(feature = "coded-phy")]
+            self.expect_tx_phys(tx & field::<2>(params, 0).map_or(0, |[_, central_rx]| central_rx));
             self.enqueue(Llid::Control, &[OP_PHY_RSP, tx, rx]);
             return;
         }
         let Some([to_peripheral, to_central, instant0, instant1]) = field::<4>(params, 0) else { return };
         self.phy_request = Request::Done;
+        // Only the PHY of the update counts from here on.
+        #[cfg(feature = "coded-phy")]
+        self.expect_tx_phys(to_central);
         if to_peripheral == 0 && to_central == 0 {
             if self.host_phy.is_some() {
                 self.phy_status = Some(STATUS_SUCCESS);
@@ -2293,6 +2321,9 @@ impl Connection {
         match opcode {
             OP_PHY_REQ => {
                 self.phy_request = Request::Done;
+                // No PHY is ahead once our request ended.
+                #[cfg(feature = "coded-phy")]
+                self.expect_tx_phys(0);
                 if self.host_phy.is_some() {
                     self.phy_status = Some(error);
                 }
@@ -3282,6 +3313,8 @@ impl Connection {
         {
             if chip::PHY_2M {
                 let [tx, rx] = self.preferred_phys;
+                #[cfg(feature = "coded-phy")]
+                self.expect_tx_phys(tx);
                 self.enqueue(Llid::Control, &[OP_PHY_REQ, tx, rx]);
                 self.phy_request = Request::Requested(deadline);
             } else {
@@ -3419,24 +3452,33 @@ impl Connection {
 
     /// Longest payload this side may send now: the effective octets, and as
     /// many as fit the effective time on the transmit PHY with the MIC.
+    #[cfg(not(feature = "coded-phy"))]
     const fn tx_payload_max(&self) -> usize {
         let [octets, time, ..] = self.length.effective();
-        #[cfg(feature = "coded-phy")]
-        if self.tx_phy.is_coded() {
-            let mic = if self.encryption.phase.tx_on() { MIC_LEN } else { 0 };
-            let pdu: usize = self.tx_phy.pdu_octets_within(time.into()).saturating_cast();
-            return pdu
-                .saturating_sub(DATA_HEADER_LEN.strict_sub(1))
-                .saturating_sub(mic)
-                .min(usize::from(octets))
-                .min(ACL_MAX);
-        }
         let per_byte = 8_u32.checked_div(u32::from(self.tx_phy.hci())).unwrap_or(8);
         let mic = if self.encryption.phase.tx_on() { MIC_LEN } else { 0 };
         // Preamble and access address, header and CRC.
         let overhead = self.tx_phy.address_offset_us().checked_div(per_byte).unwrap_or(0).saturating_add(5);
         let by_time = u32::from(time).checked_div(per_byte).unwrap_or(0).saturating_sub(overhead);
         by_time.saturating_cast::<usize>().saturating_sub(mic).min(usize::from(octets)).min(ACL_MAX)
+    }
+
+    /// Longest payload this side may send now: the effective octets, and as
+    /// many as fit the effective time on the transmit PHY with the MIC, and
+    /// while a PHY procedure may move the transmissions to LE Coded
+    /// ([`Self::phy_ahead`]) also its effective time there, so that a PDU
+    /// still unacknowledged at the instant fits it. Zephyr restricts the
+    /// time the same way, to that of "the probable PHY with longest Tx time"
+    /// (`pu_select_phy_timing_restrict` in `ull_llcp_phy.c`).
+    #[cfg(feature = "coded-phy")]
+    const fn tx_payload_max(&self) -> usize {
+        let [octets, time, ..] = self.length.effective();
+        let mic = self.encryption.phase.tx_on();
+        let now = payload_within(self.tx_phy, time, octets, mic);
+        match self.phy_ahead {
+            Some(phy) => now.min(payload_within(phy, self.length.tx_time(time_floor(phy)), octets, mic)),
+            None => now,
+        }
     }
 
     /// Sleeps until an access address arrives or `deadline` passes, woken by
@@ -3594,6 +3636,26 @@ const fn for_phy_mut<Value>(values: &mut [Value; POWER_PHYS], phy: Phy) -> &mut 
         Phy::CodedS8 => s8,
         Phy::CodedS2 => s2,
     }
+}
+
+/// Longest payload of a data PDU on `phy` within `time` microseconds on the
+/// air, with a MIC if `sealed`, at most `octets` and [`ACL_MAX`].
+#[cfg(feature = "coded-phy")]
+const fn payload_within(phy: Phy, time: u16, octets: u16, sealed: bool) -> usize {
+    let mic = if sealed { MIC_LEN } else { 0 };
+    if phy.is_coded() {
+        let pdu: usize = phy.pdu_octets_within(time.into()).saturating_cast();
+        return pdu
+            .saturating_sub(DATA_HEADER_LEN.strict_sub(1))
+            .saturating_sub(mic)
+            .min(usize::from(octets))
+            .min(ACL_MAX);
+    }
+    let per_byte = 8_u32.checked_div(u32::from(phy.hci())).unwrap_or(8);
+    // Preamble and access address, header and CRC.
+    let overhead = phy.address_offset_us().checked_div(per_byte).unwrap_or(0).saturating_add(5);
+    let by_time = u32::from(time).checked_div(per_byte).unwrap_or(0).saturating_sub(overhead);
+    by_time.saturating_cast::<usize>().saturating_sub(mic).min(usize::from(octets)).min(ACL_MAX)
 }
 
 /// Time on the air of a data PDU of `octets` octets of payload and a MIC on
