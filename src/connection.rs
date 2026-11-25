@@ -1685,6 +1685,9 @@ impl Connection {
     ) -> Option<At> {
         // Only LE 2M makes the PHYs differ. An answer on LE Coded is timed
         // the same way, once the coding of the central's packet is known.
+        #[cfg(not(feature = "coded-phy"))]
+        let asymmetric = chip::PHY_2M && self.phy != self.tx_phy;
+        #[cfg(feature = "coded-phy")]
         let asymmetric = chip::PHY_2M && (self.phy != self.tx_phy || self.phy.is_coded());
         // SAFETY: `rx` is a full packet buffer borrowed for this whole
         // exchange, which disables the radio on every path out.
