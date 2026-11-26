@@ -5,9 +5,10 @@
 #![no_std]
 // Const trait implementations of the standard library, so that const
 // functions use the methods of Option, Result, Ord, From and TryFrom, `?`,
-// slice ranges, `RangeInclusive::contains` for the range checks
-// (`const_range`) and `for` loops over ranges (`const_iter`) like the rest
-// of the code, instead of matches, casts and while loops.
+// slice ranges and `RangeInclusive::contains` for the range checks
+// (`const_range`) like the rest of the code, instead of matches and casts.
+// A range is no const iterator on current nightlies, so a const function
+// loops with `while`.
 // Beside them: default values on struct fields (`default_field_values`), so
 // a starting value stands at its field and the constructor writes `..`;
 // `saturating_cast` and `truncate` (`integer_casts`,
@@ -23,7 +24,6 @@
     const_cmp,
     const_convert,
     const_index,
-    const_iter,
     const_option_ops,
     const_range,
     const_result_trait_fn,

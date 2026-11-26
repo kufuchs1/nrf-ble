@@ -26,13 +26,16 @@ impl UsedChannels {
     #[must_use = "the map is only built"]
     pub const fn new(bits: [u8; 5]) -> Self {
         let mut map = Self { count: 0, used: [0; 37] };
-        for channel in 0..DATA_CHANNELS {
+        // A while loop: a range is no const iterator on current nightlies.
+        let mut channel: u8 = 0;
+        while channel < DATA_CHANNELS {
             if is_set(bits, channel) {
                 if let Some(slot) = map.used.get_mut(usize::from(map.count)) {
                     *slot = channel;
                 }
                 map.count = map.count.saturating_add(1);
             }
+            channel = channel.strict_add(1);
         }
         map
     }
@@ -107,10 +110,12 @@ impl Hopping {
 /// Part B, 4.5.8.3.3).
 const fn csa2_random(counter: u16, identifier: u16) -> u16 {
     let mut value = counter ^ identifier;
-    for _ in 0..PERMUTATIONS {
+    let mut round: u8 = 0;
+    while round < PERMUTATIONS {
         // The bits of each octet reversed, the octets in place.
         let permuted = value.reverse_bits().swap_bytes();
         value = permuted.wrapping_mul(17).wrapping_add(identifier);
+        round = round.strict_add(1);
     }
     value ^ identifier
 }
